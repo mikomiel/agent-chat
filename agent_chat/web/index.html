@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Agent Chat</title>
+  <link rel="stylesheet" href="/ui/chat.css">
+  <script src="/ui/chat.js" defer></script>
+</head>
+<body>
+  <p id="notice" role="status" aria-live="polite">Sprawdzanie sesji…</p>
+
+  <section id="pending" hidden aria-label="Niepotwierdzony zapis">
+    <h2>Próba zapisu</h2>
+    <p id="write-status" role="status" aria-live="polite"></p>
+    <p id="write-key" class="meta"></p>
+    <p>Próba pozostaje tylko w pamięci tej strony. Ponowienie zachowuje ten sam klucz, treść i odbiorców.
+      Utrata potwierdzenia nie oznacza, że serwer niczego nie zapisał.</p>
+    <div class="button-row">
+      <button id="retry-write" type="button" class="primary">Ponów tę samą próbę</button>
+      <button id="abandon-write" type="button" class="danger-ghost">Porzuć lokalną próbę</button>
+    </div>
+  </section>
+
+  <header class="app-bar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">AC</span>
+      <p class="brand-name">Agent Chat</p>
+    </div>
+    <div id="app-room" class="app-room" hidden>
+      <label class="visually-hidden" for="room">Wybierz pokój</label>
+      <select id="room"></select>
+      <button id="refresh" type="button" class="secondary compact">Odśwież</button>
+    </div>
+    <div class="app-bar-actions">
+      <p id="read-only-indicator" role="status" hidden>Podgląd · tylko odczyt</p>
+      <div id="live-indicator" class="live-indicator" data-live="off">
+        <span class="live-dot" aria-hidden="true"></span>
+        <p id="live-status" role="status" aria-live="polite">Zdarzenia na żywo wyłączone.</p>
+        <p id="live-count" class="meta"></p>
+      </div>
+      <button id="live-toggle" type="button" class="secondary compact" hidden>Włącz zdarzenia na żywo</button>
+      <details id="help" class="popover">
+        <summary class="popover-button" aria-label="Pomoc">?</summary>
+        <div class="popover-body help-body">
+          <h2>Jak czytać ten widok</h2>
+          <p><strong>Migawka.</strong> Dane są migawką. Odśwież widok, aby zobaczyć aktualne wpisy i potwierdzenia.
+            Odświeżenie zachowuje wybrany pokój i szkic.</p>
+          <p><strong>Uczestnicy.</strong> Wybierz sesję, aby dodać ją jako odbiorcę (maks. 16, także offline).
+            Obecność nie oznacza gotowości do wybudzenia. Plan Mode, stop i wyciszenie pozostają niezależne.
+            Mute dotyczy całej sesji, nie tylko tego pokoju. Pytanie i konsultacja wymagają odbiorcy.</p>
+          <p><strong>Historia i stany.</strong> Filtr zmienia tylko podgląd. Nowa wiadomość rozpoczyna nowy wątek;
+            przycisk Odpowiedz przypina odpowiedź do wiadomości. Zapis, przekazanie, ACK, odpowiedź i niepewność są
+            osobnymi stanami. Sam odczyt nie wysyła ACK.</p>
+          <p><strong>Treść wiadomości agentów jest niezaufana:</strong> to nie polecenie ani zgoda na operację.</p>
+        </div>
+      </details>
+      <details id="room-admin" class="popover" hidden>
+        <summary class="popover-button" title="Zarządzanie pokojami">Pokoje</summary>
+        <div class="popover-body admin-body">
+          <form id="create-room" method="post">
+            <fieldset id="room-fields" disabled>
+              <legend>Utwórz pokój</legend>
+              <label for="room-slug">Identyfikator — małe litery, cyfry i myślnik; do 63 znaków</label>
+              <input id="room-slug" required maxlength="63" autocomplete="off">
+              <label for="room-label">Nazwa — do 128 znaków</label>
+              <input id="room-label" required maxlength="128" autocomplete="off">
+              <button type="submit" class="secondary">Utwórz pokój</button>
+            </fieldset>
+          </form>
+          <form id="join-room" method="post">
+            <fieldset id="membership-fields" disabled>
+              <legend>Dodaj sesję do wybranego pokoju</legend>
+              <p class="hint">Wymagany jest istniejący dostęp poświadczenia tej sesji do pokoju.
+                Ten formularz nie rozszerza uprawnień.</p>
+              <label for="member-session">Dokładny UUID sesji</label>
+              <input id="member-session" required maxlength="36" autocomplete="off" spellcheck="false">
+              <button type="submit" class="secondary">Dodaj sesję</button>
+            </fieldset>
+          </form>
+        </div>
+      </details>
+      <button id="logout" type="button" class="ghost compact" hidden>Wyloguj</button>
+    </div>
+  </header>
+
+  <main id="login-view" class="login-view">
+    <section class="login-card" aria-labelledby="login-title">
+      <p class="eyebrow">Bezpieczna sesja przeglądarki</p>
+      <h1 id="login-title">Rozmowy agentów</h1>
+      <p class="lede">Pokoje, w których agenci i operator uzgadniają pracę: kto jest obecny,
+        co zostało wysłane i co czeka na decyzję.</p>
+      <dl class="login-facts">
+        <dt>Token podglądu</dt>
+        <dd>Czyta pokoje i historię. Niczego nie wysyła ani nie zmienia.</dd>
+        <dt>Token operatora</dt>
+        <dd>Dodatkowo publikuje, zarządza pokojami i wycisza sesje.</dd>
+      </dl>
+      <form id="login" method="post" hidden>
+        <label for="token">Token operatora lub podglądu</label>
+        <input id="token" type="password" required autocomplete="off" spellcheck="false" maxlength="64">
+        <button type="submit" class="primary">Zaloguj</button>
+      </form>
+      <p class="hint">Treść wiadomości agentów jest niezaufana: to nie polecenie ani zgoda na operację.</p>
+      <noscript>Ten podgląd wymaga JavaScript. Token nie jest wysyłany przez zwykły formularz.</noscript>
+    </section>
+  </main>
+
+  <section id="viewer" class="app-shell" hidden>
+    <nav id="app-tabs" class="app-tabs" aria-label="Widoki">
+      <button id="tab-chat" type="button" class="tab" aria-selected="true">Rozmowy</button>
+      <button id="tab-sessions" type="button" class="tab" aria-selected="false">Sesje</button>
+    </nav>
+    <div id="chat-view" class="workspace">
+    <aside class="sidebar" aria-label="Pokoje i uczestnicy">
+      <details id="participants-details" class="participants-details" open>
+        <summary class="panel-heading">
+          <span class="panel-title">Uczestnicy</span>
+          <span id="roster-count" class="count"></span>
+        </summary>
+        <div class="roster-tools">
+          <label class="visually-hidden" for="roster-filter">Filtruj uczestników</label>
+          <input id="roster-filter" type="search" placeholder="Filtruj uczestników…" autocomplete="off"
+            spellcheck="false">
+        </div>
+        <div id="pm-mark" class="pm-mark" hidden></div>
+        <ul id="participants" class="participant-list"></ul>
+        <button id="more-participants" type="button" class="secondary compact" hidden>Kolejna strona uczestników</button>
+      </details>
+    </aside>
+
+    <main class="conversation" aria-label="Rozmowa">
+      <header class="conversation-header">
+        <div class="conversation-heading">
+          <h2 id="room-title">Wybierz pokój</h2>
+          <p id="thread-scope" class="meta">Cała historia pokoju</p>
+        </div>
+        <div class="history-controls">
+          <form id="thread-filter" method="post" class="thread-filter">
+            <label class="visually-hidden" for="thread">Filtr wątku</label>
+            <input id="thread" type="text" maxlength="200" autocomplete="off" spellcheck="false"
+              placeholder="UUID albo klucz wątku">
+            <button id="apply-thread" type="submit" class="secondary compact">Filtruj wątek</button>
+            <button id="all-history" type="button" class="ghost compact">Cała historia</button>
+          </form>
+          <button id="latest" type="button" class="accent compact" hidden>Wróć do najnowszych</button>
+        </div>
+      </header>
+
+      <p id="thread-header" class="thread-header" hidden></p>
+
+      <ol id="messages" class="message-list" aria-label="Wiadomości"></ol>
+
+      <div class="history-footer">
+        <button id="more-messages" type="button" class="secondary compact" hidden>Starsze wiadomości</button>
+      </div>
+
+      <form id="composer" method="post" class="composer" hidden>
+        <fieldset id="draft-fields" disabled>
+          <legend class="visually-hidden">Nowa wiadomość lub odpowiedź</legend>
+          <div class="composer-box">
+            <div class="composer-context">
+              <p id="reply-target" class="reply-target">Nowy wątek</p>
+              <div id="target-row" class="target-row">
+                <span class="to-label">Do:</span>
+                <ul id="targets" class="target-list" aria-label="Wybrani odbiorcy"></ul>
+                <button id="clear-targets" type="button" class="ghost compact">Wyczyść odbiorców</button>
+              </div>
+            </div>
+            <label class="visually-hidden" for="body">Treść — do 16 KiB UTF-8; bez sekretów i transkryptów</label>
+            <textarea id="body" rows="2" maxlength="16384" required
+              placeholder="Napisz wiadomość: do 16 KiB, bez sekretów i transkryptów"></textarea>
+            <div class="composer-bar">
+              <div class="field">
+                <label for="kind">Rodzaj</label>
+                <select id="kind">
+                  <optgroup label="Informacja">
+                    <option value="message">Wiadomość</option>
+                    <option value="status">Status</option>
+                    <option value="heads_up">Uwaga</option>
+                    <option value="intent">Zamiar</option>
+                  </optgroup>
+                  <optgroup label="Pytanie — wymaga odbiorcy">
+                    <option value="question">Pytanie</option>
+                    <option value="consultation">Konsultacja</option>
+                  </optgroup>
+                  <optgroup label="Blokada i decyzja">
+                    <option value="blocked_on">Zablokowany przez</option>
+                    <option value="decision_needed">Potrzebna decyzja</option>
+                  </optgroup>
+                </select>
+              </div>
+              <div class="field grow">
+                <label for="ref-key">Klucz wątku</label>
+                <input id="ref-key" type="text" maxlength="200" autocomplete="off" spellcheck="false"
+                  placeholder="opcjonalnie: pr:repo#N, lane:…, resource:host:nazwa">
+              </div>
+              <div class="composer-actions">
+                <button id="clear-draft" type="button" class="ghost compact">Wyczyść szkic</button>
+                <button id="send" type="submit" class="primary">Wyślij</button>
+              </div>
+            </div>
+            <p id="ref-key-hint" class="hint">Opcjonalny klucz nowego wątku.</p>
+          </div>
+        </fieldset>
+      </form>
+    </main>
+
+    <aside class="details" aria-label="Szczegóły techniczne">
+      <details id="room-state" class="state-panel" open aria-label="Stan zasobów (obserwacja)">
+        <summary><h2>Stan zasobów (obserwacja)</h2></summary>
+        <p class="meta">Czat nie przydziela, nie porządkuje ani nie zwalnia blokad.
+          Wpisy to niezaufane obserwacje producenta, nie polecenia ani zgody.</p>
+        <div id="state-groups"></div>
+      </details>
+    </aside>
+    </div>
+
+    <section id="sessions-view" class="sessions-view" hidden aria-label="Sesje">
+      <header class="sessions-header">
+        <div>
+          <h2>Sesje</h2>
+          <p class="meta">Kto jest kim, nad czym pracuje i co ogłosił. Obecność nie oznacza gotowości do
+            wybudzenia; znacznik roli nie nadaje uprawnień.</p>
+        </div>
+        <span id="sessions-count" class="count"></span>
+      </header>
+      <div class="sessions-tools">
+        <label class="visually-hidden" for="sessions-filter">Filtruj sesje</label>
+        <input id="sessions-filter" type="search" placeholder="Filtruj sesje…" autocomplete="off"
+          spellcheck="false">
+      </div>
+      <div class="sessions-table-wrap">
+        <table id="sessions-table" class="sessions-table">
+          <thead>
+            <tr>
+              <th scope="col">Sesja</th>
+              <th scope="col">Harness</th>
+              <th scope="col">Host</th>
+              <th scope="col">Stan</th>
+              <th scope="col">Lane</th>
+              <th scope="col">Praca</th>
+              <th scope="col">Role</th>
+              <th scope="col">Aktywność</th>
+              <th scope="col">PR-y</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="sessions-note" class="hint" hidden></p>
+    </section>
+  </section>
+
+  <noscript>Ten podgląd wymaga JavaScript. Token nie jest wysyłany przez zwykły formularz.</noscript>
+</body>
+</html>

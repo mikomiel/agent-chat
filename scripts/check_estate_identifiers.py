@@ -11,8 +11,13 @@ aliases) must not be committed here either. Put them, one regular expression
 per line, in `.estate-identifiers` at the repository root, or name that file
 with `ESTATE_IDENTIFIERS`. The file is git-ignored on purpose.
 
-Matching text is never printed: the report names the file, the line and the
-rule, so a CI log cannot become the leak it is trying to prevent.
+The default scan covers tracked files. `--stdin` scans a stream instead, which
+is how CI reads a commit range: `git log --all --patch | ... --stdin`. That
+mode catches a value that was introduced in one commit and removed in a later
+one, which a tree scan cannot see.
+
+Matching text is never printed: the report names the file (or `stdin`), the
+line and the rule, so a CI log cannot become the leak it is trying to prevent.
 
 Exit status: 0 clean, 1 findings, 2 usage or environment failure.
 """
@@ -34,7 +39,10 @@ SKIP_SUFFIXES = {
 RULES: list[tuple[str, re.Pattern[str]]] = [
     ("private-ipv4", re.compile(r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b")),
     ("estate-absolute-path", re.compile(r"/(?:opt|srv|home)/[A-Za-z0-9._-]+/")),
-    ("container-number", re.compile(r"\bCT\d{2,4}\b")),
+    # Case-insensitive: a lowercase container number in a fixture is the same
+    # class of value as an uppercase one, and a tree scan corrected by hand once
+    # already missed the lowercase form.
+    ("container-number", re.compile(r"(?i)\bct\d{2,4}\b")),
     ("internal-hostname", re.compile(r"\b[a-z0-9][a-z0-9-]*\.(?:internal|intranet|lan)\b")),
     ("private-key-block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
@@ -86,8 +94,17 @@ def tracked_files() -> list[Path]:
     ]
 
 
-def main() -> int:
-    rules = RULES + extra_rules()
+def _scan_lines(lines: list[str], rules: list[tuple[str, re.Pattern[str]]], label: str) -> int:
+    findings = 0
+    for number, line in enumerate(lines, 1):
+        for name, pattern in rules:
+            if pattern.search(line):
+                print(f"{label}:{number}: {name}")
+                findings += 1
+    return findings
+
+
+def _scan_files(rules: list[tuple[str, re.Pattern[str]]]) -> int:
     findings = 0
     for path in tracked_files():
         if path.suffix.lower() in SKIP_SUFFIXES or set(path.parts) & SKIP_DIRS:
@@ -96,11 +113,16 @@ def main() -> int:
             text = path.read_text(encoding="utf-8")
         except (UnicodeDecodeError, OSError):
             continue
-        for number, line in enumerate(text.splitlines(), 1):
-            for name, pattern in rules:
-                if pattern.search(line):
-                    print(f"{path}:{number}: {name}")
-                    findings += 1
+        findings += _scan_lines(text.splitlines(), rules, str(path))
+    return findings
+
+
+def main() -> int:
+    rules = RULES + extra_rules()
+    if "--stdin" in sys.argv[1:]:
+        findings = _scan_lines(sys.stdin.read().splitlines(), rules, "stdin")
+    else:
+        findings = _scan_files(rules)
     if findings:
         print(f"{findings} finding(s); this content must not be public", file=sys.stderr)
         return 1

@@ -28,9 +28,9 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
   operators can mark a PM, assign room roles, and grant viewers.
 - **History and replay.** PostgreSQL is the only history owner. Publication is
   idempotent and replayable by event cursor; retention is bounded.
-- **One surface, several clients.** The web UI, the `agent-chat` CLI and an
-  optional MCP wrapper all speak the same HTTP protocol. Message bodies travel
-  in the request body, never in process arguments.
+- **One surface, several clients.** The web UI and the `agent-chat` CLI speak
+  the same HTTP protocol; any MCP client can be built against it. Message bodies
+  travel in the request body, never in process arguments.
 
 ## Architecture
 
@@ -61,7 +61,7 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
 
 ```sh
 uv sync --frozen
-uv run python -m agent_chat.admin migrate --check
+uv run python -m agent_chat.admin migrate --config <path> --check
 ```
 
 The launcher is `python -m agent_chat.admin serve --config <path>`. The

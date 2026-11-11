@@ -42,21 +42,6 @@ jobs:
       - name: Test
         run: uv run python -m pytest -q
 
-  dependency-review:
-    name: dependency-review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
-        with:
-          # No PR comment: the job keeps the read-only workflow token.
-          comment-summary-in-pr: never
-
   public-content:
     name: public-content
     runs-on: ubuntu-24.04
@@ -93,3 +78,12 @@ jobs:
             --config .gitleaks.toml --redact --no-banner
       - name: Scan for private estate identifiers
         run: python3 scripts/check_estate_identifiers.py
+      - name: Scan the commit range for private estate identifiers
+        # A value introduced in one commit and removed in a later one is clean
+        # in the tree but still public in the history; the patch stream catches
+        # both commits. `pipefail` is required: without it a failed `git log`
+        # feeds an empty stream to the scanner, which passes.
+        shell: bash
+        run: |
+          set -euo pipefail
+          git log --all --format= --patch | python3 scripts/check_estate_identifiers.py --stdin

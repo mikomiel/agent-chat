@@ -1,0 +1,40 @@
+# One lint standard for this repository.
+#
+# The rule set mirrors the shared standard the service was written against:
+# pycodestyle, pyflakes and isort, plus the seven flake8-bugbear rules that
+# flag real bugs rather than style choices. The strict annotation rules used by
+# a larger private deployment do not apply here; this package carries its own
+# typed surface without that obligation.
+
+exclude = [
+    ".venv",
+    "__pycache__",
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".cache",
+    "build",
+    "dist",
+]
+
+# The longest line that fits in a 120-column terminal with room for a single
+# error marker. Top-level, not under `[lint.pycodestyle]`, so every width-aware
+# rule reads the same number.
+line-length = 119
+
+# The oldest Python this package supports.
+target-version = "py311"
+
+[lint]
+# Ruff's default selectors are E4, E7, E9 and F; this selection uses the full
+# E and F families and adds I (import order) plus the bugbear subset B005,
+# B006, B008, B017, B018, B023 and B904, which flags real defects
+# (character-set strip, mutable or called defaults, `raises(Exception)`,
+# useless expressions, closure loop variables, and a bare raise inside except).
+select = ["E", "F", "I", "B005", "B006", "B008", "B017", "B018", "B023", "B904"]
+
+[lint.flake8-bugbear]
+# B008 flags a call in an argument default. `EmptyRequest()` is a pydantic body
+# model used as a FastAPI request-body default, which FastAPI treats as an
+# immutable sentinel for "no body required"; the endpoints use it by design.
+extend-immutable-calls = ["agent_chat.models.EmptyRequest"]
