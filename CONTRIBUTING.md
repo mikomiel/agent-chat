@@ -61,12 +61,19 @@ branch, and a complete policy evaluation.
   squash merge. A timeout or unreadable result is not permission to repeat the
   merge blindly.
 
-## Releases and deployment
+## Releases
 
-A merged source change does not authorize a release. Release notes live in
-`CHANGELOG.md`. A maintainer bumps the version in `pyproject.toml`, merges that
-change, creates the annotated tag and then the GitHub Release; no agent or CI
-creates tags. Package, image and deployment decisions remain separate operator
+Releases use [release-please](https://github.com/googleapis/release-please) so
+the version, the changelog and the tag cannot disagree. A merged conventional
+commit on `main` makes release-please open or update one release pull request:
+it bumps `pyproject.toml`, writes `CHANGELOG.md` and records the version in
+`.release-please-manifest.json`. Merging that pull request is the release
+decision; release-please then creates the annotated tag and the GitHub Release.
+Never tag by hand.
+
+The release pull request always changes a sensitive path, so the merge policy
+never auto-merges it: a maintainer merges it. A tag or a release is not a
+deployment; package, image and deployment decisions remain separate operator
 decisions recorded outside this repository.
 
 ## Code of conduct
