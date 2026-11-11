@@ -179,3 +179,34 @@ def test_merge_policy_admits_only_the_intended_ordinary_areas() -> None:
     assert policy.sensitive("LICENSE") is True
     assert policy.sensitive("AGENTS.md") is True
     assert policy.sensitive("docs/architecture.md") is True
+
+
+def test_release_please_observes_automated_merges_and_requires_its_token() -> None:
+    """The push trigger alone never fires for an automerge GITHUB_TOKEN merge."""
+    document = workflow("release-please.yml")
+    declared = triggers(document)
+    assert declared["push"]["branches"] == ["main"]
+    assert declared["workflow_run"]["workflows"] == ["automerge"]
+    assert declared["workflow_run"]["types"] == ["completed"]
+    assert document["permissions"] == {"contents": "write", "pull-requests": "write"}
+    job = document["jobs"]["release-please"]
+    assert job["runs-on"] == DEFAULT_RUNNER
+    assert job["timeout-minutes"] <= 10
+    assert " ".join(job["if"].split()) == (
+        "github.event_name != 'workflow_run' "
+        "|| github.event.workflow_run.head_branch == 'main'"
+    )
+    (step,) = job["steps"]
+    assert PINNED_ACTION.match(step["uses"])
+    assert step["uses"].startswith("googleapis/release-please-action@")
+    assert step["with"] == {
+        "token": "${{ secrets.RELEASE_PLEASE_TOKEN }}",
+        "config-file": "release-please-config.json",
+        "manifest-file": ".release-please-manifest.json",
+    }
+
+
+def test_release_metadata_is_never_auto_merged() -> None:
+    policy = policy_module()
+    assert policy.sensitive("release-please-config.json") is True
+    assert policy.sensitive(".release-please-manifest.json") is True
