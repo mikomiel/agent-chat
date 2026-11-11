@@ -64,12 +64,15 @@ branch, and a complete policy evaluation.
 ## Releases
 
 Releases use [release-please](https://github.com/googleapis/release-please) so
-the version, the changelog and the tag cannot disagree. A merged conventional
-commit on `main` makes release-please open or update one release pull request:
-it bumps `pyproject.toml`, writes `CHANGELOG.md` and records the version in
-`.release-please-manifest.json`. Merging that pull request is the release
-decision; release-please then creates the annotated tag and the GitHub Release.
-Never tag by hand.
+the version, the changelog and the tag cannot disagree. A merged
+release-relevant conventional commit (`feat`, `fix` or `perf`) on `main` makes
+release-please open or update one release pull request: it bumps
+`pyproject.toml`, writes `CHANGELOG.md` and records the version in
+`.release-please-manifest.json`. That update is observed after both a
+maintainer merge and a merge by the repository's own automation. Merging the
+release pull request is the release decision; release-please then creates the
+annotated tag and the GitHub Release. Never tag by hand. A `docs`, `chore` or
+`test` commit does not by itself open a release pull request.
 
 The release pull request always changes a sensitive path, so the merge policy
 never auto-merges it: a maintainer merges it. A tag or a release is not a
