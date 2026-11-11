@@ -97,7 +97,8 @@ class GitHub:
                     or item.get("state") not in policy.DECISIVE):
                 continue
             # Login is an API path segment, never a shell expression or arbitrary path.
-            if not isinstance(login, str) or not login or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" for c in login):
+            allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+            if not isinstance(login, str) or not login or any(c not in allowed for c in login):
                 raise ApiError("maintainer_identity_unusable")
             permission = self.request(f"collaborators/{login}/permission")
             if not isinstance(permission, dict) or (permission.get("user") or {}).get("id") != user.get("id"):

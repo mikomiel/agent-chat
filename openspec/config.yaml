@@ -7,7 +7,7 @@ context: |
   Deployment, TLS, credentials and backups are operator-owned and outside the product source.
   Runtime is Python 3.11+ with FastAPI, Pydantic and psycopg.
   Public examples and tests are synthetic and self-contained.
-  All artifacts are English. Use MUST for requirements and distinguish source from runtime evidence.
+  All source, test and documentation artifacts are English; the shipped web UI copy is Polish. Use MUST for requirements and distinguish source from runtime evidence.
 
 rules:
   proposal:

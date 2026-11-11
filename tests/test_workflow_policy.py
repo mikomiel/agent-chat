@@ -126,6 +126,14 @@ def test_validation_ci_is_read_only_and_runs_the_declared_checks() -> None:
     scan = [step["run"] for step in jobs["public-content"]["steps"] if "run" in step]
     assert any("gitleaks" in command for command in scan)
     assert "python3 scripts/check_estate_identifiers.py" in scan
+    assert any("git log --all --format= --patch" in command and "--stdin" in command for command in scan)
+    history = next(
+        step
+        for step in jobs["public-content"]["steps"]
+        if step.get("name") == "Scan the commit range for private estate identifiers"
+    )
+    assert history["shell"] == "bash"
+    assert "set -euo pipefail" in history["run"]
 
 
 def test_every_action_reference_is_sha_pinned() -> None:
