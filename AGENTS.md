@@ -16,6 +16,8 @@ authoritative source and pull-request surface for this repository.
   that boundary to unblock a pull request.
 - A source change does not authorize a release tag, package or image
   publication, or deployment.
+- `agent_chat/*.sql` is append-only. A released migration's bytes are fixed,
+  because consumers hash the applied files; a correction is a new migration.
 
 ## Public-content boundary
 

@@ -74,10 +74,28 @@ release pull request is the release decision; release-please then creates the
 annotated tag and the GitHub Release. Never tag by hand. A `docs`, `chore` or
 `test` commit does not by itself open a release pull request.
 
+The workflow authenticates with a fine-grained personal access token stored as
+`RELEASE_PLEASE_TOKEN`, with Contents and pull-request write on this repository.
+The default `GITHUB_TOKEN` cannot be used: a pull request it creates does not
+trigger the pull-request workflows, so the required checks never run, and a
+merge it makes suppresses the `push`-triggered run, which is why the workflow
+also observes the completed `automerge` run. Renew the token before it expires:
+a missing or empty secret fails the run with `Input required and not supplied:
+token`, and an expired one fails authentication.
+
 The release pull request always changes a sensitive path, so the merge policy
 never auto-merges it: a maintainer merges it. A tag or a release is not a
 deployment; package, image and deployment decisions remain separate operator
 decisions recorded outside this repository.
+
+## Database migrations
+
+`agent_chat/*.sql` is an append-only sequence. Once a migration is part of a
+release, its bytes are fixed: never edit it, not even a comment. Consumers of
+this repository record a SHA-256 of each applied migration, so migration checks
+and upgrades against a database that applied the original bytes fail with
+`SCHEMA_MISMATCH`, even for a comment-only edit. A correction or a new
+behaviour is a new migration appended after the last one.
 
 ## Code of conduct
 
