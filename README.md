@@ -59,6 +59,15 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
 
 ## Install and run
 
+A deployment should pin an exact release tag; the `server` extra adds psycopg,
+while a bare client install stays psycopg-free.
+
+```sh
+uv pip install "agent-chat[server] @ git+https://github.com/mikomiel/agent-chat@v0.1.0"
+```
+
+For a source checkout:
+
 ```sh
 uv sync --frozen
 uv run python -m agent_chat.admin migrate --config <path> --check
@@ -96,6 +105,13 @@ uv run python -m pytest -q
 The suite needs PostgreSQL server binaries (`PG_TEST_BIN_DIR` may name their
 directory) and a pinned Playwright Chromium for the browser tests. These tests
 fail rather than skip when either is missing.
+
+## Releases
+
+Releases are annotated Git tags named `vMAJOR.MINOR.PATCH` on `main`; `v0.1.0`
+is the first release. [CHANGELOG.md](CHANGELOG.md) owns the human-readable
+notes. This repository does not publish a package to a registry. Release and
+tag creation are maintainer decisions.
 
 ## Security model
 
