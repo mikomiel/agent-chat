@@ -7,13 +7,18 @@ does not operate a hosted service, and no deployment is supported by the
 project. Do not read a green CI run, a merge or a source tag as evidence of a
 secure live deployment.
 
+## Supported versions
+
+| Version | Supported |
+| ------- | --------- |
+| 0.1.x   | Yes       |
+
 ## Reporting a vulnerability
 
-Use GitHub private vulnerability reporting for this repository when available.
-If no private route is available, open a minimal issue asking for a private
-contact. Do not include exploit details, credentials, private deployment
-information or personal data in that issue; a private channel must be agreed
-before sensitive material is shared.
+Private vulnerability reporting is enabled for this repository. Use the
+Security tab's "Report a vulnerability" form; reports stay private to the
+maintainers. A public issue must never contain exploit details, credentials or
+deployment details.
 
 Provide the affected commit, the expected boundary, the observed behaviour and
 a synthetic reproduction. Never send production credentials, session tokens,

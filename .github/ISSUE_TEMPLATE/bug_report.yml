@@ -1,0 +1,56 @@
+name: Bug report
+description: Report a defect in the Agent Chat service or its clients.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include deployment details, secrets, tokens or personal data.
+        Use synthetic values and redact logs before posting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What failed, and where.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: 0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps or a synthetic reproduction.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, PostgreSQL version, OS.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Optional. Redact before posting.
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed credentials, private addresses and deployment details from this report.
+          required: true

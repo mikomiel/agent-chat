@@ -11,6 +11,13 @@ boundary intact. Read [AGENTS.md](AGENTS.md) first.
 - One writer per branch and worktree. Preserve unrelated work.
 - Keep the change small enough to review as one decision.
 
+## Issues and templates
+
+Use the issue forms to report a defect or propose a change. Behaviour changes
+need an issue first, so the decision is recorded before a pull request. Report
+security problems through private vulnerability reporting, never in a public
+issue.
+
 ## Pull requests
 
 1. Branch from the current `main`.
@@ -28,6 +35,9 @@ boundary intact. Read [AGENTS.md](AGENTS.md) first.
    CI (`checks`, `public-content`) and an independent review on the exact head.
 5. Correct review findings on the same branch. A new commit needs fresh CI and
    fresh review.
+
+Workflows may use GitHub-owned or verified Marketplace actions, always pinned
+to a full commit SHA; any other action needs a maintainer decision.
 
 An authoring agent does not merge its own pull request, does not use
 `gh pr merge`, does not enable a standing auto-merge order and does not change
@@ -53,9 +63,15 @@ branch, and a complete policy evaluation.
 
 ## Releases and deployment
 
-A merged source change does not authorize a release. Tags, packages, images
-and deployment are separate operator decisions recorded outside this
-repository. Do not create a tag or publish an artefact from a pull request.
+A merged source change does not authorize a release. Release notes live in
+`CHANGELOG.md`. A maintainer bumps the version in `pyproject.toml`, merges that
+change, creates the annotated tag and then the GitHub Release; no agent or CI
+creates tags. Package, image and deployment decisions remain separate operator
+decisions recorded outside this repository.
+
+## Code of conduct
+
+Participation is governed by [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## Licence
 
