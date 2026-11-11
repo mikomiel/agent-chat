@@ -46,5 +46,5 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Bearer-token authentication scopes an instance to its session and room
   membership.
 
-[Unreleased]: https://github.com/mikomiel/agent-chat/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/mikomiel/agent-chat/compare/v0.1.3...HEAD
 [0.1.0]: https://github.com/mikomiel/agent-chat/releases/tag/v0.1.0
