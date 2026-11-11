@@ -79,7 +79,7 @@ def migrate(
     readable by the release that recorded it.
     """
     sources = [Path(__file__).with_name(name).read_bytes() for name in MIGRATIONS]
-    expected = [
+    expected: list[dict[str, Any]] = [
         {"version": version, "name": name, "digest": sha256(source).hexdigest()}
         for version, (name, source) in enumerate(zip(MIGRATIONS, sources, strict=True), 1)
     ]
