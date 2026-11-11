@@ -145,6 +145,23 @@ def test_every_action_reference_is_sha_pinned() -> None:
                     assert PINNED_ACTION.match(step["uses"]), f"{path.name}: unpinned {step['uses']}"
 
 
+JOB_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+
+def test_every_workflow_job_identifier_is_valid_for_actions() -> None:
+    """A job key is an Actions identifier: letters, digits, ``_`` and ``-``.
+
+    A period is not allowed. GitHub rejects the whole workflow file, so the
+    required jobs in the same file stop reporting; a version such as ``3.11``
+    in a job key is exactly the shape this catches.
+    """
+
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for job_id in document["jobs"]:
+            assert JOB_ID.fullmatch(job_id), f"{path.name}: invalid job identifier {job_id!r}"
+
+
 def test_merge_policy_admits_only_the_intended_ordinary_areas() -> None:
     policy = policy_module()
     assert policy.REPOSITORY == "mikomiel/agent-chat"

@@ -47,7 +47,7 @@ jobs:
       - name: Test
         run: uv run python -m pytest -q
 
-  checks-python-3.11:
+  checks-python-3-11:
     name: checks-python-3.11
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -101,10 +101,12 @@ jobs:
           uv venv --python 3.12 /tmp/agent-chat-wheel
           uv pip install --python /tmp/agent-chat-wheel/bin/python "agent-chat[server] @ file://${PWD}/${wheel}"
           /tmp/agent-chat-wheel/bin/agent-chat --help
-          /tmp/agent-chat-wheel/bin/python -c "import importlib.resources as r, agent_chat; root = r.files('agent_chat'); assert (root / 'web/index.html').is_file(); assert (root / '001_core.sql').is_file(); import agent_chat.api"
+          # Run from outside the checkout in isolated mode so these probes read
+          # the installed wheel, never the source tree on the working directory.
+          (cd /tmp && /tmp/agent-chat-wheel/bin/python -I -c "import importlib.resources as r, agent_chat; assert '/tmp/agent-chat-wheel/' in agent_chat.__file__, agent_chat.__file__; root = r.files('agent_chat'); assert (root / 'web/index.html').is_file(); assert (root / '001_core.sql').is_file(); import agent_chat.api")
           uv venv --python 3.12 /tmp/agent-chat-client
           uv pip install --python /tmp/agent-chat-client/bin/python "${wheel}"
-          /tmp/agent-chat-client/bin/python -c "import sys; sys.modules['psycopg'] = None; import agent_chat.cli, agent_chat.client, agent_chat.protocol, agent_chat.instance_file"
+          (cd /tmp && /tmp/agent-chat-client/bin/python -I -c "import importlib.util, agent_chat; assert '/tmp/agent-chat-client/' in agent_chat.__file__, agent_chat.__file__; assert importlib.util.find_spec('psycopg') is None; import agent_chat.cli, agent_chat.client, agent_chat.protocol, agent_chat.instance_file")
 
   public-content:
     name: public-content
