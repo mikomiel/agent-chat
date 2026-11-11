@@ -15,6 +15,18 @@ MIGRATIONS = (
     "010_quota_backfill.sql", "011_roles_and_work.sql",
 )
 
+#: Digests a database can still hold from the migration bytes released before 0.1.1.
+#:
+#: That release scrubbed private identifiers from one comment line in each of these two files, so the
+#: bytes changed while the executable SQL did not. A database initialized from the earlier bytes
+#: records the earlier digest; accepting exactly these reviewed values lets it upgrade without
+#: rewriting its history, and leaving them unrewritten lets the earlier release read it again.
+#: Every other recorded value, including any other comment-only edit, still raises SCHEMA_MISMATCH.
+LEGACY_DIGESTS: dict[int, frozenset[str]] = {
+    9: frozenset({"39ba29970ae65754207d4ef985715aea1fad9c3b8b5b6cbe7789de7170ebb2ab"}),
+    11: frozenset({"e4e5ea6f47acebb4d33b226651f613fdabe36ce443ac907c1a6066d3c15bda29"}),
+}
+
 
 def connect(dsn: str) -> psycopg.Connection[dict[str, Any]]:
     return psycopg.Connection[dict[str, Any]].connect(
@@ -30,6 +42,11 @@ def connect(dsn: str) -> psycopg.Connection[dict[str, Any]]:
 
 
 _APPLIED = "SELECT version, digest FROM agent_chat.schema_migrations ORDER BY version"
+
+
+def _digest_matches(version: int, recorded: str, expected: str) -> bool:
+    """Whether a recorded digest is this release's bytes or one of its reviewed legacy values."""
+    return recorded == expected or recorded in LEGACY_DIGESTS.get(version, frozenset())
 
 
 def review_lines(pending: list[dict[str, Any]]) -> list[str]:
@@ -56,6 +73,10 @@ def migrate(
     `reviewed` binds the run to what the operator read: under the lock, after the prefix check and before any DDL,
     the `review_digest` of the pending set must equal it, else `ChatError("REVIEW_MISMATCH")` rolls back with no
     DDL run. An empty pending set has a digest too, so a digest that no longer matches nothing pending also refuses.
+
+    A recorded digest is accepted when it matches this release's bytes or one of the reviewed
+    `LEGACY_DIGESTS` for that version; the check never rewrites the ledger, so the database stays
+    readable by the release that recorded it.
     """
     sources = [Path(__file__).with_name(name).read_bytes() for name in MIGRATIONS]
     expected = [
@@ -67,7 +88,10 @@ def migrate(
         db.execute("SELECT pg_advisory_xact_lock(617204831095)")
         present = db.execute("SELECT to_regclass('agent_chat.schema_migrations') AS name").fetchone()
         applied = db.execute(_APPLIED).fetchall() if present and present["name"] else []
-        if applied != [{"version": entry["version"], "digest": entry["digest"]} for entry in expected[: len(applied)]]:
+        if len(applied) > len(expected) or any(
+            row["version"] != want["version"] or not _digest_matches(want["version"], row["digest"], want["digest"])
+            for row, want in zip(applied, expected, strict=False)
+        ):
             raise ChatError("SCHEMA_MISMATCH")
         pending = expected[len(applied) :]
         if reviewed is not None and review_digest(pending) != reviewed:
