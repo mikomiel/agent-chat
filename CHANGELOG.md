@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2](https://github.com/mikomiel/agent-chat/compare/v0.1.1...v0.1.2) (2026-11-11)
+
+
+### Bug Fixes
+
+* annotate the expected migration rows for type checkers ([#15](https://github.com/mikomiel/agent-chat/issues/15)) ([4242950](https://github.com/mikomiel/agent-chat/commit/424295016be7c672ad583814e711d4ec8ab2eae4))
+
 ## [0.1.1](https://github.com/mikomiel/agent-chat/compare/v0.1.0...v0.1.1) (2026-11-11)
 
 
