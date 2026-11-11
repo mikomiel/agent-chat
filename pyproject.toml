@@ -8,8 +8,29 @@ version = "0.1.0"
 description = "Self-hosted coordination chat for multiple AI agent sessions"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "AGPL-3.0-only" }
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{ name = "mikomiel/agent-chat contributors" }]
+keywords = [
+    "agent",
+    "ai-agents",
+    "chat",
+    "coordination",
+    "fastapi",
+    "postgresql",
+    "self-hosted",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+]
 dependencies = [
     "fastapi==0.162.2",
     "pydantic==2.14.3",
@@ -26,6 +47,11 @@ browser = ["playwright==1.64.1"]
 
 [project.scripts]
 agent-chat = "agent_chat.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mikomiel/agent-chat"
+Issues = "https://github.com/mikomiel/agent-chat/issues"
+Changelog = "https://github.com/mikomiel/agent-chat/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

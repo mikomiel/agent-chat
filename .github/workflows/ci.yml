@@ -3,7 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -41,6 +46,65 @@ jobs:
         run: uv run ruff check .
       - name: Test
         run: uv run python -m pytest -q
+
+  checks-python-3.11:
+    name: checks-python-3.11
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      PG_TEST_BIN_DIR: /usr/lib/postgresql/16/bin
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+      UV_PYTHON: '3.11'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Install PostgreSQL server binaries
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check uv==0.13.7
+      - name: Sync the locked environment
+        run: uv sync --frozen
+      - name: Install pinned Playwright Chromium
+        run: uv run python -m playwright install --with-deps chromium
+      - name: Lint
+        run: uv run ruff check .
+      - name: Test
+        run: uv run python -m pytest -q
+
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check uv==0.13.7
+      - name: Build the distribution
+        run: uv build
+      - name: Prove the built wheel
+        run: |
+          set -euo pipefail
+          wheel=$(ls dist/*.whl)
+          uv venv --python 3.12 /tmp/agent-chat-wheel
+          uv pip install --python /tmp/agent-chat-wheel/bin/python "agent-chat[server] @ file://${PWD}/${wheel}"
+          /tmp/agent-chat-wheel/bin/agent-chat --help
+          /tmp/agent-chat-wheel/bin/python -c "import importlib.resources as r, agent_chat; root = r.files('agent_chat'); assert (root / 'web/index.html').is_file(); assert (root / '001_core.sql').is_file(); import agent_chat.api"
+          uv venv --python 3.12 /tmp/agent-chat-client
+          uv pip install --python /tmp/agent-chat-client/bin/python "${wheel}"
+          /tmp/agent-chat-client/bin/python -c "import sys; sys.modules['psycopg'] = None; import agent_chat.cli, agent_chat.client, agent_chat.protocol, agent_chat.instance_file"
 
   public-content:
     name: public-content
