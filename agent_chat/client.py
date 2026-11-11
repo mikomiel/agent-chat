@@ -172,8 +172,8 @@ class Client:
                 connection = http.client.HTTPConnection(origin.hostname, origin.port, timeout=timeout)
             if self._deadline is not None:
                 # http.client's runtime socket-factory seam is absent from typeshed.
-                connection._create_connection = partial(  # ty: ignore[unresolved-attribute]
-                    _connect_before_deadline, deadline=self._deadline
+                setattr(  # the seam is private and absent from typeshed
+                    connection, "_create_connection", partial(_connect_before_deadline, deadline=self._deadline)
                 )
             connection.connect()
             check()
