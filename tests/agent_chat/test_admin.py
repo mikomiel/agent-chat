@@ -350,6 +350,105 @@ def test_migrate_reports_a_schema_mismatch_by_code(workdir, database):
     assert run(["migrate", "--config", config], environ=environ) == (1, "", "agent-chat-admin: SCHEMA_MISMATCH\n")
 
 
+def _record_legacy_digests(database):
+    with connect(database) as db:
+        for version in sorted(storage.LEGACY_DIGESTS):
+            db.execute(
+                "UPDATE agent_chat.schema_migrations SET digest = %s WHERE version = %s",
+                (min(storage.LEGACY_DIGESTS[version]), version),
+            )
+
+
+def test_a_reviewed_legacy_digest_is_accepted_and_left_in_place(workdir, database):
+    environ = write_dsn(workdir, database)
+    config = write_config(workdir)
+    assert run(["migrate", "--config", config], environ=environ)[0] == 0
+    _record_legacy_digests(database)
+    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=none current=11\n", "")
+    with connect(database) as db:
+        recorded = {
+            row["version"]: row["digest"]
+            for row in db.execute("SELECT version, digest FROM agent_chat.schema_migrations")
+        }
+        assert {version: recorded[version] for version in storage.LEGACY_DIGESTS} == {
+            version: min(digests) for version, digests in storage.LEGACY_DIGESTS.items()
+        }
+
+
+def test_an_unreviewed_digest_is_refused_on_a_version_with_legacy_values(workdir, database):
+    environ = write_dsn(workdir, database)
+    config = write_config(workdir)
+    assert run(["migrate", "--config", config], environ=environ)[0] == 0
+    with connect(database) as db:
+        db.execute("UPDATE agent_chat.schema_migrations SET digest = repeat('0', 64) WHERE version = 9")
+    assert run(["migrate", "--config", config], environ=environ) == (1, "", "agent-chat-admin: SCHEMA_MISMATCH\n")
+
+
+def test_a_legacy_digest_recorded_for_another_version_is_refused(workdir, database):
+    environ = write_dsn(workdir, database)
+    config = write_config(workdir)
+    assert run(["migrate", "--config", config], environ=environ)[0] == 0
+    with connect(database) as db:
+        db.execute(
+            "UPDATE agent_chat.schema_migrations SET digest = %s WHERE version = 9",
+            (min(storage.LEGACY_DIGESTS[11]),),
+        )
+    assert run(["migrate", "--config", config], environ=environ) == (1, "", "agent-chat-admin: SCHEMA_MISMATCH\n")
+
+
+_REVIEWED_LEGACY_DIGESTS = {
+    9: "39ba29970ae65754207d4ef985715aea1fad9c3b8b5b6cbe7789de7170ebb2ab",
+    11: "e4e5ea6f47acebb4d33b226651f613fdabe36ce443ac907c1a6066d3c15bda29",
+}
+
+
+def test_the_legacy_map_is_exactly_the_two_reviewed_digests():
+    assert {version: sorted(values) for version, values in storage.LEGACY_DIGESTS.items()} == {
+        version: [digest] for version, digest in _REVIEWED_LEGACY_DIGESTS.items()
+    }
+
+
+def test_a_legacy_prefix_still_applies_the_pending_migrations(workdir, database, monkeypatch):
+    environ = write_dsn(workdir, database)
+    config = write_config(workdir)
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "MIGRATIONS", storage.MIGRATIONS[:9])
+        assert run(["migrate", "--config", config], environ=environ)[0] == 0
+    with connect(database) as db:
+        db.execute(
+            "UPDATE agent_chat.schema_migrations SET digest = %s WHERE version = 9",
+            (_REVIEWED_LEGACY_DIGESTS[9],),
+        )
+    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=10,11 current=11\n", "")
+    with connect(database) as db:
+        recorded = {row["version"]: row["digest"]
+                    for row in db.execute("SELECT version, digest FROM agent_chat.schema_migrations")}
+    assert recorded[9] == _REVIEWED_LEGACY_DIGESTS[9]
+    assert recorded[10] == _digest("010_quota_backfill.sql")
+    assert recorded[11] == _digest("011_roles_and_work.sql")
+
+
+def test_an_interior_gap_in_the_ledger_is_refused(workdir, database):
+    environ = write_dsn(workdir, database)
+    config = write_config(workdir)
+    assert run(["migrate", "--config", config], environ=environ)[0] == 0
+    with connect(database) as db:
+        db.execute("DELETE FROM agent_chat.schema_migrations WHERE version = 5")
+    assert run(["migrate", "--config", config], environ=environ) == (1, "", "agent-chat-admin: SCHEMA_MISMATCH\n")
+
+
+def test_legacy_digests_swapped_between_versions_are_refused(workdir, database):
+    environ = write_dsn(workdir, database)
+    config = write_config(workdir)
+    assert run(["migrate", "--config", config], environ=environ)[0] == 0
+    with connect(database) as db:
+        db.execute("UPDATE agent_chat.schema_migrations SET digest = %s WHERE version = 9",
+                   (_REVIEWED_LEGACY_DIGESTS[11],))
+        db.execute("UPDATE agent_chat.schema_migrations SET digest = %s WHERE version = 11",
+                   (_REVIEWED_LEGACY_DIGESTS[9],))
+    assert run(["migrate", "--config", config], environ=environ) == (1, "", "agent-chat-admin: SCHEMA_MISMATCH\n")
+
+
 def _digest(name):
     return sha256((Path(admin.__file__).parent / name).read_bytes()).hexdigest()
 
