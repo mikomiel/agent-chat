@@ -192,7 +192,10 @@ def test_release_please_observes_automated_merges_and_requires_its_token() -> No
     job = document["jobs"]["release-please"]
     assert job["runs-on"] == DEFAULT_RUNNER
     assert job["timeout-minutes"] <= 10
-    assert "workflow_run" in job["if"] and "head_branch" in job["if"]
+    assert " ".join(job["if"].split()) == (
+        "github.event_name != 'workflow_run' "
+        "|| github.event.workflow_run.head_branch == 'main'"
+    )
     (step,) = job["steps"]
     assert PINNED_ACTION.match(step["uses"])
     assert step["uses"].startswith("googleapis/release-please-action@")
