@@ -1,0 +1,30 @@
+title = "agent-chat public-content policy"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "private-ipv4"
+description = "Do not publish private deployment IPv4 addresses"
+regex = '''\b(?:10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3})\b'''
+
+[[rules]]
+id = "private-dns-name"
+description = "Do not publish internal deployment DNS names"
+# The leading (?:^|[^\w.])(?:\w+/)? consumes the preceding context into the
+# match: the first prefix char cannot be a dot, so a dot-prefixed filename
+# (the dotenv file) never matches at all, and an optional word/ path segment
+# lets path-style mentions be recognized as paths. The hostname is group 1.
+regex = '''(?i)(?:^|[^\w.])(?:\w+/)?((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:internal|lan|local))\b'''
+secretGroup = 1
+  # Prose (space, quote or backtick before it) and path-style (word/ before
+  # it) mentions of the dotenv word are not hostnames and are exempted here.
+  # URL (`http://...`, the match keeps a bare `/` prefix) and assignment
+  # (`HOST=...`, the match keeps the `=` prefix) uses are still flagged.
+  [[rules.allowlists]]
+  description = "Prose and path-style mentions of the dotenv word are not hostnames; URL and assignment uses still flag"
+  regexTarget = "match"
+  regexes = [
+    '''(?i)(?:^|[\s"'`])env\.local$''',
+    '''(?i)\w+/env\.local$''',
+  ]

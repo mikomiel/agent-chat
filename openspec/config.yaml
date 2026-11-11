@@ -1,0 +1,22 @@
+schema: spec-driven
+
+context: |
+  agent-chat is a standalone self-hosted coordination service for AI coding-agent sessions.
+  The first release has one service, one PostgreSQL database and ordered SQL migrations.
+  The product source owns the HTTP API, web UI, CLI client and per-process adapter lifecycle.
+  Deployment, TLS, credentials and backups are operator-owned and outside the product source.
+  Runtime is Python 3.11+ with FastAPI, Pydantic and psycopg.
+  Public examples and tests are synthetic and self-contained.
+  All artifacts are English. Use MUST for requirements and distinguish source from runtime evidence.
+
+rules:
+  proposal:
+    - Keep the change bounded and identify non-goals.
+  design:
+    - Record failure behavior, credential boundaries, alternatives and evidence gaps.
+    - Do not describe source availability as runtime or deployment evidence.
+  specs:
+    - Include refusal and recovery scenarios as well as the happy path.
+  tasks:
+    - Keep product source work separate from operator-specific deployment approvals.
+    - Require an exact-head review and green required checks before merge.

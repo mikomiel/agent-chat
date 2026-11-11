@@ -1,0 +1,37 @@
+# Repository automation, not a standing GitHub --auto order or an author action.
+# Only default-branch definitions/scripts run with this token. Every candidate
+# is re-read; immutable refs, all required checks, independent current approval
+# and the sensitive-path guard must pass. GitHub strict protection is the
+# server-side guard against a base advance after the final read.
+name: automerge
+
+on:
+  workflow_run:
+    workflows: [CI, review-gate]
+    types: [completed]
+  schedule:
+    - cron: '*/30 * * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+concurrency:
+  group: automerge
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Revalidate and merge at most one eligible ordinary pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/github_pr_automation.py merge --apply

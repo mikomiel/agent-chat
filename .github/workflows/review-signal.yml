@@ -1,0 +1,32 @@
+# The review signal: a workflow that does nothing, on purpose.
+#
+# `pull_request_review` runs the pull request's own copy of the workflow that declares it, so neither
+# `review-gate.yml` nor `automerge.yml` may listen for a review directly: a pull request could rewrite that
+# copy to do work of its own choosing. This file may run from a head because, *as committed here*, it does
+# nothing -- no checkout, no secret, no expression that reads the pull request, and `permissions: {}`, so the
+# token this version receives can act on nothing. A rewritten copy could declare permissions for itself; what
+# it cannot do is decide anything downstream, because the two consumers below run the default branch's copy and
+# derive every answer again from the GitHub API.
+#
+# Its only product is a completed run. That completion starts `review-gate`, and `review-gate`'s own completion
+# starts `automerge`: each hop runs the default branch's copy, and those two are where the privileged work
+# happens. Nothing downstream reads this workflow's result as a verdict -- a review is a reason to look again,
+# not an answer.
+#
+# A review posted through the reviewer App's installation token does start this workflow. A status or comment
+# written with `GITHUB_TOKEN` would not: GitHub never starts a workflow from an event the repository's own token
+# created, which is why the reviewer is a GitHub App and not a workflow.
+name: review-signal
+
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  signal:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Hand the review event to the default branch
+        run: echo "review event relayed to review-gate and automerge"

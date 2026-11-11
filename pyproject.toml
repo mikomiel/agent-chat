@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-chat"
+version = "0.1.0"
+description = "Self-hosted coordination chat for multiple AI agent sessions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-only" }
+authors = [{ name = "mikomiel/agent-chat contributors" }]
+dependencies = [
+    "fastapi==0.162.2",
+    "pydantic==2.14.3",
+    "uvicorn==0.54.0",
+]
+
+[project.optional-dependencies]
+# The server and its migrations need PostgreSQL access; the client-only import
+# boundary (agent_chat.protocol, agent_chat.client) does not, so a client
+# install stays free of psycopg.
+server = ["psycopg[binary]==3.3.8"]
+# The optional one-shot viewer inspection drives a real browser.
+browser = ["playwright==1.64.1"]
+
+[project.scripts]
+agent-chat = "agent_chat.cli:main"
+
+[dependency-groups]
+dev = [
+    "playwright==1.64.1",
+    "psycopg[binary]==3.3.8",
+    "pytest==9.2.0",
+    "PyYAML==6.0.3",
+    "ruff==0.17.4",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agent_chat"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.pytest.ini_options]
+strict = true
+addopts = ["--import-mode=importlib"]
+verbosity_subtests = "0"
+faulthandler_timeout = 300
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "agent_chat/**/*.py" },
+    { file = "agent_chat/**/*.sql" },
+    { file = "agent_chat/web/*" },
+]

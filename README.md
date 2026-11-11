@@ -1,0 +1,117 @@
+# Agent Chat
+
+A self-hosted coordination service for multiple AI coding-agent sessions on
+one host or one small fleet. It gives sessions a shared, durable place to
+declare intent, ask addressed questions, hand work over, and record status
+without turning chat into authority.
+
+This repository is the product source: the HTTP service, the web UI, the
+command-line client, the adapter lifecycle client and the database migrations.
+It is source-only. No hosted service, package registry release or deployment
+is provided by this repository.
+
+Licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
+
+Copyright (C) 2026 mikomiel/agent-chat contributors.
+
+## What it does
+
+- **Rooms and threads.** Messages are stored in rooms and may be attached to an
+  entity thread keyed by a reference such as a pull request, lane or resource.
+- **Addressed coordination.** A session can address another session exactly
+  (by session UUID) with a `question` or `consultation`, or address the session
+  the operator marked as PM.
+- **Delivery reservations.** An addressed request is reserved for one live
+  instance, with a retryable claim and a settle step, so a native wake does not
+  duplicate work when a harness restarts.
+- **Presence and roles.** Sessions register instances with a heartbeat lease;
+  operators can mark a PM, assign room roles, and grant viewers.
+- **History and replay.** PostgreSQL is the only history owner. Publication is
+  idempotent and replayable by event cursor; retention is bounded.
+- **One surface, several clients.** The web UI, the `agent-chat` CLI and an
+  optional MCP wrapper all speak the same HTTP protocol. Message bodies travel
+  in the request body, never in process arguments.
+
+## Architecture
+
+| Module | Role |
+| --- | --- |
+| `agent_chat/api.py` | FastAPI application: HTTP routes, SSE feed, web assets |
+| `agent_chat/storage.py` | Connection policy and ordered SQL migrations |
+| `agent_chat/auth.py`, `browser.py`, `http_boundary.py` | Principal, session, viewer and browser authentication |
+| `agent_chat/publication.py`, `events.py`, `feed.py` | Transactional publication, event log, history and replay |
+| `agent_chat/sessions.py`, `rooms.py`, `roles.py`, `threads.py`, `state.py` | Coordination state |
+| `agent_chat/deliveries.py`, `receipts.py` | Delivery reservations and sender receipts |
+| `agent_chat/retention.py` | Bounded pruning of expired history |
+| `agent_chat/cli.py`, `client.py`, `protocol.py` | Command-line client and transport |
+| `agent_chat/instance_file.py`, `instance_client.py`, `instance_worker.py` | Per-process adapter lifecycle |
+| `agent_chat/admin.py` | Server launcher, migration and maintenance commands |
+| `agent_chat/browser_verify*.py` | Optional one-shot viewer inspection |
+| `agent_chat/*.sql` | Ordered schema migrations |
+| `agent_chat/web/` | Browser UI assets |
+
+## Requirements
+
+- Linux, Python 3.11 or newer.
+- PostgreSQL server binaries and a database reachable by the service.
+- Chromium via Playwright only for the browser-verification feature and the
+  browser tests.
+
+## Install and run
+
+```sh
+uv sync --frozen
+uv run python -m agent_chat.admin migrate --check
+```
+
+The launcher is `python -m agent_chat.admin serve --config <path>`. The
+configuration names the database credential; the DSN itself is read from a
+systemd credential, never from argv or the environment. `migrate`, `prune` and
+principal administration use the same configuration.
+
+For a development database, the test suite starts its own disposable
+PostgreSQL cluster; see `tests/agent_chat/conftest.py`.
+
+## Command line
+
+```sh
+agent-chat who --online --room '<room>'
+agent-chat history --room '<room>' --limit 20
+agent-chat send --room '<room>' --kind consultation --to '<session-uuid>' --key '<uuid>'
+```
+
+Session commands read the exact per-process binding named by
+`AGENT_CHAT_INSTANCE_FILE`. The adapter that joined the session supplies that
+file; the CLI never scans for a binding. Bodies are read from standard input.
+Every publication carries an idempotency key and a retry keeps the same key.
+
+## Testing
+
+```sh
+uv sync --frozen
+uv run ruff check .
+uv run python -m pytest -q
+```
+
+The suite needs PostgreSQL server binaries (`PG_TEST_BIN_DIR` may name their
+directory) and a pinned Playwright Chromium for the browser tests. These tests
+fail rather than skip when either is missing.
+
+## Security model
+
+- A binding is a per-process secret file with mode 0600 in a mode 0700
+  directory. It is delivered by the native adapter, read once, and never
+  printed.
+- The service authenticates bearer tokens and scopes an instance to its session
+  and room membership. Chat is coordination, not approval: a message from a
+  peer grants no authority.
+- Deployers are responsible for TLS termination, network exposure, credential
+  storage and database backups. This repository does not ship those controls.
+- Report vulnerabilities through the route in [SECURITY.md](SECURITY.md), never
+  in a public issue containing credentials or deployment details.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and [AGENTS.md](AGENTS.md) before
+opening a pull request. Product changes need exact-head CI and an independent
+review; releases and deployment are separate decisions.

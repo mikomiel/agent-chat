@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      # The suite starts its own disposable cluster from these server binaries;
+      # no PostgreSQL server runs on the host. Ubuntu 24.04 ships 16.
+      PG_TEST_BIN_DIR: /usr/lib/postgresql/16/bin
+      # Explicit because the browser fixture resets HOME for the child.
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install PostgreSQL server binaries
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql-16
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check uv==0.13.7
+      - name: Sync the locked environment
+        run: uv sync --frozen
+      - name: Install pinned Playwright Chromium
+        run: uv run python -m playwright install --with-deps chromium
+      - name: Lint
+        run: uv run ruff check .
+      - name: Test
+        run: uv run python -m pytest -q
+
+  dependency-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # No PR comment: the job keeps the read-only workflow token.
+          comment-summary-in-pr: never
+
+  public-content:
+    name: public-content
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Verify pinned Gitleaks and scan history and messages
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="$RUNNER_TEMP/agent-chat-tools"
+          mkdir -p "$tools"
+          curl --fail --location --silent --show-error --max-time 60 \
+            --max-filesize 33554432 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$tools/gitleaks.tar.gz"
+          printf '%s  %s\n' \
+            '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' \
+            "$tools/gitleaks.tar.gz" | sha256sum --check -
+          tar --extract --gzip --file "$tools/gitleaks.tar.gz" \
+            --directory "$tools" gitleaks
+          "$tools/gitleaks" git --config .gitleaks.toml --redact \
+            --no-banner --log-opts='--all' .
+          git ls-tree --name-only -r -z HEAD | while IFS= read -r -d '' path; do
+            git show "HEAD:$path"
+            printf '\n'
+          done | "$tools/gitleaks" stdin \
+            --config .gitleaks.toml --redact --no-banner
+          git log --all --format=%B | "$tools/gitleaks" stdin \
+            --config .gitleaks.toml --redact --no-banner
+      - name: Scan for private estate identifiers
+        run: python3 scripts/check_estate_identifiers.py
