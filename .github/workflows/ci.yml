@@ -153,3 +153,18 @@ jobs:
         run: |
           set -euo pipefail
           git log --all --format= --patch | python3 scripts/check_estate_identifiers.py --stdin
+
+  dependency-review:
+    name: dependency-review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          # No PR comment: the job keeps the read-only workflow token.
+          comment-summary-in-pr: never
