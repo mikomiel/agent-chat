@@ -166,7 +166,7 @@ def test_merge_policy_admits_only_the_intended_ordinary_areas() -> None:
     policy = policy_module()
     assert policy.REPOSITORY == "mikomiel/agent-chat"
     assert policy.BASE_BRANCH == "main"
-    assert policy.REQUIRED_CHECKS == ("checks", "public-content")
+    assert policy.REQUIRED_CHECKS == ("checks", "public-content", "dependency-review")
     assert policy.GATE_CONTEXT == "review"
     assert policy.sensitive("README.md") is False
     assert policy.sensitive("CHANGELOG.md") is False

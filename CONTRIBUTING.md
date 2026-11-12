@@ -18,6 +18,25 @@ need an issue first, so the decision is recorded before a pull request. Report
 security problems through private vulnerability reporting, never in a public
 issue.
 
+## Required checks
+
+`main` requires these contexts on the pull request's exact head, all strict:
+
+| Context | What it proves |
+| --- | --- |
+| `checks` | Lint and the test suite passed on the primary Python version. |
+| `public-content` | The pinned secret scan and the estate-identifier guard passed. |
+| `review` | An independent approval exists at this exact commit. |
+| `dependency-review` | The change does not add a dependency with a known vulnerability. |
+
+`build` and `checks-python-3.11` also run on pull requests. They are not
+required contexts, but they are additional checks: a missing, skipped or neutral
+result is tolerated, while a reported failure, cancellation or timeout refuses
+the merge (`additional_check_not_green`). `build` builds and verifies the Python
+distribution, not a container image; `checks` already runs the suite on the
+primary interpreter, and the second-version job is an extra compatibility
+signal. Making either a required context is a maintainer decision.
+
 ## Pull requests
 
 1. Branch from the current `main`.
@@ -31,8 +50,9 @@ issue.
    uv run python -m pytest -q
    ```
 
-4. Push the branch and open one pull request against `main`. Expect required
-   CI (`checks`, `public-content`) and an independent review on the exact head.
+4. Push the branch and open one pull request against `main`. Expect the required
+   checks (`checks`, `public-content`, `review`, `dependency-review`) and an
+   independent review on the exact head.
 5. Correct review findings on the same branch. A new commit needs fresh CI and
    fresh review.
 
@@ -45,9 +65,9 @@ branch protection to unblock a change.
 
 ## Review and merge
 
-`main` is protected. It requires the exact-head checks `checks` and
-`public-content`, the trusted `review` status published from the default
-branch, and a complete policy evaluation.
+`main` is protected. It requires the exact-head checks `checks`,
+`public-content` and `dependency-review`, the trusted `review` status published
+from the default branch, and a complete policy evaluation.
 
 - The reviewer is the configured GitHub App. A comment is not an approval; an
   approval is valid only for the head it names.
@@ -60,6 +80,12 @@ branch, and a complete policy evaluation.
   the review decision and the immutable file comparison before a head-pinned
   squash merge. A timeout or unreadable result is not permission to repeat the
   merge blindly.
+
+## Response expectations
+
+This is a spare-time project with one maintainer. Expect an acknowledgement
+within a few days, not an immediate review. A new commit restarts CI and the
+review cycle; an approval from before the latest commit does not count.
 
 ## Releases
 
