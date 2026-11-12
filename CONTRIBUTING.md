@@ -29,11 +29,13 @@ issue.
 | `review` | An independent approval exists at this exact commit. |
 | `dependency-review` | The change does not add a dependency with a known vulnerability. |
 
-`build` and `checks-python-3-11` also run on pull requests. They are additional
-signals, not required contexts: `checks` already runs the suite the merge gate
-needs, and making a slow image build or a second interpreter version a merge
-condition would block safety fixes on infrastructure noise. Changing that is a
-maintainer decision.
+`build` and `checks-python-3.11` also run on pull requests. They are not
+required contexts, but they are additional checks: a missing, skipped or neutral
+result is tolerated, while a reported failure, cancellation or timeout refuses
+the merge (`additional_check_not_green`). `build` builds and verifies the Python
+distribution, not a container image; `checks` already runs the suite on the
+primary interpreter, and the second-version job is an extra compatibility
+signal. Making either a required context is a maintainer decision.
 
 ## Pull requests
 
