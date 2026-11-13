@@ -1101,25 +1101,28 @@
     if (!selectedRoom || !sessionsPage?.next_session_id || sessionsLoading || sessionsLoadingMore || busy()) return;
     const room = selectedRoom;
     const epoch = scopeEpoch;
-    const after = sessionsPage.next_session_id;
+    const basePage = sessionsPage;
+    const after = basePage.next_session_id;
     sessionsLoadingMore = true;
     renderSessions();
     try {
       await read(async () => {
         const query = new URLSearchParams({ limit: "100", after_session: after });
         const data = await request(`${roomPath(room)}/participants?${query}`);
-        if (room !== selectedRoom || epoch !== scopeEpoch || !sessionsPage) return;
+        // Append only to the exact snapshot this request extended. A revisit of
+        // Sessions may have replaced it while the request was in flight.
+        if (room !== selectedRoom || epoch !== scopeEpoch || sessionsPage !== basePage) return;
         if (!Array.isArray(data.participants)) throw new Error("INVALID_RESPONSE");
-        const seen = new Set(sessionsPage.participants.map((person) => person.session_id));
+        const seen = new Set(basePage.participants.map((person) => person.session_id));
         sessionsPage = {
-          ...sessionsPage,
+          ...basePage,
           participants: [
-            ...sessionsPage.participants,
+            ...basePage.participants,
             ...data.participants.filter((person) => !seen.has(person.session_id)),
           ],
           next_session_id: data.next_session_id,
-          roles: data.roles ?? sessionsPage.roles,
-          pm: data.pm ?? sessionsPage.pm,
+          roles: data.roles ?? basePage.roles,
+          pm: data.pm ?? basePage.pm,
         };
         renderSessions();
       }, generation);
