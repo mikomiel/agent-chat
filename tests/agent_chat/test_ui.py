@@ -1280,6 +1280,53 @@ def test_the_operator_sets_moves_and_clears_the_pm_mark_from_the_roster(ui, db, 
     assert ui.page.locator("#body").input_value() == "unsent draft"
 
 
+def test_a_masked_not_found_refusal_clears_the_scope(ui, db, actors, credentials):
+    room, first, _second, _operator = actors
+    operator = authenticate(db, credentials.operator)
+    publish(db, first, room, uuid4(), Publication(kind="message", body="inside", ref_key=RESOURCE))
+    ui.login()
+    ui.page.locator("#thread").fill(RESOURCE)
+    ui.page.locator("#apply-thread").click()
+    expect(ui.page.locator("#thread-header")).to_contain_text(RESOURCE)
+    db.execute(
+        "DELETE FROM agent_chat.principal_rooms WHERE principal_id = %s AND room_id = %s",
+        (operator.principal_id, room),
+    )
+    with ui.page.expect_response(
+        lambda response: "/resolution" in response.url and response.request.method == "POST"
+    ) as response:
+        ui.page.get_by_role("button", name="Oznacz jako rozwiązany", exact=True).click()
+    assert response.value.status == 404
+    expect(ui.page.locator("#notice")).to_contain_text("NOT_FOUND")
+    expect(ui.page.locator("#notice")).to_contain_text("Nie znaleziono")
+    expect(ui.page.locator("#messages")).to_be_empty()
+    expect(ui.page.locator("#participants")).to_be_empty()
+
+
+def test_a_room_conflict_clears_the_scope(ui, db, credentials, actors):
+    operator = authenticate(db, credentials.operator)
+    room = UUID(credentials.room)
+    _, first, _, _ = actors
+    publish(db, first, room, uuid4(), Publication(kind="message", body="before revocation"))
+    ui.login()
+    expect(ui.page.locator("#messages > li")).not_to_have_count(0)
+    db.execute(
+        "DELETE FROM agent_chat.principal_rooms WHERE principal_id = %s AND room_id = %s",
+        (operator.principal_id, room),
+    )
+    ui.page.locator("#room-admin summary").click()
+    ui.page.locator("#room-slug").fill("homelab")
+    ui.page.locator("#room-label").fill("Homelab")
+    with ui.page.expect_response(
+        lambda response: response.url.endswith("/v1/rooms") and response.request.method == "POST"
+    ) as response:
+        ui.page.locator("#create-room").get_by_role("button").click()
+    assert response.value.status == 409
+    expect(ui.page.locator("#notice")).to_contain_text("ROOM_CONFLICT")
+    expect(ui.page.locator("#messages")).to_be_empty()
+    expect(ui.page.locator("#participants")).to_be_empty()
+
+
 def test_a_viewer_sees_the_pm_mark_and_is_offered_no_control(ui, db, actors, make_viewer):
     room, first, _second, operator = actors
     roles.assign(db, operator, room, "pm", first.session_id)
@@ -1302,6 +1349,9 @@ def test_a_refused_set_is_reported_unconfirmed_and_stores_nothing(ui, db, actors
     db.execute("DELETE FROM agent_chat.memberships WHERE session_id = %s AND room_id = %s", (first.session_id, room))
     ui.page.get_by_role("button", name=f"Ustaw PM {first.session_id}", exact=True).click()
     expect(ui.page.locator("#notice")).to_contain_text("Zmiana znacznika PM niepotwierdzona")
+    expect(ui.page.locator("#notice")).to_contain_text("INVALID_RECIPIENT")
+    expect(ui.page.locator("#notice")).to_contain_text("nie jest już dostępny")
+    # A membership-derived refusal clears the scope-sensitive snapshot.
     expect(ui.page.locator("#participants")).to_be_empty()
     expect(ui.page.locator("#pm-mark")).to_be_hidden()
     assert _pm_rows(db) == []
@@ -2718,6 +2768,25 @@ def test_the_operator_assigns_a_role_from_the_sessions_view(ui, db, actors):
     ).to_have_count(1)
     rows = db.execute("SELECT session_id FROM agent_chat.room_roles WHERE role = 'github_pm'").fetchall()
     assert rows == [{"session_id": first.session_id}]
+
+
+def test_a_role_conflict_shows_the_safe_code_and_explanation(ui, db, actors):
+    room, first, _second, operator = actors
+    roles.assign(db, operator, room, "pm", first.session_id)
+    ui.login()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    row = _sessions_row(ui.page, first.session_id)
+    row.locator("details.role-controls summary").click()
+    with ui.page.expect_response(
+        lambda response: "/roles" in response.url and response.request.method == "POST"
+    ) as response:
+        row.get_by_role("button", name="Nadaj GitHub PM", exact=True).click()
+    assert response.value.status == 409
+    expect(ui.page.locator("#sessions-view")).to_be_visible()
+    expect(ui.page.locator("#notice")).to_contain_text("ROLE_CONFLICT")
+    expect(ui.page.locator("#notice")).to_contain_text("inną rolę")
+    expect(_sessions_row(ui.page, first.session_id)).to_be_visible()
+    assert roles.current(db, room, "github_pm") is None
 
 
 def test_a_viewer_sees_no_role_controls(ui, db, actors, make_viewer):
