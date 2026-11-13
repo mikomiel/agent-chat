@@ -74,15 +74,31 @@ def _read(directory_fd: int, name: str, *, sync: bool = False) -> InstanceSecret
 
 
 def read_instance(path: Path) -> InstanceSecret:
-    """An explicit adapter-selected file, never a scan for the newest process."""
+    """An explicit adapter-selected file, never a scan for the newest process.
+
+    A missing record is ``BINDING_FILE_MISSING``. A record that exists but is
+    unreadable, is not a regular single-link file, or fails its owner or mode
+    check is ``BINDING_FILE_UNSAFE``. The two conditions have different
+    recoveries, so every reader keeps them distinct.
+    """
     try:
         if path.name != f"{UUID(path.stem)}.json":
             raise ValueError("invalid filename")
     except ValueError:
         raise ChatError("BINDING_FILE_INVALID") from None
-    fd = _directory(path.parent)
     try:
-        return _read(fd, path.name)
+        fd = _directory(path.parent)
+    except FileNotFoundError:
+        raise ChatError("BINDING_FILE_MISSING") from None
+    except OSError:
+        raise ChatError("BINDING_FILE_UNSAFE") from None
+    try:
+        try:
+            return _read(fd, path.name)
+        except FileNotFoundError:
+            raise ChatError("BINDING_FILE_MISSING") from None
+        except OSError:
+            raise ChatError("BINDING_FILE_UNSAFE") from None
     finally:
         os.close(fd)
 
