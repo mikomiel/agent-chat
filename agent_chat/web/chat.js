@@ -99,7 +99,7 @@
   // Safe, allowlisted server refusals. An unknown code keeps the generic fallback.
   const REFUSAL_TEXT = {
     ROLE_CONFLICT: "Ta sesja ma już inną rolę w tym pokoju. Zdejmij obecną rolę i spróbuj ponownie.",
-    ROOM_CONFLICT: "Pokój o tym identyfikatorze już istnieje z inną nazwą.",
+    ROOM_CONFLICT: "Nie można utworzyć pokoju o tym identyfikatorze.",
     INVALID_REQUEST: "Serwer odrzucił żądanie. Sprawdź wybrane wartości.",
     INVALID_RECIPIENT: "Wybrany odbiorca nie jest już dostępny w tym pokoju.",
     MESSAGE_EXPIRED: "Wiadomość wygasła; nie można wykonać tej operacji.",
@@ -110,7 +110,7 @@
   };
   // Only a refusal that cannot mask a revoked scope may keep the loaded view.
   // NOT_FOUND can deliberately mask ROOM_FORBIDDEN for a message-derived room.
-  const PRESERVE_ON_REFUSAL = new Set(["ROLE_CONFLICT", "ROOM_CONFLICT"]);
+  const PRESERVE_ON_REFUSAL = new Set(["ROLE_CONFLICT"]);
   function refusal(error) {
     const detail = REFUSAL_TEXT[error.code];
     return detail ? `${error.code}: ${detail}` : "";

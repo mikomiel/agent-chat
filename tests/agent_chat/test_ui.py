@@ -1303,6 +1303,30 @@ def test_a_masked_not_found_refusal_clears_the_scope(ui, db, actors, credentials
     expect(ui.page.locator("#participants")).to_be_empty()
 
 
+def test_a_room_conflict_clears_the_scope(ui, db, credentials, actors):
+    operator = authenticate(db, credentials.operator)
+    room = UUID(credentials.room)
+    _, first, _, _ = actors
+    publish(db, first, room, uuid4(), Publication(kind="message", body="before revocation"))
+    ui.login()
+    expect(ui.page.locator("#messages > li")).not_to_have_count(0)
+    db.execute(
+        "DELETE FROM agent_chat.principal_rooms WHERE principal_id = %s AND room_id = %s",
+        (operator.principal_id, room),
+    )
+    ui.page.locator("#room-admin summary").click()
+    ui.page.locator("#room-slug").fill("homelab")
+    ui.page.locator("#room-label").fill("Homelab")
+    with ui.page.expect_response(
+        lambda response: response.url.endswith("/v1/rooms") and response.request.method == "POST"
+    ) as response:
+        ui.page.locator("#create-room").get_by_role("button").click()
+    assert response.value.status == 409
+    expect(ui.page.locator("#notice")).to_contain_text("ROOM_CONFLICT")
+    expect(ui.page.locator("#messages")).to_be_empty()
+    expect(ui.page.locator("#participants")).to_be_empty()
+
+
 def test_a_viewer_sees_the_pm_mark_and_is_offered_no_control(ui, db, actors, make_viewer):
     room, first, _second, operator = actors
     roles.assign(db, operator, room, "pm", first.session_id)
