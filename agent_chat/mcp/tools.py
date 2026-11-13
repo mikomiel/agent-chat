@@ -187,13 +187,15 @@ def register(mcp: FastMCP, config: Config) -> None:
                 )
             room_id = _room(client, DEFAULT_ROOM if room is None else room)
             targets = _recipients(client, room_id, recipients or [])
-            payload = Reply(
+            publication = Publication(
+                kind="reply",
                 body=body,
                 recipients=tuple(UUID(item) for item in targets),
+                reply_to=UUID(message_id),
                 receipts=receipts,
             )
             return client.request(
-                "POST", f"/v1/messages/{message_id}/replies", _payload(payload), _uuid(key)
+                "POST", f"/v1/rooms/{room_id}/messages", _payload(publication), _uuid(key)
             )
         return _run(config, call)
 

@@ -258,6 +258,39 @@ def test_write_tools_publish_reply_and_ack(process_api, credentials, register):
         assert "error" not in call(origin, token_a, "unresolve", {"thread": thread_id})
 
 
+def test_explicit_key_reply_cannot_post_to_a_different_room(process_api, credentials, register, db):
+    token, binding = register(process_api, credentials, "mcp-room-bound-reply")
+    with serve_mcp(process_api, enable_writes=True) as origin:
+        root = call(
+            origin, token, "send",
+            {"room": "homelab", "body": "homelab root", "key": str(uuid4())},
+        )
+        assert "error" not in root
+        status, private = process_api.request(
+            "POST", "/v1/rooms", {"slug": "private", "label": "Private"}, credentials.operator
+        )
+        assert status == 200
+        db.execute(
+            "INSERT INTO agent_chat.principal_rooms VALUES (%s, %s)",
+            (credentials.principal, private["id"]),
+        )
+        db.execute(
+            "INSERT INTO agent_chat.memberships VALUES (%s, %s)",
+            (private["id"], binding["session_id"]),
+        )
+        refused = call(
+            origin, token, "reply",
+            {
+                "message": root["id"],
+                "room": "private",
+                "body": "wrong room",
+                "key": str(uuid4()),
+            },
+        )
+        assert "error" in refused
+        assert db.execute("SELECT count(*) AS n FROM agent_chat.messages").fetchone()["n"] == 1
+
+
 def test_write_tools_declare_lane_work_and_mute(process_api, credentials, register):
     token, _ = register(process_api, credentials, "mcp-coordination")
     with serve_mcp(process_api, enable_writes=True) as origin:
