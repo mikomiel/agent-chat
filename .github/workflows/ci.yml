@@ -45,7 +45,7 @@ jobs:
       - name: Lint
         run: uv run ruff check .
       - name: Test
-        run: uv run python -m pytest -q
+        run: uv run python -m pytest -q -n 4 --durations=15
 
   checks-python-3-11:
     name: checks-python-3.11
@@ -76,7 +76,7 @@ jobs:
       - name: Lint
         run: uv run ruff check .
       - name: Test
-        run: uv run python -m pytest -q
+        run: uv run python -m pytest -q -n 4 --durations=15
 
   build:
     name: build

@@ -460,6 +460,10 @@ def test_prune_deletes_old_expired_rows_in_bounded_batches_and_keeps_its_counts(
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 1,
     }
     assert count(db, "room_state") == 3
     prune(db, limit=1)
