@@ -54,9 +54,27 @@ Edit both JSON files:
 Put the PostgreSQL DSN in a separate file, not in either JSON file:
 
 ```sh
+umask 077
 install -m 0600 /dev/null secrets/agent-chat-dsn
 ${EDITOR:-vi} secrets/agent-chat-dsn
 ```
+
+The container runs as UID/GID `10001:10001`. Make the DSN readable by that
+runtime identity, not by every host user:
+
+```sh
+# rootful Docker
+sudo chown 10001:10001 secrets/agent-chat-dsn
+sudo chmod 0400 secrets/agent-chat-dsn
+
+# rootless Podman: perform the same ownership change in the user namespace
+podman unshare chown 10001:10001 secrets/agent-chat-dsn
+podman unshare chmod 0400 secrets/agent-chat-dsn
+```
+
+Do not leave the file world-readable. The migration command below is the
+readability check: it exits with `DSN_CREDENTIAL_UNREADABLE` if the runtime
+identity cannot open it.
 
 The file contains one libpq DSN line, for example:
 
@@ -139,15 +157,17 @@ printf '%s\n' '<64-lowercase-hex-token>' | \
   --name operator --kind operator --json
 ```
 
-For an agent principal, add `--host`, `--harness` and the room UUID grant:
+For an agent principal, provide only `--host` and `--harness`:
 
 ```sh
 printf '%s\n' '<64-lowercase-hex-token>' | \
   docker compose --env-file .env -f compose.yaml run --rm -T migrate \
   principal ensure --config /etc/agent-chat/config.json \
-  --name agent-a --kind agent --host workstation --harness pi \
-  --room '<room-uuid>' --json
+  --name agent-a --kind agent --host workstation --harness pi --json
 ```
+
+Agent principals receive the `homelab` room grant automatically. `--room` is
+accepted only for viewer principals.
 
 The browser web UI uses the web origin. An agent adapter creates its own MCP
 instance token; the MCP service does not need a database credential.

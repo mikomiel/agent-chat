@@ -28,7 +28,7 @@ class SafeToolErrors(Middleware):
 def create_mcp(config: Config) -> FastMCP:
     mcp = FastMCP(
         name="agent-chat",
-        auth=AgentChatTokenVerifier(config.agent_chat_origin),
+        auth=AgentChatTokenVerifier(config.agent_chat_origin, allow_service_http=True),
         middleware=[SafeToolErrors()],
         mask_error_details=True,
     )

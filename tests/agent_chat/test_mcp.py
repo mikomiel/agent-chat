@@ -18,13 +18,15 @@ from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
 from fastmcp.exceptions import ToolError
 
+from agent_chat.client import Client as ChatClient
 from agent_chat.mcp.app import create_app
 from agent_chat.mcp.auth import AgentChatTokenVerifier
 from agent_chat.mcp.config import Config
+from agent_chat.models import ChatError
 
 
 @contextmanager
-def serve_mcp(process_api, *, public_origin=None, enable_writes=False):
+def serve_mcp(process_api, *, public_origin=None, enable_writes=False, agent_chat_origin=None):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(8)
@@ -32,7 +34,7 @@ def serve_mcp(process_api, *, public_origin=None, enable_writes=False):
         config = Config(
             bind_host="127.0.0.1",
             port=port,
-            agent_chat_origin=process_api.origin,
+            agent_chat_origin=agent_chat_origin or process_api.origin,
             public_origin=public_origin,
             enable_writes=enable_writes,
         )
@@ -134,6 +136,54 @@ def test_complete_liveness_evidence_is_accepted(monkeypatch):
     assert token.client_id == SESSION
     assert token.scopes == ["chat:read"]
     assert "instance_id" in token.claims
+
+
+def test_internal_service_origin_authenticates_and_calls_a_tool(process_api, credentials, register, monkeypatch):
+    token, binding = register(process_api, credentials, "mcp-service-origin")
+    port = int(process_api.origin.rsplit(":", 1)[1])
+
+    class Resolver:
+        returncode = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def communicate(self, timeout=None):
+            addresses = socket.getaddrinfo("127.0.0.1", port, type=socket.SOCK_STREAM)
+            return json.dumps(addresses).encode(), b""
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            return None
+
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr("agent_chat.client.subprocess.Popen", lambda *_args, **_kwargs: Resolver())
+    with serve_mcp(
+        process_api,
+        agent_chat_origin=f"http://agent-chat:{port}",
+        enable_writes=True,
+    ) as origin:
+        status = call(origin, token, "status")
+        assert status["session_id"] == binding["session_id"]
+        sent = call(
+            origin, token, "send",
+            {"room": "homelab", "body": "service origin write", "key": str(uuid4())},
+        )
+        assert "error" not in sent
+
+
+def test_client_requires_an_explicit_internal_http_allowance():
+    token = "a" * 64
+    with pytest.raises(ChatError):
+        ChatClient("http://agent-chat:8443", token)
+    assert ChatClient("http://agent-chat:8443", token, allow_service_http=True)._origin == "http://agent-chat:8443"
 
 
 def test_internal_service_origin_is_allowed_but_public_http_is_not():

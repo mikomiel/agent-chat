@@ -39,7 +39,12 @@ def _client(config: Config) -> Client:
     token = get_access_token()
     if token is None:
         raise ChatError("UNAUTHENTICATED")
-    return Client(config.agent_chat_origin, token.token, deadline=time.monotonic() + REQUEST_SECONDS)
+    return Client(
+        config.agent_chat_origin,
+        token.token,
+        deadline=time.monotonic() + REQUEST_SECONDS,
+        allow_service_http=True,
+    )
 
 
 def _query(**values: Any) -> str:
