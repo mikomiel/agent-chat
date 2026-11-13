@@ -1,0 +1,36 @@
+http:
+  serversTransports:
+    agent-chat:
+      forwardingTimeouts:
+        dialTimeout: 5s
+        responseHeaderTimeout: 0s
+    agent-chat-mcp:
+      forwardingTimeouts:
+        dialTimeout: 5s
+        responseHeaderTimeout: 0s
+  routers:
+    agent-chat:
+      rule: Host(`chat.example.invalid`)
+      entryPoints:
+        - websecure
+      service: agent-chat
+      tls: {}
+    agent-chat-mcp:
+      rule: Host(`mcp.example.invalid`)
+      entryPoints:
+        - websecure
+      service: agent-chat-mcp
+      tls: {}
+  services:
+    agent-chat:
+      loadBalancer:
+        serversTransport: agent-chat
+        passHostHeader: true
+        servers:
+          - url: http://agent-chat:8443
+    agent-chat-mcp:
+      loadBalancer:
+        serversTransport: agent-chat-mcp
+        passHostHeader: true
+        servers:
+          - url: http://mcp:8951

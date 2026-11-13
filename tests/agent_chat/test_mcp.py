@@ -133,6 +133,12 @@ def test_complete_liveness_evidence_is_accepted(monkeypatch):
     assert "instance_id" in token.claims
 
 
+def test_internal_service_origin_is_allowed_but_public_http_is_not():
+    assert Config(agent_chat_origin="http://agent-chat:8443").agent_chat_origin == "http://agent-chat:8443"
+    with pytest.raises(ValueError):
+        Config(agent_chat_origin="http://evil.example:8443")
+
+
 def test_operator_and_viewer_tokens_are_rejected(process_api, credentials, make_viewer):
     verifier = AgentChatTokenVerifier(process_api.origin)
     viewer = make_viewer(credentials.room)
