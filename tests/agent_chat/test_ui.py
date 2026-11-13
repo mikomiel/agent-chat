@@ -2708,6 +2708,23 @@ def _sessions_row(page, session):
     return page.locator(f'#sessions-table tbody tr[data-session-id="{session}"]')
 
 
+def test_the_sessions_view_does_not_turn_unknown_native_state_into_idle(ui, db, actors, actor_factory):
+    room, unknown, idle, _ = actors
+    busy = actor_factory(room)
+    db.execute(
+        "UPDATE agent_chat.instances SET native_state = 'unknown' WHERE session_id = %s", (unknown.session_id,)
+    )
+    db.execute("UPDATE agent_chat.instances SET native_state = 'idle' WHERE session_id = %s", (idle.session_id,))
+    db.execute("UPDATE agent_chat.instances SET native_state = 'busy' WHERE session_id = %s", (busy.session_id,))
+    ui.login()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    unknown_row = _sessions_row(ui.page, unknown.session_id)
+    expect(unknown_row).to_contain_text("online, stan nieznany")
+    expect(unknown_row).not_to_contain_text("bezczynna")
+    expect(_sessions_row(ui.page, idle.session_id)).to_contain_text("online, bezczynna")
+    expect(_sessions_row(ui.page, busy.session_id)).to_contain_text("online, pracuje")
+
+
 def test_the_sessions_view_shows_work_roles_activity_and_announced_prs(ui, db, actors):
     room, first, second, operator = actors
     db.execute(
