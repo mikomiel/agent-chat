@@ -296,8 +296,11 @@ def _finish(
 
 def reconcile(
     db: Connection[dict[str, Any]], limit: int = 100, session: UUID | None = None, instance_id: UUID | None = None
-) -> None:
-    """Caller holds clock first. Expired reservations are terminal, never reclaimed."""
+) -> int:
+    """Caller holds clock first. Expired reservations are terminal, never reclaimed.
+
+    Return the number settled so a bounded maintenance loop can count this work as progress.
+    """
     rows = db.execute(
         """
         SELECT a.* FROM agent_chat.delivery_attempts a JOIN agent_chat.instances i ON i.id = a.instance_id
@@ -310,6 +313,7 @@ def reconcile(
     ).fetchall()
     for row in rows:
         _finish(db, row, "uncertain", "claim_expired")
+    return len(rows)
 
 
 def expire_undelivered(db: Connection[dict[str, Any]], limit: int = 100, session: UUID | None = None) -> int:

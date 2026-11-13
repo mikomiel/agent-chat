@@ -307,7 +307,19 @@ def _prune(config: Config, environ: Mapping[str, str], limit: int, max_batches: 
     if not 1 <= limit <= 1000 or max_batches < 1:
         raise _usage()
     totals = dict.fromkeys(
-        ("events", "redacted", "deleted", "ended_instances", "memberships", "expired_undelivered"), 0
+        (
+            "events",
+            "redacted",
+            "deleted",
+            "ended_instances",
+            "memberships",
+            "expired_undelivered",
+            "reservations",
+            "delivery_batches",
+            "browser_sessions",
+            "room_state",
+        ),
+        0,
     )
     batches = 0
     with connect(read_dsn(config, environ)) as db:
@@ -318,7 +330,7 @@ def _prune(config: Config, environ: Mapping[str, str], limit: int, max_batches: 
                 totals[key] += count
             if not any(removed.values()):
                 break
-    # One line, the first four keys in their original order: a LogQL parser reads it by key.
+    # One line, the original keys first in their original order: a LogQL parser reads it by key.
     print(f"batches={batches} " + " ".join(f"{key}={count}" for key, count in totals.items()), file=stdout)
     return 0
 
