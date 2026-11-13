@@ -25,3 +25,4 @@ deploy/config/server.json
 deploy/config/mcp.json
 deploy/secrets/
 deploy/traefik/dynamic.yml
+!deploy/.env.example
