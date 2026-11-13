@@ -2,5 +2,6 @@
   "bind_host": "0.0.0.0",
   "port": 8951,
   "agent_chat_origin": "http://agent-chat:8443",
-  "public_origin": "https://mcp.example.invalid"
+  "public_origin": "https://mcp.example.invalid",
+  "enable_writes": false
 }

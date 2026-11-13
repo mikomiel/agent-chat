@@ -48,7 +48,9 @@ def test_example_configs_validate_with_the_product_models():
     server = json.loads((DEPLOY / "config" / "server.example.json").read_text())
     mcp = json.loads((DEPLOY / "config" / "mcp.example.json").read_text())
     assert ServerConfig.model_validate(server).public_origin.startswith("https://")
-    assert McpConfig.model_validate(mcp).agent_chat_origin == "http://agent-chat:8443"
+    validated = McpConfig.model_validate(mcp)
+    assert validated.agent_chat_origin == "http://agent-chat:8443"
+    assert validated.enable_writes is False
 
 
 def test_dockerfile_has_two_non_root_targets():

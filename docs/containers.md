@@ -165,9 +165,9 @@ The MCP endpoint is `https://mcp.example.invalid/mcp` and requires:
 Authorization: Bearer <agent-instance-token>
 ```
 
-The default MCP surface is read-only. Write tools are opt-in through the MCP
-configuration; they still use the instance token and the same HTTP
-authorization as the CLI.
+The example MCP configuration keeps `enable_writes: false`. Set it to `true`
+only when the deployment needs write tools; they still use the instance token
+and the same HTTP authorization as the CLI.
 
 ## Security properties
 
