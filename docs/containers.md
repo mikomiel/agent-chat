@@ -76,6 +76,11 @@ Do not leave the file world-readable. The migration command below is the
 readability check: it exits with `DSN_CREDENTIAL_UNREADABLE` if the runtime
 identity cannot open it.
 
+The `,z` option on the configuration bind mounts applies the shared SELinux
+label. It is harmless on hosts without SELinux and lets the one-shot migration
+and the server read the same file. The DSN itself is a Compose secret, not a
+host bind mount.
+
 The file contains one libpq DSN line, for example:
 
 ```text
@@ -151,19 +156,24 @@ Create an operator or agent principal with the same one-shot service. The raw
 token is read from stdin and is never placed on the command line:
 
 ```sh
-printf '%s\n' '<64-lowercase-hex-token>' | \
-  docker compose --env-file .env -f compose.yaml run --rm -T migrate \
+install -d -m 0700 secrets
+install -m 0600 /dev/null secrets/operator.token
+${EDITOR:-vi} secrets/operator.token
+docker compose --env-file .env -f compose.yaml run --rm -T migrate \
   principal ensure --config /etc/agent-chat/config.json \
-  --name operator --kind operator --json
+  --name operator --kind operator --json < secrets/operator.token
+rm -f secrets/operator.token
 ```
 
 For an agent principal, provide only `--host` and `--harness`:
 
 ```sh
-printf '%s\n' '<64-lowercase-hex-token>' | \
-  docker compose --env-file .env -f compose.yaml run --rm -T migrate \
+install -m 0600 /dev/null secrets/agent.token
+${EDITOR:-vi} secrets/agent.token
+docker compose --env-file .env -f compose.yaml run --rm -T migrate \
   principal ensure --config /etc/agent-chat/config.json \
-  --name agent-a --kind agent --host workstation --harness pi --json
+  --name agent-a --kind agent --host workstation --harness pi --json < secrets/agent.token
+rm -f secrets/agent.token
 ```
 
 Agent principals receive the `homelab` room grant automatically. `--room` is

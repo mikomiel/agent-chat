@@ -186,6 +186,21 @@ def test_client_requires_an_explicit_internal_http_allowance():
     assert ChatClient("http://agent-chat:8443", token, allow_service_http=True)._origin == "http://agent-chat:8443"
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://[2606:4700:4700::1111]:8443",
+        "http://134744072:8443",
+        "http://0x7f000001:8443",
+        "http://0177.0.0.1:8443",
+        "http://evil.example:8443",
+    ],
+)
+def test_internal_service_origin_rejects_ip_literals(origin):
+    with pytest.raises(ValueError):
+        Config(agent_chat_origin=origin)
+
+
 def test_internal_service_origin_is_allowed_but_public_http_is_not():
     assert Config(agent_chat_origin="http://agent-chat:8443").agent_chat_origin == "http://agent-chat:8443"
     with pytest.raises(ValueError):

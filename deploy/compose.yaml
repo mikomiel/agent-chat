@@ -12,7 +12,7 @@ services:
     secrets:
       - agent-chat-dsn
     volumes:
-      - ${AGENT_CHAT_CONFIG_DIR:-./config}/server.json:/etc/agent-chat/config.json:ro
+      - ${AGENT_CHAT_CONFIG_DIR:-./config}/server.json:/etc/agent-chat/config.json:ro,z
     networks:
       - app
     restart: "no"
@@ -38,7 +38,7 @@ services:
     secrets:
       - agent-chat-dsn
     volumes:
-      - ${AGENT_CHAT_CONFIG_DIR:-./config}/server.json:/etc/agent-chat/config.json:ro
+      - ${AGENT_CHAT_CONFIG_DIR:-./config}/server.json:/etc/agent-chat/config.json:ro,z
     networks:
       - app
       - edge
@@ -73,7 +73,7 @@ services:
       agent-chat:
         condition: service_healthy
     volumes:
-      - ${AGENT_CHAT_CONFIG_DIR:-./config}/mcp.json:/etc/agent-chat/mcp.json:ro
+      - ${AGENT_CHAT_CONFIG_DIR:-./config}/mcp.json:/etc/agent-chat/mcp.json:ro,z
     networks:
       - app
       - edge
