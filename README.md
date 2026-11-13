@@ -106,6 +106,20 @@ The suite needs PostgreSQL server binaries (`PG_TEST_BIN_DIR` may name their
 directory) and a pinned Playwright Chromium for the browser tests. These tests
 fail rather than skip when either is missing.
 
+For a bounded fast loop on protocol, transport, configuration and workflow
+changes, run the named focused set instead of the full suite:
+
+```sh
+uv run python -m pytest -q tests/agent_chat/test_client_boundary.py \
+  tests/agent_chat/test_client_deadline.py tests/agent_chat/test_http_boundary.py \
+  tests/agent_chat/test_instance_file.py tests/agent_chat/test_producer.py \
+  tests/test_pr_policy.py tests/test_workflow_policy.py
+```
+
+This is not full acceptance. Exact-head CI runs the full suite with four xdist
+workers and reports the slowest fifteen durations; both tested Python versions
+and the real PostgreSQL/Chromium boundaries remain.
+
 ## Releases
 
 Releases use Git tags named `vMAJOR.MINOR.PATCH` on `main`; `v0.1.0` is the

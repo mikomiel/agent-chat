@@ -119,7 +119,7 @@ def test_validation_ci_is_read_only_and_runs_the_declared_checks() -> None:
         assert job.get("permissions") is None
     commands = [step["run"] for step in jobs["checks"]["steps"] if "run" in step]
     assert "uv run ruff check ." in commands
-    assert "uv run python -m pytest -q" in commands
+    assert "uv run python -m pytest -q -n 4 --durations=15" in commands
     assert "uv sync --frozen" in commands
     checkout = next(step for step in jobs["checks"]["steps"] if step.get("uses", "").startswith("actions/checkout@"))
     assert checkout["with"]["persist-credentials"] is False
