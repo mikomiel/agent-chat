@@ -1,11 +1,14 @@
+import os
+import time
 from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
 
+from agent_chat import instance_client, instance_file
 from agent_chat.adapter import Adapter, AdapterConfig
 from agent_chat.instance_client import JoinedInstance
-from agent_chat.instance_file import prepare_instance
+from agent_chat.instance_file import InstanceSecret, prepare_instance
 from agent_chat.models import ChatError, DeliveryClaim, DeliveryResult, Heartbeat
 
 
@@ -23,7 +26,9 @@ class FakeOperations:
         self.claims: list[tuple[DeliveryClaim, bool]] = []
         self.settles: list[DeliveryResult] = []
         self.ends = 0
+        self.deadlines: list[float | None] = []
         self.join_errors: list[str] = []
+        self.claim_errors: list[str] = []
         self.heartbeat_errors: list[str] = []
         self.pending_errors: list[str] = []
         self.settle_errors: list[str] = []
@@ -32,7 +37,9 @@ class FakeOperations:
         self.last_joined: JoinedInstance | None = None
 
     def join_instance(self, directory: Path, native_session_id: str, boot_id: UUID, *,
-                      server_origin: str, host_token: str, harness: str, enabled: bool) -> JoinedInstance:
+                      server_origin: str, host_token: str, harness: str, enabled: bool,
+                      deadline: float | None = None) -> JoinedInstance:
+        self.deadlines.append(deadline)
         assert directory == self.directory
         assert server_origin == "https://chat.test"
         assert host_token == "host-token"
@@ -45,14 +52,18 @@ class FakeOperations:
         self.last_joined = joined
         return joined
 
-    def heartbeat(self, instance: JoinedInstance, state: Heartbeat) -> dict[str, object]:
+    def heartbeat(self, instance: JoinedInstance, state: Heartbeat, *,
+                  deadline: float | None = None) -> dict[str, object]:
+        self.deadlines.append(deadline)
         assert instance is self.last_joined
         if self.heartbeat_errors:
             raise ChatError(self.heartbeat_errors.pop(0))
         self.heartbeats.append(state)
         return {"session_id": str(instance.session_id), "instance_id": str(instance.instance_id)}
 
-    def pending(self, instance: JoinedInstance, sizing: bool = False) -> dict[str, object]:
+    def pending(self, instance: JoinedInstance, sizing: bool = False, *,
+                deadline: float | None = None) -> dict[str, object]:
+        self.deadlines.append(deadline)
         assert instance is self.last_joined
         assert sizing is True
         self.pending_calls += 1
@@ -61,13 +72,18 @@ class FakeOperations:
         return self.pending_result
 
     def claim(self, instance: JoinedInstance, key: UUID, request: DeliveryClaim,
-              bodies: bool = False) -> dict[str, object]:
+              bodies: bool = False, *, deadline: float | None = None) -> dict[str, object]:
+        self.deadlines.append(deadline)
         assert instance is self.last_joined
         self.claims.append((request, bodies))
+        if self.claim_errors:
+            raise ChatError(self.claim_errors.pop(0))
         assert self.grant is not None
         return self.grant
 
-    def settle(self, instance: JoinedInstance, attempt: UUID, request: DeliveryResult) -> dict[str, object]:
+    def settle(self, instance: JoinedInstance, attempt: UUID, request: DeliveryResult, *,
+               deadline: float | None = None) -> dict[str, object]:
+        self.deadlines.append(deadline)
         assert instance is self.last_joined
         if self.settle_errors:
             raise ChatError(self.settle_errors.pop(0))
@@ -75,7 +91,8 @@ class FakeOperations:
         return {"id": str(attempt), "instance_id": str(instance.instance_id),
                 "outcome": request.outcome, "reason": request.reason}
 
-    def end(self, instance: JoinedInstance) -> dict[str, object]:
+    def end(self, instance: JoinedInstance, *, deadline: float | None = None) -> dict[str, object]:
+        self.deadlines.append(deadline)
         self.ends += 1
         return {"instance_id": str(instance.instance_id)}
 
@@ -257,3 +274,93 @@ def test_four_failures_in_one_hour_fail_the_rejoin_budget(tmp_path):
     adapter.tick(now)
     assert adapter.failed == "REJOIN_BUDGET"
     assert adapter.tick(10_000.0) is None
+
+
+def test_every_operation_receives_a_whole_operation_deadline(tmp_path):
+    adapter, operations, _delivery = make_adapter(tmp_path)
+    operations.pending_result = {"messages": [str(uuid4())]}
+    operations.grant = {"dispatch": True, "attempt_id": str(uuid4()), "reservation_ms": 1000}
+    adapter.start("native-a")
+    adapter.tick(0.0)
+    adapter.tick(30.0)
+    adapter.stop()
+    assert operations.deadlines
+    assert all(deadline is not None and deadline > 0 for deadline in operations.deadlines)
+
+
+def test_deadline_expiry_is_an_outage_and_rejoins(tmp_path):
+    adapter, operations, _delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    operations.heartbeat_errors = ["CLI_INTERRUPTED"]
+    adapter.tick(30.0)
+    assert adapter.failed is None
+    assert adapter.joined is None
+    assert adapter.tick(32.4) == pytest.approx(32.5)
+
+
+def test_successful_heartbeat_keeps_the_record_alive_for_the_sweep(tmp_path):
+    adapter, _operations, _delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    path = tmp_path / f"{adapter.joined.binding.boot_id}.json"
+    old = time.time() - 2 * 60 * 60
+    os.utime(path, (old, old))
+    adapter.tick(30.0)
+    assert path.stat().st_mtime > time.time() - 60
+    instance_file.sweep_stale(tmp_path, uuid4())
+    assert path.exists()
+
+
+@pytest.mark.parametrize("code", ["MESSAGE_EXPIRED", "DELIVERY_INELIGIBLE", "DELIVERY_BLOCKED"])
+def test_a_claim_refusal_does_not_disable_the_adapter(tmp_path, code):
+    adapter, operations, _delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    operations.pending_result = {"messages": [str(uuid4())]}
+    operations.claim_errors = [code]
+    operations.grant = {"dispatch": True, "attempt_id": str(uuid4()), "reservation_ms": 1000}
+    adapter.tick(0.0)
+    assert adapter.available
+    assert adapter.joined is not None
+
+
+def test_the_episode_window_is_checked_before_a_join_attempt(tmp_path):
+    adapter, operations, _delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    operations.heartbeat_errors = ["STALE_INSTANCE"]
+    adapter.tick(30.0)
+    assert adapter._next_join is not None
+    adapter._episode_started = 0.0
+    adapter.tick(7200.0)
+    assert adapter.failed == "REJOIN_WINDOW"
+    assert operations.joins == 1
+
+
+def test_a_rejoin_delay_crossing_the_window_fails_immediately(tmp_path):
+    adapter, operations, _delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    adapter._episode_started = 30.0 - (7200.0 - 1.0)
+    operations.heartbeat_errors = ["STALE_INSTANCE"]
+    adapter.tick(30.0)
+    assert adapter.failed == "REJOIN_WINDOW"
+    assert operations.joins == 1
+
+
+def test_instance_client_forwards_the_deadline(monkeypatch):
+    seen: list[float | None] = []
+
+    class Client:
+        def __init__(self, _origin, _token, *, deadline=None):
+            seen.append(deadline)
+
+        def request(self, *_args, **_kwargs):
+            raise ChatError("CLI_INTERRUPTED")
+
+    monkeypatch.setattr(instance_client, "Client", Client)
+    instance = JoinedInstance(
+        InstanceSecret("native-a", uuid4(), "0" * 64, "https://chat.test"),
+        uuid4(), uuid4(), uuid4(), "host", "pi",
+    )
+    with pytest.raises(ChatError, match="CLI_INTERRUPTED"):
+        instance_client.heartbeat(
+            instance, Heartbeat(native_state="unknown", stopped=True, plan_mode=True), deadline=123.0,
+        )
+    assert seen == [123.0]

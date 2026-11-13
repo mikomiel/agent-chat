@@ -344,7 +344,7 @@ class _Canned:
 
     reply: dict = {}
 
-    def __init__(self, *_):
+    def __init__(self, *_args, **_kwargs):
         pass
 
     def request(self, *_args, **_kwargs):

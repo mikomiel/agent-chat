@@ -47,6 +47,7 @@ def join_instance(
     host_token: str,
     harness: Literal["pi", "codex", "claude", "deepseek", "opencode"],
     enabled: bool = False,
+    deadline: float | None = None,
 ) -> JoinedInstance:
     """Persist the instance secret before sending its digest with host authority.
 
@@ -58,7 +59,7 @@ def join_instance(
         raise ChatError("INTEGRATION_DISABLED")
     if harness not in ("pi", "codex", "claude", "deepseek", "opencode"):
         raise ChatError("INVALID_REQUEST")
-    registration_client = Client(server_origin, host_token)
+    registration_client = Client(server_origin, host_token, deadline=deadline)
     secret = prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
     result = registration_client.request(
         "POST",
@@ -91,11 +92,12 @@ def join_instance(
 
 
 def _request(
-    instance: JoinedInstance, method: str, path: str, payload=None, *, invalid: str | None = None
+    instance: JoinedInstance, method: str, path: str, payload=None, *,
+    invalid: str | None = None, deadline: float | None = None,
 ) -> dict[str, Any]:
     # Each lifecycle operation has its own bounded response budget. Never retain
     # the host credential here or reopen/discover a different binding file.
-    client = Client(instance.binding.server_origin, instance.binding.token)
+    client = Client(instance.binding.server_origin, instance.binding.token, deadline=deadline)
     result = client.request(method, path, payload, invalid=invalid)
     try:
         if not isinstance(result, dict) or _uuid(result.get("instance_id")) != instance.instance_id:
@@ -110,7 +112,7 @@ def _request(
     return result
 
 
-def heartbeat(instance: JoinedInstance, state: Heartbeat) -> dict[str, Any]:
+def heartbeat(instance: JoinedInstance, state: Heartbeat, *, deadline: float | None = None) -> dict[str, Any]:
     """Only publish the owner's explicit observation; never clear stop implicitly."""
     if not isinstance(state, Heartbeat):
         raise ChatError("INVALID_REQUEST")
@@ -120,22 +122,25 @@ def heartbeat(instance: JoinedInstance, state: Heartbeat) -> dict[str, Any]:
         "/v1/instance/heartbeat",
         state.model_dump(mode="json", exclude_unset=True),
         invalid="INVALID_RESPONSE",
+        deadline=deadline,
     )
 
 
-def status(instance: JoinedInstance) -> dict[str, Any]:
+def status(instance: JoinedInstance, *, deadline: float | None = None) -> dict[str, Any]:
     """Observe this binding without renewing its lease or acknowledging messages."""
-    return _request(instance, "GET", "/v1/instance/status")
+    return _request(instance, "GET", "/v1/instance/status", deadline=deadline)
 
 
-def end(instance: JoinedInstance) -> dict[str, Any]:
+def end(instance: JoinedInstance, *, deadline: float | None = None) -> dict[str, Any]:
     """Explicitly end this exact binding, including a safe same-binding retry."""
-    return _request(instance, "POST", "/v1/instance/end", {})
+    return _request(instance, "POST", "/v1/instance/end", {}, deadline=deadline)
 
 
-def pending(instance: JoinedInstance, sizing: bool = False) -> dict[str, Any]:
+def pending(instance: JoinedInstance, sizing: bool = False, *, deadline: float | None = None) -> dict[str, Any]:
     """Candidate IDs; `sizing` adds the server's body sizes and retry marker, but only when it sent them."""
-    result = _request(instance, "GET", "/v1/instance/deliveries/pending", invalid="INVALID_RESPONSE")
+    result = _request(
+        instance, "GET", "/v1/instance/deliveries/pending", invalid="INVALID_RESPONSE", deadline=deadline
+    )
     try:
         ids = result["messages"]
         if not isinstance(ids, list) or len(ids) > 16 or len({_uuid(value) for value in ids}) != len(ids):
@@ -198,9 +203,12 @@ def _body_fields(row: dict[str, Any], wire_bytes: int) -> dict[str, Any]:
     }
 
 
-def claim(instance: JoinedInstance, key: UUID, request: DeliveryClaim, bodies: bool = False) -> dict[str, Any]:
+def claim(
+    instance: JoinedInstance, key: UUID, request: DeliveryClaim, bodies: bool = False, *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
     """Validate a grant and return metadata only; bodies stay in explicit history unless `bodies` asks."""
-    result = Client(instance.binding.server_origin, instance.binding.token).request(
+    result = Client(instance.binding.server_origin, instance.binding.token, deadline=deadline).request(
         "POST",
         "/v1/instance/deliveries/claim",
         request.model_dump(mode="json"),
@@ -283,9 +291,11 @@ def _receipt(row: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def receipts(instance: JoinedInstance) -> dict[str, Any]:
+def receipts(instance: JoinedInstance, *, deadline: float | None = None) -> dict[str, Any]:
     """The session's own undelivered sender receipts, oldest first. Reading marks nothing delivered."""
-    result = _request(instance, "GET", "/v1/instance/receipts", invalid="INVALID_RESPONSE")
+    result = _request(
+        instance, "GET", "/v1/instance/receipts", invalid="INVALID_RESPONSE", deadline=deadline
+    )
     try:
         rows = result["receipts"]
         if not isinstance(rows, list) or len(rows) > RECEIPT_FEED_LIMIT:
@@ -298,11 +308,15 @@ def receipts(instance: JoinedInstance) -> dict[str, Any]:
     return {"receipts": items}
 
 
-def receipts_delivered(instance: JoinedInstance, request: ReceiptDelivery) -> dict[str, Any]:
+def receipts_delivered(
+    instance: JoinedInstance, request: ReceiptDelivery, *, deadline: float | None = None
+) -> dict[str, Any]:
     """Mark receipts the adapter output as delivered; only the session's own are marked, and a repeat is safe."""
     if not isinstance(request, ReceiptDelivery):
         raise ChatError("INVALID_REQUEST")
-    result = _request(instance, "POST", "/v1/instance/receipts/delivered", request.model_dump(mode="json"))
+    result = _request(
+        instance, "POST", "/v1/instance/receipts/delivered", request.model_dump(mode="json"), deadline=deadline
+    )
     try:
         delivered = result["delivered"]
         if not isinstance(delivered, list):
@@ -315,8 +329,10 @@ def receipts_delivered(instance: JoinedInstance, request: ReceiptDelivery) -> di
     return {"delivered": ids}
 
 
-def settle(instance: JoinedInstance, attempt: UUID, request: DeliveryResult) -> dict[str, Any]:
-    result = Client(instance.binding.server_origin, instance.binding.token).request(
+def settle(
+    instance: JoinedInstance, attempt: UUID, request: DeliveryResult, *, deadline: float | None = None
+) -> dict[str, Any]:
+    result = Client(instance.binding.server_origin, instance.binding.token, deadline=deadline).request(
         "POST",
         f"/v1/instance/deliveries/{attempt}/result",
         request.model_dump(mode="json"),
