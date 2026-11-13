@@ -330,6 +330,9 @@ class Adapter:
             self._next_poll = now + self.config.poll_seconds
             return
         messages = tuple(UUID(str(value)) for value in candidates)
+        # The reservation starts inside the claim, not when this tick began: a slow
+        # heartbeat or pending call must not hand the harness an already-expired deadline.
+        claim_started = self._clock()
         try:
             grant = self.operations.claim(
                 self.joined, uuid4(), DeliveryClaim(messages=messages), bodies=True,
@@ -345,7 +348,7 @@ class Adapter:
             self._next_poll = now + self.config.poll_seconds
             return
         attempt = UUID(str(grant["attempt_id"]))
-        deadline = now + float(grant.get("reservation_ms", 0)) / 1000.0
+        deadline = claim_started + float(grant.get("reservation_ms", 0)) / 1000.0
         try:
             outcome, reason = self.delivery.deliver(grant.get("messages", ()), deadline)
             result = DeliveryResult(outcome=outcome, reason=reason)

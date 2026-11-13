@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from agent_chat import instance_client, instance_file
-from agent_chat.adapter import Adapter, AdapterConfig
+from agent_chat.adapter import ADAPTER_REQUEST_SECONDS, Adapter, AdapterConfig
 from agent_chat.instance_client import JoinedInstance
 from agent_chat.instance_file import InstanceSecret, prepare_instance
 from agent_chat.models import ChatError, DeliveryClaim, DeliveryResult, Heartbeat
@@ -27,6 +27,8 @@ class FakeOperations:
         self.settles: list[DeliveryResult] = []
         self.ends = 0
         self.deadlines: list[float | None] = []
+        self.deadline_pairs: list[tuple[float | None, float]] = []
+        self.on_call = None
         self.join_errors: list[str] = []
         self.claim_errors: list[str] = []
         self.heartbeat_errors: list[str] = []
@@ -36,10 +38,14 @@ class FakeOperations:
         self.grant: dict[str, object] | None = None
         self.last_joined: JoinedInstance | None = None
 
+    def _record(self, deadline: float | None) -> None:
+        self.deadlines.append(deadline)
+        self.deadline_pairs.append((deadline, time.monotonic()))
+
     def join_instance(self, directory: Path, native_session_id: str, boot_id: UUID, *,
                       server_origin: str, host_token: str, harness: str, enabled: bool,
                       deadline: float | None = None) -> JoinedInstance:
-        self.deadlines.append(deadline)
+        self._record(deadline)
         assert directory == self.directory
         assert server_origin == "https://chat.test"
         assert host_token == "host-token"
@@ -54,7 +60,9 @@ class FakeOperations:
 
     def heartbeat(self, instance: JoinedInstance, state: Heartbeat, *,
                   deadline: float | None = None) -> dict[str, object]:
-        self.deadlines.append(deadline)
+        self._record(deadline)
+        if self.on_call is not None:
+            self.on_call("heartbeat")
         assert instance is self.last_joined
         if self.heartbeat_errors:
             raise ChatError(self.heartbeat_errors.pop(0))
@@ -63,7 +71,9 @@ class FakeOperations:
 
     def pending(self, instance: JoinedInstance, sizing: bool = False, *,
                 deadline: float | None = None) -> dict[str, object]:
-        self.deadlines.append(deadline)
+        self._record(deadline)
+        if self.on_call is not None:
+            self.on_call("pending")
         assert instance is self.last_joined
         assert sizing is True
         self.pending_calls += 1
@@ -73,7 +83,9 @@ class FakeOperations:
 
     def claim(self, instance: JoinedInstance, key: UUID, request: DeliveryClaim,
               bodies: bool = False, *, deadline: float | None = None) -> dict[str, object]:
-        self.deadlines.append(deadline)
+        self._record(deadline)
+        if self.on_call is not None:
+            self.on_call("claim")
         assert instance is self.last_joined
         self.claims.append((request, bodies))
         if self.claim_errors:
@@ -83,7 +95,7 @@ class FakeOperations:
 
     def settle(self, instance: JoinedInstance, attempt: UUID, request: DeliveryResult, *,
                deadline: float | None = None) -> dict[str, object]:
-        self.deadlines.append(deadline)
+        self._record(deadline)
         assert instance is self.last_joined
         if self.settle_errors:
             raise ChatError(self.settle_errors.pop(0))
@@ -92,7 +104,7 @@ class FakeOperations:
                 "outcome": request.outcome, "reason": request.reason}
 
     def end(self, instance: JoinedInstance, *, deadline: float | None = None) -> dict[str, object]:
-        self.deadlines.append(deadline)
+        self._record(deadline)
         self.ends += 1
         return {"instance_id": str(instance.instance_id)}
 
@@ -119,7 +131,7 @@ class FakeDelivery:
         self.contexts.append(text)
 
 
-def make_adapter(tmp_path: Path, *, enabled: bool = True):
+def make_adapter(tmp_path: Path, *, enabled: bool = True, clock=None):
     operations = FakeOperations(tmp_path)
     delivery = FakeDelivery()
     config = AdapterConfig(
@@ -130,7 +142,7 @@ def make_adapter(tmp_path: Path, *, enabled: bool = True):
         harness="pi",
         enabled=enabled,
     )
-    adapter = Adapter(config, delivery, operations=operations, clock=lambda: 0.0, rng=FixedRandom())
+    adapter = Adapter(config, delivery, operations=operations, clock=clock or (lambda: 0.0), rng=FixedRandom())
     return adapter, operations, delivery
 
 
@@ -285,7 +297,9 @@ def test_every_operation_receives_a_whole_operation_deadline(tmp_path):
     adapter.tick(30.0)
     adapter.stop()
     assert operations.deadlines
-    assert all(deadline is not None and deadline > 0 for deadline in operations.deadlines)
+    for deadline, called in operations.deadline_pairs:
+        assert deadline is not None
+        assert 0 < deadline - called <= ADAPTER_REQUEST_SECONDS + 0.5
 
 
 def test_deadline_expiry_is_an_outage_and_rejoins(tmp_path):
@@ -312,7 +326,7 @@ def test_successful_heartbeat_keeps_the_record_alive_for_the_sweep(tmp_path):
 
 @pytest.mark.parametrize("code", ["MESSAGE_EXPIRED", "DELIVERY_INELIGIBLE", "DELIVERY_BLOCKED"])
 def test_a_claim_refusal_does_not_disable_the_adapter(tmp_path, code):
-    adapter, operations, _delivery = make_adapter(tmp_path)
+    adapter, operations, delivery = make_adapter(tmp_path)
     adapter.start("native-a")
     operations.pending_result = {"messages": [str(uuid4())]}
     operations.claim_errors = [code]
@@ -320,6 +334,12 @@ def test_a_claim_refusal_does_not_disable_the_adapter(tmp_path, code):
     adapter.tick(0.0)
     assert adapter.available
     assert adapter.joined is not None
+    assert len(operations.claims) == 1
+
+    adapter.tick(adapter._next_poll)
+    assert len(operations.claims) == 2
+    assert len(operations.settles) == 1
+    assert len(delivery.delivered) == 1
 
 
 def test_the_episode_window_is_checked_before_a_join_attempt(tmp_path):
@@ -364,3 +384,21 @@ def test_instance_client_forwards_the_deadline(monkeypatch):
             instance, Heartbeat(native_state="unknown", stopped=True, plan_mode=True), deadline=123.0,
         )
     assert seen == [123.0]
+
+
+def test_delivery_deadline_is_anchored_at_the_claim(tmp_path):
+    clock = [30.0]
+    adapter, operations, delivery = make_adapter(tmp_path, clock=lambda: clock[0])
+    operations.pending_result = {"messages": [str(uuid4())]}
+    operations.grant = {"dispatch": True, "attempt_id": str(uuid4()), "reservation_ms": 30_000}
+
+    def advance(operation: str) -> None:
+        if operation in ("heartbeat", "pending", "claim"):
+            clock[0] += 19.0
+
+    operations.on_call = advance
+    adapter.start("native-a")
+    clock[0] = 60.0
+    adapter.tick()
+
+    assert delivery.delivered[0][1] == pytest.approx(128.0)
