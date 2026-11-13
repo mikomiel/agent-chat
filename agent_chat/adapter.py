@@ -349,6 +349,23 @@ class Adapter:
             return
         attempt = UUID(str(grant["attempt_id"]))
         deadline = claim_started + float(grant.get("reservation_ms", 0)) / 1000.0
+        if deadline <= self._clock():
+            # The reservation can be shorter than 30 s (the server caps it at the
+            # remaining lease) and a streamed claim response can consume it. Never
+            # hand the harness a batch it cannot settle inside the reservation.
+            try:
+                self.operations.settle(
+                    self.joined,
+                    attempt,
+                    DeliveryResult(outcome="uncertain", reason="transport_ambiguous"),
+                    deadline=self._request_deadline(),
+                )
+            except ChatError as error:
+                if error.code not in _DELIVERY_REFUSALS:
+                    self._failed_operation(error.code, now)
+                    return
+            self._next_poll = now + self.config.poll_seconds
+            return
         try:
             outcome, reason = self.delivery.deliver(grant.get("messages", ()), deadline)
             result = DeliveryResult(outcome=outcome, reason=reason)

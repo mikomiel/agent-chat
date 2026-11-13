@@ -402,3 +402,23 @@ def test_delivery_deadline_is_anchored_at_the_claim(tmp_path):
     adapter.tick()
 
     assert delivery.delivered[0][1] == pytest.approx(128.0)
+
+
+def test_an_expired_reservation_is_not_delivered(tmp_path):
+    clock = [30.0]
+    adapter, operations, delivery = make_adapter(tmp_path, clock=lambda: clock[0])
+    operations.pending_result = {"messages": [str(uuid4())]}
+    operations.grant = {"dispatch": True, "attempt_id": str(uuid4()), "reservation_ms": 13_000}
+
+    def advance(operation: str) -> None:
+        if operation in ("heartbeat", "pending", "claim"):
+            clock[0] += 19.0
+
+    operations.on_call = advance
+    adapter.start("native-a")
+    clock[0] = 60.0
+    adapter.tick()
+
+    assert delivery.delivered == []
+    assert operations.settles == [DeliveryResult(outcome="uncertain", reason="transport_ambiguous")]
+    assert adapter.available
