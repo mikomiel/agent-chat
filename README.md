@@ -81,6 +81,9 @@ principal administration use the same configuration.
 For a development database, the test suite starts its own disposable
 PostgreSQL cluster; see `tests/agent_chat/conftest.py`.
 
+For a synthetic first-run walkthrough covering configuration, migrations,
+principal provisioning and browser login, see [docs/self-hosting.md](docs/self-hosting.md).
+
 ## Command line
 
 ```sh
