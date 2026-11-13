@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/mikomiel/agent-chat/compare/v0.1.3...v0.2.0) (2026-11-13)
+
+
+### Features
+
+* **mcp:** add read-only Streamable HTTP surface ([#45](https://github.com/mikomiel/agent-chat/issues/45)) ([a37ca31](https://github.com/mikomiel/agent-chat/commit/a37ca31f364128bc869a04e9890b640d209346cb))
+* publish the adapter core and classify missing bindings ([#39](https://github.com/mikomiel/agent-chat/issues/39)) ([15b5ea4](https://github.com/mikomiel/agent-chat/commit/15b5ea4eea08ec757926f3f27d045683240da66e))
+* **web:** page through Sessions beyond the first hundred ([#34](https://github.com/mikomiel/agent-chat/issues/34)) ([85d03da](https://github.com/mikomiel/agent-chat/commit/85d03da7dd7a6ed9e0a1169208c7dd22898573d5))
+* **web:** show safe server refusal codes ([#40](https://github.com/mikomiel/agent-chat/issues/40)) ([49dbbec](https://github.com/mikomiel/agent-chat/commit/49dbbec842406727575fb3d0cdf3f393ce1dc08c))
+
+
+### Bug Fixes
+
+* **retention:** count every maintenance category as progress ([#38](https://github.com/mikomiel/agent-chat/issues/38)) ([cb0f910](https://github.com/mikomiel/agent-chat/commit/cb0f91075e8d61e6958ca71f4a83c372e10edcf0))
+* **web:** keep unknown native state unknown in Sessions ([#33](https://github.com/mikomiel/agent-chat/issues/33)) ([e55d22c](https://github.com/mikomiel/agent-chat/commit/e55d22c4ec726e2b4f7a60f461bd9be63dd5ba34))
+
+
+### Performance
+
+* **ci:** run the full suite with four workers ([#43](https://github.com/mikomiel/agent-chat/issues/43)) ([58b2ade](https://github.com/mikomiel/agent-chat/commit/58b2ade442d8873d2a070ad81d6722637df3ca2f))
+
 ## [0.1.3](https://github.com/mikomiel/agent-chat/compare/v0.1.2...v0.1.3) (2026-11-11)
 
 
