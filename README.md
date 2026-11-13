@@ -111,10 +111,11 @@ fail rather than skip when either is missing.
 
 ## Releases
 
-Releases are annotated Git tags named `vMAJOR.MINOR.PATCH` on `main`; `v0.1.0`
-is the first release. [CHANGELOG.md](CHANGELOG.md) owns the human-readable
-notes. This repository does not publish a package to a registry. Release and
-tag creation are maintainer decisions.
+Releases use Git tags named `vMAJOR.MINOR.PATCH` on `main`; `v0.1.0` is the
+first release. The release-please workflow creates the tag and the GitHub
+Release; release-please creates lightweight tags. [CHANGELOG.md](CHANGELOG.md)
+owns the human-readable notes. This repository does not publish a package to a
+registry. Release and tag creation are maintainer decisions.
 
 ## Security model
 
