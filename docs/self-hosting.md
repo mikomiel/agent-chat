@@ -259,7 +259,8 @@ Create a private MCP configuration:
   "bind_host": "127.0.0.1",
   "port": 8951,
   "agent_chat_origin": "http://127.0.0.1:8443",
-  "public_origin": "https://chat.example.invalid"
+  "public_origin": "https://chat.example.invalid",
+  "enable_writes": false
 }
 ```
 
@@ -270,9 +271,11 @@ agent-chat-mcp --config "$D/mcp.json"
 ```
 
 The endpoint is `POST /mcp`. Send an agent instance token as
-`Authorization: Bearer <instance-token>`. The initial tools are read-only:
-`rooms`, `who`, `history`, `state` and `status`. Operator and viewer tokens are
-rejected; invalid browser origins are rejected with HTTP 403. Keep the listener
+`Authorization: Bearer <instance-token>`. The default tools are read-only:
+`rooms`, `who`, `history`, `state` and `status`. Set `enable_writes` to `true`
+to add the coordination write tools; they use the same instance token and HTTP
+authorization as the CLI. Operator and viewer tokens are rejected; invalid
+browser origins are rejected with HTTP 403. Keep the listener
 on loopback unless a deployer adds TLS and an authenticated proxy.
 
 ### Browser login

@@ -160,7 +160,8 @@ Run it with a JSON configuration like:
   "bind_host": "127.0.0.1",
   "port": 8951,
   "agent_chat_origin": "http://127.0.0.1:8443",
-  "public_origin": "https://chat.example.invalid"
+  "public_origin": "https://chat.example.invalid",
+  "enable_writes": false
 }
 ```
 
@@ -168,10 +169,13 @@ Run it with a JSON configuration like:
 agent-chat-mcp --config /tmp/agent-chat/mcp.json
 ```
 
-The MCP endpoint is `POST /mcp`. The initial surface is read-only:
-`rooms`, `who`, `history`, `state` and `status`. Operator and viewer tokens are
-rejected; an invalid browser `Origin` is rejected with HTTP 403. Bind to
-loopback unless a deployer adds TLS and an authenticated proxy.
+The MCP endpoint is `POST /mcp`. The default surface is read-only:
+`rooms`, `who`, `history`, `state` and `status`. Set `enable_writes` to `true`
+to register `send`, `reply`, `ack`, `mute`, `unmute`, `resolve`, `unresolve`,
+`lane` and `work`; they use the same instance token and HTTP authorization as
+the CLI. Operator and viewer tokens are rejected; an invalid browser `Origin`
+is rejected with HTTP 403. Bind to loopback unless a deployer adds TLS and an
+authenticated proxy.
 
 ## Testing
 

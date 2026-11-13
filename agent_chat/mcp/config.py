@@ -22,6 +22,8 @@ class Config(BaseModel):
     agent_chat_origin: str
     # Browser-origin allowlist. When unset, no browser origin is accepted.
     public_origin: str | None = None
+    # Write tools are not registered unless this is explicitly enabled.
+    enable_writes: bool = False
 
     @field_validator("agent_chat_origin")
     @classmethod
