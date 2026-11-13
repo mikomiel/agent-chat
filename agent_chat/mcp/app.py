@@ -5,6 +5,9 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
+from fastmcp.server.middleware import Middleware
 from starlette.responses import Response
 
 from .auth import AgentChatTokenVerifier
@@ -12,8 +15,23 @@ from .config import Config
 from .tools import register
 
 
+class SafeToolErrors(Middleware):
+    """Replace framework argument-validation details with a stable code."""
+
+    async def on_call_tool(self, context, call_next):
+        try:
+            return await call_next(context)
+        except FastMCPValidationError:
+            raise ToolError("INVALID_REQUEST") from None
+
+
 def create_mcp(config: Config) -> FastMCP:
-    mcp = FastMCP(name="agent-chat", auth=AgentChatTokenVerifier(config.agent_chat_origin))
+    mcp = FastMCP(
+        name="agent-chat",
+        auth=AgentChatTokenVerifier(config.agent_chat_origin),
+        middleware=[SafeToolErrors()],
+        mask_error_details=True,
+    )
     register(mcp, config)
     return mcp
 
