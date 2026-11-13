@@ -640,7 +640,8 @@ def test_prune_on_an_empty_database_stops_after_one_batch(workdir, db, database)
     environ = write_dsn(workdir, database)
     assert run(["prune", "--config", write_config(workdir)], environ=environ) == (
         0,
-        "batches=1 events=0 redacted=0 deleted=0 ended_instances=0 memberships=0 expired_undelivered=0\n",
+        "batches=1 events=0 redacted=0 deleted=0 ended_instances=0 memberships=0 expired_undelivered=0 "
+        "reservations=0 delivery_batches=0 browser_sessions=0 room_state=0\n",
         "",
     )
 
@@ -672,6 +673,7 @@ def test_prune_is_bounded_by_max_batches(workdir, database, monkeypatch):
         calls.append(limit)
         return {
             "events": 1, "redacted": 2, "deleted": 3, "ended_instances": 4, "memberships": 5, "expired_undelivered": 6,
+            "reservations": 7, "delivery_batches": 8, "browser_sessions": 9, "room_state": 10,
         }
 
     monkeypatch.setattr(retention, "prune", always_removes)
@@ -679,23 +681,46 @@ def test_prune_is_bounded_by_max_batches(workdir, database, monkeypatch):
     code, out, _ = run(
         ["prune", "--config", write_config(workdir), "--limit", "7", "--max-batches", "3"], environ=environ
     )
-    # The first four keys keep their order: the journal line is read by key with LogQL.
+    # The original keys keep their order: the journal line is read by key with LogQL.
     assert (code, out) == (
         0,
-        "batches=3 events=3 redacted=6 deleted=9 ended_instances=12 memberships=15 expired_undelivered=18\n",
+        "batches=3 events=3 redacted=6 deleted=9 ended_instances=12 memberships=15 expired_undelivered=18 "
+        "reservations=21 delivery_batches=24 browser_sessions=27 room_state=30\n",
     )
     assert calls == [7, 7, 7]
 
 
 def test_prune_stops_on_the_first_empty_batch(workdir, database, monkeypatch):
-    keys = ("events", "redacted", "deleted", "ended_instances", "memberships", "expired_undelivered")
+    keys = (
+        "events", "redacted", "deleted", "ended_instances", "memberships", "expired_undelivered",
+        "reservations", "delivery_batches", "browser_sessions", "room_state",
+    )
     quiet = dict.fromkeys(keys, 0)
     results = iter([{**quiet, "events": 2, "expired_undelivered": 1}, quiet])
     monkeypatch.setattr(retention, "prune", lambda _db, limit: next(results))
     environ = write_dsn(workdir, database)
     assert run(["prune", "--config", write_config(workdir)], environ=environ)[1] == (
-        "batches=2 events=2 redacted=0 deleted=0 ended_instances=0 memberships=0 expired_undelivered=1\n"
+        "batches=2 events=2 redacted=0 deleted=0 ended_instances=0 memberships=0 expired_undelivered=1 "
+        "reservations=0 delivery_batches=0 browser_sessions=0 room_state=0\n"
     )
+
+
+def test_prune_drains_auxiliary_rows_within_the_batch_budget(workdir, db, database, actors):
+    _, _, _, operator = actors
+    for index in range(3):
+        db.execute(
+            "INSERT INTO agent_chat.browser_sessions(token_hash, principal_id, expires_at) "
+            "VALUES (%s, %s, clock_timestamp() - interval '1 hour')",
+            (sha256(f"expired-{index}".encode()).hexdigest(), operator.principal_id),
+        )
+    environ = write_dsn(workdir, database)
+    code, out, err = run(
+        ["prune", "--config", write_config(workdir), "--limit", "1", "--max-batches", "10"], environ=environ
+    )
+    assert (code, err) == (0, "")
+    fields = dict(part.split("=") for part in out.split())
+    assert int(fields["browser_sessions"]) == 3
+    assert db.execute("SELECT count(*) AS n FROM agent_chat.browser_sessions").fetchone()["n"] == 0
 
 
 @pytest.mark.parametrize("flags", [["--limit", "0"], ["--limit", "1001"], ["--max-batches", "0"], ["--limit", "x"]])

@@ -44,7 +44,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
         """,
             (limit,),
         ).rowcount
-        deliveries.reconcile(db, limit=limit)
+        reservations = deliveries.reconcile(db, limit=limit)
         expired_undelivered = deliveries.expire_undelivered(db, limit=limit)
         # Expire only a cursor prefix. A backwards wall-clock adjustment must not
         # expire a later event while silently skipping an earlier retained event.
@@ -78,7 +78,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
         db.execute("DELETE FROM agent_chat.recipients WHERE message_id = ANY(%s)", (ids,))
         # Keep admission evidence even if its message just expired. A resume or
         # prune must not refill the rolling wake budget. No content is stored here.
-        db.execute(
+        removed_batches = db.execute(
             """
             DELETE FROM agent_chat.delivery_batches b WHERE b.id IN (
                 SELECT candidate.id FROM agent_chat.delivery_batches candidate
@@ -90,7 +90,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             )
         """,
             (WAKE_WINDOW_SECONDS, limit),
-        )
+        ).rowcount
         # Remove leaf tombstones only. A retained child or event keeps its parent.
         # Subsequent batches collect ancestors, including the final thread root.
         deleted = db.execute(
@@ -118,7 +118,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             ([row["thread_id"] for row in deleted],),
         )
         # Authentication expiry is eight hours, not the conversation retention window.
-        db.execute(
+        removed_browser_sessions = db.execute(
             """
             DELETE FROM agent_chat.browser_sessions WHERE token_hash IN (
                 SELECT token_hash FROM agent_chat.browser_sessions
@@ -126,9 +126,9 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             )
         """,
             (limit,),
-        )
+        ).rowcount
         # Room state rows are independent of events; one that expired long ago is no longer worth showing as stale.
-        db.execute(
+        removed_state = db.execute(
             """
             DELETE FROM agent_chat.room_state WHERE (room_id, state_key) IN (
                 SELECT room_id, state_key FROM agent_chat.room_state
@@ -137,7 +137,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             )
         """,
             (limit,),
-        )
+        ).rowcount
         return {
             "events": removed_events,
             "redacted": len(redacted),
@@ -145,4 +145,10 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             "ended_instances": ended_instances,
             "memberships": memberships,
             "expired_undelivered": expired_undelivered,
+            # Every other progress-making operation belongs in the maintenance
+            # result too; admin.prune stops on a result whose counts are all zero.
+            "reservations": reservations,
+            "delivery_batches": removed_batches,
+            "browser_sessions": removed_browser_sessions,
+            "room_state": removed_state,
         }
