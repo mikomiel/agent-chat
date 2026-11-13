@@ -1106,26 +1106,33 @@
     sessionsLoadingMore = true;
     renderSessions();
     try {
-      await read(async () => {
-        const query = new URLSearchParams({ limit: "100", after_session: after });
-        const data = await request(`${roomPath(room)}/participants?${query}`);
-        // Append only to the exact snapshot this request extended. A revisit of
-        // Sessions may have replaced it while the request was in flight.
-        if (room !== selectedRoom || epoch !== scopeEpoch || sessionsPage !== basePage) return;
-        if (!Array.isArray(data.participants)) throw new Error("INVALID_RESPONSE");
-        const seen = new Set(basePage.participants.map((person) => person.session_id));
-        sessionsPage = {
-          ...basePage,
-          participants: [
-            ...basePage.participants,
-            ...data.participants.filter((person) => !seen.has(person.session_id)),
-          ],
-          next_session_id: data.next_session_id,
-          roles: data.roles ?? basePage.roles,
-          pm: data.pm ?? basePage.pm,
-        };
-        renderSessions();
-      }, generation);
+      const query = new URLSearchParams({ limit: "100", after_session: after });
+      const data = await request(`${roomPath(room)}/participants?${query}`);
+      // Append only to the exact snapshot this request extended. A revisit of
+      // Sessions may have replaced it while the request was in flight.
+      if (room !== selectedRoom || epoch !== scopeEpoch || sessionsPage !== basePage) return;
+      if (!Array.isArray(data.participants)) throw new Error("INVALID_RESPONSE");
+      const seen = new Set(basePage.participants.map((person) => person.session_id));
+      sessionsPage = {
+        ...basePage,
+        participants: [
+          ...basePage.participants,
+          ...data.participants.filter((person) => !seen.has(person.session_id)),
+        ],
+        next_session_id: data.next_session_id,
+        roles: data.roles ?? basePage.roles,
+        pm: data.pm ?? basePage.pm,
+      };
+      renderSessions();
+    } catch (error) {
+      // A failed later page is not a failed snapshot. Ignore it when a newer
+      // snapshot replaced this one; keep access refusals fail-closed.
+      if (room !== selectedRoom || epoch !== scopeEpoch || sessionsPage !== basePage) return;
+      if (error.status === 401 || error.status === 403) {
+        failed(error, generation);
+        return;
+      }
+      el("notice").textContent = "Nie udało się pobrać kolejnej strony sesji. Spróbuj ponownie.";
     } finally {
       sessionsLoadingMore = false;
       if (sessionsPage) renderSessions();
