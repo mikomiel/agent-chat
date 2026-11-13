@@ -565,7 +565,7 @@ def test_revoked_stale_and_unsafe_bindings_refuse_without_renewal(cli, process_a
 
 def test_cli_with_a_removed_record_refuses_without_discovering_another(cli):
     cli.path.unlink()
-    assert cli.run("status") == (1, {"error": {"code": "BINDING_FILE_UNSAFE"}})
+    assert cli.run("status") == (1, {"error": {"code": "BINDING_FILE_MISSING"}})
 
 
 def test_cli_never_rebinds_an_ended_process(cli, process_api, credentials, register):

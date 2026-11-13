@@ -473,7 +473,8 @@ def main() -> int:
             try:
                 binding = read_instance(Path(filename))
             except OSError:
-                # A missing or unreadable record is the binding's fault, not any later I/O's.
+                # read_instance names a missing or unsafe record itself; anything
+                # left is an unexpected read fault, never a later I/O error.
                 raise ChatError("BINDING_FILE_UNSAFE") from None
             token = binding.token
             output = {"result": execute(args, Client(binding.server_origin, binding.token))}
