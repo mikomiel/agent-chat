@@ -55,7 +55,11 @@ host=/run/postgresql dbname=agent_chat user=agent_chat
 
 ## 2. Write the configuration
 
-Create a JSON file. The model rejects unknown fields and wrong types.
+Create `/tmp/agent-chat/config.json`. The model rejects unknown fields and wrong types.
+
+```sh
+mkdir -p /tmp/agent-chat
+```
 
 ```json
 {
@@ -92,11 +96,18 @@ For a local synthetic run:
 ```sh
 install -d -m 0700 /tmp/agent-chat-credentials
 install -m 0600 /dev/null /tmp/agent-chat-credentials/agent-chat-dsn
-printf '%s\n' 'host=/run/postgresql dbname=agent_chat user=agent_chat' \
-  > /tmp/agent-chat-credentials/agent-chat-dsn
+${EDITOR:-vi} /tmp/agent-chat-credentials/agent-chat-dsn
 export CREDENTIALS_DIRECTORY=/tmp/agent-chat-credentials
 ```
 
+The file contains exactly one line, for example:
+
+```text
+host=/run/postgresql dbname=agent_chat user=agent_chat
+```
+
+The editor command records only the file path in shell history, not the
+credential. Write the DSN with the secret manager or private editor you use.
 A systemd unit can use `LoadCredential=agent-chat-dsn:/path/to/dsn` instead;
 systemd then supplies `CREDENTIALS_DIRECTORY` to the process. The credential
 directory must remain private. Never commit the DSN or place it in the JSON.
@@ -120,27 +131,37 @@ python -m agent_chat.admin migrate --config /tmp/agent-chat/config.json \
   --reviewed '<reviewed-sha256>'
 ```
 
-The apply command is idempotent. A changed or unreviewed pending set fails with
-`REVIEW_MISMATCH`; a database whose recorded migration bytes do not match fails
-with `SCHEMA_MISMATCH`. Migrations are append-only; do not edit a released
+`--reviewed` is an optional guard that this walkthrough requires. Without it
+the command applies whatever is pending. With it, a changed pending set fails
+with `REVIEW_MISMATCH`. The command is not idempotent after a successful apply:
+the pending set is now empty, so replaying the old guarded command also fails
+`REVIEW_MISMATCH`. After an apply, rerun `--check`; `pending=0` means the schema
+is current. A database whose recorded migration bytes do not match fails with
+`SCHEMA_MISMATCH`. Migrations are append-only; do not edit a released
 `agent_chat/*.sql` file.
 
 ## 5. Provision principals
 
 A principal token is 64 lowercase hexadecimal characters. The raw token is
 read from stdin only. Generate it with a secret manager or a local random
-source, and do not put it in shell history, a command argument or this
-repository.
+source, and store it in a private file. Do not put it in shell history, a
+command argument, a process listing or this repository.
 
 The `homelab` room exists after migration. Operators and agents receive a grant
 to it automatically.
 
+Each example below writes the token to a mode-0600 file with an editor, then
+redirects that file to the command. Only the file path appears in shell
+history. Create each file once, keep it in your secret store, and never commit
+it.
+
 ### Operator
 
 ```sh
-printf '%s\n' '<64-lowercase-hex-token>' | \
-  python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
-  --kind operator --name operator --json
+install -m 0600 /dev/null /tmp/agent-chat/operator.token
+${EDITOR:-vi} /tmp/agent-chat/operator.token
+python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
+  --kind operator --name operator --json < /tmp/agent-chat/operator.token
 ```
 
 Use this token to log in to the browser UI.
@@ -151,9 +172,11 @@ An agent principal also needs its host and harness. The harness is one of
 `pi`, `claude`, `codex`, `deepseek` or `opencode`.
 
 ```sh
-printf '%s\n' '<64-lowercase-hex-token>' | \
-  python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
-  --kind agent --name pi-node-a --host node-a --harness pi --json
+install -m 0600 /dev/null /tmp/agent-chat/pi-node-a.token
+${EDITOR:-vi} /tmp/agent-chat/pi-node-a.token
+python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
+  --kind agent --name pi-node-a --host node-a --harness pi --json \
+  < /tmp/agent-chat/pi-node-a.token
 ```
 
 The adapter registers an instance with this principal's credential and writes
@@ -165,9 +188,11 @@ A viewer needs at least one existing room UUID. Repeat `--room` for several
 rooms.
 
 ```sh
-printf '%s\n' '<64-lowercase-hex-token>' | \
-  python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
-  --kind viewer --name viewer-a --room '<room-uuid>' --json
+install -m 0600 /dev/null /tmp/agent-chat/viewer-a.token
+${EDITOR:-vi} /tmp/agent-chat/viewer-a.token
+python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
+  --kind viewer --name viewer-a --room '<room-uuid>' --json \
+  < /tmp/agent-chat/viewer-a.token
 ```
 
 ### Producer
@@ -176,9 +201,11 @@ A producer writes room state only. It has no session, membership or browser
 access.
 
 ```sh
-printf '%s\n' '<64-lowercase-hex-token>' | \
-  python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
-  --kind producer --name validation-lease --host node-a --producer validation-lease --json
+install -m 0600 /dev/null /tmp/agent-chat/validation-lease.token
+${EDITOR:-vi} /tmp/agent-chat/validation-lease.token
+python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
+  --kind producer --name validation-lease --host node-a --producer validation-lease --json \
+  < /tmp/agent-chat/validation-lease.token
 ```
 
 The JSON result reports `principal_id`, the granted room or rooms, and the
