@@ -1302,9 +1302,15 @@ def test_a_refused_set_is_reported_unconfirmed_and_stores_nothing(ui, db, actors
     db.execute("DELETE FROM agent_chat.memberships WHERE session_id = %s AND room_id = %s", (first.session_id, room))
     ui.page.get_by_role("button", name=f"Ustaw PM {first.session_id}", exact=True).click()
     expect(ui.page.locator("#notice")).to_contain_text("Zmiana znacznika PM niepotwierdzona")
-    expect(ui.page.locator("#participants")).to_be_empty()
-    expect(ui.page.locator("#pm-mark")).to_be_hidden()
+    expect(ui.page.locator("#notice")).to_contain_text("INVALID_RECIPIENT")
+    expect(ui.page.locator("#notice")).to_contain_text("nie jest już dostępny")
+    # A known refusal did not mutate state, so the loaded snapshot stays for the next decision.
+    expect(ui.page.locator("#participants")).not_to_be_empty()
+    expect(_roster_row(ui.page, first.session_id)).to_be_visible()
+    expect(ui.page.locator("#pm-mark")).to_be_visible()
+    expect(ui.page.locator("#pm-mark")).to_have_text("Znacznik PM: brak.")
     assert _pm_rows(db) == []
+    # An explicit refresh is what removes the departed member.
     ui.page.locator("#refresh").click()
     expect(ui.page.locator("#notice")).to_contain_text("Migawka historii")
     expect(_roster_row(ui.page, first.session_id)).to_have_count(0)
