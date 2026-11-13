@@ -26,6 +26,30 @@ def test_instance_secret_is_private_persistent_and_hidden_in_repr(tmp_path):
     assert resumed.boot_id != first.boot_id
 
 
+def test_read_instance_distinguishes_missing_from_unsafe(tmp_path):
+    missing = tmp_path / f"{uuid4()}.json"
+    with pytest.raises(ChatError, match="^BINDING_FILE_MISSING$"):
+        instance_file.read_instance(missing)
+    with pytest.raises(ChatError, match="^BINDING_FILE_MISSING$"):
+        instance_file.read_instance(tmp_path / "gone" / missing.name)
+
+    boot = uuid4()
+    prepare_instance(tmp_path, "native", boot, server_origin="https://chat.test")
+    record = tmp_path / f"{boot}.json"
+    record.chmod(0o644)
+    with pytest.raises(ChatError, match="^BINDING_FILE_UNSAFE$"):
+        instance_file.read_instance(record)
+
+
+def test_read_instance_refuses_a_symlink_as_unsafe(tmp_path):
+    target = tmp_path / "target"
+    target.write_text("unrelated")
+    link = tmp_path / f"{uuid4()}.json"
+    link.symlink_to(target)
+    with pytest.raises(ChatError, match="^BINDING_FILE_UNSAFE$"):
+        instance_file.read_instance(link)
+
+
 def test_mismatched_or_partial_file_is_not_overwritten(tmp_path):
     boot = uuid4()
     prepare_instance(tmp_path, "native", boot, server_origin="https://chat.test")

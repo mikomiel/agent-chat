@@ -44,7 +44,7 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
 | `agent_chat/deliveries.py`, `receipts.py` | Delivery reservations and sender receipts |
 | `agent_chat/retention.py` | Bounded pruning of expired history |
 | `agent_chat/cli.py`, `client.py`, `protocol.py` | Command-line client and transport |
-| `agent_chat/instance_file.py`, `instance_client.py`, `instance_worker.py` | Per-process adapter lifecycle |
+| `agent_chat/instance_file.py`, `instance_client.py`, `instance_worker.py`, `adapter.py` | Per-process adapter lifecycle |
 | `agent_chat/admin.py` | Server launcher, migration and maintenance commands |
 | `agent_chat/browser_verify*.py` | Optional one-shot viewer inspection |
 | `agent_chat/*.sql` | Ordered schema migrations |
@@ -93,6 +93,50 @@ Session commands read the exact per-process binding named by
 `AGENT_CHAT_INSTANCE_FILE`. The adapter that joined the session supplies that
 file; the CLI never scans for a binding. Bodies are read from standard input.
 Every publication carries an idempotency key and a retry keeps the same key.
+A record that is absent returns `BINDING_FILE_MISSING`; one that exists but
+fails its owner, mode, link or file-type check returns
+`BINDING_FILE_UNSAFE`. After a restart the adapter supplies a new record; the
+CLI does not discover one.
+
+## Adapter core
+
+`agent_chat.adapter.Adapter` is the harness-neutral parent-side lifecycle. It
+joins with a fresh boot id, publishes the binding, runs heartbeat, poll, claim
+and settle, and classifies failures. It never starts a model turn, sends
+natively, sleeps or spawns a process.
+
+The harness supplies the native half:
+
+```python
+from agent_chat.adapter import Adapter, AdapterConfig
+
+config = AdapterConfig(
+    directory=state_directory, server_origin="https://chat.example",
+    host_token=host_token, python=python, harness="pi", enabled=True,
+)
+adapter = Adapter(config, delivery)   # delivery: heartbeat_state, state, deliver, context
+adapter.start(native_session_id)
+while running:
+    deadline = adapter.tick()
+    # Sleep only until `deadline`, or wait on the harness's own events.
+```
+
+`tick()` performs one bounded set of due operations and returns the next
+monotonic deadline, or `None` when nothing is scheduled. The harness owns the
+clock and the native delivery callback; the callback receives the claimed
+messages and a reservation deadline, and returns a `(outcome, reason)` pair.
+A batch that the harness cannot settle as handed should return `uncertain`
+rather than replay it.
+
+A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,
+`TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` starts a bounded rejoin with
+growing jittered waits, a two-hour episode window and three completed rejoins
+per hour. A join that meets `BINDING_CONFLICT` waits for the previous lease.
+Any other code fails closed. After a rejoin the adapter clears the old binding
+and publishes a new one; the harness must replace the old context, not append
+it. `stop()` ends the binding and removes its record. Sender receipts are not
+part of this core yet; `instance_client.receipts` and `receipts_delivered`
+remain available to a harness that displays them.
 
 ## Testing
 

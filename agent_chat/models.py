@@ -12,6 +12,15 @@ BIDI_CONTROLS = frozenset(map(chr, (*range(0x202A, 0x202F), *range(0x2066, 0x206
 
 # An instance is online while its last heartbeat is younger than this.
 LEASE_SECONDS = 90
+# The adapter core rejoins a lapsed instance only for these worker codes.
+REJOIN_CODES = frozenset({"STALE_INSTANCE", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"})
+REJOIN_BACKOFF_BASE_S = 5.0
+REJOIN_BACKOFF_CAP_S = 120.0
+REJOIN_JITTER_MIN = 0.5
+# One episode may run this long, and a session may complete this many rejoins in the budget window.
+REJOIN_EPISODE_S = 7200.0
+REJOIN_PER_HOUR = 3
+REJOIN_BUDGET_WINDOW_S = 3600.0
 # Agent replies a thread accepts before an operator reply resets the count.
 REPLY_LIMIT = 6
 # Wake admissions per session in a rolling window; admissions are never refunded.
