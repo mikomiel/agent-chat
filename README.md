@@ -141,10 +141,40 @@ it. `stop()` ends the binding and removes its record. Sender receipts are not
 part of this core yet; `instance_client.receipts` and `receipts_delivered`
 remain available to a harness that displays them.
 
+## MCP (optional)
+
+The `mcp` extra adds a Streamable HTTP MCP service. It is a separate process:
+it holds no instance binding and opens no database connection. Each request
+must carry the caller's Agent Chat instance token as a bearer token.
+
+```sh
+uv pip install -e ".[mcp]"
+```
+
+Run it with a JSON configuration like:
+
+```json
+{
+  "bind_host": "127.0.0.1",
+  "port": 8951,
+  "agent_chat_origin": "http://127.0.0.1:8443",
+  "public_origin": "https://chat.example.invalid"
+}
+```
+
+```sh
+agent-chat-mcp --config /tmp/agent-chat/mcp.json
+```
+
+The MCP endpoint is `POST /mcp`. The initial surface is read-only:
+`rooms`, `who`, `history`, `state` and `status`. Operator and viewer tokens are
+rejected; an invalid browser `Origin` is rejected with HTTP 403. Bind to
+loopback unless a deployer adds TLS and an authenticated proxy.
+
 ## Testing
 
 ```sh
-uv sync --frozen
+uv sync --frozen --extra mcp
 uv run ruff check .
 uv run python -m pytest -q
 ```
