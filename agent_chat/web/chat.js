@@ -108,6 +108,9 @@
     SESSION_FORBIDDEN: "Brak uprawnień do tej zmiany.",
     NOT_FOUND: "Nie znaleziono obiektu. Odśwież widok.",
   };
+  // Only a refusal that cannot mask a revoked scope may keep the loaded view.
+  // NOT_FOUND can deliberately mask ROOM_FORBIDDEN for a message-derived room.
+  const PRESERVE_ON_REFUSAL = new Set(["ROLE_CONFLICT", "ROOM_CONFLICT"]);
   function refusal(error) {
     const detail = REFUSAL_TEXT[error.code];
     return detail ? `${error.code}: ${detail}` : "";
@@ -1002,13 +1005,15 @@
       if (error.status === 401 || error.status === 403) {
         failed(error, current);
         el("notice").textContent = `${result} Dostęp wygasł lub został cofnięty. Zaloguj się ponownie.`;
-      } else if (detail) {
-        // A known domain refusal is final and did not mutate server state.
+      } else if (detail && PRESERVE_ON_REFUSAL.has(error.code)) {
+        // These refusals cannot mask a revoked room or session scope.
         el("notice").textContent = `${result} ${detail}`;
       } else {
         invalidate();
         clearRoom();
-        el("notice").textContent = `${result} Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.`;
+        el("notice").textContent = detail
+          ? `${result} ${detail} Odśwież stan przed następną decyzją.`
+          : `${result} Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.`;
       }
     } finally {
       if (controlRequest === attempt) controlRequest = null;

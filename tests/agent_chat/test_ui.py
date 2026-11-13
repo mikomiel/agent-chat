@@ -1280,6 +1280,29 @@ def test_the_operator_sets_moves_and_clears_the_pm_mark_from_the_roster(ui, db, 
     assert ui.page.locator("#body").input_value() == "unsent draft"
 
 
+def test_a_masked_not_found_refusal_clears_the_scope(ui, db, actors, credentials):
+    room, first, _second, _operator = actors
+    operator = authenticate(db, credentials.operator)
+    publish(db, first, room, uuid4(), Publication(kind="message", body="inside", ref_key=RESOURCE))
+    ui.login()
+    ui.page.locator("#thread").fill(RESOURCE)
+    ui.page.locator("#apply-thread").click()
+    expect(ui.page.locator("#thread-header")).to_contain_text(RESOURCE)
+    db.execute(
+        "DELETE FROM agent_chat.principal_rooms WHERE principal_id = %s AND room_id = %s",
+        (operator.principal_id, room),
+    )
+    with ui.page.expect_response(
+        lambda response: "/resolution" in response.url and response.request.method == "POST"
+    ) as response:
+        ui.page.get_by_role("button", name="Oznacz jako rozwiązany", exact=True).click()
+    assert response.value.status == 404
+    expect(ui.page.locator("#notice")).to_contain_text("NOT_FOUND")
+    expect(ui.page.locator("#notice")).to_contain_text("Nie znaleziono")
+    expect(ui.page.locator("#messages")).to_be_empty()
+    expect(ui.page.locator("#participants")).to_be_empty()
+
+
 def test_a_viewer_sees_the_pm_mark_and_is_offered_no_control(ui, db, actors, make_viewer):
     room, first, _second, operator = actors
     roles.assign(db, operator, room, "pm", first.session_id)
@@ -1304,13 +1327,10 @@ def test_a_refused_set_is_reported_unconfirmed_and_stores_nothing(ui, db, actors
     expect(ui.page.locator("#notice")).to_contain_text("Zmiana znacznika PM niepotwierdzona")
     expect(ui.page.locator("#notice")).to_contain_text("INVALID_RECIPIENT")
     expect(ui.page.locator("#notice")).to_contain_text("nie jest już dostępny")
-    # A known refusal did not mutate state, so the loaded snapshot stays for the next decision.
-    expect(ui.page.locator("#participants")).not_to_be_empty()
-    expect(_roster_row(ui.page, first.session_id)).to_be_visible()
-    expect(ui.page.locator("#pm-mark")).to_be_visible()
-    expect(ui.page.locator("#pm-mark")).to_have_text("Znacznik PM: brak.")
+    # A membership-derived refusal clears the scope-sensitive snapshot.
+    expect(ui.page.locator("#participants")).to_be_empty()
+    expect(ui.page.locator("#pm-mark")).to_be_hidden()
     assert _pm_rows(db) == []
-    # An explicit refresh is what removes the departed member.
     ui.page.locator("#refresh").click()
     expect(ui.page.locator("#notice")).to_contain_text("Migawka historii")
     expect(_roster_row(ui.page, first.session_id)).to_have_count(0)
