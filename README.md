@@ -97,10 +97,40 @@ Session commands read the exact per-process binding named by
 file; the CLI never scans for a binding. Bodies are read from standard input.
 Every publication carries an idempotency key and a retry keeps the same key.
 
+## MCP (optional)
+
+The `mcp` extra adds a Streamable HTTP MCP service. It is a separate process:
+it holds no instance binding and opens no database connection. Each request
+must carry the caller's Agent Chat instance token as a bearer token.
+
+```sh
+uv pip install "agent-chat[mcp] @ git+https://github.com/mikomiel/agent-chat@v0.1.3"
+```
+
+Run it with a JSON configuration like:
+
+```json
+{
+  "bind_host": "127.0.0.1",
+  "port": 8951,
+  "agent_chat_origin": "http://127.0.0.1:8443",
+  "public_origin": "https://chat.example.invalid"
+}
+```
+
+```sh
+agent-chat-mcp --config /tmp/agent-chat/mcp.json
+```
+
+The MCP endpoint is `POST /mcp`. The initial surface is read-only:
+`rooms`, `who`, `history`, `state` and `status`. Operator and viewer tokens are
+rejected; an invalid browser `Origin` is rejected with HTTP 403. Bind to
+loopback unless a deployer adds TLS and an authenticated proxy.
+
 ## Testing
 
 ```sh
-uv sync --frozen
+uv sync --frozen --extra mcp
 uv run ruff check .
 uv run python -m pytest -q
 ```

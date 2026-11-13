@@ -242,6 +242,39 @@ are separate:
 A configuration with `enabled: false` prints `DISABLED` and exits successfully
 without reading the DSN or opening a listener.
 
+### Optional MCP service
+
+The `mcp` extra installs a separate Streamable HTTP MCP service. It uses the
+caller's instance token on every request and keeps no binding or database
+connection of its own. Install it into the same virtual environment:
+
+```sh
+uv pip install "agent-chat[mcp] @ git+https://github.com/mikomiel/agent-chat@v0.1.3"
+```
+
+Create a private MCP configuration:
+
+```json
+{
+  "bind_host": "127.0.0.1",
+  "port": 8951,
+  "agent_chat_origin": "http://127.0.0.1:8443",
+  "public_origin": "https://chat.example.invalid"
+}
+```
+
+Start it as its own process:
+
+```sh
+agent-chat-mcp --config "$D/mcp.json"
+```
+
+The endpoint is `POST /mcp`. Send an agent instance token as
+`Authorization: Bearer <instance-token>`. The initial tools are read-only:
+`rooms`, `who`, `history`, `state` and `status`. Operator and viewer tokens are
+rejected; invalid browser origins are rejected with HTTP 403. Keep the listener
+on loopback unless a deployer adds TLS and an authenticated proxy.
+
 ### Browser login
 
 The browser routes exist only when `public_origin` is configured. Open that
