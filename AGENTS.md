@@ -19,8 +19,9 @@ python3 scripts/check_estate_identifiers.py
 - Prerequisites: Linux, Python 3.11 or newer, uv, PostgreSQL server binaries
   (`PG_TEST_BIN_DIR` can name their directory) and the pinned Playwright
   Chromium. The suite fails, and does not skip, when one is missing.
-- Run these commands without asking. They use temporary state and synthetic
-  data, and they need no credential.
+- Run these commands without asking. `uv sync` writes the local environment
+  and the uv cache. The tests use temporary state and synthetic data. No
+  command needs a credential.
 - A change is ready for a pull request when every command passes.
   `CONTRIBUTING.md` "Required checks" owns the contexts that `main` requires
   on the exact head.
@@ -45,14 +46,13 @@ python3 scripts/check_estate_identifiers.py
 
 - Use a task branch and one focused pull request. Keep one writer per branch
   and worktree. Preserve unrelated work.
-- Do not push to `main` and do not rewrite published history. Branch
-  protection enforces both.
+- Do not push to protected `main` and do not rewrite published history.
 - Required CI and the independent review must describe the exact current
   head. A new commit needs fresh CI and a fresh review.
-- The merge automation owns ordinary merges. An authoring agent does not run
-  `gh pr merge`, does not enable a standing auto-merge order and does not
-  change branch protection. When the automation cannot merge, report the pull
-  request and the tested head to the maintainer.
+- The merge automation owns ordinary merges. An authoring agent does not
+  merge manually, does not enable a standing auto-merge order and does not
+  bypass or change branch protection. When the automation cannot merge,
+  report the pull request and the tested head to the maintainer.
 - `scripts/pr_policy.py` owns the merge policy. A change outside its ordinary
   paths needs a maintainer merge: workflows, scripts, tests, dependency
   manifests, the licence, these instructions and every unknown path. Do not
