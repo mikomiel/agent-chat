@@ -62,6 +62,7 @@
   let savedChatScroll = null;
   let sessionsPage = null;
   let sessionsLoading = false;
+  let sessionsLoadingMore = false;
   // A first visit to Sesje can arrive while a write or a live refresh is in flight; remember the request
   // and satisfy it when that operation settles instead of leaving the view empty.
   let sessionsDeferred = null;
@@ -136,7 +137,7 @@
     el("ref-key-hint").hidden = replyTarget === null && !question;
     el("pending").hidden = pending === null;
     el("retry-write").disabled = el("abandon-write").disabled = !writable || sending;
-    for (const id of ["room", "refresh", "more-messages", "more-participants", "latest"])
+    for (const id of ["room", "refresh", "more-messages", "more-participants", "latest", "more-sessions"])
       el(id).disabled = busy();
     el("latest").hidden = historyPageStart === null;
     for (const id of ["thread", "apply-thread", "all-history"])
@@ -205,6 +206,7 @@
     el("sessions-table").querySelector("tbody").replaceChildren();
     el("sessions-count").textContent = "";
     el("sessions-note").hidden = true;
+    el("more-sessions").hidden = true;
     clearState();
     el("thread-header").hidden = true;
     el("more-messages").hidden = true;
@@ -1095,6 +1097,48 @@
     return painted;
   }
 
+  async function loadMoreSessions() {
+    if (!selectedRoom || !sessionsPage?.next_session_id || sessionsLoading || sessionsLoadingMore || busy()) return;
+    const room = selectedRoom;
+    const epoch = scopeEpoch;
+    const basePage = sessionsPage;
+    const after = basePage.next_session_id;
+    sessionsLoadingMore = true;
+    renderSessions();
+    try {
+      const query = new URLSearchParams({ limit: "100", after_session: after });
+      const data = await request(`${roomPath(room)}/participants?${query}`);
+      // Append only to the exact snapshot this request extended. A revisit of
+      // Sessions may have replaced it while the request was in flight.
+      if (room !== selectedRoom || epoch !== scopeEpoch || sessionsPage !== basePage) return;
+      if (!Array.isArray(data.participants)) throw new Error("INVALID_RESPONSE");
+      const seen = new Set(basePage.participants.map((person) => person.session_id));
+      sessionsPage = {
+        ...basePage,
+        participants: [
+          ...basePage.participants,
+          ...data.participants.filter((person) => !seen.has(person.session_id)),
+        ],
+        next_session_id: data.next_session_id,
+        roles: data.roles ?? basePage.roles,
+        pm: data.pm ?? basePage.pm,
+      };
+      renderSessions();
+    } catch (error) {
+      // A failed later page is not a failed snapshot. Ignore it when a newer
+      // snapshot replaced this one; keep access refusals fail-closed.
+      if (room !== selectedRoom || epoch !== scopeEpoch || sessionsPage !== basePage) return;
+      if (error.status === 401 || error.status === 403) {
+        failed(error, generation);
+        return;
+      }
+      el("notice").textContent = "Nie udało się pobrać kolejnej strony sesji. Spróbuj ponownie.";
+    } finally {
+      sessionsLoadingMore = false;
+      if (sessionsPage) renderSessions();
+    }
+  }
+
   async function setRole(session, role, assigned) {
     if (access !== "operator" || busy() || !uuid(session) || !ROLE_ORDER.includes(role)) return;
     const targetRoom = selectedRoom;
@@ -1181,7 +1225,12 @@
 
   function stateCell(person) {
     const cell = document.createElement("td");
-    cell.append(text("span", person.online ? (person.native_state === "busy" ? "online, pracuje" : "online, bezczynna") : "offline", "state-line"));
+    // Liveness and the observed native state are separate facts. A live lease
+    // with `unknown` must not be rendered as a positive idle claim.
+    const state = !person.online
+      ? "offline"
+      : { busy: "online, pracuje", idle: "online, bezczynna" }[person.native_state] ?? "online, stan nieznany";
+    cell.append(text("span", state, "state-line"));
     const flags = [];
     if (person.stopped) flags.push("stop");
     if (person.plan_mode) flags.push("Plan Mode");
@@ -1278,10 +1327,14 @@
     }
     el("sessions-count").textContent = `${shown} z ${rows.length}`;
     const note = el("sessions-note");
-    note.hidden = !sessionsPage.next_session_id;
-    note.textContent = sessionsPage.next_session_id
-      ? "Pokazano pierwsze 100 sesji. Zawęź filtr; pełna lista ponad limit nie jest pobierana."
+    const next = Boolean(sessionsPage.next_session_id);
+    note.hidden = !next;
+    note.textContent = next
+      ? `Wczytano ${rows.length} sesji. Filtr obejmuje wczytane wiersze; pobierz kolejną stronę, aby szukać dalej.`
       : "";
+    const more = el("more-sessions");
+    more.hidden = !next;
+    more.disabled = sessionsLoadingMore || busy();
   }
 
   el("create-room").addEventListener("submit", async (event) => {
@@ -1676,6 +1729,7 @@
   el("tab-chat").addEventListener("click", () => showView("chat"));
   el("tab-sessions").addEventListener("click", () => showView("sessions"));
   el("sessions-filter").addEventListener("input", renderSessions);
+  el("more-sessions").addEventListener("click", loadMoreSessions);
   el("thread-filter").addEventListener("submit", (event) => {
     event.preventDefault();
     const value = el("thread").value.trim();
