@@ -97,7 +97,8 @@ release-please open or update one release pull request: it bumps
 `.release-please-manifest.json`. That update is observed after both a
 maintainer merge and a merge by the repository's own automation. Merging the
 release pull request is the release decision; release-please then creates the
-annotated tag and the GitHub Release. Never tag by hand. A `docs`, `chore` or
+tag and the GitHub Release. release-please creates a lightweight tag. Never tag
+by hand and never move a published tag. A `docs`, `chore` or
 `test` commit does not by itself open a release pull request.
 
 The workflow authenticates with a fine-grained personal access token stored as
