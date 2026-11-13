@@ -16,6 +16,7 @@ import pytest
 import uvicorn
 from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
+from fastmcp.exceptions import ToolError
 
 from agent_chat.mcp.app import create_app
 from agent_chat.mcp.auth import AgentChatTokenVerifier
@@ -289,6 +290,21 @@ def test_explicit_key_reply_cannot_post_to_a_different_room(process_api, credent
         )
         assert "error" in refused
         assert db.execute("SELECT count(*) AS n FROM agent_chat.messages").fetchone()["n"] == 1
+
+
+def test_invalid_write_arguments_do_not_echo_body_or_log_it(process_api, credentials, register, caplog):
+    token, _ = register(process_api, credentials, "mcp-invalid-arguments")
+    marker = "SYNTHETIC_PRIVATE_" + secrets.token_hex(8)
+    caplog.set_level("WARNING", logger="fastmcp.server.server")
+    with serve_mcp(process_api, enable_writes=True) as origin:
+        async def invoke():
+            async with Client(f"{origin}/mcp", auth=BearerAuth(token)) as client:
+                return await client.call_tool("send", {"body": marker})
+
+        with pytest.raises(ToolError) as error:
+            asyncio.run(invoke())
+    assert marker not in str(error.value)
+    assert marker not in caplog.text
 
 
 def test_write_tools_declare_lane_work_and_mute(process_api, credentials, register):
