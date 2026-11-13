@@ -1181,7 +1181,12 @@
 
   function stateCell(person) {
     const cell = document.createElement("td");
-    cell.append(text("span", person.online ? (person.native_state === "busy" ? "online, pracuje" : "online, bezczynna") : "offline", "state-line"));
+    // Liveness and the observed native state are separate facts. A live lease
+    // with `unknown` must not be rendered as a positive idle claim.
+    const state = !person.online
+      ? "offline"
+      : { busy: "online, pracuje", idle: "online, bezczynna" }[person.native_state] ?? "online, stan nieznany";
+    cell.append(text("span", state, "state-line"));
     const flags = [];
     if (person.stopped) flags.push("stop");
     if (person.plan_mode) flags.push("Plan Mode");
