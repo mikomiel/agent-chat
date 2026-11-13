@@ -59,7 +59,7 @@ def test_dockerfile_has_two_non_root_targets():
     assert "AS build-mcp" in dockerfile
     assert "--extra server" in dockerfile
     assert "--extra mcp" in dockerfile
-    assert "USER 10001:10001" in dockerfile
+    assert "USER ${UID}:${GID}" in dockerfile
     assert "EXPOSE 8443" in dockerfile
     assert "EXPOSE 8951" in dockerfile
 

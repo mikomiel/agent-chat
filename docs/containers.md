@@ -78,8 +78,22 @@ identity cannot open it.
 
 The `,z` option on the configuration bind mounts applies the shared SELinux
 label. It is harmless on hosts without SELinux and lets the one-shot migration
-and the server read the same file. The DSN itself is a Compose secret, not a
-host bind mount.
+and the server read the same file.
+
+Compose implements a file-backed secret as a read-only bind mount. On an
+SELinux-enforcing host, apply the same shared-container label to the DSN source
+file as well:
+
+```sh
+# rootful Docker
+sudo chcon -t container_file_t secrets/agent-chat-dsn
+
+# rootless Podman: apply the label in the user namespace
+podman unshare chcon -t container_file_t secrets/agent-chat-dsn
+```
+
+Keep the ownership and mode restrictions above. Do not disable SELinux to make
+the mount readable.
 
 The file contains one libpq DSN line, for example:
 

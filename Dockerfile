@@ -29,7 +29,7 @@ ENV PATH=/app/.venv/bin:${PATH} \
     PYTHONUNBUFFERED=1 \
     HOME=/tmp
 WORKDIR /app
-USER 10001:10001
+USER ${UID}:${GID}
 STOPSIGNAL SIGTERM
 
 FROM runtime-base AS server
