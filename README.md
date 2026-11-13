@@ -148,7 +148,7 @@ it holds no instance binding and opens no database connection. Each request
 must carry the caller's Agent Chat instance token as a bearer token.
 
 ```sh
-uv pip install "agent-chat[mcp] @ git+https://github.com/mikomiel/agent-chat@v0.1.3"
+uv pip install -e ".[mcp]"
 ```
 
 Run it with a JSON configuration like:

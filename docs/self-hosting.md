@@ -249,7 +249,7 @@ caller's instance token on every request and keeps no binding or database
 connection of its own. Install it into the same virtual environment:
 
 ```sh
-uv pip install "agent-chat[mcp] @ git+https://github.com/mikomiel/agent-chat@v0.1.3"
+uv pip install -e ".[mcp]"
 ```
 
 Create a private MCP configuration:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 from fastmcp import FastMCP
 from starlette.responses import Response
 
@@ -34,7 +36,10 @@ class OriginGuard:
 
 def create_app(config: Config):
     """Return the stateless Streamable HTTP ASGI app with an Origin guard."""
-    allowed_hosts = sorted({config.bind_host, "127.0.0.1", "localhost", "::1"})
+    allowed_hosts = {config.bind_host, "127.0.0.1", "localhost", "::1"}
+    if config.public_origin is not None:
+        allowed_hosts.add(urlsplit(config.public_origin).hostname)
+    allowed_hosts = sorted(host for host in allowed_hosts if host)
     app = create_mcp(config).http_app(
         path="/mcp",
         stateless_http=True,

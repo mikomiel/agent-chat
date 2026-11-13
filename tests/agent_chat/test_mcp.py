@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import socket
 import time
 from contextlib import closing, contextmanager
 from http.client import HTTPConnection
 from threading import Thread
 
+import pytest
 import uvicorn
 from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
@@ -83,6 +85,52 @@ def test_read_tools_are_scoped_to_the_calling_instance(process_api, credentials,
         assert status_b["session_id"] == binding_b["session_id"]
         assert status_a["session_id"] != status_b["session_id"]
         assert "error" not in status_a and "error" not in status_b
+        assert call(origin, token_a, "rooms")["rooms"]
+        page = call(origin, token_a, "who", {"room": "homelab", "limit": 1})
+        assert len(page["participants"]) == 1 and page["next_session_id"]
+        assert call(origin, token_a, "who", {"room": credentials.room})["participants"]
+        assert "messages" in call(origin, token_a, "history", {"room": "homelab", "limit": 1})
+        assert "entries" in call(origin, token_a, "state", {"room": "homelab"})
+        refused = call(
+            origin, token_a, "who",
+            {"room": "00000000-0000-4000-8000-000000000099"},
+        )
+        assert refused == {"error": {"code": "ROOM_FORBIDDEN"}}
+
+
+SESSION = "00000000-0000-4000-8000-000000000001"
+INSTANCE = "00000000-0000-4000-8000-000000000002"
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {},
+        {"session_id": SESSION, "instance_id": INSTANCE},
+        {"session_id": SESSION, "instance_id": INSTANCE, "online": None},
+        {"session_id": SESSION, "instance_id": INSTANCE, "online": "false"},
+        {"session_id": SESSION, "instance_id": INSTANCE, "online": 0},
+        {"session_id": "not-a-uuid", "instance_id": INSTANCE, "online": True},
+    ],
+)
+def test_incomplete_liveness_evidence_is_rejected(monkeypatch, status):
+    verifier = AgentChatTokenVerifier("http://127.0.0.1:1")
+    monkeypatch.setattr(verifier, "_status", lambda _token: status)
+    assert asyncio.run(verifier.verify_token(secrets.token_hex(32))) is None
+
+
+def test_complete_liveness_evidence_is_accepted(monkeypatch):
+    verifier = AgentChatTokenVerifier("http://127.0.0.1:1")
+    monkeypatch.setattr(
+        verifier,
+        "_status",
+        lambda _token: {"session_id": SESSION, "instance_id": INSTANCE, "online": True},
+    )
+    token = asyncio.run(verifier.verify_token(secrets.token_hex(32)))
+    assert token is not None
+    assert token.client_id == SESSION
+    assert token.scopes == ["chat:read"]
+    assert "instance_id" in token.claims
 
 
 def test_operator_and_viewer_tokens_are_rejected(process_api, credentials, make_viewer):
@@ -110,6 +158,22 @@ def test_mcp_requires_a_bearer_token(process_api):
             connection.request(
                 "POST", "/mcp", body=b"{}",
                 headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+            response = connection.getresponse()
+            assert response.status == 401
+
+
+def test_valid_public_origin_reaches_authentication(process_api):
+    with serve_mcp(process_api, public_origin="https://chat.example.invalid") as origin:
+        with closing(HTTPConnection("127.0.0.1", int(origin.rsplit(":", 1)[1]), timeout=5)) as connection:
+            connection.request(
+                "POST", "/mcp", body=b"{}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
+                    "Host": "chat.example.invalid",
+                    "Origin": "https://chat.example.invalid",
+                },
             )
             response = connection.getresponse()
             assert response.status == 401

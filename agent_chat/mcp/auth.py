@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
+from uuid import UUID
 
 from fastmcp.server.auth import AccessToken, TokenVerifier
 
@@ -18,6 +19,16 @@ from ..client import Client
 from ..models import ChatError
 
 VERIFY_SECONDS = 5.0
+
+
+def _canonical_uuid(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = UUID(value)
+    except ValueError:
+        return None
+    return str(parsed) if str(parsed) == value else None
 
 
 class AgentChatTokenVerifier(TokenVerifier):
@@ -34,11 +45,9 @@ class AgentChatTokenVerifier(TokenVerifier):
             return None
         if not isinstance(status, dict):
             return None
-        session_id = status.get("session_id")
-        instance_id = status.get("instance_id")
-        if not isinstance(session_id, str) or not isinstance(instance_id, str):
-            return None
-        if status.get("online") is False:
+        session_id = _canonical_uuid(status.get("session_id"))
+        instance_id = _canonical_uuid(status.get("instance_id"))
+        if session_id is None or instance_id is None or status.get("online") is not True:
             return None
         return AccessToken(
             token=token,
