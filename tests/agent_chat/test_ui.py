@@ -2721,6 +2721,23 @@ def test_the_sessions_filter_is_client_side(ui, actors):
     expect(_sessions_row(ui.page, second.session_id)).to_be_hidden()
 
 
+def test_the_sessions_view_loads_the_next_bounded_page(ui, db, actors, actor_factory):
+    room, first, second, _ = actors
+    extra = [actor_factory(room) for _ in range(99)]
+    last = max([first, second, *extra], key=lambda actor: actor.session_id)
+    marker = "pagination-marker"
+    db.execute("UPDATE agent_chat.sessions SET title = %s WHERE id = %s", (marker, last.session_id))
+    ui.login()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+    expect(_sessions_row(ui.page, last.session_id)).to_have_count(0)
+    ui.page.get_by_role("button", name="Kolejne sesje", exact=True).click()
+    expect(ui.page.locator("#more-sessions")).to_be_hidden()
+    expect(_sessions_row(ui.page, last.session_id)).to_have_count(1)
+    ui.page.locator("#sessions-filter").fill(marker)
+    expect(_sessions_row(ui.page, last.session_id)).to_be_visible()
+
+
 def test_the_sessions_view_fills_after_a_live_refresh_that_held_it(ui, actors):
     _room, first, _second, _operator = actors
     ui.login()
