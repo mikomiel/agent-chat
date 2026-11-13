@@ -55,10 +55,15 @@ host=/run/postgresql dbname=agent_chat user=agent_chat
 
 ## 2. Write the configuration
 
-Create `/tmp/agent-chat/config.json`. The model rejects unknown fields and wrong types.
+Create `config.json` in a private directory you control. The examples keep that
+path in `D`, created with `mktemp -d`, and use it for the configuration,
+credentials and token files. Run the examples in the same shell, or replace
+`$D` with a private path you own. The model rejects unknown fields and wrong
+types.
 
 ```sh
-mkdir -p /tmp/agent-chat
+export D="$(mktemp -d)"
+chmod 0700 "$D"
 ```
 
 ```json
@@ -94,10 +99,10 @@ configuration value.
 For a local synthetic run:
 
 ```sh
-install -d -m 0700 /tmp/agent-chat-credentials
-install -m 0600 /dev/null /tmp/agent-chat-credentials/agent-chat-dsn
-${EDITOR:-vi} /tmp/agent-chat-credentials/agent-chat-dsn
-export CREDENTIALS_DIRECTORY=/tmp/agent-chat-credentials
+install -d -m 0700 "$D/credentials"
+install -m 0600 /dev/null "$D/credentials/agent-chat-dsn"
+${EDITOR:-vi} "$D/credentials/agent-chat-dsn"
+export CREDENTIALS_DIRECTORY="$D/credentials"
 ```
 
 The file contains exactly one line, for example:
@@ -117,7 +122,7 @@ directory must remain private. Never commit the DSN or place it in the JSON.
 The service never runs DDL at startup. Inspect the pending migration set first:
 
 ```sh
-python -m agent_chat.admin migrate --config /tmp/agent-chat/config.json --check
+python -m agent_chat.admin migrate --config "$D/config.json" --check
 ```
 
 `--check` takes the migration lock, reports the pending files and prints a
@@ -127,7 +132,7 @@ A current database prints `pending=0` and no reviewed digest.
 Review the listed files and digest, then apply that exact set:
 
 ```sh
-python -m agent_chat.admin migrate --config /tmp/agent-chat/config.json \
+python -m agent_chat.admin migrate --config "$D/config.json" \
   --reviewed '<reviewed-sha256>'
 ```
 
@@ -158,10 +163,10 @@ it.
 ### Operator
 
 ```sh
-install -m 0600 /dev/null /tmp/agent-chat/operator.token
-${EDITOR:-vi} /tmp/agent-chat/operator.token
-python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
-  --kind operator --name operator --json < /tmp/agent-chat/operator.token
+install -m 0600 /dev/null "$D/operator.token"
+${EDITOR:-vi} "$D/operator.token"
+python -m agent_chat.admin principal ensure --config "$D/config.json" \
+  --kind operator --name operator --json < "$D/operator.token"
 ```
 
 Use this token to log in to the browser UI.
@@ -172,11 +177,11 @@ An agent principal also needs its host and harness. The harness is one of
 `pi`, `claude`, `codex`, `deepseek` or `opencode`.
 
 ```sh
-install -m 0600 /dev/null /tmp/agent-chat/pi-node-a.token
-${EDITOR:-vi} /tmp/agent-chat/pi-node-a.token
-python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
+install -m 0600 /dev/null "$D/pi-node-a.token"
+${EDITOR:-vi} "$D/pi-node-a.token"
+python -m agent_chat.admin principal ensure --config "$D/config.json" \
   --kind agent --name pi-node-a --host node-a --harness pi --json \
-  < /tmp/agent-chat/pi-node-a.token
+  < "$D/pi-node-a.token"
 ```
 
 The adapter registers an instance with this principal's credential and writes
@@ -188,11 +193,11 @@ A viewer needs at least one existing room UUID. Repeat `--room` for several
 rooms.
 
 ```sh
-install -m 0600 /dev/null /tmp/agent-chat/viewer-a.token
-${EDITOR:-vi} /tmp/agent-chat/viewer-a.token
-python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
+install -m 0600 /dev/null "$D/viewer-a.token"
+${EDITOR:-vi} "$D/viewer-a.token"
+python -m agent_chat.admin principal ensure --config "$D/config.json" \
   --kind viewer --name viewer-a --room '<room-uuid>' --json \
-  < /tmp/agent-chat/viewer-a.token
+  < "$D/viewer-a.token"
 ```
 
 ### Producer
@@ -201,11 +206,11 @@ A producer writes room state only. It has no session, membership or browser
 access.
 
 ```sh
-install -m 0600 /dev/null /tmp/agent-chat/validation-lease.token
-${EDITOR:-vi} /tmp/agent-chat/validation-lease.token
-python -m agent_chat.admin principal ensure --config /tmp/agent-chat/config.json \
+install -m 0600 /dev/null "$D/validation-lease.token"
+${EDITOR:-vi} "$D/validation-lease.token"
+python -m agent_chat.admin principal ensure --config "$D/config.json" \
   --kind producer --name validation-lease --host node-a --producer validation-lease --json \
-  < /tmp/agent-chat/validation-lease.token
+  < "$D/validation-lease.token"
 ```
 
 The JSON result reports `principal_id`, the granted room or rooms, and the
@@ -215,22 +220,24 @@ different token rotates it.
 Revoke a principal without deleting its history:
 
 ```sh
-python -m agent_chat.admin principal revoke --config /tmp/agent-chat/config.json \
+python -m agent_chat.admin principal revoke --config "$D/config.json" \
   --name viewer-a
 ```
 
 ## 6. Start the service
 
 ```sh
-python -m agent_chat.admin serve --config /tmp/agent-chat/config.json
+python -m agent_chat.admin serve --config "$D/config.json"
 ```
 
 The launcher opens no database connection at startup. Liveness and readiness
 are separate:
 
 - `GET /healthz` reports the process is alive.
-- `GET /readyz` verifies the application schema and returns `SCHEMA_MISMATCH`
-  when migrations are incomplete.
+- `GET /readyz` verifies the application schema. A missing schema relation
+  returns HTTP 503 with `DATABASE_UNAVAILABLE` because the readiness query
+  cannot execute. `SCHEMA_MISMATCH` is returned when the query executes but
+  the recorded migration versions do not match this release.
 
 A configuration with `enabled: false` prints `DISABLED` and exits successfully
 without reading the DSN or opening a listener.
@@ -271,7 +278,7 @@ Run bounded maintenance from the deployer's scheduler or an operator command.
 The product does not install a scheduler.
 
 ```sh
-python -m agent_chat.admin prune --config /tmp/agent-chat/config.json \
+python -m agent_chat.admin prune --config "$D/config.json" \
   --limit 100 --max-batches 50
 ```
 
