@@ -10,6 +10,7 @@ import time
 from contextlib import closing, contextmanager
 from http.client import HTTPConnection
 from threading import Thread
+from uuid import uuid4
 
 import pytest
 import uvicorn
@@ -22,7 +23,7 @@ from agent_chat.mcp.config import Config
 
 
 @contextmanager
-def serve_mcp(process_api, *, public_origin=None):
+def serve_mcp(process_api, *, public_origin=None, enable_writes=False):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(8)
@@ -32,6 +33,7 @@ def serve_mcp(process_api, *, public_origin=None):
             port=port,
             agent_chat_origin=process_api.origin,
             public_origin=public_origin,
+            enable_writes=enable_writes,
         )
         server = uvicorn.Server(
             uvicorn.Config(
@@ -192,3 +194,76 @@ def test_invalid_origin_is_rejected(process_api):
             )
             response = connection.getresponse()
             assert response.status == 403
+
+
+WRITE_TOOLS = [
+    "ack", "history", "lane", "mute", "reply", "resolve", "rooms",
+    "send", "state", "status", "unmute", "unresolve", "who", "work",
+]
+
+
+def test_write_tools_are_registered_only_when_enabled(process_api, credentials, register):
+    token, _ = register(process_api, credentials, "mcp-write-tools")
+    with serve_mcp(process_api) as origin:
+        assert "send" not in tool_names(origin, token)
+    with serve_mcp(process_api, enable_writes=True) as origin:
+        assert sorted(tool_names(origin, token)) == WRITE_TOOLS
+
+
+def test_write_tools_publish_reply_and_ack(process_api, credentials, register):
+    token_a, binding_a = register(process_api, credentials, "mcp-write-a")
+    token_b, binding_b = register(process_api, credentials, "mcp-write-b")
+    with serve_mcp(process_api, enable_writes=True) as origin:
+        sent = call(
+            origin, token_a, "send",
+            {
+                "room": "homelab",
+                "body": "synthetic mcp write",
+                "key": str(uuid4()),
+                "recipients": [binding_b["session_id"]],
+            },
+        )
+        assert "error" not in sent
+        message_id = sent["id"]
+        thread_id = sent["thread_id"]
+        history = call(origin, token_b, "history", {"room": "homelab", "limit": 10})
+        assert any(row.get("id") == message_id for row in history["messages"])
+
+        acknowledged = call(origin, token_b, "ack", {"message": message_id})
+        assert "error" not in acknowledged
+
+        replied = call(
+            origin, token_b, "reply",
+            {
+                "message": message_id,
+                "body": "synthetic mcp reply",
+                "key": str(uuid4()),
+                "recipients": [binding_a["session_id"]],
+            },
+        )
+        assert "error" not in replied
+        assert replied["reply_to"] == message_id
+
+        one_step = call(
+            origin, token_b, "reply",
+            {
+                "message": message_id,
+                "body": "synthetic one-step reply",
+                "recipients": [binding_a["session_id"]],
+            },
+        )
+        assert "error" not in one_step
+
+        assert "error" not in call(origin, token_a, "resolve", {"thread": thread_id})
+        assert "error" not in call(origin, token_a, "unresolve", {"thread": thread_id})
+
+
+def test_write_tools_declare_lane_work_and_mute(process_api, credentials, register):
+    token, _ = register(process_api, credentials, "mcp-coordination")
+    with serve_mcp(process_api, enable_writes=True) as origin:
+        assert "error" not in call(origin, token, "lane", {"lane": "project::0123456789ab-0123"})
+        assert "error" not in call(origin, token, "lane", {"clear": True})
+        assert "error" not in call(origin, token, "work", {"github": ["owner/repo"]})
+        assert "error" not in call(origin, token, "work", {"clear": True})
+        assert "error" not in call(origin, token, "mute")
+        assert "error" not in call(origin, token, "unmute")
