@@ -81,7 +81,7 @@ python3 scripts/check_estate_identifiers.py
   `SECURITY.md`.
 - For a behaviour change, open an issue first. `CONTRIBUTING.md` owns that
   rule.
-- For a specification under `openspec/`, use controlled technical English.
+- For a specification, use controlled technical English.
 
 ## Reporting
 
