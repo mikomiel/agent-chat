@@ -2807,6 +2807,108 @@ def test_the_sessions_filter_is_client_side(ui, actors):
     expect(_sessions_row(ui.page, second.session_id)).to_be_hidden()
 
 
+def test_the_sessions_view_loads_the_next_bounded_page(ui, db, actors, actor_factory):
+    room, first, second, _ = actors
+    extra = [actor_factory(room) for _ in range(99)]
+    last = max([first, second, *extra], key=lambda actor: actor.session_id)
+    marker = "pagination-marker"
+    db.execute("UPDATE agent_chat.sessions SET title = %s WHERE id = %s", (marker, last.session_id))
+    ui.login()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+    expect(_sessions_row(ui.page, last.session_id)).to_have_count(0)
+    ui.page.get_by_role("button", name="Kolejne sesje", exact=True).click()
+    expect(ui.page.locator("#more-sessions")).to_be_hidden()
+    expect(_sessions_row(ui.page, last.session_id)).to_have_count(1)
+    ui.page.locator("#sessions-filter").fill(marker)
+    expect(_sessions_row(ui.page, last.session_id)).to_be_visible()
+
+
+def test_a_stale_sessions_page_cannot_replace_the_current_snapshot(ui, db, actors, actor_factory):
+    room, first, second, _ = actors
+    extra = [actor_factory(room) for _ in range(199)]
+    last = max([first, second, *extra], key=lambda actor: actor.session_id)
+    marker = "pagination-stale-marker"
+    db.execute("UPDATE agent_chat.sessions SET title = %s WHERE id = %s", (marker, last.session_id))
+    ui.login()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+    more = ui.page.get_by_role("button", name="Kolejne sesje", exact=True)
+    more.click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 200 sesji")
+
+    held = []
+    holding = [True]
+
+    def transport(route):
+        if holding[0] and "after_session=" in route.request.url:
+            holding[0] = False
+            held.append((route, route.fetch()))
+            return
+        route.continue_()
+
+    ui.page.route("**/v1/rooms/*/participants?*", transport)
+    more.click()
+    wait_held(ui.page, held)
+    ui.page.get_by_role("button", name="Rozmowy", exact=True).click()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+
+    release(held[0])
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+    expect(ui.page.locator("#sessions-table tbody tr[data-session-id]")).to_have_count(100)
+    expect(_sessions_row(ui.page, last.session_id)).to_have_count(0)
+    expect(more).to_be_visible()
+
+    more.click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 200 sesji")
+    more.click()
+    expect(_sessions_row(ui.page, last.session_id)).to_have_count(1)
+
+
+def test_a_stale_sessions_page_failure_does_not_clear_the_current_snapshot(ui, db, actors, actor_factory):
+    room, first, second, _ = actors
+    extra = [actor_factory(room) for _ in range(199)]
+    last = max([first, second, *extra], key=lambda actor: actor.session_id)
+    ui.login()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+    more = ui.page.get_by_role("button", name="Kolejne sesje", exact=True)
+    more.click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 200 sesji")
+
+    held = []
+    holding = [True]
+
+    def transport(route):
+        if holding[0] and "after_session=" in route.request.url:
+            holding[0] = False
+            held.append((route, route.fetch()))
+            return
+        route.continue_()
+
+    ui.page.route("**/v1/rooms/*/participants?*", transport)
+    more.click()
+    wait_held(ui.page, held)
+    ui.page.get_by_role("button", name="Rozmowy", exact=True).click()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+
+    route, _response = held[0]
+    route.fulfill(
+        status=500,
+        content_type="application/json",
+        body='{"error":{"code":"SERVICE_UNAVAILABLE","message":"SERVICE_UNAVAILABLE"}}',
+    )
+    expect(ui.page.locator("#viewer")).to_be_visible()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 100 sesji")
+    expect(ui.page.locator("#sessions-table tbody tr[data-session-id]")).to_have_count(100)
+    expect(_sessions_row(ui.page, last.session_id)).to_have_count(0)
+
+    more.click()
+    expect(ui.page.locator("#sessions-note")).to_contain_text("Wczytano 200 sesji")
+
+
 def test_the_sessions_view_fills_after_a_live_refresh_that_held_it(ui, actors):
     _room, first, _second, _operator = actors
     ui.login()
