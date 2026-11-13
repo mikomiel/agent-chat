@@ -38,6 +38,10 @@ def test_retained_reply_keeps_redacted_parent_then_collects_thread(db, actors, e
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
     rows = db.execute("SELECT id, body FROM agent_chat.messages").fetchall()
     assert {row["id"]: row["body"] for row in rows} == {parent["id"]: None, reply["id"]: "retained body"}
@@ -58,6 +62,10 @@ def test_retained_reply_keeps_redacted_parent_then_collects_thread(db, actors, e
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
     assert prune(db) == {
         "events": 0,
@@ -66,6 +74,10 @@ def test_retained_reply_keeps_redacted_parent_then_collects_thread(db, actors, e
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
     assert db.execute("SELECT id FROM agent_chat.threads").fetchall() == []
     assert db.execute("SELECT message_id FROM agent_chat.recipients").fetchall() == []
@@ -77,6 +89,10 @@ def test_retained_reply_keeps_redacted_parent_then_collects_thread(db, actors, e
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
 
 
@@ -92,6 +108,10 @@ def test_retention_never_skips_retained_event_in_cursor_prefix(db, actors, event
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
     assert event_log(db, sender) == [
         {"position": 1, "kind": "message", "message_id": first["id"]},
@@ -105,6 +125,10 @@ def test_retention_never_skips_retained_event_in_cursor_prefix(db, actors, event
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
 
 
@@ -121,6 +145,10 @@ def test_batches_are_bounded_and_cursor_does_not_reset(db, actors, event_log):
             "ended_instances": 0,
             "memberships": 0,
             "expired_undelivered": 0,
+            "reservations": 0,
+            "delivery_batches": 0,
+            "browser_sessions": 0,
+            "room_state": 0,
         }
     fresh = publish(db, sender, room, uuid4(), Publication(kind="message", body="new"))
     assert event_log(db, sender, after=3) == [{"position": 4, "kind": "message", "message_id": fresh["id"]}]
@@ -131,6 +159,10 @@ def test_batches_are_bounded_and_cursor_does_not_reset(db, actors, event_log):
         "ended_instances": 0,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
 
 
@@ -196,6 +228,10 @@ def test_instance_lapsed_over_a_day_is_ended_and_a_live_one_is_not(db, actors):
         "ended_instances": 1,
         "memberships": 0,
         "expired_undelivered": 0,
+        "reservations": 0,
+        "delivery_batches": 0,
+        "browser_sessions": 0,
+        "room_state": 0,
     }
     assert ended(db, lapsed) is not None
     assert ended(db, live) is None
@@ -272,6 +308,37 @@ def test_limit_bounds_instance_ending_and_membership_age_out(db, actors):
     assert len(members(db, room) & {first.session_id, second.session_id}) == 1
     assert prune(db, limit=1)["memberships"] == 1
     assert prune(db, limit=1)["memberships"] == 0
+
+
+@pytest.mark.parametrize("table", ["browser_sessions", "room_state", "delivery_batches"])
+def test_auxiliary_cleanup_counts_as_progress(db, actors, make_producer, table):
+    """Every category that can delete a row must be visible to the bounded admin loop."""
+    room, sender, _, operator = actors
+    if table == "browser_sessions":
+        for _ in range(3):
+            db.execute(
+                "INSERT INTO agent_chat.browser_sessions(token_hash, principal_id, expires_at) "
+                "VALUES (%s, %s, clock_timestamp() - interval '1 hour')",
+                (secrets.token_hex(32), operator.principal_id),
+            )
+    elif table == "room_state":
+        producer = make_producer()
+        for index in range(3):
+            db.execute(
+                "WITH moment AS MATERIALIZED (SELECT clock_timestamp() - interval '800 hours' AS t) "
+                "INSERT INTO agent_chat.room_state(room_id, state_key, value, producer_principal_id, "
+                "changed_at, observed_at, expires_at) "
+                "SELECT %s, %s, '{}', %s, t, t, t + interval '30 minutes' FROM moment",
+                (room, f"validation-lease:node-a:old-{index}", producer.principal),
+            )
+    else:
+        for _ in range(3):
+            db.execute(
+                "INSERT INTO agent_chat.delivery_batches(id, session_id, message_ids) VALUES (%s, %s, %s)",
+                (uuid4(), sender.session_id, [uuid4()]),
+            )
+    for expected in (1, 1, 1, 0):
+        assert prune(db, limit=1)[table] == expected
 
 
 def test_prune_settles_items_never_handed_within_the_age_limit(db, actors):
