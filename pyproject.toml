@@ -58,6 +58,7 @@ dev = [
     "playwright==1.64.1",
     "psycopg[binary]==3.3.8",
     "pytest==9.2.0",
+    "pytest-xdist==3.8.0",
     "PyYAML==6.0.3",
     "ruff==0.17.4",
 ]
