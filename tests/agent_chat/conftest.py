@@ -434,6 +434,9 @@ def postgres_cluster():
 
 
 def _drop_database(admin, dsn, name):
+    # Cleanup can wait on a checkpoint. A 5s product statement timeout is too short
+    # when several xdist workers drop databases together; this budget is test-only.
+    admin.execute("SET statement_timeout = '30s'")
     # Observe only slow cleanup. No extra connection on the normal fast path;
     # no query text, DSN, database names, credentials or conversation content.
     done = Event()
