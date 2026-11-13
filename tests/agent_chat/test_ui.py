@@ -2703,6 +2703,25 @@ def test_the_operator_assigns_a_role_from_the_sessions_view(ui, db, actors):
     assert rows == [{"session_id": first.session_id}]
 
 
+def test_a_role_conflict_shows_the_safe_code_and_explanation(ui, db, actors):
+    room, first, _second, operator = actors
+    roles.assign(db, operator, room, "pm", first.session_id)
+    ui.login()
+    ui.page.get_by_role("button", name="Sesje", exact=True).click()
+    row = _sessions_row(ui.page, first.session_id)
+    row.locator("details.role-controls summary").click()
+    with ui.page.expect_response(
+        lambda response: "/roles" in response.url and response.request.method == "POST"
+    ) as response:
+        row.get_by_role("button", name="Nadaj GitHub PM", exact=True).click()
+    assert response.value.status == 409
+    expect(ui.page.locator("#sessions-view")).to_be_visible()
+    expect(ui.page.locator("#notice")).to_contain_text("ROLE_CONFLICT")
+    expect(ui.page.locator("#notice")).to_contain_text("inną rolę")
+    expect(_sessions_row(ui.page, first.session_id)).to_be_visible()
+    assert roles.current(db, room, "github_pm") is None
+
+
 def test_a_viewer_sees_no_role_controls(ui, db, actors, make_viewer):
     room, _first, _second, _operator = actors
     viewer = make_viewer(room)

@@ -96,6 +96,22 @@
     heads_up: "Uwaga", blocked_on: "Zablokowany przez", decision_needed: "Potrzebna decyzja", intent: "Zamiar",
   };
   const QUESTION_KINDS = new Set(["question", "consultation"]);
+  // Safe, allowlisted server refusals. An unknown code keeps the generic fallback.
+  const REFUSAL_TEXT = {
+    ROLE_CONFLICT: "Ta sesja ma już inną rolę w tym pokoju. Zdejmij obecną rolę i spróbuj ponownie.",
+    ROOM_CONFLICT: "Pokój o tym identyfikatorze już istnieje z inną nazwą.",
+    INVALID_REQUEST: "Serwer odrzucił żądanie. Sprawdź wybrane wartości.",
+    INVALID_RECIPIENT: "Wybrany odbiorca nie jest już dostępny w tym pokoju.",
+    MESSAGE_EXPIRED: "Wiadomość wygasła; nie można wykonać tej operacji.",
+    STALE_INSTANCE: "Ta sesja nie jest już aktywna. Odśwież widok.",
+    ROOM_FORBIDDEN: "Brak dostępu do tego pokoju.",
+    SESSION_FORBIDDEN: "Brak uprawnień do tej zmiany.",
+    NOT_FOUND: "Nie znaleziono obiektu. Odśwież widok.",
+  };
+  function refusal(error) {
+    const detail = REFUSAL_TEXT[error.code];
+    return detail ? `${error.code}: ${detail}` : "";
+  }
   const TIME_FORMAT = new Intl.DateTimeFormat("pl-PL", { dateStyle: "short", timeStyle: "short" });
 
   // Secondary panels are disclosures where they would crowd the conversation: below 821 px the roster and the resource
@@ -281,6 +297,11 @@
       if (!response.ok) {
         const error = new Error("REQUEST_FAILED");
         error.status = response.status;
+        try {
+          const payload = await response.json();
+          const code = payload?.error?.code;
+          if (typeof code === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(code)) error.code = code;
+        } catch { /* A non-JSON refusal keeps the generic message. */ }
         throw error;
       }
       return await response.json();
@@ -977,9 +998,13 @@
       if (stale(controlRequest, attempt, current)) return;
       controlRequest = null;
       const result = confirmed ? `Zapis ${label} potwierdzony, ale odczyt stanu niedostępny.` : `Zmiana ${label} niepotwierdzona.`;
+      const detail = !confirmed && error.status !== 401 && error.status !== 403 ? refusal(error) : "";
       if (error.status === 401 || error.status === 403) {
         failed(error, current);
         el("notice").textContent = `${result} Dostęp wygasł lub został cofnięty. Zaloguj się ponownie.`;
+      } else if (detail) {
+        // A known domain refusal is final and did not mutate server state.
+        el("notice").textContent = `${result} ${detail}`;
       } else {
         invalidate();
         clearRoom();
