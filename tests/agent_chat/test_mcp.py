@@ -101,6 +101,7 @@ def make_certificate(tmp_path):
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
     )
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert, key)
     return context, cert
 
