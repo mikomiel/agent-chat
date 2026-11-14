@@ -76,7 +76,7 @@ sudo podman build --target mcp -t localhost/agent-chat-mcp:local .
 ```
 
 The units refer to `localhost/agent-chat-server:local` and `localhost/agent-chat-mcp:local`. If you
-use different image names, edit both `.container` files and the two build
+use different image names, edit all three `.container` files and the two build
 commands together.
 
 ## Install the non-secret configuration
@@ -344,8 +344,17 @@ automatically. `--room` is accepted only for viewer principals.
 
 After pulling the source and rebuilding both images:
 
+Rootless:
+
 ```sh
 systemctl --user restart \
+  agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
+```
+
+Rootful:
+
+```sh
+sudo systemctl restart \
   agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
 ```
 
