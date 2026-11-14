@@ -1,0 +1,32 @@
+[Unit]
+Description=Agent Chat Streamable HTTP MCP service (optional)
+After=network-online.target agent-chat.service
+Wants=network-online.target
+Requires=agent-chat.service
+
+[Container]
+Image=localhost/agent-chat-mcp:local
+ContainerName=agent-chat-mcp
+Exec=--config /etc/agent-chat/mcp.json
+Volume=/etc/agent-chat/mcp.json:/etc/agent-chat/mcp.json:ro
+Network=agent-chat.network
+Network=traefik
+NetworkAlias=mcp
+User=10001:10001
+ReadOnly=true
+Tmpfs=/tmp:rw,noexec,nosuid,size=16m
+DropCapability=ALL
+NoNewPrivileges=true
+HealthCmd=python -c "import socket; s=socket.create_connection(('127.0.0.1',8951),2); s.close()"
+HealthInterval=10s
+HealthTimeout=3s
+HealthStartPeriod=10s
+HealthRetries=6
+StopTimeout=30
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target
