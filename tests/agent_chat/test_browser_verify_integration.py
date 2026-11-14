@@ -116,7 +116,9 @@ def test_command_observes_real_viewer_service_without_chat_effects(
     assert all(status == "PASS" for status in evidence["cleanup"].values()), failure_summary
     assert {entry.get("viewport") for entry in evidence["assertions"] if "viewport" in entry} == {0, 1}
     web = Path(__file__).parents[2] / "agent_chat/web"
-    assert evidence["served_hashes"] == {name: hashlib.sha256((web / name).read_bytes()).hexdigest()
-                                         for name in ("index.html", "chat.js", "chat.css", "Manrope-Variable.ttf")}
+    assert evidence["served_hashes"] == {
+        name: hashlib.sha256((web / name).read_bytes()).hexdigest()
+        for name in ("index.html", "chat.js", "i18n.js", "chat.css", "Manrope-Variable.ttf")
+    }
     assert snapshot(db) == before
     assert db.execute("SELECT count(*) AS count FROM agent_chat.browser_sessions").fetchone()["count"] == 0

@@ -144,6 +144,7 @@ def create_app(
             # No generic directory mount, path joining from arbitrary input or index listing.
             assets = {
                 "chat.js": "text/javascript",
+                "i18n.js": "text/javascript",
                 "chat.css": "text/css",
                 "Manrope-Variable.ttf": "font/ttf",
             }

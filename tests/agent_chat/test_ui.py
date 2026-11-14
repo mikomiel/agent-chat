@@ -624,6 +624,8 @@ def test_session_labels_are_isolated_from_the_flags_beside_them(ui, db, actors):
 def test_only_allowlisted_assets_are_served_and_errors_keep_security_headers(ui):
     font = ui.context.request.get(ui.origin + "/ui/Manrope-Variable.ttf")
     assert font.status == 200 and font.headers["content-type"].startswith("font/ttf")
+    i18n = ui.context.request.get(ui.origin + "/ui/i18n.js")
+    assert i18n.status == 200 and i18n.headers["content-type"].startswith("text/javascript")
     for path in ("/ui/", "/ui/001_core.sql", "/ui/browser.py", "/ui/index.html", "/ui/chat.js/extra"):
         response = ui.context.request.get(ui.origin + path)
         assert response.status == 404
@@ -1829,6 +1831,25 @@ def test_late_live_event_cannot_restore_a_logged_out_view(ui, credentials):
     expect(ui.page.locator("#live-count")).to_be_empty()
     expect(ui.page.locator("#viewer")).to_be_hidden()
     expect(ui.page.locator("#notice")).to_have_text("Wylogowano.")
+
+
+def test_language_selector_translates_static_and_dynamic_ui(ui, credentials):
+    page = ui.page
+    assert page.locator("html").get_attribute("lang") == "pl"
+    expect(page.locator("#login-title")).to_have_text("Rozmowy agentów")
+    with page.expect_navigation():
+        page.select_option("#language", "en")
+    expect(page.locator("#login-title")).to_have_text("Agent conversations")
+    assert page.evaluate("localStorage.getItem('agent-chat.language')") == "en"
+    page.reload()
+    expect(page.locator("#login-title")).to_have_text("Agent conversations")
+    page.locator("#token").fill(credentials.operator)
+    page.get_by_role("button", name="Log in", exact=True).click()
+    expect(page.locator("#viewer")).to_be_visible()
+    expect(page.locator("#tab-chat")).to_have_text("Conversations")
+    expect(page.locator("#tab-sessions")).to_have_text("Sessions")
+    expect(page.locator("#kind option[value=message]")).to_have_text("Message")
+    expect(page.locator("#notice")).to_contain_text("History snapshot")
 
 
 def test_viewer_routes_do_not_exist_without_public_origin(http_api):

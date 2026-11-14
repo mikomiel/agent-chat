@@ -35,9 +35,9 @@ MAX_BODY = 2 * 1024 * 1024
 # Logout and the resource closes together may use this share of the cleanup budget: six of its eight seconds. The
 # rest is slack, so a close times out before the budget cancels it and the worker can still report after a run limit.
 CLOSE_BUDGET_SHARE = 0.75
-ASSETS = {"/": "index.html", "/ui/chat.js": "chat.js", "/ui/chat.css": "chat.css",
-          "/ui/Manrope-Variable.ttf": "Manrope-Variable.ttf"}
-PUBLIC = {"/": "document", "/ui/chat.js": "script", "/ui/chat.css": "style",
+ASSETS = {"/": "index.html", "/ui/chat.js": "chat.js", "/ui/i18n.js": "i18n.js",
+          "/ui/chat.css": "chat.css", "/ui/Manrope-Variable.ttf": "Manrope-Variable.ttf"}
+PUBLIC = {"/": "document", "/ui/chat.js": "script", "/ui/i18n.js": "script", "/ui/chat.css": "style",
           "/ui/Manrope-Variable.ttf": "font", "/healthz": "health", "/readyz": "ready",
           "/v1/login": "login", "/v1/logout": "logout", "/v1/browser/session": "bootstrap"}
 
