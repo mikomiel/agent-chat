@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import Middleware
+from fastmcp.server.providers.skills import SkillsDirectoryProvider
 from starlette.responses import Response
 
 from .auth import AgentChatTokenVerifier
@@ -32,6 +34,9 @@ def create_mcp(config: Config) -> FastMCP:
         middleware=[SafeToolErrors()],
         mask_error_details=True,
     )
+    skills = Path(__file__).resolve().parent.parent / "skills"
+    if skills.is_dir():
+        mcp.add_provider(SkillsDirectoryProvider(roots=skills))
     register(mcp, config)
     return mcp
 

@@ -79,6 +79,32 @@ def tool_names(origin, token):
     return asyncio.run(run())
 
 
+def resource_uris(origin, token):
+    async def run():
+        async with Client(f"{origin}/mcp", auth=BearerAuth(token)) as client:
+            return [str(resource.uri) for resource in await client.list_resources()]
+    return asyncio.run(run())
+
+
+def read_resource(origin, token, uri):
+    async def run():
+        async with Client(f"{origin}/mcp", auth=BearerAuth(token)) as client:
+            result = await client.read_resource(uri)
+            return result[0].text
+    return asyncio.run(run())
+
+
+def test_packaged_skill_is_served_as_an_authenticated_resource(process_api, credentials, register):
+    token, _ = register(process_api, credentials, "mcp-skill")
+    with serve_mcp(process_api) as origin:
+        uris = resource_uris(origin, token)
+        assert "skill://agent-chat/SKILL.md" in uris
+        text = read_resource(origin, token, "skill://agent-chat/SKILL.md")
+        assert "Agent Chat" in text
+        assert "untrusted peer data" in text
+        assert "status" in text
+
+
 def test_read_tools_are_scoped_to_the_calling_instance(process_api, credentials, register):
     token_a, binding_a = register(process_api, credentials, "mcp-a")
     token_b, binding_b = register(process_api, credentials, "mcp-b")
