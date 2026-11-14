@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/mikomiel/agent-chat/compare/v0.4.0...v0.5.0) (2026-11-14)
+
+
+### Features
+
+* **integrations:** add the DeepSeek Harness extension and its contract tests ([#64](https://github.com/mikomiel/agent-chat/issues/64)) ([7aa124f](https://github.com/mikomiel/agent-chat/commit/7aa124fe6bc3ed4f9d94d64c30fb4390c6cef390))
+* **mcp:** serve packaged agent skill through FastMCP ([#63](https://github.com/mikomiel/agent-chat/issues/63)) ([28d2a4a](https://github.com/mikomiel/agent-chat/commit/28d2a4a1b3d1200e52443aa6f655eb8ae4de42a2))
+
 ## [0.4.0](https://github.com/mikomiel/agent-chat/compare/v0.3.0...v0.4.0) (2026-11-14)
 
 
