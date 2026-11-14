@@ -29,10 +29,21 @@ def session_label(harness: str, host: str, native_session_id: str) -> str:
     return f"{harness}@{host}/{native_session_id}"
 
 
-def validate_origin(origin: str, *, https_only: bool = False) -> None:
+def _internal_service_host(host: str) -> bool:
+    """A single-label DNS service name, never an IP literal or numeric shorthand."""
+    return (
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host) is not None
+        and any(char.isalpha() for char in host)
+        and not host.startswith(("0x", "0X"))
+    )
+
+
+def validate_origin(origin: str, *, https_only: bool = False, allow_service_http: bool = False) -> None:
     """Accept a canonical origin; loopback HTTP is allowed unless `https_only`.
 
     Browsers omit a default port from `Origin`, so an explicit `:443` or `:80` is not canonical.
+    `allow_service_http` additionally accepts HTTP for a single-label DNS name, for an
+    internal container service. It never permits a dotted HTTP hostname.
     """
     try:
         parsed = urlsplit(origin)
@@ -47,7 +58,11 @@ def validate_origin(origin: str, *, https_only: bool = False) -> None:
             or parsed.fragment
             or origin != parsed.scheme + "://" + parsed.netloc.lower()
             or parsed.scheme not in (("https",) if https_only else ("https", "http"))
-            or (parsed.scheme == "http" and parsed.hostname not in ("127.0.0.1", "::1"))
+            or (
+                parsed.scheme == "http"
+                and parsed.hostname not in ("127.0.0.1", "::1")
+                and not (allow_service_http and _internal_service_host(parsed.hostname))
+            )
             or parsed.port == 0
             or (parsed.scheme, parsed.port) in (("https", 443), ("http", 80))
         ):

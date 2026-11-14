@@ -34,9 +34,10 @@ def _canonical_uuid(value: Any) -> str | None:
 class AgentChatTokenVerifier(TokenVerifier):
     """Verify an Agent Chat instance token through GET /v1/instance/status."""
 
-    def __init__(self, agent_chat_origin: str):
+    def __init__(self, agent_chat_origin: str, *, allow_service_http: bool = False):
         super().__init__()
         self._origin = agent_chat_origin
+        self._allow_service_http = allow_service_http
 
     async def verify_token(self, token: str) -> AccessToken | None:
         try:
@@ -57,5 +58,10 @@ class AgentChatTokenVerifier(TokenVerifier):
         )
 
     def _status(self, token: str) -> dict[str, Any]:
-        client = Client(self._origin, token, deadline=time.monotonic() + VERIFY_SECONDS)
+        client = Client(
+            self._origin,
+            token,
+            deadline=time.monotonic() + VERIFY_SECONDS,
+            allow_service_http=self._allow_service_http,
+        )
         return client.request("GET", "/v1/instance/status")

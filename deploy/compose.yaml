@@ -1,0 +1,109 @@
+name: agent-chat
+
+services:
+  migrate:
+    build:
+      context: ..
+      target: server
+    image: ${AGENT_CHAT_SERVER_IMAGE:-agent-chat-server:local}
+    command: ["migrate", "--config", "/etc/agent-chat/config.json"]
+    environment:
+      CREDENTIALS_DIRECTORY: /run/secrets
+    secrets:
+      - agent-chat-dsn
+    volumes:
+      - ${AGENT_CHAT_CONFIG_DIR:-./config}/server.json:/etc/agent-chat/config.json:ro,z
+    networks:
+      - app
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  agent-chat:
+    build:
+      context: ..
+      target: server
+    image: ${AGENT_CHAT_SERVER_IMAGE:-agent-chat-server:local}
+    command: ["serve", "--config", "/etc/agent-chat/config.json"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      CREDENTIALS_DIRECTORY: /run/secrets
+    secrets:
+      - agent-chat-dsn
+    volumes:
+      - ${AGENT_CHAT_CONFIG_DIR:-./config}/server.json:/etc/agent-chat/config.json:ro,z
+    networks:
+      - app
+      - edge
+    expose:
+      - "8443"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8443/healthz', timeout=2)
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  mcp:
+    build:
+      context: ..
+      target: mcp
+    image: ${AGENT_CHAT_MCP_IMAGE:-agent-chat-mcp:local}
+    command: ["--config", "/etc/agent-chat/mcp.json"]
+    depends_on:
+      agent-chat:
+        condition: service_healthy
+    volumes:
+      - ${AGENT_CHAT_CONFIG_DIR:-./config}/mcp.json:/etc/agent-chat/mcp.json:ro,z
+    networks:
+      - app
+      - edge
+    expose:
+      - "8951"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import socket; s=socket.create_connection(('127.0.0.1',8951),2); s.close()
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  app:
+  edge:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik}
+
+secrets:
+  agent-chat-dsn:
+    file: ${AGENT_CHAT_DSN_FILE:?set AGENT_CHAT_DSN_FILE to the DSN file path}
