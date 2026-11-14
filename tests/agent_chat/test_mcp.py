@@ -9,6 +9,7 @@ import socket
 import time
 from contextlib import closing, contextmanager
 from http.client import HTTPConnection
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
 from uuid import uuid4
 
@@ -23,6 +24,55 @@ from agent_chat.mcp.app import create_app
 from agent_chat.mcp.auth import AgentChatTokenVerifier
 from agent_chat.mcp.config import Config
 from agent_chat.models import ChatError
+
+
+class DestinationHandler(BaseHTTPRequestHandler):
+    hits = 0
+
+    def do_GET(self):
+        type(self).hits += 1
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *_args):
+        pass
+
+
+def redirect_handler(destination_port):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{destination_port}/login")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    return Handler
+
+
+class SlowHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        time.sleep(4)
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, *_args):
+        pass
+
+
+@contextmanager
+def http_server(handler):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 @contextmanager
@@ -123,6 +173,29 @@ def test_readiness_refuses_an_unreachable_upstream(process_api):
         status, body = get_json(origin, "/readyz")
         assert status == 503
         assert body == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
+
+
+def test_readiness_does_not_follow_redirects(process_api):
+    DestinationHandler.hits = 0
+    with http_server(DestinationHandler) as destination:
+        with http_server(redirect_handler(destination.server_port)) as redirect:
+            origin = f"http://127.0.0.1:{redirect.server_port}"
+            with serve_mcp(process_api, agent_chat_origin=origin) as mcp:
+                status, body = get_json(mcp, "/readyz")
+                assert status == 503
+                assert body == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
+                assert DestinationHandler.hits == 0
+
+
+def test_readiness_has_an_absolute_deadline(process_api):
+    with http_server(SlowHandler) as upstream:
+        origin = f"http://127.0.0.1:{upstream.server_port}"
+        with serve_mcp(process_api, agent_chat_origin=origin) as mcp:
+            started = time.monotonic()
+            status, body = get_json(mcp, "/readyz")
+            assert status == 503
+            assert body == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
+            assert time.monotonic() - started < 3
 
 
 def test_read_tools_are_scoped_to_the_calling_instance(process_api, credentials, register):

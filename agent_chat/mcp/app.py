@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import urllib.request
+import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -43,12 +43,37 @@ def create_mcp(config: Config) -> FastMCP:
     return mcp
 
 
+READINESS_PROBE = r"""
+import http.client
+import sys
+from urllib.parse import urlsplit
+
+url = sys.stdin.readline().strip()
+parts = urlsplit(url)
+connection = None
+try:
+    if parts.scheme == "https":
+        connection = http.client.HTTPSConnection(parts.hostname, parts.port or 443, timeout=2)
+    else:
+        connection = http.client.HTTPConnection(parts.hostname, parts.port or 80, timeout=2)
+    connection.request("GET", parts.path or "/readyz")
+    response = connection.getresponse()
+    sys.exit(0 if response.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+finally:
+    if connection is not None:
+        connection.close()
+"""
+
+
 class HealthEndpoints:
     """Serve liveness and readiness outside MCP authentication."""
 
     def __init__(self, app, config: Config):
         self.app = app
         self.config = config
+        self._readiness: asyncio.Task[bool] | None = None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["method"] == "GET":
@@ -57,7 +82,7 @@ class HealthEndpoints:
                 return
             if scope["path"] == "/readyz":
                 try:
-                    ready = await asyncio.to_thread(self._upstream_ready)
+                    ready = await self._readiness_check()
                 except Exception:
                     ready = False
                 if ready:
@@ -70,14 +95,34 @@ class HealthEndpoints:
                 return
         await self.app(scope, receive, send)
 
-    def _upstream_ready(self) -> bool:
+    async def _readiness_check(self) -> bool:
+        if self._readiness is None or self._readiness.done():
+            self._readiness = asyncio.create_task(self._probe())
+        return await asyncio.shield(self._readiness)
+
+    async def _probe(self) -> bool:
         url = f"{self.config.agent_chat_origin.rstrip('/')}/readyz"
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with opener.open(url, timeout=2) as response:
-                return response.status == 200
-        except (OSError, ValueError):
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, "-c", READINESS_PROBE,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env={},
+            )
+        except OSError:
             return False
+        assert process.stdin is not None
+        process.stdin.write(url.encode("utf-8") + b"\n")
+        await process.stdin.drain()
+        process.stdin.close()
+        try:
+            return_code = await asyncio.wait_for(process.wait(), timeout=2)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return False
+        return return_code == 0
 
 
 class OriginGuard:
