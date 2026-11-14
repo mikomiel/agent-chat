@@ -1,5 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { execFileSync } from "node:child_process"
 import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -95,5 +96,16 @@ test("a record larger than 16 KiB is refused before it can be used", () => {
   try {
     assert.ok(Buffer.byteLength(JSON.stringify(oversized), "utf8") > 16 * 1024)
     assert.equal(loadConfig({ AGENT_CHAT_DEEPSEEK_CONFIG: file }), null)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("a FIFO is refused without blocking the harness", () => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-chat-config-"))
+  const fifo = join(dir, "chat.json")
+  try {
+    execFileSync("mkfifo", [fifo])
+    const started = Date.now()
+    assert.equal(loadConfig({ AGENT_CHAT_DEEPSEEK_CONFIG: fifo }), null)
+    assert.ok(Date.now() - started < 1000)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })

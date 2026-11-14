@@ -61,6 +61,7 @@ export function createLifecycle(bus, delivery, config, {
   let pollTimer = null
   let rejoinTimer = null
   let ending = null
+  const draining = new Set()
   let busy = false
   let dirty = false
   let pollDue = false
@@ -127,7 +128,11 @@ export function createLifecycle(bus, delivery, config, {
     const rejoinable = typeof code === "string" && REJOIN_AFTER.has(code) && (code !== "BINDING_CONFLICT" || joining)
     if (!rejoinable) return failClosed(error)
     notify(`Agent Chat reconnecting (${code}).`)
-    void stopLive()
+    // Keep the draining worker's exit proof: disposal during the backoff must
+    // still be able to prove that the previous instance ended.
+    const stopping = Promise.resolve(stopLive()).catch(() => null)
+    draining.add(stopping)
+    void stopping.finally(() => draining.delete(stopping))
     let delay
     try { delay = policy.next(code) }
     catch (exhausted) { return failClosed(exhausted) }
@@ -358,17 +363,26 @@ export function createLifecycle(bus, delivery, config, {
     joined = null
     // Keep the exit promise: a caller proving the worker ended must be able to
     // await the same shutdown, not a second disconnect that found it already gone.
-    ending = Promise.resolve(disconnect()).catch(() => null)
+    ending = finishExit()
   })
 
   // Public: disposal. Idempotent, so a shutdown that a bus event already began
   // still resolves the worker's exit for the caller that must prove it ended.
+  function finishExit() {
+    const pending = [...draining]
+    return Promise.allSettled([...pending, disconnect()]).then(results => {
+      const failed = results.some(result => result.status === "rejected" ||
+        (result.status === "fulfilled" && typeof result.value?.code === "number" && result.value.code !== 0))
+      return { code: failed ? 1 : 0, signal: null }
+    })
+  }
+
   function stop() {
     if (ending) return ending
     closed = true
     disabled = true
     try { delivery.disable?.() } catch { /* chat-only latch */ }
-    ending = Promise.resolve(disconnect()).catch(() => null)
+    ending = finishExit()
     return ending
   }
 

@@ -192,3 +192,29 @@ test("the ownership mirror excludes a real subagent child, not a fork root", () 
   assert.equal(isSubagentChild(ctx, { id: "root", session: { header: {} } }), false)
   assert.equal(isSubagentChild(ctx, { id: "sub", session: { header: { origin: "subagent" } } }), true)
 })
+
+test("a user prompt during adoption is replayed after the lifecycle starts", async () => {
+  const { dir, file } = configFile()
+  try {
+    let releaseParts
+    const ready = new Promise(resolve => { releaseParts = resolve })
+    const loaded = parts()
+    const loadParts = async () => { await ready; return loaded.loadParts() }
+    const plugin = createAgentChat({ env: { AGENT_CHAT_DEEPSEEK_CONFIG: file }, loadParts })
+    const { ctx, injected } = roots()
+    plugin(ctx)
+    const { webCtx, fire, agents } = fakeWebCtx()
+    injected[0].callback(webCtx)
+    const root = { id: "native-1", session: { id: "native-1", header: {} } }
+    agents.set(root.id, root)
+    fire("agent/created", { agent: root })
+    await flush()
+    // The lifecycle does not exist yet; the prompt must still be remembered.
+    fire("agent/inbox/inserted", { agent: root, message: { source: { kind: "user", rpcId: "rpc-1" } } })
+    releaseParts()
+    await flush()
+    await flush()
+    assert.equal(loaded.created.length, 1)
+    assert.equal(loaded.inputs.length, 1)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})

@@ -350,3 +350,36 @@ test("session shutdown ends the worker and still proves the exit", async () => {
   const result = await lifecycle.stop()
   assert.deepEqual(result, { code: 0, signal: null })
 })
+
+test("disposal during a rejoin waits for the drained worker's exit proof", async () => {
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  let release
+  const closed = new Promise(resolve => { release = resolve })
+  const worker = {
+    ready: Promise.resolve(joined),
+    closed,
+    request: op => op === "heartbeat"
+      ? Promise.reject(Object.assign(new Error("TRANSPORT_UNAVAILABLE"), { code: "TRANSPORT_UNAVAILABLE", operation: "heartbeat" }))
+      : Promise.resolve({}),
+    stop() { return closed },
+  }
+  let retry = null
+  const lifecycle = createLifecycle(bus, delivery, config, {
+    ...timers,
+    startProcess: () => worker,
+    now: () => 0,
+    random: () => 0,
+    setTimeoutImpl: (fn) => { retry = fn; return 1 },
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  assert.equal(typeof retry, "function")
+  const stopping = lifecycle.stop()
+  let settled = false
+  void stopping.then(() => { settled = true })
+  await flush()
+  assert.equal(settled, false)
+  release({ code: 0, signal: null })
+  assert.deepEqual(await stopping, { code: 0, signal: null })
+})

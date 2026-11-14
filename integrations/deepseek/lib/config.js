@@ -17,7 +17,9 @@ export function loadConfig(env = process.env, name = DEEPSEEK_CHAT_CONFIG_ENV) {
   if (typeof raw !== "string" || !raw || env.AGENT_CHAT_DELEGATED_CHILD === "1" || !isAbsolute(raw)) return null
   let descriptor
   try {
-    descriptor = openSync(raw, constants.O_RDONLY | constants.O_NOFOLLOW)
+    // O_NONBLOCK keeps a FIFO from blocking the whole harness before fstat can
+    // refuse it; the regular-file check below is still the gate.
+    descriptor = openSync(raw, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   } catch { return null }
   let data
   try {

@@ -100,7 +100,7 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
 
       function route(agent, fn) {
         const state = states.get(agent)
-        if (!state) return
+        if (!state || !state.delivery) return
         try { fn(state) } catch (error) { isolate(agent, error) }
       }
 
@@ -108,7 +108,7 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
         if (state.closing) return state.closing
         try { state.delivery?.dispose?.() } catch { /* the fence is already closed */ }
         let ended
-        try { ended = Promise.resolve(state.lifecycle?.stop?.()).catch(() => null) } catch { ended = Promise.resolve(null) }
+        try { ended = state.lifecycle?.stop ? state.lifecycle.stop() : Promise.resolve({ code: 0 }) } catch { ended = Promise.resolve(null) }
         const closing = Promise.all([retiring.get(agent.id) ?? true, ended])
           .then(([before, result]) => before === true && result?.code === 0)
           .catch(() => false)
@@ -124,38 +124,59 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
 
       async function adopt(agent) {
         if (!active || disposed.has(agent) || states.has(agent) || !eligible(agent)) return
-        const loaded = await parts
-        if (!loaded || !active || disposed.has(agent) || states.has(agent) ||
-            webCtx.agents.get(agent.id) !== agent || !eligible(agent)) return
-        // The same session id under a new agent object (clear/compact) must not
-        // leave two joins for one native session.
-        for (const [other, state] of states) {
-          if (other.id === agent.id) { states.delete(other); disposed.add(other); dispose(other, state) }
+        // A user prompt can arrive before the libraries load or the previous
+        // worker ends. Create the latch state first and record that prompt, or
+        // the new lifecycle would start stopped and stay stopped.
+        for (const [other, previous] of states) {
+          if (other.id === agent.id) { states.delete(other); disposed.add(other); dispose(other, previous) }
         }
-        const ended = await (retiring.get(agent.id) ?? true)
-        if (!active || disposed.has(agent) || states.has(agent) ||
-            webCtx.agents.get(agent.id) !== agent || !eligible(agent)) return
-        if (!ended) { log("warn", "chat replacement refused after an unproved instance end; CI is unchanged"); return }
-        let delivery
-        try { delivery = loaded.createDelivery(webCtx, agent) } catch (error) { isolate(agent, error); return }
         const handlers = new Map()
         const bus = { on(name, fn) { handlers.set(name, [...(handlers.get(name) ?? []), fn]) } }
         const state = {
-          delivery,
+          delivery: null,
           lifecycle: null,
           bootstrap: null,
           closing: null,
-          fire(name, payload) { for (const fn of handlers.get(name) ?? []) fn(payload) },
+          latchEvents: [],
+          fire(name, payload) {
+            if (!state.lifecycle) return
+            for (const fn of handlers.get(name) ?? []) fn(payload)
+          },
         }
         states.set(agent, state)
         try {
+          const loaded = await parts
+          if (!loaded || !active || disposed.has(agent) || states.get(agent) !== state ||
+              webCtx.agents.get(agent.id) !== agent || !eligible(agent)) {
+            states.delete(agent)
+            return
+          }
+          const ended = await (retiring.get(agent.id) ?? true)
+          if (!active || disposed.has(agent) || states.get(agent) !== state ||
+              webCtx.agents.get(agent.id) !== agent || !eligible(agent)) {
+            states.delete(agent)
+            return
+          }
+          if (!ended) {
+            states.delete(agent)
+            log("warn", "chat replacement refused after an unproved instance end; CI is unchanged")
+            return
+          }
+          const delivery = loaded.createDelivery(webCtx, agent)
+          state.delivery = delivery
           // Each join mints a fresh random boot id inside the lifecycle.
           state.lifecycle = loaded.createLifecycle(bus, delivery, config, {
             startProcess: loaded.startProcess,
             notice: text => log("info", String(text)),
           })
           state.fire("session_start", { nativeSessionId: agent.id })
+          for (const event of state.latchEvents) {
+            if (event === "input") state.fire("input", { source: "local" })
+            else state.fire("agent_settled", { aborted: true })
+          }
+          state.latchEvents = []
         } catch (error) {
+          states.delete(agent)
           isolate(agent, error)
         }
       }
@@ -193,6 +214,13 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
           } catch (error) { isolate(agent, error); return decision }
         }),
         webCtx.on("agent/inbox/inserted", ({ agent, message }) => {
+          const state = states.get(agent)
+          if (!state) return
+          if (!state.delivery) {
+            const source = message?.source
+            if (source?.kind === "user" && typeof source.rpcId === "string" && source.rpcId) state.latchEvents.push("input")
+            return
+          }
           route(agent, state => { if (state.delivery.onInserted(message)) state.fire("input", { source: "local" }) })
         }),
         webCtx.on("agent/inbox/claimed", ({ agent, message }) => {
@@ -208,6 +236,14 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
           try {
             const agent = webCtx.agents.get(session?.id)
             if (!agent || agent.session !== session) return
+            const state = states.get(agent)
+            if (state && !state.delivery) {
+              const reason = event?.data?.reason
+              if (event?.type === "turn/end" && reason?.kind === "aborted" && reason.reason?.kind === "user") {
+                state.latchEvents.push("abort")
+              }
+              return
+            }
             if (event?.type === "session/title") {
               route(agent, state => state.fire("session_info_changed", {}))
               return
