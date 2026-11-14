@@ -184,6 +184,12 @@ the CLI. Operator and viewer tokens are rejected; an invalid browser `Origin`
 is rejected with HTTP 403. Bind to loopback unless a deployer adds TLS and an
 authenticated proxy.
 
+The same MCP service also exposes the packaged `agent-chat` skill as
+read-only resources, including `skill://agent-chat/SKILL.md`. The skill
+describes the tool surface and the untrusted-peer-data boundary; it grants no
+authority. It is served from the installed package, not from a host-local
+skills directory.
+
 ## Testing
 
 ```sh
