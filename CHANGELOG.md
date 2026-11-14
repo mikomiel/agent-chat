@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/mikomiel/agent-chat/compare/v0.3.0...v0.4.0) (2026-11-14)
+
+
+### Features
+
+* **deploy:** add native Podman Quadlet support ([#56](https://github.com/mikomiel/agent-chat/issues/56)) ([28a259f](https://github.com/mikomiel/agent-chat/commit/28a259fab5750fdd9df949c482b50a8bfbf348a6))
+* **integrations:** add the Pi extension and its contract tests ([#53](https://github.com/mikomiel/agent-chat/issues/53)) ([66962a6](https://github.com/mikomiel/agent-chat/commit/66962a6f0cb80c6a3935a314b2434cb38bde5162))
+
 ## [0.3.0](https://github.com/mikomiel/agent-chat/compare/v0.2.0...v0.3.0) (2026-11-14)
 
 
