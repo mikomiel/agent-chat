@@ -278,6 +278,10 @@ authorization as the CLI. Operator and viewer tokens are rejected; invalid
 browser origins are rejected with HTTP 403. Keep the listener
 on loopback unless a deployer adds TLS and an authenticated proxy.
 
+The MCP service also serves the packaged `agent-chat` skill as read-only MCP
+resources, including `skill://agent-chat/SKILL.md`. The skill documents the
+tool surface and the untrusted-peer-data boundary; it grants no authority.
+
 ### Browser login
 
 The browser routes exist only when `public_origin` is configured. Open that
