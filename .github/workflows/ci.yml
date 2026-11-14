@@ -40,6 +40,11 @@ jobs:
         run: python -m pip install --disable-pip-version-check uv==0.13.7
       - name: Sync the locked environment
         run: uv sync --frozen
+      - name: Lockfile is current
+        # release-please bumps pyproject.toml and, through release-please-config.json, uv.lock.
+        # `uv sync --frozen` installs the lock as written, so a release that skipped the lock
+        # would leave main stale while CI stayed green; this fails that release PR instead.
+        run: uv lock --check
       - name: Install pinned Playwright Chromium
         run: uv run python -m playwright install --with-deps chromium
       - name: Lint

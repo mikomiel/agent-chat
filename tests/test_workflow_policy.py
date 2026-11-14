@@ -8,6 +8,7 @@ module, so a change to either fails here before it reaches the default branch.
 from __future__ import annotations
 
 import importlib.util
+import json
 import re
 from pathlib import Path
 
@@ -210,3 +211,38 @@ def test_release_metadata_is_never_auto_merged() -> None:
     policy = policy_module()
     assert policy.sensitive("release-please-config.json") is True
     assert policy.sensitive(".release-please-manifest.json") is True
+
+
+def test_release_please_updates_the_lockfile_project_version() -> None:
+    """release-please bumps pyproject.toml; the lock's root version needs the same bump.
+
+    A release pull request that skipped ``uv.lock`` would leave ``main`` stale
+    while ``uv sync --frozen`` kept CI green. This pins the extra-files entry
+    that prevents it; if release-please stops matching the jsonpath, the lock
+    check in ``checks`` fails the release pull request instead of merging it.
+    """
+    config = json.loads((ROOT / "release-please-config.json").read_text(encoding="utf-8"))
+    (entry,) = config["packages"]["."]["extra-files"]
+    assert entry == {
+        "type": "toml",
+        "path": "uv.lock",
+        "jsonpath": "$.package[?(@.name.value=='agent-chat')].version",
+    }
+
+
+def test_checks_asserts_the_lockfile_is_current() -> None:
+    """The check is the backstop for the extra-files entry, so it must stay in ``checks``.
+
+    Removing the step breaks the singleton unpacking. These assertions also
+    keep it fail-closed: a later ``if``, ``continue-on-error`` or an
+    intervening ``uv run`` (which can relock an environment) would turn the
+    guard into a no-op or repair the lock before it is checked.
+    """
+    steps = workflow("ci.yml")["jobs"]["checks"]["steps"]
+    (step,) = [item for item in steps if item.get("run") == "uv lock --check"]
+    assert step["name"] == "Lockfile is current"
+    assert "if" not in step
+    assert "continue-on-error" not in step
+    runs = [item.get("run") for item in steps]
+    sync = runs.index("uv sync --frozen")
+    assert runs.index("uv lock --check") == sync + 1
