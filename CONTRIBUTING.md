@@ -46,6 +46,7 @@ signal. Making either a required context is a maintainer decision.
 
    ```sh
    uv sync --frozen
+   uv lock --check
    uv run ruff check .
    uv run python -m pytest -q
    ```
