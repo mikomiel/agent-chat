@@ -148,7 +148,7 @@ def result(capsys: Any) -> dict[str, Any]:
     assert len(captured.out) < 32768
     data = json.loads(captured.out)
     assert data["source_ref"] == "unknown"
-    assert set(data["served_hashes"]) == {"index.html", "chat.js", "chat.css", "Manrope-Variable.ttf"}
+    assert set(data["served_hashes"]) == {"index.html", "chat.js", "i18n.js", "chat.css", "Manrope-Variable.ttf"}
     assert all(value == "unknown" or re.fullmatch(r"[0-9a-f]{64}", value) for value in data["served_hashes"].values())
     assert len(data["artifacts"]) <= 4 and data["expiry"] == "NOT_RUN"
     if data["artifacts"]:
@@ -623,6 +623,7 @@ def synthetic(tls_cert: tuple[Path, Path], browser_capability: None) -> Any:
                                      "next_cursor": "1", "has_more": False, "position": "1", "retained_floor": "0"})
             assets = {"": ("index.html", HTML.encode(), "text/html"),
                       "ui/chat.js": ("chat.js", JS.encode(), "text/javascript"),
+                      "ui/i18n.js": ("i18n.js", b"", "text/javascript"),
                       "ui/chat.css": ("chat.css", CSS.encode(), "text/css"),
                       "ui/Manrope-Variable.ttf": ("Manrope-Variable.ttf", b"", "font/ttf")}
             if path in assets:
@@ -1262,7 +1263,7 @@ def test_actual_production_assets_load_through_https_fence_without_static_copies
     observed = asyncio.run(inspect_assets())
     assert observed["served_hashes"] == {
         name: hashlib.sha256(WEB.joinpath(name).read_bytes()).hexdigest()
-        for name in ("index.html", "chat.js", "chat.css", "Manrope-Variable.ttf")
+        for name in ("index.html", "chat.js", "i18n.js", "chat.css", "Manrope-Variable.ttf")
     }
     assert synthetic.target_calls == [] and synthetic.logout_count == 1
 

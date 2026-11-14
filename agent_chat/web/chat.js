@@ -1,5 +1,8 @@
 "use strict";
 
+const t = window.AgentChatI18n.t;
+const UI_LOCALE = window.AgentChatI18n.locale;
+
 // Operator publications use an immutable in-memory attempt. No ACK or automatic retry.
 (() => {
   const el = (id) => document.getElementById(id);
@@ -93,30 +96,30 @@
   // The same grammar the server enforces on a thread key; the server stays the authority.
   const REF_KEY = /^(pr:[A-Za-z0-9_.-]{1,40}\/[A-Za-z0-9_.-]{1,80}#[1-9][0-9]{0,9}|lane:[A-Za-z0-9_.\/-]{1,80}::[A-Za-z0-9-]{1,40}|resource:[a-z0-9][a-z0-9-]{0,62}:[a-z0-9][a-z0-9-]{0,62})$/;
   const KIND_LABELS = {
-    message: "Wiadomość", status: "Status", question: "Pytanie", consultation: "Konsultacja", reply: "Odpowiedź",
-    heads_up: "Uwaga", blocked_on: "Zablokowany przez", decision_needed: "Potrzebna decyzja", intent: "Zamiar",
+    message: t("Wiadomość"), status: t("Status"), question: t("Pytanie"), consultation: t("Konsultacja"), reply: t("Odpowiedź"),
+    heads_up: t("Uwaga"), blocked_on: t("Zablokowany przez"), decision_needed: t("Potrzebna decyzja"), intent: t("Zamiar"),
   };
   const QUESTION_KINDS = new Set(["question", "consultation"]);
   // Safe, allowlisted server refusals. An unknown code keeps the generic fallback.
   const REFUSAL_TEXT = {
-    ROLE_CONFLICT: "Ta sesja ma już inną rolę w tym pokoju. Zdejmij obecną rolę i spróbuj ponownie.",
-    ROOM_CONFLICT: "Nie można utworzyć pokoju o tym identyfikatorze.",
-    INVALID_REQUEST: "Serwer odrzucił żądanie. Sprawdź wybrane wartości.",
-    INVALID_RECIPIENT: "Wybrany odbiorca nie jest już dostępny w tym pokoju.",
-    MESSAGE_EXPIRED: "Wiadomość wygasła; nie można wykonać tej operacji.",
-    STALE_INSTANCE: "Ta sesja nie jest już aktywna. Odśwież widok.",
-    ROOM_FORBIDDEN: "Brak dostępu do tego pokoju.",
-    SESSION_FORBIDDEN: "Brak uprawnień do tej zmiany.",
-    NOT_FOUND: "Nie znaleziono obiektu. Odśwież widok.",
+    ROLE_CONFLICT: t("Ta sesja ma już inną rolę w tym pokoju. Zdejmij obecną rolę i spróbuj ponownie."),
+    ROOM_CONFLICT: t("Nie można utworzyć pokoju o tym identyfikatorze."),
+    INVALID_REQUEST: t("Serwer odrzucił żądanie. Sprawdź wybrane wartości."),
+    INVALID_RECIPIENT: t("Wybrany odbiorca nie jest już dostępny w tym pokoju."),
+    MESSAGE_EXPIRED: t("Wiadomość wygasła; nie można wykonać tej operacji."),
+    STALE_INSTANCE: t("Ta sesja nie jest już aktywna. Odśwież widok."),
+    ROOM_FORBIDDEN: t("Brak dostępu do tego pokoju."),
+    SESSION_FORBIDDEN: t("Brak uprawnień do tej zmiany."),
+    NOT_FOUND: t("Nie znaleziono obiektu. Odśwież widok."),
   };
   // Only a refusal that cannot mask a revoked scope may keep the loaded view.
   // NOT_FOUND can deliberately mask ROOM_FORBIDDEN for a message-derived room.
   const PRESERVE_ON_REFUSAL = new Set(["ROLE_CONFLICT"]);
   function refusal(error) {
     const detail = REFUSAL_TEXT[error.code];
-    return detail ? `${error.code}: ${detail}` : "";
+    return detail ? `${error.code}: ${t(detail)}` : "";
   }
-  const TIME_FORMAT = new Intl.DateTimeFormat("pl-PL", { dateStyle: "short", timeStyle: "short" });
+  const TIME_FORMAT = new Intl.DateTimeFormat(UI_LOCALE, { dateStyle: "short", timeStyle: "short" });
 
   // Secondary panels are disclosures where they would crowd the conversation: below 821 px the roster and the resource
   // observations stack under the app bar and start collapsed.
@@ -149,10 +152,10 @@
     const question = QUESTION_KINDS.has(el("kind").value);
     el("ref-key").disabled = !writable || writesBusy() || replyTarget !== null || question;
     el("ref-key-hint").textContent = replyTarget
-      ? "Odpowiedź dziedziczy wątek; klucz wątku jest niedostępny."
+      ? t("Odpowiedź dziedziczy wątek; klucz wątku jest niedostępny.")
       : question
-        ? "Pytanie i konsultacja nie przyjmują klucza wątku."
-        : "Opcjonalny klucz nowego wątku.";
+        ? t("Pytanie i konsultacja nie przyjmują klucza wątku.")
+        : t("Opcjonalny klucz nowego wątku.");
     el("ref-key-hint").hidden = replyTarget === null && !question;
     el("pending").hidden = pending === null;
     el("retry-write").disabled = el("abandon-write").disabled = !writable || sending;
@@ -175,11 +178,13 @@
       return item;
     }));
     for (const row of el("participants").children) row.classList.toggle("is-target", targets.has(row.dataset.sessionId));
-    el("reply-target").textContent = replyTarget ? `Odpowiedź na ${replyTarget.id} · wątek ${replyTarget.thread_id}` : "Nowy wątek";
+    el("reply-target").textContent = replyTarget
+      ? t("Odpowiedź na {id} · wątek {thread}", { id: replyTarget.id, thread: replyTarget.thread_id })
+      : t("Nowy wątek");
     const roomOption = el("room").selectedOptions[0];
     el("room-title").textContent = selectedRoom && roomOption
       ? (roomOption.dataset.label || roomOption.textContent)
-      : "Wybierz pokój";
+      : t("Wybierz pokój");
     el("live-toggle").hidden = csrf === null || el("viewer").hidden;
     el("live-toggle").disabled = live === null && (busy() || !composerReady);
     scheduleLive(live);
@@ -199,9 +204,9 @@
   }
 
   function mayDiscard() {
-    if (pending) return window.confirm("Zapis mógł już powstać. Usunąć wyłącznie lokalną kopię próby? To nie cofa zapisu na serwerze.");
-    if (controlRequest && !window.confirm("Zmiana administracyjna może zostać zapisana mimo opuszczenia widoku. Kontynuować?")) return false;
-    return !hasDraft() || window.confirm("Usunąć niezapisany szkic?");
+    if (pending) return window.confirm(t("Zapis mógł już powstać. Usunąć wyłącznie lokalną kopię próby? To nie cofa zapisu na serwerze."));
+    if (controlRequest && !window.confirm(t("Zmiana administracyjna może zostać zapisana mimo opuszczenia widoku. Kontynuować?"))) return false;
+    return !hasDraft() || window.confirm(t("Usunąć niezapisany szkic?"));
   }
 
   function invalidate(abort = true) {
@@ -239,7 +244,7 @@
     clearSnapshot();
     historyCursor = historyPageStart = participantCursor = participantPageStart = selectedThread = selectedRef = null;
     el("thread").value = "";
-    el("thread-scope").textContent = "Cała historia pokoju";
+    el("thread-scope").textContent = t("Cała historia pokoju");
     composerReady = controlsReady = false;
     syncComposer();
   }
@@ -315,7 +320,7 @@
 
   // A failed read discards potentially stale scope-sensitive content, never the operator's draft.
   // `saved` is a confirmed write that this read followed: the failure is appended, not substituted.
-  function failed(error, current, { saved = "", denied = "Sesja wygasła lub dostęp został cofnięty. Zaloguj się ponownie." } = {}) {
+  function failed(error, current, { saved = "", denied = t("Sesja wygasła lub dostęp został cofnięty. Zaloguj się ponownie.") } = {}) {
     if (current !== generation || pending || controlRequest) return false;
     invalidate();
     clearRoom();
@@ -324,10 +329,11 @@
       lock();
       el("notice").textContent = prefix + denied;
     } else if (error.status === 429) {
-      el("notice").textContent = `${prefix}Zbyt wiele żądań lub nieudanych prób logowania. Spróbuj ponownie za minutę.`;
+      el("notice").textContent = prefix + t("Zbyt wiele żądań lub nieudanych prób logowania. Spróbuj ponownie za minutę.");
     } else {
-      el("notice").textContent = `${prefix}Nie udało się odczytać danych. Odśwież widok` +
-        (saved ? "; nie wysyłaj wiadomości ponownie." : " lub zaloguj się ponownie.");
+      el("notice").textContent = prefix + t(saved
+        ? "Nie udało się odczytać danych. Odśwież widok; nie wysyłaj wiadomości ponownie."
+        : "Nie udało się odczytać danych. Odśwież widok lub zaloguj się ponownie.");
     }
     return true;
   }
@@ -404,7 +410,7 @@
   }
 
   function receiptState(label, present) {
-    return text("span", `${label}: ${present ? "tak" : "—"}`,
+    return text("span", `${t(label)}: ${present ? t("tak") : "—"}`,
       `receipt-state ${present ? "is-present" : "is-missing"}`);
   }
 
@@ -412,17 +418,17 @@
     const item = document.createElement("li");
     const peer = participantNames.get(receipt.session_id) ?? receipt;
     item.append(text("bdi", peer.title ? `${peer.title} · ${sessionIdentity(peer)}` : sessionIdentity(peer), "receipt-session"));
-    item.append(receiptState("zapis", Boolean(receipt.stored_at)));
-    item.append(receiptState("przekazanie", Boolean(receipt.handed_at)));
+    item.append(receiptState(t("zapis"), Boolean(receipt.stored_at)));
+    item.append(receiptState(t("przekazanie"), Boolean(receipt.handed_at)));
     item.append(receiptState("ACK", Boolean(receipt.acknowledged_at)));
-    item.append(receiptState("odpowiedź", Boolean(receipt.replying_message_id)));
+    item.append(receiptState(t("odpowiedź"), Boolean(receipt.replying_message_id)));
     // Every state renders, absent ones as "—". `browser_verify_checks.py`
     // asserts this exact set against the API row, so hiding the empty ones
     // would break the verifier's receipt contract rather than merely tidy the
     // line. Readability here is the label fix above, not dropping fields.
-    item.append(text("span", `niepewność: ${receipt.uncertainty_reason ?? "—"}`,
+    item.append(text("span", t("niepewność: {reason}", { reason: receipt.uncertainty_reason ?? "—" }),
       `receipt-state ${receipt.uncertainty_reason ? "is-uncertain" : "is-missing"}`));
-    item.append(text("span", `próba: ${receipt.delivery?.outcome ?? "—"}`, "receipt-state"));
+    item.append(text("span", t("próba: {outcome}", { outcome: receipt.delivery?.outcome ?? "—" }), "receipt-state"));
     return item;
   }
 
@@ -434,7 +440,7 @@
     line.hidden = false;
     line.classList.toggle("is-set", pm !== null && pm !== undefined);
     if (!pm) {
-      line.append("Znacznik PM: brak.");
+      line.append(t("Znacznik PM: brak."));
       return;
     }
     const holder = participantNames.get(pm.session_id);
@@ -442,13 +448,16 @@
     more.className = "pm-mark-details";
     more.open = pmDetailsOpen;
     more.addEventListener("toggle", () => { pmDetailsOpen = more.open; });
-    const times = text("p", `${pm.session_id} · ustawiony ${displayTimestamp(pm.set_at)} · ` +
-      `ostatnia aktywność ${displayTimestamp(pm.last_activity_at)} · wygasa ${displayTimestamp(pm.expires_at)}.`,
-      "pm-mark-times");
+    const times = text("p", t("{session} · ustawiony {set} · ostatnia aktywność {activity} · wygasa {expires}.", {
+      session: pm.session_id, set: displayTimestamp(pm.set_at),
+      activity: displayTimestamp(pm.last_activity_at), expires: displayTimestamp(pm.expires_at),
+    }), "pm-mark-times");
     // The text shows local times; the tooltip keeps the exact server values.
-    times.title = `ustawiony: ${pm.set_at} · ostatnia aktywność: ${pm.last_activity_at} · wygasa: ${pm.expires_at}`;
-    more.append(text("summary", "Znacznik nie nadaje uprawnień."), times);
-    line.append("Znacznik PM: ", holder ? bdi(sessionName(holder)) : "sesja z innej strony listy", more);
+    times.title = t("ustawiony: {set} · ostatnia aktywność: {activity} · wygasa: {expires}", {
+      set: pm.set_at, activity: pm.last_activity_at, expires: pm.expires_at,
+    });
+    more.append(text("summary", t("Znacznik nie nadaje uprawnień.")), times);
+    line.append(t("Znacznik PM: "), holder ? bdi(sessionName(holder)) : t("sesja z innej strony listy"), more);
   }
 
   // A chip names only what needs attention: a confirmed "off" stays quiet, anything else (on, unknown) shows.
@@ -484,7 +493,7 @@
       if (row.hidden || headed.has(row.dataset.online)) continue;
       headed.add(row.dataset.online);
       row.dataset.group = row.dataset.online === "true" ? "Online" : "Offline";
-      row.dataset.count = `${sizes[row.dataset.online]}${rosterPartial ? " na stronie" : ""}`;
+      row.dataset.count = `${sizes[row.dataset.online]}${rosterPartial ? t(" na stronie") : ""}`;
     }
   }
 
@@ -500,8 +509,8 @@
     const onlineCount = rows.length - ordered.filter((p) => !p.online).length;
     // The counts describe the loaded page. While it is the whole room they stand bare; otherwise they say so, and the
     // tooltip explains it, because the server sends no room-wide total.
-    el("roster-count").textContent = `${partial ? "na stronie: " : ""}${onlineCount} online · ${rows.length}`;
-    if (partial) el("roster-count").title = "Liczby dotyczą załadowanej strony uczestników, nie całego pokoju.";
+    el("roster-count").textContent = `${partial ? t("na stronie: ") : ""}${onlineCount} online · ${rows.length}`;
+    if (partial) el("roster-count").title = t("Liczby dotyczą załadowanej strony uczestników, nie całego pokoju.");
     else el("roster-count").removeAttribute("title");
     el("participants").replaceChildren(...ordered.map((p) => {
       const label = sessionName(p);
@@ -534,7 +543,7 @@
       // Advisory only: the declaration is neither an entitlement nor evidence of what the session is doing.
       // The row shows a short chip; the full wording, with the disclaimer, is one disclosure away.
       const laneNote = p.lane
-        ? ` · zadeklarowany ${Math.floor((p.lane_age_seconds ?? 0) / 60)} min temu · deklaracja, nie uprawnienie`
+        ? ` · ${t("zadeklarowany {minutes} min temu · deklaracja, nie uprawnienie", { minutes: Math.floor((p.lane_age_seconds ?? 0) / 60) })}`
         : "";
       if (p.lane) {
         const chip = document.createElement("span");
@@ -546,21 +555,21 @@
       if (sub.childElementCount) item.append(sub);
       const actions = document.createElement("div");
       actions.className = "participant-actions";
-      actions.append(rosterButton("choose-target", "Wybierz", `Wybierz ${p.session_id}`, () => {
+      actions.append(rosterButton("choose-target", t("Wybierz"), t("Wybierz {id}", { id: p.session_id }), () => {
         if (access !== "operator" || writesBusy() || !composerReady) return;
         if (targets.size === 16 && !targets.has(p.session_id)) {
-          el("notice").textContent = "Można wybrać najwyżej 16 sesji.";
+          el("notice").textContent = t("Można wybrać najwyżej 16 sesji.");
           return;
         }
         targets.set(p.session_id, label);
         syncComposer();
       }));
       if (typeof p.muted === "boolean") {
-        const verb = p.muted ? "Cofnij wyciszenie" : "Wycisz";
+        const verb = p.muted ? t("Cofnij wyciszenie") : t("Wycisz");
         actions.append(rosterButton("mute-session", verb, `${verb} ${p.session_id}`,
           () => muteSession(p.session_id, !p.muted)));
       }
-      const mark = holder ? "Zdejmij PM" : "Ustaw PM";
+      const mark = holder ? t("Zdejmij PM") : t("Ustaw PM");
       actions.append(rosterButton("pm-session", mark, `${mark} ${p.session_id}`, () => setPm(p.session_id, !holder)));
       item.append(actions);
       // The exact selector stays on the row, one disclosure away, and is never replaced by the title.
@@ -574,7 +583,7 @@
       const selector = document.createElement("div");
       selector.className = "participant-label";
       selector.append(bdi(p.label));
-      details.append(text("summary", "Szczegóły"), text("div", p.session_id, "participant-id"), selector,
+      details.append(text("summary", t("Szczegóły")), text("div", p.session_id, "participant-id"), selector,
         text("div", `${p.online ? "online" : "offline"} · ${p.native_state} · ` +
           `mute: ${p.muted} · stop: ${p.stopped} · Plan Mode: ${p.plan_mode}`, "participant-flags"));
       if (p.lane) {
@@ -705,14 +714,14 @@
       // mean something else (question, status, ...) are marked.
       if (m.kind !== "message" && m.kind !== "reply") header.append(text("span", KIND_LABELS[m.kind] ?? m.kind, `kind-badge kind-${m.kind}`));
       if (m.thread_ref_key) header.append(text("bdi", m.thread_ref_key, "thread-key"));
-      if (m.thread_resolved_at) header.append(text("span", "rozwiązany", "resolved-badge"));
+      if (m.thread_resolved_at) header.append(text("span", t("rozwiązany"), "resolved-badge"));
       main.append(header);
-      if (m.reply_to) main.append(text("p", `Odpowiedź na ${String(m.reply_to).slice(0, 8)}…`, "reply-context"));
+      if (m.reply_to) main.append(text("p", t("Odpowiedź na {id}", { id: `${String(m.reply_to).slice(0, 8)}…` }), "reply-context"));
       main.append(text("p", m.body, "body"));
       if (receipts.length) {
         const summary = document.createElement("ul");
         summary.className = "receipt-summary";
-        summary.setAttribute("aria-label", "Potwierdzenia dostarczenia");
+        summary.setAttribute("aria-label", t("Potwierdzenia dostarczenia"));
         for (const receipt of receipts) summary.append(receiptSummary(receipt));
         main.append(summary);
       }
@@ -720,7 +729,7 @@
       actions.className = "message-actions";
       // The identifier belongs in the evidence disclosure, not in the label: a
       // full UUID as button text was the single loudest thing on the page.
-      const button = text("button", "Odpowiedz", "reply");
+      const button = text("button", t("Odpowiedz"), "reply");
       button.type = "button";
       button.dataset.messageAction = "reply";
       button.addEventListener("click", () => {
@@ -732,7 +741,7 @@
         el("body").focus();
       });
       actions.append(button);
-      const show = text("button", "Wątek", "show-thread");
+      const show = text("button", t("Wątek"), "show-thread");
       show.type = "button";
       show.dataset.messageAction = "thread";
       show.addEventListener("click", () => filterThread(m.thread_id));
@@ -740,26 +749,26 @@
       main.append(actions);
       const evidence = document.createElement("details");
       evidence.className = "message-evidence";
-      const evidenceSummary = text("summary", "Szczegóły techniczne");
+      const evidenceSummary = text("summary", t("Szczegóły techniczne"));
       evidenceSummary.dataset.messageAction = "evidence";
       evidence.append(evidenceSummary);
       const grid = document.createElement("dl");
       grid.className = "evidence-grid";
-      grid.append(...definition("ID wiadomości", m.id));
-      grid.append(...definition("Wątek", m.thread_id));
-      grid.append(...definition("Odpowiedź na", m.reply_to ?? "—"));
-      grid.append(...definition("Nadawca", m.sender.session_id ?? m.sender.principal_id));
+      grid.append(...definition(t("ID wiadomości"), m.id));
+      grid.append(...definition(t("Wątek"), m.thread_id));
+      grid.append(...definition(t("Odpowiedź na"), m.reply_to ?? "—"));
+      grid.append(...definition(t("Nadawca"), m.sender.session_id ?? m.sender.principal_id));
       if (m.sender.session_id && senderInfo(m).native_session_id)
-        grid.append(...definition("Sesja natywna", senderInfo(m).native_session_id));
-      grid.append(...definition("Czas", m.created_at));
+        grid.append(...definition(t("Sesja natywna"), senderInfo(m).native_session_id));
+      grid.append(...definition(t("Czas"), m.created_at));
       evidence.append(grid);
       if (receipts.length) {
         const full = document.createElement("ul");
         full.className = "evidence-receipts";
         for (const receipt of receipts) full.append(text("li",
-          `${receipt.session_id} · zapis: ${receipt.stored_at ?? "—"} · przekazanie: ${receipt.handed_at ?? "—"} · ` +
-          `ACK: ${receipt.acknowledged_at ?? "—"} · odpowiedź: ${receipt.replying_message_id ?? "—"} · ` +
-          `niepewność: ${receipt.uncertainty_reason ?? "—"} · próba: ${receipt.delivery?.outcome ?? "—"}`,
+          `${receipt.session_id} · ${t("zapis:")} ${receipt.stored_at ?? "—"} · ${t("przekazanie:")} ${receipt.handed_at ?? "—"} · ` +
+          `ACK: ${receipt.acknowledged_at ?? "—"} · ${t("odpowiedź:")} ${receipt.replying_message_id ?? "—"} · ` +
+          `${t("niepewność:")} ${receipt.uncertainty_reason ?? "—"} · ${t("próba:")} ${receipt.delivery?.outcome ?? "—"}`,
         ));
         evidence.append(full);
       }
@@ -781,8 +790,12 @@
   // One slot of a validation-lease observation, as text.
   function slotLine(slot, since) {
     const who = [slot.lane ?? slot.owner, slot.branch, slot.profile].filter(Boolean).join(", ");
-    const state = { free: "wolny", held: `zajęty (${who}) od ${since}`, stuck: "zablokowany (stuck)" }[slot.state];
-    return `Slot ${slot.slot ?? "?"}: ${state ?? "nieznany"}`;
+    const state = {
+      free: t("wolny"),
+      held: t("zajęty ({who}) od {since}", { who, since }),
+      stuck: t("zablokowany (stuck)"),
+    }[slot.state];
+    return `Slot ${slot.slot ?? "?"}: ${state ?? t("nieznany")}`;
   }
 
   function renderStateValue(entry) {
@@ -790,10 +803,10 @@
     const value = entry.value;
     if (entry.stale) {
       box.append(text("p", entry.stale_reason === "revoked"
-        ? "nieznany (producent odwołany)"
-        : `nieznany, ostatnio widziany ${entry.age_seconds} s temu`));
+        ? t("nieznany (producent odwołany)")
+        : t("nieznany, ostatnio widziany {seconds} s temu", { seconds: entry.age_seconds })));
     } else if (value.schema === "agent-chat.validation-lease.v1") {
-      if (value.scan === "unknown") box.append(text("p", `nieznany (${value.reason ?? "—"})`));
+      if (value.scan === "unknown") box.append(text("p", t("nieznany ({reason})", { reason: value.reason ?? "—" })));
       else {
         // Times are local and absolute; the exact ISO value stays in the tooltip.
         for (const slot of (Array.isArray(value.slots) ? value.slots : []).slice(0, 16)) {
@@ -803,7 +816,10 @@
         }
         for (const waiter of (Array.isArray(value.waiters) ? value.waiters : []).slice(0, 16)) {
           const w = waiter && typeof waiter === "object" ? waiter : {};
-          const line = text("p", `Oczekuje: ${[w.lane ?? w.owner, w.branch].filter(Boolean).join(", ")} od ${w.waiting_since ? displayTimestamp(w.waiting_since) : "—"}`);
+          const line = text("p", t("Oczekuje: {who} od {since}", {
+            who: [w.lane ?? w.owner, w.branch].filter(Boolean).join(", "),
+            since: w.waiting_since ? displayTimestamp(w.waiting_since) : "—",
+          }));
           if (w.waiting_since) line.title = `od: ${w.waiting_since}`;
           box.append(line);
         }
@@ -824,14 +840,14 @@
       groups.get(key).push(entry);
     }
     if (!data.entries.length) {
-      el("state-groups").replaceChildren(text("p", "Brak obserwacji stanu.", "meta"));
+      el("state-groups").replaceChildren(text("p", t("Brak obserwacji stanu."), "meta"));
       return;
     }
     el("state-groups").replaceChildren(...Array.from(groups, ([key, entries]) => {
       const group = document.createElement("div");
-      group.append(key ? bdi(key) : text("span", "Bez klucza wątku"));
+      group.append(key ? bdi(key) : text("span", t("Bez klucza wątku")));
       if (key) {
-        const show = text("button", "Pokaż wątek", "show-thread");
+        const show = text("button", t("Pokaż wątek"), "show-thread");
         show.type = "button";
         show.setAttribute("aria-label", `Pokaż wątek ${key}`);
         show.addEventListener("click", () => filterThread(key));
@@ -842,15 +858,19 @@
         const item = document.createElement("li");
         // Local, absolute times: a snapshot ages, so "3 min ago" would be wrong. The exact ISO values sit in the tooltip.
         const meta = text("p", `${entry.state_key} · ${entry.producer.producer}@${entry.producer.host} · ` +
-          `zmiana: ${displayTimestamp(entry.changed_at)} · obserwacja: ${displayTimestamp(entry.observed_at)}`, "meta");
-        meta.title = `zmiana: ${entry.changed_at} · obserwacja: ${entry.observed_at}`;
+          t("zmiana: {changed} · obserwacja: {observed}", {
+            changed: displayTimestamp(entry.changed_at), observed: displayTimestamp(entry.observed_at),
+          }), "meta");
+        meta.title = t("zmiana: {changed} · obserwacja: {observed}", {
+          changed: entry.changed_at, observed: entry.observed_at,
+        });
         item.append(meta, renderStateValue(entry));
         list.append(item);
       }
       group.append(list);
       return group;
     }));
-    if (data.next_key) el("state-groups").append(text("p", "Wyświetlono pierwsze wpisy; reszta wymaga agent-chat state.", "meta"));
+    if (data.next_key) el("state-groups").append(text("p", t("Wyświetlono pierwsze wpisy; reszta wymaga agent-chat state."), "meta"));
     // Staleness comes from the server's flags; this timer only asks it again just after the soonest fresh entry lapses.
     const lives = data.entries.filter((entry) => !entry.stale).map((entry) => entry.expires_in_seconds);
     if (lives.length) {
@@ -865,7 +885,7 @@
         } catch (error) {
           if (epoch !== stateEpoch) return;
           if (error.status === 401 || error.status === 403) failed(error, generation);
-          else el("state-groups").replaceChildren(text("p", "Stan zasobów niedostępny.", "meta"));
+          else el("state-groups").replaceChildren(text("p", t("Stan zasobów niedostępny."), "meta"));
         }
       }, Math.min(...lives) * 1000 + 1500);
     }
@@ -879,7 +899,7 @@
     } catch (error) {
       // The card is advisory: only a lost session ends the view; any other failure leaves the rest readable.
       if (error.status === 401 || error.status === 403) throw error;
-      if (current === generation) el("state-groups").replaceChildren(text("p", "Stan zasobów niedostępny.", "meta"));
+      if (current === generation) el("state-groups").replaceChildren(text("p", t("Stan zasobów niedostępny."), "meta"));
     }
   }
 
@@ -920,19 +940,24 @@
     if (header.hidden) return;
     const first = messages[0];
     if (!first) {
-      header.append("Brak wiadomości w tym wątku.");
+      header.append(t("Brak wiadomości w tym wątku."));
       return;
     }
     const resolved = Boolean(first.thread_resolved_at);
-    header.append("Klucz: ", first.thread_ref_key ? bdi(first.thread_ref_key) : "brak",
-      ` · stan: ${resolved ? `rozwiązany ${first.thread_resolved_at}` : "otwarty"} `);
-    const button = text("button", resolved ? "Otwórz ponownie" : "Oznacz jako rozwiązany", "resolve-thread");
+    const threadState = resolved
+      ? t("rozwiązany {time}", { time: first.thread_resolved_at })
+      : t("otwarty");
+    header.append(`${t("Klucz:")} `, first.thread_ref_key ? bdi(first.thread_ref_key) : t("brak"),
+      ` · ${t("stan:")} ${threadState} `);
+    const button = text("button", resolved ? t("Otwórz ponownie") : t("Oznacz jako rozwiązany"), "resolve-thread");
     button.type = "button";
     button.disabled = access !== "operator" || busy() || !composerReady;
     button.hidden = access !== "operator";
     button.addEventListener("click", () => control(`/v1/threads/${first.thread_id}/resolution`, { resolved: !resolved }, {
       matches: (data) => data.thread_id === first.thread_id && data.resolved === !resolved,
-      success: () => `Potwierdzono zapis: wątek ${resolved ? "otwarty ponownie" : "oznaczony jako rozwiązany"}. Rozwiązanie nie blokuje pisania.`,
+      success: () => t("Potwierdzono zapis: wątek {state}. Rozwiązanie nie blokuje pisania.", {
+        state: resolved ? t("otwarty ponownie") : t("oznaczony jako rozwiązany"),
+      }),
       label: "rozwiązania wątku",
     }));
     header.append(button);
@@ -942,23 +967,25 @@
     if (busy() || !composerReady) return;
     const isRef = thread !== null && !uuid(thread) && REF_KEY.test(thread);
     if (thread !== null && !uuid(thread) && !isRef) {
-      el("notice").textContent = "Podaj poprawny UUID wątku, klucz wątku albo pozostaw puste pole.";
+      el("notice").textContent = t("Podaj poprawny UUID wątku, klucz wątku albo pozostaw puste pole.");
       return;
     }
     const current = invalidate();
     selectedThread = isRef ? null : thread;
     selectedRef = isRef ? thread : null;
     el("thread").value = thread ?? "";
-    el("thread-scope").textContent = thread ? `Wątek: ${thread}` : "Cała historia pokoju";
+    el("thread-scope").textContent = thread
+      ? t("Wątek: {thread}", { thread })
+      : t("Cała historia pokoju");
     el("thread-header").hidden = true;
     el("messages").replaceChildren();
     historyCursor = historyPageStart = null;
     el("more-messages").hidden = true;
     el("latest").hidden = true;
-    el("notice").textContent = "Odczyt historii…";
+    el("notice").textContent = t("Odczyt historii…");
     await read(async () => {
       await history(current);
-      if (current === generation) el("notice").textContent = "Migawka historii. Filtr nie zmienia szkicu ani odbiorców.";
+      if (current === generation) el("notice").textContent = t("Migawka historii. Filtr nie zmienia szkicu ani odbiorców.");
     }, current);
   }
 
@@ -966,12 +993,12 @@
     if (busy() || !composerReady || historyPageStart === null) return;
     const current = invalidate();
     el("latest").disabled = true;
-    el("notice").textContent = "Powrót do najnowszych…";
+    el("notice").textContent = t("Powrót do najnowszych…");
     await read(async () => {
       await history(current);
       if (current === generation) {
         scrollMessagesToBottom();
-        el("notice").textContent = "Migawka historii. Filtr nie zmienia szkicu ani odbiorców.";
+        el("notice").textContent = t("Migawka historii. Filtr nie zmienia szkicu ani odbiorców.");
       }
     }, current);
     syncComposer();
@@ -986,7 +1013,7 @@
     controlRequest = attempt;
     syncComposer();
     let confirmed = false;
-    el("notice").textContent = "Zapisywanie zmiany…";
+    el("notice").textContent = t("Zapisywanie zmiany…");
     try {
       const data = await request(path, { method: "POST", body: payload, csrfToken: attempt.csrfToken });
       if (stale(controlRequest, attempt, current)) return;
@@ -1002,11 +1029,13 @@
     } catch (error) {
       if (stale(controlRequest, attempt, current)) return;
       controlRequest = null;
-      const result = confirmed ? `Zapis ${label} potwierdzony, ale odczyt stanu niedostępny.` : `Zmiana ${label} niepotwierdzona.`;
+      const result = confirmed
+        ? t("Zapis {label} potwierdzony, ale odczyt stanu niedostępny.", { label: t(label) })
+        : t("Zmiana {label} niepotwierdzona.", { label: t(label) });
       const detail = !confirmed && error.status !== 401 && error.status !== 403 ? refusal(error) : "";
       if (error.status === 401 || error.status === 403) {
         failed(error, current);
-        el("notice").textContent = `${result} Dostęp wygasł lub został cofnięty. Zaloguj się ponownie.`;
+        el("notice").textContent = `${result} ${t("Dostęp wygasł lub został cofnięty. Zaloguj się ponownie.")}`;
       } else if (detail && PRESERVE_ON_REFUSAL.has(error.code)) {
         // These refusals cannot mask a revoked room or session scope.
         el("notice").textContent = `${result} ${detail}`;
@@ -1014,8 +1043,8 @@
         invalidate();
         clearRoom();
         el("notice").textContent = detail
-          ? `${result} ${detail} Odśwież stan przed następną decyzją.`
-          : `${result} Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.`;
+          ? `${result} ${detail} ${t("Odśwież stan przed następną decyzją.")}`
+          : `${result} ${t("Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.")}`;
       }
     } finally {
       if (controlRequest === attempt) controlRequest = null;
@@ -1028,7 +1057,7 @@
     if (access !== "operator" || !composerReady || !uuid(session) || typeof muted !== "boolean") return;
     return control(`/v1/sessions/${session}/mute`, { muted }, {
       matches: (data) => data.session_id === session && data.muted === muted,
-      success: () => `Potwierdzono zapis mute=${muted} dla ${session}. Lista pokazuje późniejszy odczyt; stop i Plan Mode pozostają niezależne.`,
+      success: () => t("Potwierdzono zapis mute={muted} dla {session}. Lista pokazuje późniejszy odczyt; stop i Plan Mode pozostają niezależne.", { muted, session }),
       label: "mute",
     });
   }
@@ -1040,8 +1069,8 @@
     return control(`${roomPath(targetRoom)}/pm`, { session_id: session, pm }, {
       matches: (data) => data.room_id === targetRoom && (pm ? data.pm?.session_id === session : data.pm === null),
       success: () => pm
-        ? `Potwierdzono zapis: znacznik PM ma ${session}. Znacznik nie nadaje uprawnień.`
-        : `Potwierdzono zapis: znacznik PM zdjęty z ${session}.`,
+        ? t("Potwierdzono zapis: znacznik PM ma {session}. Znacznik nie nadaje uprawnień.", { session })
+        : t("Potwierdzono zapis: znacznik PM zdjęty z {session}.", { session }),
       label: "znacznika PM",
     });
   }
@@ -1162,7 +1191,7 @@
         failed(error, generation);
         return;
       }
-      el("notice").textContent = "Nie udało się pobrać kolejnej strony sesji. Spróbuj ponownie.";
+      el("notice").textContent = t("Nie udało się pobrać kolejnej strony sesji. Spróbuj ponownie.");
     } finally {
       sessionsLoadingMore = false;
       if (sessionsPage) renderSessions();
@@ -1177,8 +1206,8 @@
       matches: (data) => data.room_id === targetRoom
         && (assigned ? data.roles?.[role]?.session_id === session : data.roles?.[role] === null),
       success: () => assigned
-        ? `Potwierdzono: ${label} ma ${session}. Znacznik nie nadaje uprawnień.`
-        : `Potwierdzono: znacznik ${label} zdjęty z ${session}.`,
+        ? t("Potwierdzono: {label} ma {session}. Znacznik nie nadaje uprawnień.", { label, session })
+        : t("Potwierdzono: znacznik {label} zdjęty z {session}.", { label, session }),
       label: `znacznika ${label}`,
     });
     if (result && view === "sessions") requestSessions();
@@ -1232,7 +1261,7 @@
     if (access !== "operator") return cell;
     const details = document.createElement("details");
     details.className = "role-controls";
-    details.append(text("summary", "Zmień rolę"));
+    details.append(text("summary", t("Zmień rolę")));
     for (const role of ROLE_ORDER) {
       const held = roles?.[role]?.session_id === person.session_id;
       const row = document.createElement("div");
@@ -1243,8 +1272,8 @@
       button.className = "role-session";
       button.dataset.role = role;
       button.disabled = busy() || !composerReady;
-      button.textContent = held ? "Zdejmij" : "Nadaj";
-      button.setAttribute("aria-label", `${held ? "Zdejmij" : "Nadaj"} ${ROLE_LABELS[role]}`);
+      button.textContent = held ? t("Zdejmij") : t("Nadaj");
+      button.setAttribute("aria-label", `${held ? t("Zdejmij") : t("Nadaj")} ${ROLE_LABELS[role]}`);
       button.addEventListener("click", () => setRole(person.session_id, role, !held));
       row.append(button);
       details.append(row);
@@ -1258,13 +1287,13 @@
     // Liveness and the observed native state are separate facts. A live lease
     // with `unknown` must not be rendered as a positive idle claim.
     const state = !person.online
-      ? "offline"
-      : { busy: "online, pracuje", idle: "online, bezczynna" }[person.native_state] ?? "online, stan nieznany";
+      ? t("offline")
+      : { busy: t("online, pracuje"), idle: t("online, bezczynna") }[person.native_state] ?? t("online, stan nieznany");
     cell.append(text("span", state, "state-line"));
     const flags = [];
     if (person.stopped) flags.push("stop");
     if (person.plan_mode) flags.push("Plan Mode");
-    if (person.muted) flags.push("wyciszona");
+    if (person.muted) flags.push(t("wyciszona"));
     if (flags.length) cell.append(text("span", flags.join(" · "), "state-line"));
     return cell;
   }
@@ -1277,7 +1306,7 @@
     }
     cell.append(bdi(person.lane));
     const age = formatAge(person.lane_age_seconds);
-    if (age) cell.append(text("span", `od ${age}`, "session-meta"));
+    if (age) cell.append(text("span", t("od {age}", { age }), "session-meta"));
     return cell;
   }
 
@@ -1285,7 +1314,7 @@
     const cell = document.createElement("td");
     cell.append(text("span", person.last_published_at ? displayTimestamp(person.last_published_at) : "—", "state-line"));
     const count = Number(person.messages_24h) || 0;
-    cell.append(text("span", `${count} w 24 h`, "session-meta"));
+    cell.append(text("span", t("{count} w 24 h", { count }), "session-meta"));
     return cell;
   }
 
@@ -1351,16 +1380,16 @@
       row.className = "empty-row";
       const cell = document.createElement("td");
       cell.colSpan = 9;
-      cell.textContent = "Brak sesji w tym pokoju.";
+      cell.textContent = t("Brak sesji w tym pokoju.");
       row.append(cell);
       body.append(row);
     }
-    el("sessions-count").textContent = `${shown} z ${rows.length}`;
+    el("sessions-count").textContent = t("{shown} z {total}", { shown, total: rows.length });
     const note = el("sessions-note");
     const next = Boolean(sessionsPage.next_session_id);
     note.hidden = !next;
     note.textContent = next
-      ? `Wczytano ${rows.length} sesji. Filtr obejmuje wczytane wiersze; pobierz kolejną stronę, aby szukać dalej.`
+      ? t("Wczytano {count} sesji. Filtr obejmuje wczytane wiersze; pobierz kolejną stronę, aby szukać dalej.", { count: rows.length })
       : "";
     const more = el("more-sessions");
     more.hidden = !next;
@@ -1373,12 +1402,12 @@
     const slug = el("room-slug").value;
     const label = el("room-label").value;
     if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(slug) || !label || [...label].length > 128 || /[\x00-\x1f\x7f]/.test(label)) {
-      el("notice").textContent = "Niepoprawny identyfikator lub nazwa pokoju.";
+      el("notice").textContent = t("Niepoprawny identyfikator lub nazwa pokoju.");
       return;
     }
     const result = await control("/v1/rooms", { slug, label }, {
       matches: (data) => uuid(data.id) && data.slug === slug && data.label === label,
-      success: (data) => `Pokój zapisany: ${data.id}. Wybierz go na liście pokoi.`,
+      success: (data) => t("Pokój zapisany: {id}. Wybierz go na liście pokoi.", { id: data.id }),
       label: "pokoju",
       updateRooms: true,
     });
@@ -1390,10 +1419,10 @@
     if (access !== "operator" || busy() || !composerReady) return;
     const session = el("member-session").value.trim().toLowerCase();
     const targetRoom = selectedRoom;
-    if (!uuid(session)) { el("notice").textContent = "Podaj dokładny UUID sesji."; return; }
+    if (!uuid(session)) { el("notice").textContent = t("Podaj dokładny UUID sesji."); return; }
     const result = await control(`${roomPath(targetRoom)}/memberships`, { session_id: session }, {
       matches: (data) => data.room_id === targetRoom && data.session_id === session,
-      success: () => `Członkostwo zapisane: ${session}. Uprawnienia poświadczenia nie zostały rozszerzone.`,
+      success: () => t("Członkostwo zapisane: {session}. Uprawnienia poświadczenia nie zostały rozszerzone.", { session }),
       label: "członkostwa",
     });
     if (result) el("member-session").value = "";
@@ -1412,7 +1441,7 @@
       syncComposer();
       return;
     }
-    el("notice").textContent = saved ? `${saved} Odczyt pokoju…` : "Odczyt pokoju…";
+    el("notice").textContent = saved ? `${saved} Odczyt pokoju…` : t("Odczyt pokoju…");
     await read(async () => {
       await Promise.all([participants(current), history(current), roomState(current)]);
       if (current === generation) {
@@ -1421,7 +1450,7 @@
         syncComposer();
         // The composer changes the list height; keep the newest page at its true bottom.
         if (historyPageStart === null) scrollMessagesToBottom();
-        el("notice").textContent = saved || "Migawka historii. Odczyt nie potwierdza przetworzenia wiadomości.";
+        el("notice").textContent = saved || t("Migawka historii. Odczyt nie potwierdza przetworzenia wiadomości.");
         if (view === "sessions") requestSessions();
         resumeLive();
       }
@@ -1431,7 +1460,7 @@
   async function roomOptions(current) {
     const data = await request("/v1/rooms");
     if (current !== generation) return;
-    const empty = text("option", "Wybierz pokój");
+    const empty = text("option", t("Wybierz pokój"));
     empty.value = "";
     el("room").replaceChildren(empty, ...data.rooms.map((r) => {
       const option = text("option", r.label && r.label !== r.slug ? `${r.label} — ${r.slug}` : r.slug);
@@ -1445,7 +1474,7 @@
       // Never move the operator, or a draft written for that room, into another room unasked.
       selectedRoom = "";
       clearRoom();
-      el("notice").textContent = "Wybrany pokój nie jest już dostępny. Wybierz pokój z listy." +
+      el("notice").textContent = t("Wybrany pokój nie jest już dostępny. Wybierz pokój z listy.") +
         (composerDraft() ? " Szkic został zachowany." : "");
     }
     el("room").value = selectedRoom;
@@ -1463,7 +1492,7 @@
       controlsReady = true;
       syncComposer();
       el("notice").textContent = access === "operator"
-        ? "Brak dostępnych pokoi. Możesz utworzyć pokój." : "Brak dostępnych pokoi.";
+        ? t("Brak dostępnych pokoi. Możesz utworzyć pokój.") : t("Brak dostępnych pokoi.");
       return;
     }
     if (selectedRoom) {
@@ -1478,10 +1507,10 @@
     controlsReady = true;
     syncComposer();
     if (!hadSelection)
-      el("notice").textContent = "Wybierz pokój, aby otworzyć rozmowę. Szkic pozostaje w pamięci tej strony.";
+      el("notice").textContent = t("Wybierz pokój, aby otworzyć rozmowę. Szkic pozostaje w pamięci tej strony.");
   }
 
-  function stopLive(message = "Zdarzenia na żywo wyłączone.") {
+  function stopLive(message = t("Zdarzenia na żywo wyłączone.")) {
     const owner = live;
     live = null;
     if (owner) {
@@ -1490,7 +1519,7 @@
       owner.controller.abort();
       if (owner.loading) invalidate();
     }
-    el("live-toggle").textContent = "Włącz zdarzenia na żywo";
+    el("live-toggle").textContent = t("Włącz zdarzenia na żywo");
     el("live-status").textContent = message;
     el("live-count").textContent = "";
     el("live-indicator").dataset.live = "off";
@@ -1512,9 +1541,9 @@
     scopeEpoch += 1;
     clearSnapshot();
     if (pending) el("viewer").hidden = true;
-    if (controlRequest) el("notice").textContent = "Zmiana administracyjna niepotwierdzona; wymagany świeży odczyt.";
+    if (controlRequest) el("notice").textContent = t("Zmiana administracyjna niepotwierdzona; wymagany świeży odczyt.");
     el("live-indicator").dataset.live = "off";
-    el("live-status").textContent = resync ? "Wymagana resynchronizacja historii i zakresu." : "Połączenie przerwane; ponowny odczyt przed połączeniem.";
+    el("live-status").textContent = resync ? t("Wymagana resynchronizacja historii i zakresu.") : t("Połączenie przerwane; ponowny odczyt przed połączeniem.");
     scheduleLive(owner, 1000);
   }
 
@@ -1526,7 +1555,7 @@
     owner.source = null;
     owner.dirty = true;
     el("live-indicator").dataset.live = "off";
-    el("live-status").textContent = "Strumień zakończony; ponowne łączenie od zapamiętanego kursora.";
+    el("live-status").textContent = t("Strumień zakończony; ponowne łączenie od zapamiętanego kursora.");
     scheduleLive(owner, 1000);
   }
 
@@ -1538,7 +1567,7 @@
       if (live === owner && owner.source === source) {
         owner.opened = true;
         el("live-indicator").dataset.live = "on";
-        el("live-status").textContent = "Połączenie zdarzeń aktywne; odczyty nie wysyłają ACK.";
+        el("live-status").textContent = t("Połączenie zdarzeń aktywne; odczyty nie wysyłają ACK.");
       }
     };
     source.onerror = () => {
@@ -1563,11 +1592,13 @@
         if (BigInt(event.lastEventId) <= BigInt(owner.seen.get(data.room_id) ?? "0")) return;
         owner.seen.set(data.room_id, event.lastEventId);
         owner.received += 1;
-        el("live-count").textContent = `Odebrane zdarzenia: ${owner.received} · kursor: ${owner.cursor}`;
+        el("live-count").textContent = t("Odebrane zdarzenia: {received} · kursor: {cursor}", {
+          received: owner.received, cursor: owner.cursor,
+        });
         if (data.room_id === selectedRoom) { owner.dirty = true; scheduleLive(owner); }
       } catch {
         disconnectLive(owner);
-        stopLive("Niepoprawna ramka zdarzeń. Odśwież widok ręcznie.");
+        stopLive(t("Niepoprawna ramka zdarzeń. Odśwież widok ręcznie."));
         syncComposer();
       }
     });
@@ -1590,7 +1621,7 @@
       const scope = available.map((r) => r.id).sort().join(",");
       if (scope !== owner.rooms) { owner.rooms = scope; owner.resync = true; }
       if (!selectedRoom) {
-        stopLive(available.length ? "Nie wybrano pokoju; zdarzenia wyłączone." : "Brak dostępnych pokoi; zdarzenia wyłączone.");
+        stopLive(available.length ? t("Nie wybrano pokoju; zdarzenia wyłączone.") : t("Brak dostępnych pokoi; zdarzenia wyłączone."));
         controlsReady = true;
         return;
       }
@@ -1603,7 +1634,7 @@
         owner.source = null;
         owner.cursor = historyFloor;
         owner.resync = false;
-        el("live-status").textContent = "Odtworzono zachowaną historię; wznawianie zdarzeń.";
+        el("live-status").textContent = t("Odtworzono zachowaną historię; wznawianie zdarzeń.");
       }
       // Detect HTTP cursor refusals before EventSource, whose error hides the status.
       if (!owner.source) await request(`${roomPath()}/history?after=${owner.cursor}&limit=1`);
@@ -1617,10 +1648,10 @@
       if (error.status === 401 || error.status === 403) {
         stopLive();
         lock();
-        el("notice").textContent = "Sesja lub zakres zmieniły się. Zaloguj się ponownie; nie przyjmujemy innego powiązania automatycznie.";
+        el("notice").textContent = t("Sesja lub zakres zmieniły się. Zaloguj się ponownie; nie przyjmujemy innego powiązania automatycznie.");
       } else if (error.status === 422) {
         disconnectLive(owner);
-        stopLive("Niepoprawny kursor. Odśwież widok ręcznie.");
+        stopLive(t("Niepoprawny kursor. Odśwież widok ręcznie."));
       } else {
         if (error.status === 410) owner.resync = true;
         disconnectLive(owner, owner.resync);
@@ -1644,8 +1675,8 @@
       source: null, opened: false, timer: null, controller: new AbortController(), seen: new Map(),
       loading: false, dirty: true, resync: false, backoff: 1000,
     };
-    el("live-toggle").textContent = "Wyłącz zdarzenia na żywo";
-    el("live-status").textContent = "Sprawdzanie powiązania i zakresu…";
+    el("live-toggle").textContent = t("Wyłącz zdarzenia na żywo");
+    el("live-status").textContent = t("Sprawdzanie powiązania i zakresu…");
     scheduleLive(live, 0);
     return true;
   }
@@ -1682,7 +1713,7 @@
       acceptSession(data);
       showSession();
       await rooms(current, { initial: !preserve, keepDraft: preserve });
-    }, current, { denied: "Brak aktywnej sesji. Zaloguj się tokenem operatora lub podglądu." });
+    }, current, { denied: t("Brak aktywnej sesji. Zaloguj się tokenem operatora lub podglądu.") });
     if (reported) {
       el("login").hidden = csrf !== null;
       el("login-view").hidden = csrf !== null;
@@ -1696,7 +1727,7 @@
     const current = invalidate();
     el("login").hidden = true;
     el("login-view").hidden = true;
-    el("notice").textContent = "Logowanie…";
+    el("notice").textContent = t("Logowanie…");
     const reported = await read(async () => {
       const challenge = await request("/v1/login");
       if (current !== generation) return;
@@ -1713,7 +1744,7 @@
       acceptSession(session);
       showSession();
       await rooms(current, { initial: true });
-    }, current, { denied: "Logowanie odrzucone. Sprawdź token i spróbuj ponownie." });
+    }, current, { denied: t("Logowanie odrzucone. Sprawdź token i spróbuj ponownie.") });
     if (reported) {
       el("login").hidden = csrf !== null;
       el("login-view").hidden = csrf !== null;
@@ -1726,21 +1757,21 @@
     lock(); // Hide private data immediately, even if the network is unavailable.
     const current = generation;
     el("login").hidden = true;
-    el("notice").textContent = "Wylogowywanie…";
+    el("notice").textContent = t("Wylogowywanie…");
     try {
       await request("/v1/logout", { method: "POST", body: {}, csrfToken: oldCsrf });
       if (current !== generation) return;
-      el("notice").textContent = "Wylogowano.";
+      el("notice").textContent = t("Wylogowano.");
       el("login").hidden = false;
     } catch (error) {
       if (current !== generation) return;
       if (error.status === 401) {
-        el("notice").textContent = "Sesja nie jest już aktywna.";
+        el("notice").textContent = t("Sesja nie jest już aktywna.");
         el("login").hidden = false;
       } else {
         csrf = oldCsrf;
         el("logout").hidden = false;
-        el("notice").textContent = "Wylogowanie niepotwierdzone. Ponów wylogowanie; nie zamykaj tego okna jako potwierdzenia.";
+        el("notice").textContent = t("Wylogowanie niepotwierdzone. Ponów wylogowanie; nie zamykaj tego okna jako potwierdzenia.");
       }
     }
   });
@@ -1788,7 +1819,7 @@
     const attempt = pending;
     sending = true;
     syncComposer();
-    el("write-status").textContent = "Wysyłanie…";
+    el("write-status").textContent = t("Wysyłanie…");
     try {
       const data = await request(attempt.path, attempt.options);
       if (pending !== attempt) return;
@@ -1803,19 +1834,19 @@
       pending = null;
       clearDraft();
       // The message is committed: report it before the read-back, which can only add to that report.
-      const saved = `Zapisano ${data.id}. To nie jest potwierdzenie wybudzenia ani ACK.`;
+      const saved = t("Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.", { id: data.id });
       el("notice").textContent = saved;
       await room(saved);
       scrollMessagesToBottom();
     } catch (error) {
       if (pending !== attempt) return;
       // Even a refusal on a retry cannot disprove an earlier committed attempt.
-      el("write-status").textContent = "Zapis niepotwierdzony. Ponów tę samą próbę lub sprawdź historię w osobnym oknie.";
+      el("write-status").textContent = t("Zapis niepotwierdzony. Ponów tę samą próbę lub sprawdź historię w osobnym oknie.");
       if (error.status === 401 || error.status === 403) {
         clearRoom();
         el("viewer").hidden = true;
         el("body").value = "";
-        el("write-status").textContent += " Brak dostępu; nie zmieniamy tożsamości ani klucza próby.";
+        el("write-status").textContent += " " + t("Brak dostępu; nie zmieniamy tożsamości ani klucza próby.");
       }
     } finally {
       sending = false;
@@ -1830,17 +1861,17 @@
     const body = el("body").value;
     const kind = replyTarget ? "reply" : el("kind").value;
     if (!body || body.includes("\u0000") || new TextEncoder().encode(body).length > 16384) {
-      el("notice").textContent = "Treść musi zawierać od 1 do 16384 bajtów UTF-8, bez NUL.";
+      el("notice").textContent = t("Treść musi zawierać od 1 do 16384 bajtów UTF-8, bez NUL.");
       return;
     }
     // Empty replies otherwise implicitly address the parent sender on the server.
     if ((["question", "consultation"].includes(kind) || replyTarget?.senderSession) && !targets.size) {
-      el("notice").textContent = "Wybierz konkretnego odbiorcę.";
+      el("notice").textContent = t("Wybierz konkretnego odbiorcę.");
       return;
     }
     const refKey = el("ref-key").value.trim();
     if (refKey && (replyTarget || ["question", "consultation"].includes(kind) || !REF_KEY.test(refKey))) {
-      el("notice").textContent = "Niepoprawny klucz wątku albo rodzaj wiadomości, który go nie przyjmuje.";
+      el("notice").textContent = t("Niepoprawny klucz wątku albo rodzaj wiadomości, który go nie przyjmuje.");
       return;
     }
     const key = crypto.randomUUID();
@@ -1852,7 +1883,7 @@
           ...(refKey ? { ref_key: refKey } : {}) }),
       }),
     });
-    el("write-key").textContent = `Klucz: ${key} · pokój: ${selectedRoom}`;
+    el("write-key").textContent = t("Klucz: {key} · pokój: {room}", { key, room: selectedRoom });
     sendPending();
   });
   el("kind").addEventListener("change", () => {
@@ -1860,7 +1891,7 @@
     // leaving a disabled but submitted value that the server would refuse.
     if (QUESTION_KINDS.has(el("kind").value) && el("ref-key").value) {
       el("ref-key").value = "";
-      el("notice").textContent = "Usunięto klucz wątku: pytanie i konsultacja nie przyjmują klucza wątku.";
+      el("notice").textContent = t("Usunięto klucz wątku: pytanie i konsultacja nie przyjmują klucza wątku.");
     }
     syncComposer();
   });
@@ -1873,8 +1904,15 @@
   el("clear-draft").addEventListener("click", () => { if (!writesBusy() && mayDiscard()) clearDraft(); });
   el("clear-targets").addEventListener("click", () => { if (!writesBusy()) { targets.clear(); syncComposer(); } });
   el("roster-filter").addEventListener("input", applyRosterFilter);
+  let languageUnload = false;
+  window.agentChatMayDiscardForLanguage = () => {
+    if (!writesBusy() && !hasDraft()) return true;
+    if (!mayDiscard()) return false;
+    languageUnload = true;
+    return true;
+  };
   window.addEventListener("beforeunload", (event) => {
-    if (writesBusy() || hasDraft()) { event.preventDefault(); event.returnValue = ""; }
+    if (!languageUnload && (writesBusy() || hasDraft())) { event.preventDefault(); event.returnValue = ""; }
   });
   window.addEventListener("pagehide", lock);
   // pagehide has already locked the page, so a bfcache restore reloads like a first load: it selects a room

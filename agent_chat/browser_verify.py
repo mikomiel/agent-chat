@@ -244,7 +244,10 @@ def evidence(request: Request | None = None, binding: Binding | None = None) -> 
         "receipt_session": request.receipt_session if request else None,
         "viewports": [{"width": width, "height": height} for width, height in VIEWPORTS],
         "source_ref": "unknown",
-        "served_hashes": {name: "unknown" for name in ("index.html", "chat.js", "chat.css", "Manrope-Variable.ttf")},
+        "served_hashes": {
+            name: "unknown"
+            for name in ("index.html", "chat.js", "i18n.js", "chat.css", "Manrope-Variable.ttf")
+        },
         "assertions": [], "artifacts": [], "retention": "NOT_RUN", "retention_seconds": None, "expiry": "NOT_RUN",
         "cleanup": {key: "NOT_RUN" for key in ("logout", "context", "browser", "children", "temporary")}
                    | ({"artifacts": "NOT_RUN"} if request is not None and request.screenshot else {}),

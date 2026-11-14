@@ -6,6 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>Agent Chat</title>
   <link rel="stylesheet" href="/ui/chat.css">
+  <script src="/ui/i18n.js" defer></script>
   <script src="/ui/chat.js" defer></script>
 </head>
 <body>
@@ -34,6 +35,10 @@
       <button id="refresh" type="button" class="secondary compact">Odśwież</button>
     </div>
     <div class="app-bar-actions">
+      <select id="language" aria-label="Język / Language">
+        <option value="pl">Polski</option>
+        <option value="en">English</option>
+      </select>
       <p id="read-only-indicator" role="status" hidden>Podgląd · tylko odczyt</p>
       <div id="live-indicator" class="live-indicator" data-live="off">
         <span class="live-dot" aria-hidden="true"></span>
