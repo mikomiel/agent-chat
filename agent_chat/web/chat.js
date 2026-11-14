@@ -540,7 +540,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       // Advisory only: the declaration is neither an entitlement nor evidence of what the session is doing.
       // The row shows a short chip; the full wording, with the disclaimer, is one disclosure away.
       const laneNote = p.lane
-        ? ` · zadeklarowany ${Math.floor((p.lane_age_seconds ?? 0) / 60)} min temu · deklaracja, nie uprawnienie`
+        ? ` · ${t("zadeklarowany {minutes} min temu · deklaracja, nie uprawnienie", { minutes: Math.floor((p.lane_age_seconds ?? 0) / 60) })}`
         : "";
       if (p.lane) {
         const chip = document.createElement("span");
@@ -552,7 +552,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       if (sub.childElementCount) item.append(sub);
       const actions = document.createElement("div");
       actions.className = "participant-actions";
-      actions.append(rosterButton("choose-target", t("Wybierz"), `Wybierz ${p.session_id}`, () => {
+      actions.append(rosterButton("choose-target", t("Wybierz"), t("Wybierz {id}", { id: p.session_id }), () => {
         if (access !== "operator" || writesBusy() || !composerReady) return;
         if (targets.size === 16 && !targets.has(p.session_id)) {
           el("notice").textContent = t("Można wybrać najwyżej 16 sesji.");
@@ -1045,7 +1045,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     if (access !== "operator" || !composerReady || !uuid(session) || typeof muted !== "boolean") return;
     return control(`/v1/sessions/${session}/mute`, { muted }, {
       matches: (data) => data.session_id === session && data.muted === muted,
-      success: () => `Potwierdzono zapis mute=${muted} dla ${session}. Lista pokazuje późniejszy odczyt; stop i Plan Mode pozostają niezależne.`,
+      success: () => t("Potwierdzono zapis mute={muted} dla {session}. Lista pokazuje późniejszy odczyt; stop i Plan Mode pozostają niezależne.", { muted, session }),
       label: "mute",
     });
   }
@@ -1275,13 +1275,13 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     // Liveness and the observed native state are separate facts. A live lease
     // with `unknown` must not be rendered as a positive idle claim.
     const state = !person.online
-      ? "offline"
-      : { busy: "online, pracuje", idle: "online, bezczynna" }[person.native_state] ?? "online, stan nieznany";
+      ? t("offline")
+      : { busy: t("online, pracuje"), idle: t("online, bezczynna") }[person.native_state] ?? t("online, stan nieznany");
     cell.append(text("span", state, "state-line"));
     const flags = [];
     if (person.stopped) flags.push("stop");
     if (person.plan_mode) flags.push("Plan Mode");
-    if (person.muted) flags.push("wyciszona");
+    if (person.muted) flags.push(t("wyciszona"));
     if (flags.length) cell.append(text("span", flags.join(" · "), "state-line"));
     return cell;
   }
@@ -1372,12 +1372,12 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       row.append(cell);
       body.append(row);
     }
-    el("sessions-count").textContent = `${shown} z ${rows.length}`;
+    el("sessions-count").textContent = t("{shown} z {total}", { shown, total: rows.length });
     const note = el("sessions-note");
     const next = Boolean(sessionsPage.next_session_id);
     note.hidden = !next;
     note.textContent = next
-      ? `Wczytano ${rows.length} sesji. Filtr obejmuje wczytane wiersze; pobierz kolejną stronę, aby szukać dalej.`
+      ? t("Wczytano {count} sesji. Filtr obejmuje wczytane wiersze; pobierz kolejną stronę, aby szukać dalej.", { count: rows.length })
       : "";
     const more = el("more-sessions");
     more.hidden = !next;
@@ -1395,7 +1395,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     }
     const result = await control("/v1/rooms", { slug, label }, {
       matches: (data) => uuid(data.id) && data.slug === slug && data.label === label,
-      success: (data) => `Pokój zapisany: ${data.id}. Wybierz go na liście pokoi.`,
+      success: (data) => t("Pokój zapisany: {id}. Wybierz go na liście pokoi.", { id: data.id }),
       label: "pokoju",
       updateRooms: true,
     });
@@ -1410,7 +1410,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     if (!uuid(session)) { el("notice").textContent = t("Podaj dokładny UUID sesji."); return; }
     const result = await control(`${roomPath(targetRoom)}/memberships`, { session_id: session }, {
       matches: (data) => data.room_id === targetRoom && data.session_id === session,
-      success: () => `Członkostwo zapisane: ${session}. Uprawnienia poświadczenia nie zostały rozszerzone.`,
+      success: () => t("Członkostwo zapisane: {session}. Uprawnienia poświadczenia nie zostały rozszerzone.", { session }),
       label: "członkostwa",
     });
     if (result) el("member-session").value = "";

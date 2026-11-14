@@ -229,7 +229,21 @@
   "Odśwież stan przed następną decyzją.": "Refresh state before the next decision.",
   "Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.": "Refresh state before the next decision; the operation is not retried automatically.",
   "Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.": "Stored {id}. This is not confirmation of a wake or ACK.",
-  "Sesja wygasła lub dostęp został cofnięty. Zaloguj się ponownie.": "The session expired or access was revoked. Log in again."
+  "Sesja wygasła lub dostęp został cofnięty. Zaloguj się ponownie.": "The session expired or access was revoked. Log in again.",
+  "zadeklarowany {minutes} min temu · deklaracja, nie uprawnienie": "declared {minutes} min ago · declaration, not authority",
+  "offline": "offline",
+  "online, pracuje": "online, busy",
+  "online, bezczynna": "online, idle",
+  "online, stan nieznany": "online, unknown state",
+  "wyciszona": "muted",
+  "{shown} z {total}": "{shown} of {total}",
+  "Wczytano {count} sesji. Filtr obejmuje wczytane wiersze; pobierz kolejną stronę, aby szukać dalej.": "{count} sessions loaded. The filter covers loaded rows; fetch another page to search further.",
+  "Potwierdzono zapis mute={muted} dla {session}. Lista pokazuje późniejszy odczyt; stop i Plan Mode pozostają niezależne.": "Confirmed mute={muted} for {session}. The list shows a later read; stop and Plan Mode remain independent.",
+  "Pokój zapisany: {id}. Wybierz go na liście pokoi.": "Room stored: {id}. Select it in the rooms list.",
+  "Członkostwo zapisane: {session}. Uprawnienia poświadczenia nie zostały rozszerzone.": "Membership stored: {session}. Credential permissions were not widened.",
+  "Potwierdzono: {label} ma {session}. Znacznik nie nadaje uprawnień.": "Confirmed: {label} held by {session}. The mark grants no authority.",
+  "Potwierdzono: znacznik {label} zdjęty z {session}.": "Confirmed: {label} mark removed from {session}.",
+  "Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.": "Stored {id}. This is not confirmation of a wake or ACK."
 };
   const normalize = (value) => value.replace(/\s+/g, " ").trim();
   const LOOKUP = Object.fromEntries(Object.entries(EN).map(([key, value]) => [normalize(key), value]));
@@ -237,7 +251,8 @@
   function t(text, values = {}) {
     const key = normalize(text);
     let result = language === "en" ? (LOOKUP[key] ?? text) : text;
-    for (const [name, value] of Object.entries(values)) result = result.replaceAll(`{${name}}`, String(value));
+    result = result.replace(/\{([A-Za-z0-9_]+)\}/g, (match, name) =>
+      Object.prototype.hasOwnProperty.call(values, name) ? String(values[name]) : match);
     return result;
   }
   const skipText = (node) => node.parentElement?.closest("script, style, textarea, #language, [data-no-i18n]");
