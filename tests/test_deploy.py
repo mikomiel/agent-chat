@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import configparser
 import json
 from pathlib import Path
 
@@ -16,6 +17,68 @@ DEPLOY = ROOT / "deploy"
 
 def _compose() -> dict:
     return yaml.safe_load((DEPLOY / "compose.yaml").read_text())
+
+
+QUADLET = DEPLOY / "podman"
+
+
+def _quadlet(name: str) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.read(QUADLET / name)
+    return parser
+
+
+def test_quadlet_units_are_native_and_secure():
+    names = {
+        "agent-chat.container",
+        "agent-chat-migrate.container",
+        "agent-chat-mcp.container",
+        "agent-chat.network",
+    }
+    assert {path.name for path in QUADLET.iterdir()} == names
+
+    for name in names - {"agent-chat.network"}:
+        raw = (QUADLET / name).read_text()
+        assert "PublishPort=" not in raw
+        assert "ReadOnly=true" in raw
+        assert "DropCapability=ALL" in raw
+        assert "NoNewPrivileges=true" in raw
+        assert "User=10001:10001" in raw
+        assert _quadlet(name)["Container"]["user"] == "10001:10001"
+
+    server = _quadlet("agent-chat.container")
+    server_raw = (QUADLET / "agent-chat.container").read_text()
+    assert server["Container"]["image"] == "localhost/agent-chat-server:local"
+    assert server["Container"]["exec"].startswith("serve ")
+    assert "agent-chat-dsn" in server["Container"]["secret"]
+    assert server["Container"]["environment"] == "CREDENTIALS_DIRECTORY=/run/secrets"
+    assert "Network=agent-chat.network" in server_raw
+    assert "Network=traefik" in server_raw
+    assert "agent-chat-migrate.service" in server["Unit"]["requires"]
+
+    migrate = _quadlet("agent-chat-migrate.container")
+    assert migrate["Service"]["type"] == "oneshot"
+    assert migrate["Service"]["remainafterexit"] == "yes"
+    assert migrate["Container"]["exec"].startswith("migrate ")
+
+    mcp = _quadlet("agent-chat-mcp.container")
+    assert mcp["Container"]["image"] == "localhost/agent-chat-mcp:local"
+    assert mcp["Container"]["exec"].startswith("--config ")
+    assert "secret" not in mcp["Container"]
+    assert "agent-chat.service" in mcp["Unit"]["requires"]
+
+    network = _quadlet("agent-chat.network")
+    assert network["Network"]["networkname"] == "agent-chat"
+
+
+def test_quadlet_guide_documents_supported_topology_and_secret_source():
+    guide = (ROOT / "docs" / "podman.md").read_text()
+    assert "Rootless app + rootful Traefik" in guide
+    assert "Infisical" in guide
+    assert "podman secret create" in guide
+    assert "enable_writes" in guide
+    assert "docs/podman.md" in (ROOT / "README.md").read_text()
+    assert "podman.md" in (ROOT / "docs" / "containers.md").read_text()
 
 
 def test_compose_uses_external_postgres_and_traefik_only():
@@ -70,7 +133,5 @@ def test_traefik_routes_preserve_host_and_have_no_extra_auth():
     assert set(http["routers"]) == {"agent-chat", "agent-chat-mcp"}
     assert http["routers"]["agent-chat-mcp"]["rule"] == "Host(`mcp.example.invalid`)"
     assert http["services"]["agent-chat-mcp"]["loadBalancer"]["passHostHeader"] is True
-    assert http["services"]["agent-chat-mcp"]["loadBalancer"]["servers"] == [
-        {"url": "http://mcp:8951"}
-    ]
+    assert http["services"]["agent-chat-mcp"]["loadBalancer"]["servers"] == [{"url": "http://mcp:8951"}]
     assert "basicAuth" not in str(http)

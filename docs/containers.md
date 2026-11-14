@@ -1,6 +1,9 @@
 # Container deployment
 
 This is a LAN-oriented Compose deployment for Agent Chat and its MCP surface.
+For native Podman with systemd, use the
+[Quadlet deployment](podman.md), which avoids the Compose provider and
+documents the supported rootless/rootful Traefik topologies.
 It deliberately uses two external dependencies:
 
 - an existing PostgreSQL server, owned and backed up by the deployer;
@@ -23,7 +26,8 @@ private `app` network. Only Traefik is reachable from the LAN.
 
 ## Prerequisites
 
-- Docker with Compose, or rootless Podman with a Compose provider.
+- Docker with Compose, or Podman with a working Compose provider. For native
+  Podman Quadlet, see [podman.md](podman.md).
 - An existing PostgreSQL database, role and DSN. The role must own the database.
 - An existing Traefik instance on a shared external network, with a TLS
   certificate covering the web and MCP hostnames.
@@ -243,12 +247,18 @@ database volume to back up.
 
 ## Podman notes
 
-Rootless Podman cannot bind ports below 1024 by default. Traefik may need the
-unprivileged-port setting, or it can listen on high ports with an outer
-redirect. The application containers bind only container-internal ports, so
-they are unaffected. Rootless Podman also needs a working Compose provider;
-`podman compose` and `podman-compose` have different installation paths. The
-network and secrets must exist before the stack starts.
+`podman compose` is a wrapper around an external provider; it is not built into
+Podman. Install and test the provider before relying on this Compose file.
+
+For native Podman with systemd, use [podman.md](podman.md). That path avoids the
+provider and documents the supported rootless/rootful Traefik topologies. In
+particular, a rootless Compose stack cannot join a rootful Traefik network;
+both must run in the same Podman user namespace.
+
+The application containers bind only container-internal ports. Rootless Podman
+cannot bind ports below 1024 by default; if Traefik listens on a low port, it
+needs the unprivileged-port setting or an outer redirect. The network and
+secrets must exist before the stack starts.
 
 ## Validation
 
