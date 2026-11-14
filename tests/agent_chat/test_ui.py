@@ -1875,6 +1875,18 @@ def test_language_selection_works_when_storage_is_blocked(ui):
     assert page.url.endswith("#lang=en")
 
 
+def test_language_switch_can_be_cancelled_with_a_draft(ui, credentials):
+    ui.login()
+    page = ui.page
+    page.locator("#body").fill("synthetic unsaved draft")
+    page.once("dialog", lambda dialog: dialog.dismiss())
+    page.select_option("#language", "en")
+    assert page.locator("#language").input_value() == "pl"
+    assert "#lang=" not in page.url
+    assert page.evaluate("localStorage.getItem('agent-chat.language')") is None
+    expect(page.locator("#tab-chat")).to_have_text("Rozmowy")
+
+
 def test_viewer_routes_do_not_exist_without_public_origin(http_api):
     for path in ("/", "/ui/chat.js", "/ui/chat.css", "/ui/Manrope-Variable.ttf"):
         assert http_api("GET", path)[0] == 404

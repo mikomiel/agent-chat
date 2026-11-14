@@ -320,6 +320,11 @@
   for (const select of document.querySelectorAll("#language")) {
     select.value = language;
     select.addEventListener("change", () => {
+      if (typeof window.agentChatMayDiscardForLanguage === "function"
+          && !window.agentChatMayDiscardForLanguage()) {
+        select.value = language;
+        return;
+      }
       const chosen = select.value === "en" ? "en" : "pl";
       try { window.localStorage.setItem(STORAGE_KEY, chosen); } catch {}
       const next = new URL(window.location.href);

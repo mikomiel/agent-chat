@@ -1904,8 +1904,15 @@ const UI_LOCALE = window.AgentChatI18n.locale;
   el("clear-draft").addEventListener("click", () => { if (!writesBusy() && mayDiscard()) clearDraft(); });
   el("clear-targets").addEventListener("click", () => { if (!writesBusy()) { targets.clear(); syncComposer(); } });
   el("roster-filter").addEventListener("input", applyRosterFilter);
+  let languageUnload = false;
+  window.agentChatMayDiscardForLanguage = () => {
+    if (!writesBusy() && !hasDraft()) return true;
+    if (!mayDiscard()) return false;
+    languageUnload = true;
+    return true;
+  };
   window.addEventListener("beforeunload", (event) => {
-    if (writesBusy() || hasDraft()) { event.preventDefault(); event.returnValue = ""; }
+    if (!languageUnload && (writesBusy() || hasDraft())) { event.preventDefault(); event.returnValue = ""; }
   });
   window.addEventListener("pagehide", lock);
   // pagehide has already locked the page, so a bfcache restore reloads like a first load: it selects a room
