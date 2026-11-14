@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -102,13 +103,18 @@ class HealthEndpoints:
 
     async def _probe(self) -> bool:
         url = f"{self.config.agent_chat_origin.rstrip('/')}/readyz"
+        environment = {
+            name: os.environ[name]
+            for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")
+            if name in os.environ
+        }
         try:
             process = await asyncio.create_subprocess_exec(
                 sys.executable, "-c", READINESS_PROBE,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
-                env={},
+                env=environment,
             )
         except OSError:
             return False

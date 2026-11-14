@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
+import shutil
 import socket
+import ssl
+import subprocess
 import time
 from contextlib import closing, contextmanager
 from http.client import HTTPConnection
@@ -51,6 +54,17 @@ def redirect_handler(destination_port):
     return Handler
 
 
+class ReadyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"status":"ready"}')
+
+    def log_message(self, *_args):
+        pass
+
+
 class SlowHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         time.sleep(4)
@@ -59,6 +73,36 @@ class SlowHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args):
         pass
+
+
+@contextmanager
+def tls_server(handler, context):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def make_certificate(tmp_path):
+    openssl = shutil.which("openssl")
+    assert openssl is not None, "UNAVAILABLE: openssl required for real TLS tests"
+    key, cert = tmp_path / "key.pem", tmp_path / "cert.pem"
+    subprocess.run(
+        [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+         "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+         "-keyout", str(key), "-out", str(cert)],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20,
+    )
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    return context, cert
 
 
 @contextmanager
@@ -173,6 +217,19 @@ def test_readiness_refuses_an_unreachable_upstream(process_api):
         status, body = get_json(origin, "/readyz")
         assert status == 503
         assert body == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
+
+
+def test_readiness_uses_the_mcp_ca_configuration(process_api, tmp_path, monkeypatch):
+    context, cert = make_certificate(tmp_path)
+    with tls_server(ReadyHandler, context) as upstream:
+        origin = f"https://127.0.0.1:{upstream.server_port}"
+        monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        with serve_mcp(process_api, agent_chat_origin=origin) as mcp:
+            assert get_json(mcp, "/readyz") == (200, {"status": "ready"})
+            monkeypatch.delenv("SSL_CERT_FILE")
+            assert get_json(mcp, "/readyz") == (
+                503, {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
+            )
 
 
 def test_readiness_does_not_follow_redirects(process_api):
