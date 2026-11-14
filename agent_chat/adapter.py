@@ -20,7 +20,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
 from . import instance_client, instance_file
@@ -148,7 +148,7 @@ class Adapter:
     ) -> None:
         self.config = config
         self.delivery = delivery
-        self.operations: AdapterOperations = operations or _ClientOperations()
+        self.operations: AdapterOperations = cast(AdapterOperations, operations or _ClientOperations())
         self._clock = clock
         self._rng = rng or random.Random()
         self.native_session_id: str | None = None
