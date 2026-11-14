@@ -93,8 +93,11 @@ Releases use [release-please](https://github.com/googleapis/release-please) so
 the version, the changelog and the tag cannot disagree. A merged
 release-relevant conventional commit (`feat`, `fix` or `perf`) on `main` makes
 release-please open or update one release pull request: it bumps
-`pyproject.toml`, writes `CHANGELOG.md` and records the version in
-`.release-please-manifest.json`. That update is observed after both a
+`pyproject.toml`, writes `CHANGELOG.md`, records the version in
+`.release-please-manifest.json` and updates the project's own version in
+`uv.lock`. `checks` runs `uv lock --check`, so a release pull request whose
+lock disagrees with `pyproject.toml` fails before it can reach `main`. That
+update is observed after both a
 maintainer merge and a merge by the repository's own automation. Merging the
 release pull request is the release decision; release-please then creates the
 tag and the GitHub Release. release-please creates a lightweight tag. Never tag
