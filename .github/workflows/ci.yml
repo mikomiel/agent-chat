@@ -78,6 +78,21 @@ jobs:
       - name: Test
         run: uv run python -m pytest -q -n 4 --durations=15
 
+  integrations:
+    name: integrations
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      # The runner image's Node 20 satisfies the package engine; no dependency
+      # install or third-party action is needed for the contract tests.
+      - name: Test the Pi integration contract
+        working-directory: integrations/pi
+        run: node --test
+
   build:
     name: build
     runs-on: ubuntu-24.04

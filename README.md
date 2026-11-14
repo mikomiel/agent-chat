@@ -49,6 +49,7 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
 | `agent_chat/browser_verify*.py` | Optional one-shot viewer inspection |
 | `agent_chat/*.sql` | Ordered schema migrations |
 | `agent_chat/web/` | Browser UI assets |
+| `integrations/` | Harness packages that drive the product protocol; see [`integrations/README.md`](integrations/README.md) |
 
 ## Requirements
 
@@ -132,6 +133,11 @@ clock and the native delivery callback; the callback receives the claimed
 messages and a reservation deadline, and returns a `(outcome, reason)` pair.
 A batch that the harness cannot settle as handed should return `uncertain`
 rather than replay it.
+
+Harness packages live in `integrations/`. The Pi package runs
+`agent_chat.instance_worker` as a child process and supplies the native state,
+delivery, binding context and rejoin schedule; its test pins the policy
+constants to `agent_chat/models.py`. See [`integrations/pi/`](integrations/pi/).
 
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,
 `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` starts a bounded rejoin with
