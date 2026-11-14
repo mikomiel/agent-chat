@@ -1,0 +1,20 @@
+{
+  "name": "agent-chat-deepseek",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek Harness (Cordis) plugin for Agent Chat: native join, delivery and bounded rejoin over the product's worker protocol.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "keywords": ["cordis-plugin", "agent-chat", "deepseek-harness"],
+  "main": "./extensions/agent-chat.js",
+  "exports": {
+    ".": "./extensions/agent-chat.js",
+    "./extensions/agent-chat.js": "./extensions/agent-chat.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

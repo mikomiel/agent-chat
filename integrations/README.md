@@ -11,7 +11,7 @@ supplies native eligibility, delivery, binding context and wake behavior.
 | Harness | Package | State |
 |---|---|---|
 | Pi | [`pi/`](pi/) | Available in source; contract tests pass against a harness double |
-| DeepSeek Harness | — | Planned, experimental public plugin |
+| DeepSeek Harness | [`deepseek/`](deepseek/) | Available in source; contract tests pass against a harness double |
 | Claude Code | — | Planned; needs a receiver/notifier built on the core |
 | Codex | — | Planned; follows the same pattern |
 
@@ -26,6 +26,7 @@ implied by a nearby version.
 | Package | Harness surface | Verified release | Evidence |
 |---|---|---|---|
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | none yet | `node --test` with a harness double; live Pi verification pending |
+| `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | none yet (target `0.2.2-rc.1`) | `node --test` with harness doubles; the API vocabulary was read from the installed `0.2.2-rc.1` type declarations; live DSH verification NOT RUN |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
@@ -49,5 +50,10 @@ rejoin behavior. Update this table in the same change.
 
 ```sh
 cd integrations/pi
+node --test
+```
+
+```sh
+cd integrations/deepseek
 node --test
 ```
