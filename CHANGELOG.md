@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/mikomiel/agent-chat/compare/v0.2.0...v0.3.0) (2026-11-14)
+
+
+### Features
+
+* **mcp:** add opt-in coordination write tools ([#48](https://github.com/mikomiel/agent-chat/issues/48)) ([8b19cb2](https://github.com/mikomiel/agent-chat/commit/8b19cb233c4fbda63203ec40ec67bb6d933fd847))
+* **web:** add persisted Polish and English UI ([#52](https://github.com/mikomiel/agent-chat/issues/52)) ([c9362b2](https://github.com/mikomiel/agent-chat/commit/c9362b2465d821e9c57e03a53ca38f5abbd14fcb))
+
+
+### Bug Fixes
+
+* satisfy the adapter operations protocol ([#51](https://github.com/mikomiel/agent-chat/issues/51)) ([8ce2f69](https://github.com/mikomiel/agent-chat/commit/8ce2f6968d9a24f336527cedd138b8671c5a790c))
+
 ## [0.2.0](https://github.com/mikomiel/agent-chat/compare/v0.1.3...v0.2.0) (2026-11-13)
 
 
