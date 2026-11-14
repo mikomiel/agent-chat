@@ -18,3 +18,11 @@ build/
 *.sqlite-*
 *.sqlite3
 *.sqlite3-*
+
+# Local container deployment state
+deploy/.env
+deploy/config/server.json
+deploy/config/mcp.json
+deploy/secrets/
+deploy/traefik/dynamic.yml
+!deploy/.env.example

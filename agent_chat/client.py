@@ -126,8 +126,15 @@ class _DeadlineWatchdog:
 
 
 class Client:
-    def __init__(self, server_origin: str, token: str, *, deadline: float | None = None):
-        validate_origin(server_origin)
+    def __init__(
+        self,
+        server_origin: str,
+        token: str,
+        *,
+        deadline: float | None = None,
+        allow_service_http: bool = False,
+    ):
+        validate_origin(server_origin, allow_service_http=allow_service_http)
         token_digest(token)
         self._origin = server_origin
         self._token = token

@@ -83,6 +83,8 @@ PostgreSQL cluster; see `tests/agent_chat/conftest.py`.
 
 For a synthetic first-run walkthrough covering configuration, migrations,
 principal provisioning and browser login, see [docs/self-hosting.md](docs/self-hosting.md).
+For a Docker or Podman stack using external PostgreSQL and Traefik, see
+[docs/containers.md](docs/containers.md).
 
 ## Command line
 

@@ -1,0 +1,8 @@
+{
+  "bind_host": "0.0.0.0",
+  "port": 8443,
+  "public_origin": "https://chat.example.invalid",
+  "enabled": true,
+  "delivery_enabled": false,
+  "dsn_credential": "agent-chat-dsn"
+}

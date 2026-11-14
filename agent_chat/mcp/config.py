@@ -29,7 +29,7 @@ class Config(BaseModel):
     @classmethod
     def valid_service_origin(cls, value: str) -> str:
         try:
-            validate_origin(value)
+            validate_origin(value, allow_service_http=True)
         except ChatError:
             raise ValueError("agent_chat_origin must be a canonical origin") from None
         return value
