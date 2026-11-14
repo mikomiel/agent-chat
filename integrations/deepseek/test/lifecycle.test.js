@@ -422,3 +422,20 @@ test("a fail-closed shutdown retains its exit proof for disposal", async () => {
   release({ code: 0, signal: null })
   assert.deepEqual(await stopping, { code: 0, signal: null })
 })
+
+test("a throwing worker shutdown is not converted into a proved end", async () => {
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  const worker = {
+    ready: Promise.resolve(joined),
+    closed: new Promise(() => {}),
+    request: op => op === "heartbeat"
+      ? Promise.reject(Object.assign(new Error("BINDING_FILE_UNSAFE"), { code: "BINDING_FILE_UNSAFE", operation: "heartbeat" }))
+      : Promise.resolve({}),
+    stop() { throw new Error("shutdown refused") },
+  }
+  const lifecycle = createLifecycle(bus, delivery, config, { ...timers, startProcess: () => worker, now: () => 0 })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  assert.deepEqual(await lifecycle.stop(), { code: 1, signal: null })
+})

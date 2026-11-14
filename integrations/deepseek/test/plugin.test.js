@@ -60,6 +60,7 @@ function parts() {
   const disposed = []
   const stops = []
   const deliveries = []
+  const settles = []
   const loadParts = async () => ({
     createDelivery() {
       let stopped = true
@@ -74,7 +75,9 @@ function parts() {
         },
         onClaimed: () => {},
         onDiscarded: () => {},
-        onTurnEnd: () => {},
+        onTurnEnd(reason) {
+          if (reason?.kind === "aborted" && reason.reason?.kind === "user") stopped = true
+        },
       }
       deliveries.push(delivery)
       return delivery
@@ -84,6 +87,7 @@ function parts() {
       created.push(record)
       bus.on("session_start", event => starts.push(event))
       bus.on("input", event => inputs.push(event))
+      bus.on("agent_settled", event => settles.push(event))
       return {
         context: () => "synthetic binding metadata",
         stop() { stops.push(true); return Promise.resolve({ code: 0, signal: null }) },
@@ -91,7 +95,7 @@ function parts() {
     },
     startProcess() { throw new Error("this test starts no worker") },
   })
-  return { loadParts, created, starts, inputs, disposed, stops, deliveries }
+  return { loadParts, created, starts, inputs, disposed, stops, deliveries, settles }
 }
 
 function pluginWith(file) {
@@ -227,5 +231,31 @@ test("a user prompt during adoption is replayed after the lifecycle starts", asy
     assert.equal(loaded.created.length, 1)
     assert.equal(loaded.inputs.length, 1)
     assert.equal(loaded.deliveries[0].state(), null)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("a buffered prompt followed by a user abort leaves both latches stopped", async () => {
+  const { dir, file } = configFile()
+  try {
+    let releaseParts
+    const ready = new Promise(resolve => { releaseParts = resolve })
+    const loaded = parts()
+    const loadParts = async () => { await ready; return loaded.loadParts() }
+    const plugin = createAgentChat({ env: { AGENT_CHAT_DEEPSEEK_CONFIG: file }, loadParts })
+    const { ctx, injected } = roots()
+    plugin(ctx)
+    const { webCtx, fire, agents } = fakeWebCtx()
+    injected[0].callback(webCtx)
+    const root = { id: "native-1", session: { id: "native-1", header: {} } }
+    agents.set(root.id, root)
+    fire("agent/created", { agent: root })
+    await flush()
+    fire("agent/inbox/inserted", { agent: root, message: { source: { kind: "user", rpcId: "rpc-1" } } })
+    fire("session/event", root.session, { type: "turn/end", data: { reason: { kind: "aborted", reason: { kind: "user" } } } })
+    releaseParts()
+    await flush()
+    await flush()
+    assert.equal(loaded.deliveries[0].state(), "stopped")
+    assert.equal(loaded.settles.length, 1)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })

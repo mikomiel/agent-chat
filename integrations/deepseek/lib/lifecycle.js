@@ -100,7 +100,7 @@ export function createLifecycle(bus, delivery, config, {
     pollTimer = null
     try { delivery.context?.(null) } catch { /* a stale binding must not block an end */ }
     if (!record?.worker) return Promise.resolve(null)
-    try { return record.worker.stop() } catch { return Promise.resolve(null) }
+    try { return record.worker.stop() } catch (error) { return Promise.reject(error) }
   }
 
   function disconnect() {
