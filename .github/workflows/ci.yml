@@ -97,6 +97,9 @@ jobs:
       - name: Test the Pi integration contract
         working-directory: integrations/pi
         run: node --test
+      - name: Test the DeepSeek integration contract
+        working-directory: integrations/deepseek
+        run: node --test
 
   build:
     name: build
