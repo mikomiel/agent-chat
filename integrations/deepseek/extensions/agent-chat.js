@@ -171,8 +171,14 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
           })
           state.fire("session_start", { nativeSessionId: agent.id })
           for (const event of state.latchEvents) {
-            if (event === "input") state.fire("input", { source: "local" })
-            else state.fire("agent_settled", { aborted: true })
+            if (event.kind === "input") {
+              // The native delivery has its own stop latch; replaying only the
+              // lifecycle event would leave heartbeats and delivery stopped.
+              if (delivery.onInserted(event.message)) state.fire("input", { source: "local" })
+            } else {
+              delivery.onTurnEnd({ kind: "aborted", reason: { kind: "user" } })
+              state.fire("agent_settled", { aborted: true })
+            }
           }
           state.latchEvents = []
         } catch (error) {
@@ -218,7 +224,9 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
           if (!state) return
           if (!state.delivery) {
             const source = message?.source
-            if (source?.kind === "user" && typeof source.rpcId === "string" && source.rpcId) state.latchEvents.push("input")
+            if (source?.kind === "user" && typeof source.rpcId === "string" && source.rpcId) {
+              state.latchEvents.push({ kind: "input", message })
+            }
             return
           }
           route(agent, state => { if (state.delivery.onInserted(message)) state.fire("input", { source: "local" }) })
@@ -240,7 +248,7 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
             if (state && !state.delivery) {
               const reason = event?.data?.reason
               if (event?.type === "turn/end" && reason?.kind === "aborted" && reason.reason?.kind === "user") {
-                state.latchEvents.push("abort")
+                state.latchEvents.push({ kind: "abort" })
               }
               return
             }

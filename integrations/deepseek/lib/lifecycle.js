@@ -61,6 +61,7 @@ export function createLifecycle(bus, delivery, config, {
   let pollTimer = null
   let rejoinTimer = null
   let ending = null
+  let drainFailed = false
   const draining = new Set()
   let busy = false
   let dirty = false
@@ -113,8 +114,7 @@ export function createLifecycle(bus, delivery, config, {
     disabled = true
     try { delivery.disable?.() } catch { /* chat-only latch */ }
     notify(`Agent Chat stopped (${reason ?? "local stop"}); the native session and CI are unchanged.`)
-    const endingPromise = disconnect()
-    return Promise.resolve(endingPromise).catch(() => null)
+    return trackDrain(disconnect())
   }
 
   function failClosed(error) {
@@ -130,9 +130,7 @@ export function createLifecycle(bus, delivery, config, {
     notify(`Agent Chat reconnecting (${code}).`)
     // Keep the draining worker's exit proof: disposal during the backoff must
     // still be able to prove that the previous instance ended.
-    const stopping = Promise.resolve(stopLive()).catch(() => null)
-    draining.add(stopping)
-    void stopping.finally(() => draining.delete(stopping))
+    trackDrain(stopLive())
     let delay
     try { delay = policy.next(code) }
     catch (exhausted) { return failClosed(exhausted) }
@@ -368,11 +366,24 @@ export function createLifecycle(bus, delivery, config, {
 
   // Public: disposal. Idempotent, so a shutdown that a bus event already began
   // still resolves the worker's exit for the caller that must prove it ended.
+  // Every initiated shutdown is retained until stop(): a drain that already
+  // settled still carries the evidence a later disposal must evaluate. A worker
+  // that a signal killed has `{code: null, signal}` and is not a proved end.
+  function trackDrain(promise) {
+    const tracked = Promise.resolve(promise).catch(() => { drainFailed = true; return null })
+    draining.add(tracked)
+    return tracked
+  }
+
+  function exitProved(result) {
+    return result === null || result === undefined || (result.code === 0 && !result.signal)
+  }
+
   function finishExit() {
     const pending = [...draining]
     return Promise.allSettled([...pending, disconnect()]).then(results => {
-      const failed = results.some(result => result.status === "rejected" ||
-        (result.status === "fulfilled" && typeof result.value?.code === "number" && result.value.code !== 0))
+      const failed = drainFailed || results.some(result => result.status === "rejected" ||
+        (result.status === "fulfilled" && !exitProved(result.value)))
       return { code: failed ? 1 : 0, signal: null }
     })
   }

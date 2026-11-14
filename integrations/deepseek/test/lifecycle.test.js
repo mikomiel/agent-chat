@@ -383,3 +383,42 @@ test("disposal during a rejoin waits for the drained worker's exit proof", async
   release({ code: 0, signal: null })
   assert.deepEqual(await stopping, { code: 0, signal: null })
 })
+
+test("a signal-terminated worker exit is not a proved end", async () => {
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  let release
+  const closed = new Promise(resolve => { release = resolve })
+  const worker = { ready: Promise.resolve(joined), closed, request: () => Promise.resolve({}), stop: () => closed }
+  const lifecycle = createLifecycle(bus, delivery, config, { ...timers, startProcess: () => worker })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  const stopping = lifecycle.stop()
+  release({ code: null, signal: "SIGKILL" })
+  assert.deepEqual(await stopping, { code: 1, signal: null })
+})
+
+test("a fail-closed shutdown retains its exit proof for disposal", async () => {
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  let release
+  const closed = new Promise(resolve => { release = resolve })
+  const worker = {
+    ready: Promise.resolve(joined),
+    closed,
+    request: op => op === "heartbeat"
+      ? Promise.reject(Object.assign(new Error("BINDING_FILE_UNSAFE"), { code: "BINDING_FILE_UNSAFE", operation: "heartbeat" }))
+      : Promise.resolve({}),
+    stop: () => closed,
+  }
+  const lifecycle = createLifecycle(bus, delivery, config, { ...timers, startProcess: () => worker, now: () => 0 })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  const stopping = lifecycle.stop()
+  let settled = false
+  void stopping.then(() => { settled = true })
+  await flush()
+  assert.equal(settled, false)
+  release({ code: 0, signal: null })
+  assert.deepEqual(await stopping, { code: 0, signal: null })
+})

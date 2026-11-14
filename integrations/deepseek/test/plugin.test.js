@@ -59,15 +59,25 @@ function parts() {
   const inputs = []
   const disposed = []
   const stops = []
+  const deliveries = []
   const loadParts = async () => ({
     createDelivery() {
-      return {
+      let stopped = true
+      const delivery = {
+        state() { return stopped ? "stopped" : null },
         dispose() { disposed.push(true) },
-        onInserted: message => message?.source?.kind === "user" && Boolean(message.source.rpcId),
+        onInserted(message) {
+          const source = message?.source
+          if (source?.kind !== "user" || typeof source.rpcId !== "string" || !source.rpcId) return false
+          stopped = false
+          return true
+        },
         onClaimed: () => {},
         onDiscarded: () => {},
         onTurnEnd: () => {},
       }
+      deliveries.push(delivery)
+      return delivery
     },
     createLifecycle(bus, delivery, received, options) {
       const record = { bus, delivery, config: received, options }
@@ -81,7 +91,7 @@ function parts() {
     },
     startProcess() { throw new Error("this test starts no worker") },
   })
-  return { loadParts, created, starts, inputs, disposed, stops }
+  return { loadParts, created, starts, inputs, disposed, stops, deliveries }
 }
 
 function pluginWith(file) {
@@ -216,5 +226,6 @@ test("a user prompt during adoption is replayed after the lifecycle starts", asy
     await flush()
     assert.equal(loaded.created.length, 1)
     assert.equal(loaded.inputs.length, 1)
+    assert.equal(loaded.deliveries[0].state(), null)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
