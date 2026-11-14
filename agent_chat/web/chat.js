@@ -329,10 +329,11 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       lock();
       el("notice").textContent = prefix + denied;
     } else if (error.status === 429) {
-      el("notice").textContent = `${prefix}Zbyt wiele żądań lub nieudanych prób logowania. Spróbuj ponownie za minutę.`;
+      el("notice").textContent = prefix + t("Zbyt wiele żądań lub nieudanych prób logowania. Spróbuj ponownie za minutę.");
     } else {
-      el("notice").textContent = `${prefix}Nie udało się odczytać danych. Odśwież widok` +
-        (saved ? "; nie wysyłaj wiadomości ponownie." : " lub zaloguj się ponownie.");
+      el("notice").textContent = prefix + t(saved
+        ? "Nie udało się odczytać danych. Odśwież widok; nie wysyłaj wiadomości ponownie."
+        : "Nie udało się odczytać danych. Odśwież widok lub zaloguj się ponownie.");
     }
     return true;
   }
@@ -409,7 +410,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
   }
 
   function receiptState(label, present) {
-    return text("span", `${label}: ${present ? "tak" : "—"}`,
+    return text("span", `${t(label)}: ${present ? t("tak") : "—"}`,
       `receipt-state ${present ? "is-present" : "is-missing"}`);
   }
 
@@ -417,17 +418,17 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     const item = document.createElement("li");
     const peer = participantNames.get(receipt.session_id) ?? receipt;
     item.append(text("bdi", peer.title ? `${peer.title} · ${sessionIdentity(peer)}` : sessionIdentity(peer), "receipt-session"));
-    item.append(receiptState("zapis", Boolean(receipt.stored_at)));
-    item.append(receiptState("przekazanie", Boolean(receipt.handed_at)));
+    item.append(receiptState(t("zapis"), Boolean(receipt.stored_at)));
+    item.append(receiptState(t("przekazanie"), Boolean(receipt.handed_at)));
     item.append(receiptState("ACK", Boolean(receipt.acknowledged_at)));
-    item.append(receiptState("odpowiedź", Boolean(receipt.replying_message_id)));
+    item.append(receiptState(t("odpowiedź"), Boolean(receipt.replying_message_id)));
     // Every state renders, absent ones as "—". `browser_verify_checks.py`
     // asserts this exact set against the API row, so hiding the empty ones
     // would break the verifier's receipt contract rather than merely tidy the
     // line. Readability here is the label fix above, not dropping fields.
-    item.append(text("span", `niepewność: ${receipt.uncertainty_reason ?? "—"}`,
+    item.append(text("span", t("niepewność: {reason}", { reason: receipt.uncertainty_reason ?? "—" }),
       `receipt-state ${receipt.uncertainty_reason ? "is-uncertain" : "is-missing"}`));
-    item.append(text("span", `próba: ${receipt.delivery?.outcome ?? "—"}`, "receipt-state"));
+    item.append(text("span", t("próba: {outcome}", { outcome: receipt.delivery?.outcome ?? "—" }), "receipt-state"));
     return item;
   }
 
@@ -763,8 +764,8 @@ const UI_LOCALE = window.AgentChatI18n.locale;
         full.className = "evidence-receipts";
         for (const receipt of receipts) full.append(text("li",
           `${receipt.session_id} · zapis: ${receipt.stored_at ?? "—"} · przekazanie: ${receipt.handed_at ?? "—"} · ` +
-          `ACK: ${receipt.acknowledged_at ?? "—"} · odpowiedź: ${receipt.replying_message_id ?? "—"} · ` +
-          `niepewność: ${receipt.uncertainty_reason ?? "—"} · próba: ${receipt.delivery?.outcome ?? "—"}`,
+          `ACK: ${receipt.acknowledged_at ?? "—"} · ${t("odpowiedź:")} ${receipt.replying_message_id ?? "—"} · ` +
+          `${t("niepewność:")} ${receipt.uncertainty_reason ?? "—"} · ${t("próba:")} ${receipt.delivery?.outcome ?? "—"}`,
         ));
         evidence.append(full);
       }
@@ -1016,11 +1017,13 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     } catch (error) {
       if (stale(controlRequest, attempt, current)) return;
       controlRequest = null;
-      const result = confirmed ? `Zapis ${label} potwierdzony, ale odczyt stanu niedostępny.` : `Zmiana ${label} niepotwierdzona.`;
+      const result = confirmed
+        ? t("Zapis {label} potwierdzony, ale odczyt stanu niedostępny.", { label })
+        : t("Zmiana {label} niepotwierdzona.", { label });
       const detail = !confirmed && error.status !== 401 && error.status !== 403 ? refusal(error) : "";
       if (error.status === 401 || error.status === 403) {
         failed(error, current);
-        el("notice").textContent = `${result} Dostęp wygasł lub został cofnięty. Zaloguj się ponownie.`;
+        el("notice").textContent = `${result} ${t("Dostęp wygasł lub został cofnięty. Zaloguj się ponownie.")}`;
       } else if (detail && PRESERVE_ON_REFUSAL.has(error.code)) {
         // These refusals cannot mask a revoked room or session scope.
         el("notice").textContent = `${result} ${detail}`;
@@ -1028,8 +1031,8 @@ const UI_LOCALE = window.AgentChatI18n.locale;
         invalidate();
         clearRoom();
         el("notice").textContent = detail
-          ? `${result} ${detail} Odśwież stan przed następną decyzją.`
-          : `${result} Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.`;
+          ? `${result} ${detail} ${t("Odśwież stan przed następną decyzją.")}`
+          : `${result} ${t("Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.")}`;
       }
     } finally {
       if (controlRequest === attempt) controlRequest = null;
@@ -1459,7 +1462,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       // Never move the operator, or a draft written for that room, into another room unasked.
       selectedRoom = "";
       clearRoom();
-      el("notice").textContent = t(t("Wybrany pokój nie jest już dostępny. Wybierz pokój z listy.")) +
+      el("notice").textContent = t("Wybrany pokój nie jest już dostępny. Wybierz pokój z listy.") +
         (composerDraft() ? " Szkic został zachowany." : "");
     }
     el("room").value = selectedRoom;
@@ -1817,7 +1820,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       pending = null;
       clearDraft();
       // The message is committed: report it before the read-back, which can only add to that report.
-      const saved = `Zapisano ${data.id}. To nie jest potwierdzenie wybudzenia ani ACK.`;
+      const saved = t("Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.", { id: data.id });
       el("notice").textContent = saved;
       await room(saved);
       scrollMessagesToBottom();

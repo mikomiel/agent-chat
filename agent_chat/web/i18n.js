@@ -211,7 +211,25 @@
   "przekazanie:": "handed:",
   "odpowiedź:": "reply:",
   "niepewność:": "uncertainty:",
-  "próba:": "attempt:"
+  "próba:": "attempt:",
+  "Zbyt wiele żądań lub nieudanych prób logowania. Spróbuj ponownie za minutę.": "Too many requests or failed login attempts. Try again in a minute.",
+  "Nie udało się odczytać danych. Odśwież widok lub zaloguj się ponownie.": "Could not read data. Refresh the view or log in again.",
+  "Nie udało się odczytać danych. Odśwież widok; nie wysyłaj wiadomości ponownie.": "Could not read data. Refresh the view; do not send the message again.",
+  "zapis": "stored",
+  "przekazanie": "handed",
+  "odpowiedź": "reply",
+  "niepewność": "uncertainty",
+  "próba": "attempt",
+  "tak": "yes",
+  "niepewność: {reason}": "uncertainty: {reason}",
+  "próba: {outcome}": "attempt: {outcome}",
+  "Zapis {label} potwierdzony, ale odczyt stanu niedostępny.": "Write of {label} confirmed, but state read unavailable.",
+  "Zmiana {label} niepotwierdzona.": "Change of {label} unconfirmed.",
+  "Dostęp wygasł lub został cofnięty. Zaloguj się ponownie.": "Access expired or was revoked. Log in again.",
+  "Odśwież stan przed następną decyzją.": "Refresh state before the next decision.",
+  "Odśwież stan przed następną decyzją; nie ponawiamy operacji automatycznie.": "Refresh state before the next decision; the operation is not retried automatically.",
+  "Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.": "Stored {id}. This is not confirmation of a wake or ACK.",
+  "Sesja wygasła lub dostęp został cofnięty. Zaloguj się ponownie.": "The session expired or access was revoked. Log in again."
 };
   const normalize = (value) => value.replace(/\s+/g, " ").trim();
   const LOOKUP = Object.fromEntries(Object.entries(EN).map(([key, value]) => [normalize(key), value]));
@@ -222,9 +240,8 @@
     for (const [name, value] of Object.entries(values)) result = result.replaceAll(`{${name}}`, String(value));
     return result;
   }
-  const skip = (node) => node.nodeType === Node.ELEMENT_NODE
-    ? node.closest("script, style, textarea, #language, [data-no-i18n]")
-    : node.parentElement?.closest("script, style, textarea, #language, [data-no-i18n]");
+  const skipText = (node) => node.parentElement?.closest("script, style, textarea, #language, [data-no-i18n]");
+  const skipElement = (node) => node.closest("script, style, #language, [data-no-i18n]");
   function translateNode(node) {
     if (language !== "en" || !node.nodeValue) return;
     const raw = node.nodeValue;
@@ -235,15 +252,15 @@
     node.nodeValue = leading + LOOKUP[key] + trailing;
   }
   function translateAttributes(element) {
-    if (language !== "en" || skip(element)) return;
-    for (const name of ["placeholder", "title", "aria-label"]) {
+    if (language !== "en" || skipElement(element)) return;
+    for (const name of ["placeholder", "title", "aria-label", "label"]) {
       const value = element.getAttribute(name);
       if (value && LOOKUP[normalize(value)] !== undefined) element.setAttribute(name, LOOKUP[normalize(value)]);
     }
   }
   function walk(root) {
-    if (root.nodeType === Node.TEXT_NODE) { if (!skip(root)) translateNode(root); return; }
-    if (root.nodeType !== Node.ELEMENT_NODE || skip(root)) return;
+    if (root.nodeType === Node.TEXT_NODE) { if (!skipText(root)) translateNode(root); return; }
+    if (root.nodeType !== Node.ELEMENT_NODE || skipElement(root)) return;
     translateAttributes(root);
     for (const child of root.childNodes) walk(child);
   }

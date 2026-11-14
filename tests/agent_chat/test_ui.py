@@ -1849,7 +1849,16 @@ def test_language_selector_translates_static_and_dynamic_ui(ui, credentials):
     expect(page.locator("#tab-chat")).to_have_text("Conversations")
     expect(page.locator("#tab-sessions")).to_have_text("Sessions")
     expect(page.locator("#kind option[value=message]")).to_have_text("Message")
+    expect(page.locator("#body")).to_have_attribute(
+        "placeholder", "Write a message: up to 16 KiB, no secrets or transcripts"
+    )
+    expect(page.locator("#kind optgroup").first).to_have_attribute("label", "Information")
     expect(page.locator("#notice")).to_contain_text("History snapshot")
+    expect(page.locator("#send")).to_be_enabled()
+    page.locator("#body").fill("synthetic english body")
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator("#notice")).to_contain_text("Stored")
+    expect(page.locator("#notice")).to_contain_text("not confirmation of a wake or ACK")
 
 
 def test_viewer_routes_do_not_exist_without_public_origin(http_api):
