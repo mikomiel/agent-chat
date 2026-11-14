@@ -766,7 +766,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
         const full = document.createElement("ul");
         full.className = "evidence-receipts";
         for (const receipt of receipts) full.append(text("li",
-          `${receipt.session_id} · zapis: ${receipt.stored_at ?? "—"} · przekazanie: ${receipt.handed_at ?? "—"} · ` +
+          `${receipt.session_id} · ${t("zapis:")} ${receipt.stored_at ?? "—"} · ${t("przekazanie:")} ${receipt.handed_at ?? "—"} · ` +
           `ACK: ${receipt.acknowledged_at ?? "—"} · ${t("odpowiedź:")} ${receipt.replying_message_id ?? "—"} · ` +
           `${t("niepewność:")} ${receipt.uncertainty_reason ?? "—"} · ${t("próba:")} ${receipt.delivery?.outcome ?? "—"}`,
         ));
@@ -804,9 +804,9 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     if (entry.stale) {
       box.append(text("p", entry.stale_reason === "revoked"
         ? t("nieznany (producent odwołany)")
-        : `nieznany, ostatnio widziany ${entry.age_seconds} s temu`));
+        : t("nieznany, ostatnio widziany {seconds} s temu", { seconds: entry.age_seconds })));
     } else if (value.schema === "agent-chat.validation-lease.v1") {
-      if (value.scan === "unknown") box.append(text("p", `nieznany (${value.reason ?? "—"})`));
+      if (value.scan === "unknown") box.append(text("p", t("nieznany ({reason})", { reason: value.reason ?? "—" })));
       else {
         // Times are local and absolute; the exact ISO value stays in the tooltip.
         for (const slot of (Array.isArray(value.slots) ? value.slots : []).slice(0, 16)) {
@@ -816,7 +816,10 @@ const UI_LOCALE = window.AgentChatI18n.locale;
         }
         for (const waiter of (Array.isArray(value.waiters) ? value.waiters : []).slice(0, 16)) {
           const w = waiter && typeof waiter === "object" ? waiter : {};
-          const line = text("p", `Oczekuje: ${[w.lane ?? w.owner, w.branch].filter(Boolean).join(", ")} od ${w.waiting_since ? displayTimestamp(w.waiting_since) : "—"}`);
+          const line = text("p", t("Oczekuje: {who} od {since}", {
+            who: [w.lane ?? w.owner, w.branch].filter(Boolean).join(", "),
+            since: w.waiting_since ? displayTimestamp(w.waiting_since) : "—",
+          }));
           if (w.waiting_since) line.title = `od: ${w.waiting_since}`;
           box.append(line);
         }
@@ -855,8 +858,12 @@ const UI_LOCALE = window.AgentChatI18n.locale;
         const item = document.createElement("li");
         // Local, absolute times: a snapshot ages, so "3 min ago" would be wrong. The exact ISO values sit in the tooltip.
         const meta = text("p", `${entry.state_key} · ${entry.producer.producer}@${entry.producer.host} · ` +
-          `zmiana: ${displayTimestamp(entry.changed_at)} · obserwacja: ${displayTimestamp(entry.observed_at)}`, "meta");
-        meta.title = `zmiana: ${entry.changed_at} · obserwacja: ${entry.observed_at}`;
+          t("zmiana: {changed} · obserwacja: {observed}", {
+            changed: displayTimestamp(entry.changed_at), observed: displayTimestamp(entry.observed_at),
+          }), "meta");
+        meta.title = t("zmiana: {changed} · obserwacja: {observed}", {
+          changed: entry.changed_at, observed: entry.observed_at,
+        });
         item.append(meta, renderStateValue(entry));
         list.append(item);
       }
@@ -948,7 +955,9 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     button.hidden = access !== "operator";
     button.addEventListener("click", () => control(`/v1/threads/${first.thread_id}/resolution`, { resolved: !resolved }, {
       matches: (data) => data.thread_id === first.thread_id && data.resolved === !resolved,
-      success: () => `Potwierdzono zapis: wątek ${resolved ? "otwarty ponownie" : "oznaczony jako rozwiązany"}. Rozwiązanie nie blokuje pisania.`,
+      success: () => t("Potwierdzono zapis: wątek {state}. Rozwiązanie nie blokuje pisania.", {
+        state: resolved ? t("otwarty ponownie") : t("oznaczony jako rozwiązany"),
+      }),
       label: "rozwiązania wątku",
     }));
     header.append(button);

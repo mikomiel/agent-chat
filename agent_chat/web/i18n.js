@@ -251,6 +251,15 @@
   "ustawiony: {set} · ostatnia aktywność: {activity} · wygasa: {expires}": "set: {set} · last activity: {activity} · expires: {expires}",
   "Potwierdzono zapis: znacznik PM ma {session}. Znacznik nie nadaje uprawnień.": "Confirmed: PM mark held by {session}. The mark grants no authority.",
   "Potwierdzono zapis: znacznik PM zdjęty z {session}.": "Confirmed: PM mark removed from {session}.",
+  "zapis:": "stored:",
+  "przekazanie:": "handed:",
+  "nieznany, ostatnio widziany {seconds} s temu": "unknown, last seen {seconds}s ago",
+  "nieznany ({reason})": "unknown ({reason})",
+  "Oczekuje: {who} od {since}": "Waiting: {who} since {since}",
+  "zmiana: {changed} · obserwacja: {observed}": "changed: {changed} · observed: {observed}",
+  "Potwierdzono zapis: wątek {state}. Rozwiązanie nie blokuje pisania.": "Confirmed: thread {state}. Resolution does not block writing.",
+  "otwarty ponownie": "reopened",
+  "oznaczony jako rozwiązany": "marked resolved",
   "Odebrane zdarzenia: {received} · kursor: {cursor}": "Events received: {received} · cursor: {cursor}",
   "Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.": "Stored {id}. This is not confirmation of a wake or ACK."
 };
