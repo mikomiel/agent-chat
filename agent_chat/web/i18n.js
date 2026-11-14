@@ -260,6 +260,15 @@
   "Potwierdzono zapis: wątek {state}. Rozwiązanie nie blokuje pisania.": "Confirmed: thread {state}. Resolution does not block writing.",
   "otwarty ponownie": "reopened",
   "oznaczony jako rozwiązany": "marked resolved",
+  "Znacznik PM: ": "PM mark: ",
+  "sesja z innej strony listy": "session on another page",
+  "od {age}": "{age} ago",
+  "{count} w 24 h": "{count} in 24 h",
+  "Brak dostępu; nie zmieniamy tożsamości ani klucza próby.": "No access; identity and attempt key are not changed.",
+  "pokoju": "room",
+  "członkostwa": "membership",
+  "znacznika PM": "PM mark",
+  "rozwiązania wątku": "thread resolution",
   "Odebrane zdarzenia: {received} · kursor: {cursor}": "Events received: {received} · cursor: {cursor}",
   "Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.": "Stored {id}. This is not confirmation of a wake or ACK."
 };

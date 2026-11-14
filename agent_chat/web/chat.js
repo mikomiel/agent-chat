@@ -457,7 +457,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       set: pm.set_at, activity: pm.last_activity_at, expires: pm.expires_at,
     });
     more.append(text("summary", t("Znacznik nie nadaje uprawnień.")), times);
-    line.append("Znacznik PM: ", holder ? bdi(sessionName(holder)) : "sesja z innej strony listy", more);
+    line.append(t("Znacznik PM: "), holder ? bdi(sessionName(holder)) : t("sesja z innej strony listy"), more);
   }
 
   // A chip names only what needs attention: a confirmed "off" stays quiet, anything else (on, unknown) shows.
@@ -1030,8 +1030,8 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       if (stale(controlRequest, attempt, current)) return;
       controlRequest = null;
       const result = confirmed
-        ? t("Zapis {label} potwierdzony, ale odczyt stanu niedostępny.", { label })
-        : t("Zmiana {label} niepotwierdzona.", { label });
+        ? t("Zapis {label} potwierdzony, ale odczyt stanu niedostępny.", { label: t(label) })
+        : t("Zmiana {label} niepotwierdzona.", { label: t(label) });
       const detail = !confirmed && error.status !== 401 && error.status !== 403 ? refusal(error) : "";
       if (error.status === 401 || error.status === 403) {
         failed(error, current);
@@ -1306,7 +1306,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     }
     cell.append(bdi(person.lane));
     const age = formatAge(person.lane_age_seconds);
-    if (age) cell.append(text("span", `od ${age}`, "session-meta"));
+    if (age) cell.append(text("span", t("od {age}", { age }), "session-meta"));
     return cell;
   }
 
@@ -1314,7 +1314,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     const cell = document.createElement("td");
     cell.append(text("span", person.last_published_at ? displayTimestamp(person.last_published_at) : "—", "state-line"));
     const count = Number(person.messages_24h) || 0;
-    cell.append(text("span", `${count} w 24 h`, "session-meta"));
+    cell.append(text("span", t("{count} w 24 h", { count }), "session-meta"));
     return cell;
   }
 
@@ -1846,7 +1846,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
         clearRoom();
         el("viewer").hidden = true;
         el("body").value = "";
-        el("write-status").textContent += " Brak dostępu; nie zmieniamy tożsamości ani klucza próby.";
+        el("write-status").textContent += " " + t("Brak dostępu; nie zmieniamy tożsamości ani klucza próby.");
       }
     } finally {
       sending = false;
