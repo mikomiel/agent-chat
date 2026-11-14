@@ -107,6 +107,15 @@ The MCP configuration defaults to `"enable_writes": false`. Set it to `true`
 only when the deployment needs write tools. Those tools still use the caller's
 instance token and the server's normal authorization.
 
+On SELinux-enforcing hosts, label the two root-owned configuration files once:
+
+```sh
+sudo chcon -t container_file_t /etc/agent-chat/server.json /etc/agent-chat/mcp.json
+```
+
+The units mount these files read-only without `:z`, so a rootless deployment user
+does not need to relabel a root-owned file.
+
 These files contain no credential. The DSN is handled separately below.
 
 ## Provide the PostgreSQL DSN
@@ -188,25 +197,52 @@ the external PostgreSQL host. The application containers publish no ports.
 
 ```sh
 install -d ~/.config/containers/systemd
-install -m 0644 deploy/podman/*.network deploy/podman/*.container \
+install -m 0644 \
+  deploy/podman/agent-chat.network \
+  deploy/podman/agent-chat-migrate.container \
+  deploy/podman/agent-chat.container \
   ~/.config/containers/systemd/
+
+# Optional MCP unit:
+install -m 0644 deploy/podman/agent-chat-mcp.container \
+  ~/.config/containers/systemd/
+
 systemctl --user daemon-reload
-systemctl --user enable --now \
-  agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
+systemctl --user start agent-chat-migrate.service agent-chat.service
+# Optional:
+systemctl --user start agent-chat-mcp.service
 ```
 
-If the MCP surface is not needed, omit `agent-chat-mcp.service` from both the
-install and enable commands, and do not add its Traefik route.
+Quadlet generates these units; do not run `systemctl enable` on them. The
+`[Install] WantedBy=default.target` section is processed by the generator and
+provides activation at the next boot. If the rootless user must run without a
+login session, enable lingering:
+
+```sh
+sudo loginctl enable-linger "$USER"
+```
+
+If the MCP surface is not needed, do not install `agent-chat-mcp.container` or
+start its service, and do not add its Traefik route.
 
 ### Rootful
 
 ```sh
 sudo install -d /etc/containers/systemd
-sudo install -m 0644 deploy/podman/*.network deploy/podman/*.container \
+sudo install -m 0644 \
+  deploy/podman/agent-chat.network \
+  deploy/podman/agent-chat-migrate.container \
+  deploy/podman/agent-chat.container \
   /etc/containers/systemd/
+
+# Optional MCP unit:
+sudo install -m 0644 deploy/podman/agent-chat-mcp.container \
+  /etc/containers/systemd/
+
 sudo systemctl daemon-reload
-sudo systemctl enable --now \
-  agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
+sudo systemctl start agent-chat-migrate.service agent-chat.service
+# Optional:
+sudo systemctl start agent-chat-mcp.service
 ```
 
 The migration unit is a one-shot service with `RemainAfterExit=yes`. The server
@@ -218,6 +254,9 @@ Add the routes from
 [`deploy/traefik/dynamic.example.yml`](../deploy/traefik/dynamic.example.yml)
 to the file-provider Traefik already uses, replacing both hostnames and keeping
 `passHostHeader: true`.
+
+The MCP unit adds `NetworkAlias=mcp`, so the example backend
+`http://mcp:8951` resolves in this deployment as well.
 
 The routers use the `websecure` entrypoint and `tls: {}`; the certificate and
 entrypoint belong to the existing Traefik. For a LAN-only deployment, use an
@@ -254,35 +293,47 @@ Use `sudo journalctl` for rootful units.
 
 ## First principal
 
-Create an operator or agent principal with the migration image. The raw token is
-read from stdin and is never placed on the command line:
+Choose the same Podman identity that owns the units:
 
 ```sh
-install -d -m 0700 /root/agent-chat-secrets
-install -m 0600 /dev/null /root/agent-chat-secrets/operator.token
-${EDITOR:-vi} /root/agent-chat-secrets/operator.token
-podman run --rm -i \
+PODMAN=podman              # rootless
+# PODMAN="sudo podman"     # rootful
+```
+
+Create an operator principal with the server image. The raw token is read from
+stdin and is never placed on the command line:
+
+```sh
+TOKEN_FILE="$HOME/.config/agent-chat/operator.token"
+install -d -m 0700 "$(dirname "$TOKEN_FILE")"
+install -m 0600 /dev/null "$TOKEN_FILE"
+${EDITOR:-vi} "$TOKEN_FILE"
+$PODMAN run --rm -i \
   --secret agent-chat-dsn,type=mount,target=agent-chat-dsn,uid=10001,gid=10001,mode=0400 \
   -e CREDENTIALS_DIRECTORY=/run/secrets \
-  -v /etc/agent-chat/server.json:/etc/agent-chat/config.json:ro,z \
+  -v /etc/agent-chat/server.json:/etc/agent-chat/config.json:ro \
   localhost/agent-chat-server:local \
   principal ensure --config /etc/agent-chat/config.json \
-  --name operator --kind operator --json < /root/agent-chat-secrets/operator.token
-rm -f /root/agent-chat-secrets/operator.token
+  --name operator --kind operator --json < "$TOKEN_FILE"
+rm -f "$TOKEN_FILE"
 ```
 
 For an agent principal, provide only `--host` and `--harness`:
 
 ```sh
-podman run --rm -i \
+TOKEN_FILE="$HOME/.config/agent-chat/agent.token"
+install -d -m 0700 "$(dirname "$TOKEN_FILE")"
+install -m 0600 /dev/null "$TOKEN_FILE"
+${EDITOR:-vi} "$TOKEN_FILE"
+$PODMAN run --rm -i \
   --secret agent-chat-dsn,type=mount,target=agent-chat-dsn,uid=10001,gid=10001,mode=0400 \
   -e CREDENTIALS_DIRECTORY=/run/secrets \
-  -v /etc/agent-chat/server.json:/etc/agent-chat/config.json:ro,z \
+  -v /etc/agent-chat/server.json:/etc/agent-chat/config.json:ro \
   localhost/agent-chat-server:local \
   principal ensure --config /etc/agent-chat/config.json \
   --name agent-a --kind agent --host workstation --harness pi --json \
-  < /root/agent-chat-secrets/agent.token
-rm -f /root/agent-chat-secrets/agent.token
+  < "$TOKEN_FILE"
+rm -f "$TOKEN_FILE"
 ```
 
 This one-shot command needs only the config and DSN. It does not start or

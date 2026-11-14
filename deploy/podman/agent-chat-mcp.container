@@ -8,9 +8,10 @@ Requires=agent-chat.service
 Image=localhost/agent-chat-mcp:local
 ContainerName=agent-chat-mcp
 Exec=--config /etc/agent-chat/mcp.json
-Volume=/etc/agent-chat/mcp.json:/etc/agent-chat/mcp.json:ro,z
+Volume=/etc/agent-chat/mcp.json:/etc/agent-chat/mcp.json:ro
 Network=agent-chat.network
 Network=traefik
+NetworkAlias=mcp
 User=10001:10001
 ReadOnly=true
 Tmpfs=/tmp:rw,noexec,nosuid,size=16m

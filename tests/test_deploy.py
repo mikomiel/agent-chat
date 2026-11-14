@@ -44,6 +44,7 @@ def test_quadlet_units_are_native_and_secure():
         assert "DropCapability=ALL" in raw
         assert "NoNewPrivileges=true" in raw
         assert "User=10001:10001" in raw
+        assert ":ro,z" not in raw
         assert _quadlet(name)["Container"]["user"] == "10001:10001"
 
     server = _quadlet("agent-chat.container")
@@ -66,6 +67,7 @@ def test_quadlet_units_are_native_and_secure():
     assert mcp["Container"]["exec"].startswith("--config ")
     assert "secret" not in mcp["Container"]
     assert "agent-chat.service" in mcp["Unit"]["requires"]
+    assert "NetworkAlias=mcp" in (QUADLET / "agent-chat-mcp.container").read_text()
 
     network = _quadlet("agent-chat.network")
     assert network["Network"]["networkname"] == "agent-chat"
@@ -77,6 +79,10 @@ def test_quadlet_guide_documents_supported_topology_and_secret_source():
     assert "Infisical" in guide
     assert "podman secret create" in guide
     assert "enable_writes" in guide
+    assert "enable --now" not in guide
+    assert "systemctl --user start agent-chat" in guide
+    assert "chcon -t container_file_t" in guide
+    assert "TOKEN_FILE" in guide
     assert "docs/podman.md" in (ROOT / "README.md").read_text()
     assert "podman.md" in (ROOT / "docs" / "containers.md").read_text()
 

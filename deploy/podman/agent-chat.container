@@ -10,7 +10,7 @@ ContainerName=agent-chat
 Exec=serve --config /etc/agent-chat/config.json
 Environment=CREDENTIALS_DIRECTORY=/run/secrets
 Secret=agent-chat-dsn,type=mount,target=agent-chat-dsn,uid=10001,gid=10001,mode=0400
-Volume=/etc/agent-chat/server.json:/etc/agent-chat/config.json:ro,z
+Volume=/etc/agent-chat/server.json:/etc/agent-chat/config.json:ro
 Network=agent-chat.network
 Network=traefik
 User=10001:10001
