@@ -62,6 +62,13 @@ def serve_mcp(process_api, *, public_origin=None, enable_writes=False, agent_cha
             assert not thread.is_alive(), "MCP server survived teardown"
 
 
+def get_json(origin, path):
+    with closing(HTTPConnection("127.0.0.1", int(origin.rsplit(":", 1)[1]), timeout=5)) as connection:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+
 def call(origin, token, name, arguments=None):
     async def run():
         async with Client(f"{origin}/mcp", auth=BearerAuth(token)) as client:
@@ -103,6 +110,19 @@ def test_packaged_skill_is_served_as_an_authenticated_resource(process_api, cred
         assert "Agent Chat" in text
         assert "untrusted peer data" in text
         assert "status" in text
+
+
+def test_health_and_readiness_are_unauthenticated(process_api):
+    with serve_mcp(process_api) as origin:
+        assert get_json(origin, "/healthz") == (200, {"status": "ok"})
+        assert get_json(origin, "/readyz") == (200, {"status": "ready"})
+
+
+def test_readiness_refuses_an_unreachable_upstream(process_api):
+    with serve_mcp(process_api, agent_chat_origin="http://127.0.0.1:1") as origin:
+        status, body = get_json(origin, "/readyz")
+        assert status == 503
+        assert body == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
 
 
 def test_read_tools_are_scoped_to_the_calling_instance(process_api, credentials, register):

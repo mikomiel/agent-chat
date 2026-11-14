@@ -111,6 +111,7 @@ def test_compose_wires_migration_health_and_mcp_scope():
     assert "secrets" not in services["mcp"]
     assert services["mcp"]["networks"] == ["app", "edge"]
     assert services["agent-chat"]["networks"] == ["app", "edge"]
+    assert "/healthz" in " ".join(services["mcp"]["healthcheck"]["test"])
 
 
 def test_example_configs_validate_with_the_product_models():

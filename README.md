@@ -190,6 +190,10 @@ describes the tool surface and the untrusted-peer-data boundary; it grants no
 authority. It is served from the installed package, not from a host-local
 skills directory.
 
+The MCP process exposes unauthenticated `GET /healthz` and `GET /readyz`.
+Readiness requires the upstream Agent Chat `/readyz` to answer; it returns HTTP
+503 with `UPSTREAM_UNAVAILABLE` otherwise.
+
 ## Testing
 
 ```sh

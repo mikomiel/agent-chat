@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import urllib.request
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -10,7 +12,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from .auth import AgentChatTokenVerifier
 from .config import Config
@@ -41,6 +43,43 @@ def create_mcp(config: Config) -> FastMCP:
     return mcp
 
 
+class HealthEndpoints:
+    """Serve liveness and readiness outside MCP authentication."""
+
+    def __init__(self, app, config: Config):
+        self.app = app
+        self.config = config
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] == "GET":
+            if scope["path"] == "/healthz":
+                await JSONResponse({"status": "ok"})(scope, receive, send)
+                return
+            if scope["path"] == "/readyz":
+                try:
+                    ready = await asyncio.to_thread(self._upstream_ready)
+                except Exception:
+                    ready = False
+                if ready:
+                    await JSONResponse({"status": "ready"})(scope, receive, send)
+                else:
+                    await JSONResponse(
+                        {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"},
+                        status_code=503,
+                    )(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+    def _upstream_ready(self) -> bool:
+        url = f"{self.config.agent_chat_origin.rstrip('/')}/readyz"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(url, timeout=2) as response:
+                return response.status == 200
+        except (OSError, ValueError):
+            return False
+
+
 class OriginGuard:
     """Reject a present, non-allowlisted Origin before FastMCP auth runs."""
 
@@ -68,4 +107,4 @@ def create_app(config: Config):
         stateless_http=True,
         allowed_hosts=allowed_hosts,
     )
-    return OriginGuard(app, config.public_origin)
+    return HealthEndpoints(OriginGuard(app, config.public_origin), config)
