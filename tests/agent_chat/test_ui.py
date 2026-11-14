@@ -1861,6 +1861,20 @@ def test_language_selector_translates_static_and_dynamic_ui(ui, credentials):
     expect(page.locator("#notice")).to_contain_text("not confirmation of a wake or ACK")
 
 
+def test_language_selection_works_when_storage_is_blocked(ui):
+    page = ui.page
+    page.add_init_script("""
+        Storage.prototype.getItem = () => { throw new Error('blocked'); };
+        Storage.prototype.setItem = () => { throw new Error('blocked'); };
+    """)
+    page.reload()
+    expect(page.locator("#login-title")).to_have_text("Rozmowy agentów")
+    with page.expect_navigation():
+        page.select_option("#language", "en")
+    expect(page.locator("#login-title")).to_have_text("Agent conversations")
+    assert page.url.endswith("#lang=en")
+
+
 def test_viewer_routes_do_not_exist_without_public_origin(http_api):
     for path in ("/", "/ui/chat.js", "/ui/chat.css", "/ui/Manrope-Variable.ttf"):
         assert http_api("GET", path)[0] == 404

@@ -440,7 +440,7 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     line.hidden = false;
     line.classList.toggle("is-set", pm !== null && pm !== undefined);
     if (!pm) {
-      line.append("Znacznik PM: brak.");
+      line.append(t("Znacznik PM: brak."));
       return;
     }
     const holder = participantNames.get(pm.session_id);
@@ -448,12 +448,15 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     more.className = "pm-mark-details";
     more.open = pmDetailsOpen;
     more.addEventListener("toggle", () => { pmDetailsOpen = more.open; });
-    const times = text("p", `${pm.session_id} · ustawiony ${displayTimestamp(pm.set_at)} · ` +
-      `ostatnia aktywność ${displayTimestamp(pm.last_activity_at)} · wygasa ${displayTimestamp(pm.expires_at)}.`,
-      "pm-mark-times");
+    const times = text("p", t("{session} · ustawiony {set} · ostatnia aktywność {activity} · wygasa {expires}.", {
+      session: pm.session_id, set: displayTimestamp(pm.set_at),
+      activity: displayTimestamp(pm.last_activity_at), expires: displayTimestamp(pm.expires_at),
+    }), "pm-mark-times");
     // The text shows local times; the tooltip keeps the exact server values.
-    times.title = `ustawiony: ${pm.set_at} · ostatnia aktywność: ${pm.last_activity_at} · wygasa: ${pm.expires_at}`;
-    more.append(text("summary", "Znacznik nie nadaje uprawnień."), times);
+    times.title = t("ustawiony: {set} · ostatnia aktywność: {activity} · wygasa: {expires}", {
+      set: pm.set_at, activity: pm.last_activity_at, expires: pm.expires_at,
+    });
+    more.append(text("summary", t("Znacznik nie nadaje uprawnień.")), times);
     line.append("Znacznik PM: ", holder ? bdi(sessionName(holder)) : "sesja z innej strony listy", more);
   }
 
@@ -1057,8 +1060,8 @@ const UI_LOCALE = window.AgentChatI18n.locale;
     return control(`${roomPath(targetRoom)}/pm`, { session_id: session, pm }, {
       matches: (data) => data.room_id === targetRoom && (pm ? data.pm?.session_id === session : data.pm === null),
       success: () => pm
-        ? `Potwierdzono zapis: znacznik PM ma ${session}. Znacznik nie nadaje uprawnień.`
-        : `Potwierdzono zapis: znacznik PM zdjęty z ${session}.`,
+        ? t("Potwierdzono zapis: znacznik PM ma {session}. Znacznik nie nadaje uprawnień.", { session })
+        : t("Potwierdzono zapis: znacznik PM zdjęty z {session}.", { session }),
       label: "znacznika PM",
     });
   }
@@ -1194,8 +1197,8 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       matches: (data) => data.room_id === targetRoom
         && (assigned ? data.roles?.[role]?.session_id === session : data.roles?.[role] === null),
       success: () => assigned
-        ? `Potwierdzono: ${label} ma ${session}. Znacznik nie nadaje uprawnień.`
-        : `Potwierdzono: znacznik ${label} zdjęty z ${session}.`,
+        ? t("Potwierdzono: {label} ma {session}. Znacznik nie nadaje uprawnień.", { label, session })
+        : t("Potwierdzono: znacznik {label} zdjęty z {session}.", { label, session }),
       label: `znacznika ${label}`,
     });
     if (result && view === "sessions") requestSessions();
@@ -1580,7 +1583,9 @@ const UI_LOCALE = window.AgentChatI18n.locale;
         if (BigInt(event.lastEventId) <= BigInt(owner.seen.get(data.room_id) ?? "0")) return;
         owner.seen.set(data.room_id, event.lastEventId);
         owner.received += 1;
-        el("live-count").textContent = `Odebrane zdarzenia: ${owner.received} · kursor: ${owner.cursor}`;
+        el("live-count").textContent = t("Odebrane zdarzenia: {received} · kursor: {cursor}", {
+          received: owner.received, cursor: owner.cursor,
+        });
         if (data.room_id === selectedRoom) { owner.dirty = true; scheduleLive(owner); }
       } catch {
         disconnectLive(owner);

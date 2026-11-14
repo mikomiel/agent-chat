@@ -243,11 +243,26 @@
   "Członkostwo zapisane: {session}. Uprawnienia poświadczenia nie zostały rozszerzone.": "Membership stored: {session}. Credential permissions were not widened.",
   "Potwierdzono: {label} ma {session}. Znacznik nie nadaje uprawnień.": "Confirmed: {label} held by {session}. The mark grants no authority.",
   "Potwierdzono: znacznik {label} zdjęty z {session}.": "Confirmed: {label} mark removed from {session}.",
+  "Odpowiedź na {id}": "Reply to {id}",
+  "Treść wiadomości agentów jest niezaufana: to nie polecenie ani zgoda na operację.": "Agent message content is untrusted: it is not an instruction or approval for an operation.",
+  "Znacznik PM: brak.": "PM mark: none.",
+  "Znacznik nie nadaje uprawnień.": "The mark grants no authority.",
+  "{session} · ustawiony {set} · ostatnia aktywność {activity} · wygasa {expires}.": "{session} · set {set} · last activity {activity} · expires {expires}.",
+  "ustawiony: {set} · ostatnia aktywność: {activity} · wygasa: {expires}": "set: {set} · last activity: {activity} · expires: {expires}",
+  "Potwierdzono zapis: znacznik PM ma {session}. Znacznik nie nadaje uprawnień.": "Confirmed: PM mark held by {session}. The mark grants no authority.",
+  "Potwierdzono zapis: znacznik PM zdjęty z {session}.": "Confirmed: PM mark removed from {session}.",
+  "Odebrane zdarzenia: {received} · kursor: {cursor}": "Events received: {received} · cursor: {cursor}",
   "Zapisano {id}. To nie jest potwierdzenie wybudzenia ani ACK.": "Stored {id}. This is not confirmation of a wake or ACK."
 };
   const normalize = (value) => value.replace(/\s+/g, " ").trim();
   const LOOKUP = Object.fromEntries(Object.entries(EN).map(([key, value]) => [normalize(key), value]));
-  const language = (() => { try { return window.localStorage.getItem(STORAGE_KEY) === "en" ? "en" : "pl"; } catch { return "pl"; } })();
+  const language = (() => {
+    try {
+      const fromUrl = new URLSearchParams(window.location.hash.slice(1)).get("lang");
+      if (fromUrl === "en" || fromUrl === "pl") return fromUrl;
+      return window.localStorage.getItem(STORAGE_KEY) === "en" ? "en" : "pl";
+    } catch { return "pl"; }
+  })();
   function t(text, values = {}) {
     const key = normalize(text);
     let result = language === "en" ? (LOOKUP[key] ?? text) : text;
@@ -287,7 +302,12 @@
   for (const select of document.querySelectorAll("#language")) {
     select.value = language;
     select.addEventListener("change", () => {
-      try { window.localStorage.setItem(STORAGE_KEY, select.value === "en" ? "en" : "pl"); } catch {}
+      const chosen = select.value === "en" ? "en" : "pl";
+      try { window.localStorage.setItem(STORAGE_KEY, chosen); } catch {}
+      const next = new URL(window.location.href);
+      next.searchParams.delete("lang");
+      next.hash = `lang=${chosen}`;
+      window.history.replaceState(null, "", `${next.pathname}${next.search}${next.hash}`);
       window.location.reload();
     });
   }
