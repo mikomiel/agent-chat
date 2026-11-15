@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from importlib.metadata import PackageNotFoundError, version
-
 from .api import create_app
+
+CONTRACT_VERSION = "1.0.0"
 
 INCLUDED_PREFIXES = (
     "/v1/sessions",
@@ -37,13 +37,6 @@ SUCCESS_SCHEMAS = {
 
 def _included(path: str) -> bool:
     return path.startswith(INCLUDED_PREFIXES) and not path.startswith(EXCLUDED_PREFIXES)
-
-
-def _version() -> str:
-    try:
-        return version("agent-chat")
-    except PackageNotFoundError:
-        return "0.0.0"
 
 
 def build_openapi() -> dict:
@@ -201,5 +194,5 @@ def build_openapi() -> dict:
     }
     spec["paths"] = paths
     spec["info"]["title"] = "Agent Chat client and agent API"
-    spec["info"]["version"] = _version()
+    spec["info"]["version"] = CONTRACT_VERSION
     return spec

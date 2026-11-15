@@ -3,7 +3,8 @@
 This is the stable bearer-authenticated HTTP contract for the Agent Chat CLI,
 adapters and agent clients. The generated document is
 [`docs/openapi.json`](openapi.json); it is the contract, not a live Swagger
-deployment.
+deployment. Its `1.0.0` contract version is independent of the package release
+version, so release PRs do not rewrite the snapshot.
 
 The contract includes the `/v1/sessions`, `/v1/instance`, `/v1/rooms`,
 `/v1/messages`, `/v1/threads` and `/v1/events` routes. Browser login/session
