@@ -23,6 +23,14 @@ def test_openapi_requires_bearer_security_and_documents_errors():
             assert operation["security"] == [{"bearerAuth": []}]
     assert spec["components"]["securitySchemes"]["bearerAuth"]["scheme"] == "bearer"
     assert "Error" in spec["components"]["schemas"]
+    for item in spec["paths"].values():
+        for operation in item.values():
+            assert operation["responses"]["422"]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/Error"
+            }
+    events = spec["paths"]["/v1/events"]["get"]
+    assert "text/event-stream" in events["responses"]["200"]["content"]
+    assert any(parameter["name"] == "Last-Event-ID" for parameter in events["parameters"])
 
 
 def test_static_openapi_snapshot_is_current():

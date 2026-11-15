@@ -32,10 +32,36 @@ def build_openapi() -> dict:
     """Return the filtered contract; live FastAPI docs remain disabled."""
     spec = create_app("postgresql://unused", enabled=True).openapi()
     paths = {path: item for path, item in spec["paths"].items() if _included(path)}
-    for item in paths.values():
-        for operation in item.values():
-            if isinstance(operation, dict):
-                operation["security"] = [{"bearerAuth": []}]
+    error_response = {
+        "description": "Stable Agent Chat refusal envelope",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}},
+    }
+    for path, item in paths.items():
+        for method, operation in item.items():
+            if not isinstance(operation, dict):
+                continue
+            operation["security"] = [{"bearerAuth": []}]
+            responses = operation.setdefault("responses", {})
+            responses["422"] = error_response
+            for status in ("401", "403", "503"):
+                responses.setdefault(status, error_response)
+            if path == "/v1/events" and method == "get":
+                responses["200"] = {
+                    "description": (
+                        "Server-Sent Events stream. Reconnect with the last event id; the "
+                        "Last-Event-ID header takes precedence over the after query. A "
+                        "mid-stream control event may carry a stable error code."
+                    ),
+                    "content": {"text/event-stream": {"schema": {"type": "string"}}},
+                }
+                parameters = operation.setdefault("parameters", [])
+                parameters.append({
+                    "name": "Last-Event-ID",
+                    "in": "header",
+                    "required": False,
+                    "schema": {"type": "string"},
+                    "description": "Last durable event id; takes precedence over after.",
+                })
     components = spec.setdefault("components", {})
     components.setdefault("securitySchemes", {})["bearerAuth"] = {
         "type": "http",
