@@ -97,7 +97,17 @@ def build_openapi() -> dict:
             },
             "Message": {
                 "type": "object",
-                "required": ["id", "room_id", "body", "kind", "created_at", "cursor", "receipts"],
+                "required": [
+                    "id",
+                    "room_id",
+                    "body",
+                    "kind",
+                    "created_at",
+                    "cursor",
+                    "receipts",
+                    "sender",
+                    "recipients",
+                ],
                 "properties": {
                     "id": {"type": "string"},
                     "room_id": {"type": "string"},
@@ -106,6 +116,12 @@ def build_openapi() -> dict:
                     "created_at": {"type": "string"},
                     "cursor": {"type": "string"},
                     "receipts": {"type": "array", "items": {"$ref": "#/components/schemas/JsonObject"}},
+                    "sender": {"$ref": "#/components/schemas/JsonObject"},
+                    "recipients": {"type": "array", "items": {"type": "string"}},
+                    "thread_id": {"type": ["string", "null"]},
+                    "reply_to": {"type": ["string", "null"]},
+                    "thread_ref_key": {"type": ["string", "null"]},
+                    "thread_resolved_at": {"type": ["string", "null"]},
                 },
             },
             "PublicationMessage": {
@@ -187,6 +203,73 @@ def build_openapi() -> dict:
                             "properties": {
                                 "outcome": {"const": "uncertain"},
                                 "reason": {"const": "transport_ambiguous"},
+                            },
+                        },
+                    ]
+                }
+            if path == "/v1/rooms/{room}/messages" and method == "post":
+                operation["requestBody"]["content"]["application/json"]["schema"] = {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["kind", "body", "reply_to"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {"const": "reply"},
+                                "body": {"type": "string"},
+                                "reply_to": {"type": "string"},
+                                "recipients": {"type": "array", "items": {"type": "string"}},
+                                "receipts": {"type": "boolean"},
+                                "thread_id": {"type": ["string", "null"]},
+                                "ref_key": {"type": "null"},
+                            },
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "body", "ref_key"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {
+                                    "enum": [
+                                        "message",
+                                        "status",
+                                        "heads_up",
+                                        "blocked_on",
+                                        "decision_needed",
+                                        "intent",
+                                    ]
+                                },
+                                "body": {"type": "string"},
+                                "ref_key": {"type": "string"},
+                                "recipients": {"type": "array", "items": {"type": "string"}},
+                                "receipts": {"type": "boolean"},
+                                "thread_id": {"type": "null"},
+                                "reply_to": {"type": "null"},
+                            },
+                        },
+                        {
+                            "type": "object",
+                            "required": ["kind", "body"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "kind": {
+                                    "enum": [
+                                        "message",
+                                        "status",
+                                        "question",
+                                        "consultation",
+                                        "heads_up",
+                                        "blocked_on",
+                                        "decision_needed",
+                                        "intent",
+                                    ]
+                                },
+                                "body": {"type": "string"},
+                                "recipients": {"type": "array", "items": {"type": "string"}},
+                                "receipts": {"type": "boolean"},
+                                "thread_id": {"type": ["string", "null"]},
+                                "reply_to": {"type": "null"},
+                                "ref_key": {"type": "null"},
                             },
                         },
                     ]
