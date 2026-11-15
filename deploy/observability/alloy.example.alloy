@@ -1,0 +1,82 @@
+// Example Alloy configuration for Agent Chat.
+// The deployer owns the real Alloy, remote-write, Blackbox, Grafana and alert
+// routing configuration. Replace the example endpoints and labels before use.
+// Scrape /metrics on the private container network; never expose it through the
+// public Traefik routers.
+
+prometheus.scrape "agent_chat_server" {
+  targets = [{
+    "__address__" = "agent-chat:8443",
+    "job"         = "agent-chat",
+    "service"     = "agent-chat",
+    "component"   = "server",
+  }]
+  metrics_path   = "/metrics"
+  scheme         = "http"
+  scrape_interval = "15s"
+  forward_to     = [prometheus.remote_write.estate.receiver]
+}
+
+prometheus.scrape "agent_chat_mcp" {
+  targets = [{
+    "__address__" = "mcp:8951",
+    "job"         = "agent-chat-mcp",
+    "service"     = "agent-chat",
+    "component"   = "mcp",
+  }]
+  metrics_path   = "/metrics"
+  scheme         = "http"
+  scrape_interval = "15s"
+  forward_to     = [prometheus.remote_write.estate.receiver]
+}
+
+prometheus.scrape "agent_chat_blackbox" {
+  targets = [
+    {
+      "__address__"       = "blackbox-exporter:9115",
+      "__param_module"    = "http_2xx",
+      "__param_target"    = "http://agent-chat:8443/healthz",
+      "job"               = "blackbox_http",
+      "service"           = "agent-chat",
+      "component"         = "server",
+      "probe"             = "healthz",
+    },
+    {
+      "__address__"       = "blackbox-exporter:9115",
+      "__param_module"    = "http_2xx",
+      "__param_target"    = "http://agent-chat:8443/readyz",
+      "job"               = "blackbox_http",
+      "service"           = "agent-chat",
+      "component"         = "server",
+      "probe"             = "readyz",
+    },
+    {
+      "__address__"       = "blackbox-exporter:9115",
+      "__param_module"    = "http_2xx",
+      "__param_target"    = "http://mcp:8951/healthz",
+      "job"               = "blackbox_http",
+      "service"           = "agent-chat",
+      "component"         = "mcp",
+      "probe"             = "healthz",
+    },
+    {
+      "__address__"       = "blackbox-exporter:9115",
+      "__param_module"    = "http_2xx",
+      "__param_target"    = "http://mcp:8951/readyz",
+      "job"               = "blackbox_http",
+      "service"           = "agent-chat",
+      "component"         = "mcp",
+      "probe"             = "readyz",
+    },
+  ]
+  metrics_path   = "/probe"
+  scheme         = "http"
+  scrape_interval = "30s"
+  forward_to     = [prometheus.remote_write.estate.receiver]
+}
+
+prometheus.remote_write "estate" {
+  endpoint {
+    url = "http://mimir.example.invalid:9009/api/v1/push"
+  }
+}

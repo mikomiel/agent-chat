@@ -200,6 +200,9 @@ unauthenticated and contains aggregate counters/gauges only; do not route it
 through a public Traefik entrypoint. Scrape it from the private deployment
 network.
 
+An example Alloy scrape/probe and alert set is in
+[deploy/observability](deploy/observability/README.md).
+
 ## Testing
 
 ```sh
