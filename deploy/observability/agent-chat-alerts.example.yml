@@ -1,0 +1,51 @@
+groups:
+  - name: agent-chat
+    rules:
+      - alert: AgentChatServerDown
+        expr: up{job="agent-chat"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Agent Chat server scrape is down
+
+      - alert: AgentChatMCPDown
+        expr: up{job="agent-chat-mcp"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Agent Chat MCP scrape is down
+
+      - alert: AgentChatNotReady
+        expr: probe_success{job="blackbox_http",service="agent-chat",component="server",probe="readyz"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Agent Chat readiness probe is failing
+
+      - alert: AgentChatMCPNotReady
+        expr: probe_success{job="blackbox_http",service="agent-chat",component="mcp",probe="readyz"} == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Agent Chat MCP readiness probe is failing
+
+      - alert: AgentChatDeliveryBacklog
+        expr: agent_chat_delivery_pending > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Agent Chat has a sustained delivery backlog
+          description: Check delivery uncertainty, instance liveness and session wake budget.
+
+      - alert: AgentChatUncertainDelivery
+        expr: agent_chat_delivery_uncertain > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Agent Chat has unresolved uncertain deliveries
