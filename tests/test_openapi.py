@@ -20,6 +20,14 @@ def test_openapi_is_filtered_to_client_and_agent_paths():
     assert "PublicationMessage" in spec["components"]["schemas"]
     assert "next_key" in spec["components"]["schemas"]["StatePage"]["properties"]
     assert "/v1/rooms/{room}/roles" not in paths
+    publication = spec["paths"]["/v1/rooms/{room}/messages"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+    assert "oneOf" in publication
+    assert all(variant["allOf"][0] == {"$ref": "#/components/schemas/Publication"} for variant in publication["oneOf"])
+    base = spec["components"]["schemas"]["Publication"]["properties"]
+    assert base["body"]["minLength"] == 1
+    assert base["recipients"]["maxItems"] == 16
+    assert base["recipients"]["items"]["format"] == "uuid"
+    assert "pattern" in base["ref_key"]
 
 
 def test_openapi_requires_bearer_security_and_documents_errors():

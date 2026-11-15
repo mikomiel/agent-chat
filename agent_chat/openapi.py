@@ -208,69 +208,70 @@ def build_openapi() -> dict:
                     ]
                 }
             if path == "/v1/rooms/{room}/messages" and method == "post":
+                base = {"$ref": "#/components/schemas/Publication"}
                 operation["requestBody"]["content"]["application/json"]["schema"] = {
                     "oneOf": [
                         {
-                            "type": "object",
-                            "required": ["kind", "body", "reply_to"],
-                            "additionalProperties": False,
-                            "properties": {
-                                "kind": {"const": "reply"},
-                                "body": {"type": "string"},
-                                "reply_to": {"type": "string"},
-                                "recipients": {"type": "array", "items": {"type": "string"}},
-                                "receipts": {"type": "boolean"},
-                                "thread_id": {"type": ["string", "null"]},
-                                "ref_key": {"type": "null"},
-                            },
+                            "allOf": [
+                                base,
+                                {
+                                    "type": "object",
+                                    "required": ["reply_to"],
+                                    "properties": {
+                                        "kind": {"const": "reply"},
+                                        "reply_to": {"type": "string", "format": "uuid"},
+                                        "ref_key": {"type": "null"},
+                                    },
+                                },
+                            ]
                         },
                         {
-                            "type": "object",
-                            "required": ["kind", "body", "ref_key"],
-                            "additionalProperties": False,
-                            "properties": {
-                                "kind": {
-                                    "enum": [
-                                        "message",
-                                        "status",
-                                        "heads_up",
-                                        "blocked_on",
-                                        "decision_needed",
-                                        "intent",
-                                    ]
+                            "allOf": [
+                                base,
+                                {
+                                    "type": "object",
+                                    "required": ["ref_key"],
+                                    "properties": {
+                                        "kind": {
+                                            "enum": [
+                                                "message",
+                                                "status",
+                                                "heads_up",
+                                                "blocked_on",
+                                                "decision_needed",
+                                                "intent",
+                                            ]
+                                        },
+                                        "ref_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:/-]{0,127}$"},
+                                        "thread_id": {"type": "null"},
+                                        "reply_to": {"type": "null"},
+                                    },
                                 },
-                                "body": {"type": "string"},
-                                "ref_key": {"type": "string"},
-                                "recipients": {"type": "array", "items": {"type": "string"}},
-                                "receipts": {"type": "boolean"},
-                                "thread_id": {"type": "null"},
-                                "reply_to": {"type": "null"},
-                            },
+                            ]
                         },
                         {
-                            "type": "object",
-                            "required": ["kind", "body"],
-                            "additionalProperties": False,
-                            "properties": {
-                                "kind": {
-                                    "enum": [
-                                        "message",
-                                        "status",
-                                        "question",
-                                        "consultation",
-                                        "heads_up",
-                                        "blocked_on",
-                                        "decision_needed",
-                                        "intent",
-                                    ]
+                            "allOf": [
+                                base,
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "kind": {
+                                            "enum": [
+                                                "message",
+                                                "status",
+                                                "question",
+                                                "consultation",
+                                                "heads_up",
+                                                "blocked_on",
+                                                "decision_needed",
+                                                "intent",
+                                            ]
+                                        },
+                                        "reply_to": {"type": "null"},
+                                        "ref_key": {"type": "null"},
+                                    },
                                 },
-                                "body": {"type": "string"},
-                                "recipients": {"type": "array", "items": {"type": "string"}},
-                                "receipts": {"type": "boolean"},
-                                "thread_id": {"type": ["string", "null"]},
-                                "reply_to": {"type": "null"},
-                                "ref_key": {"type": "null"},
-                            },
+                            ]
                         },
                     ]
                 }

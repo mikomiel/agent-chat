@@ -2806,130 +2806,94 @@
               "schema": {
                 "oneOf": [
                   {
-                    "additionalProperties": false,
-                    "properties": {
-                      "body": {
-                        "type": "string"
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/Publication"
                       },
-                      "kind": {
-                        "const": "reply"
-                      },
-                      "receipts": {
-                        "type": "boolean"
-                      },
-                      "recipients": {
-                        "items": {
-                          "type": "string"
+                      {
+                        "properties": {
+                          "kind": {
+                            "const": "reply"
+                          },
+                          "ref_key": {
+                            "type": "null"
+                          },
+                          "reply_to": {
+                            "format": "uuid",
+                            "type": "string"
+                          }
                         },
-                        "type": "array"
-                      },
-                      "ref_key": {
-                        "type": "null"
-                      },
-                      "reply_to": {
-                        "type": "string"
-                      },
-                      "thread_id": {
-                        "type": [
-                          "string",
-                          "null"
-                        ]
+                        "required": [
+                          "reply_to"
+                        ],
+                        "type": "object"
                       }
-                    },
-                    "required": [
-                      "kind",
-                      "body",
-                      "reply_to"
-                    ],
-                    "type": "object"
+                    ]
                   },
                   {
-                    "additionalProperties": false,
-                    "properties": {
-                      "body": {
-                        "type": "string"
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/Publication"
                       },
-                      "kind": {
-                        "enum": [
-                          "message",
-                          "status",
-                          "heads_up",
-                          "blocked_on",
-                          "decision_needed",
-                          "intent"
-                        ]
-                      },
-                      "receipts": {
-                        "type": "boolean"
-                      },
-                      "recipients": {
-                        "items": {
-                          "type": "string"
+                      {
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "message",
+                              "status",
+                              "heads_up",
+                              "blocked_on",
+                              "decision_needed",
+                              "intent"
+                            ]
+                          },
+                          "ref_key": {
+                            "pattern": "^[a-z0-9][a-z0-9._:/-]{0,127}$",
+                            "type": "string"
+                          },
+                          "reply_to": {
+                            "type": "null"
+                          },
+                          "thread_id": {
+                            "type": "null"
+                          }
                         },
-                        "type": "array"
-                      },
-                      "ref_key": {
-                        "type": "string"
-                      },
-                      "reply_to": {
-                        "type": "null"
-                      },
-                      "thread_id": {
-                        "type": "null"
+                        "required": [
+                          "ref_key"
+                        ],
+                        "type": "object"
                       }
-                    },
-                    "required": [
-                      "kind",
-                      "body",
-                      "ref_key"
-                    ],
-                    "type": "object"
+                    ]
                   },
                   {
-                    "additionalProperties": false,
-                    "properties": {
-                      "body": {
-                        "type": "string"
+                    "allOf": [
+                      {
+                        "$ref": "#/components/schemas/Publication"
                       },
-                      "kind": {
-                        "enum": [
-                          "message",
-                          "status",
-                          "question",
-                          "consultation",
-                          "heads_up",
-                          "blocked_on",
-                          "decision_needed",
-                          "intent"
-                        ]
-                      },
-                      "receipts": {
-                        "type": "boolean"
-                      },
-                      "recipients": {
-                        "items": {
-                          "type": "string"
+                      {
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "message",
+                              "status",
+                              "question",
+                              "consultation",
+                              "heads_up",
+                              "blocked_on",
+                              "decision_needed",
+                              "intent"
+                            ]
+                          },
+                          "ref_key": {
+                            "type": "null"
+                          },
+                          "reply_to": {
+                            "type": "null"
+                          }
                         },
-                        "type": "array"
-                      },
-                      "ref_key": {
-                        "type": "null"
-                      },
-                      "reply_to": {
-                        "type": "null"
-                      },
-                      "thread_id": {
-                        "type": [
-                          "string",
-                          "null"
-                        ]
+                        "type": "object"
                       }
-                    },
-                    "required": [
-                      "kind",
-                      "body"
-                    ],
-                    "type": "object"
+                    ]
                   }
                 ]
               }
