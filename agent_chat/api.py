@@ -26,6 +26,7 @@ from . import events as event_store
 from . import rooms as room_store
 from .auth import authenticate, authenticate_producer, lock_actor
 from .http_boundary import LOG, UNMATCHED, RequestBoundary, error_response, log_error
+from .metrics import Metrics
 from .models import (
     HTTP_ERROR_STATUS,
     REF_KEY_PATTERN,
@@ -81,6 +82,7 @@ def create_app(
             validate_origin(public_origin, https_only=True)
         except ChatError:
             raise ValueError("public_origin must be a canonical HTTPS origin") from None
+    metrics = Metrics()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     app.add_middleware(RequestBoundary, public_origin=public_origin)
 
@@ -88,17 +90,41 @@ def create_app(
     async def chat_error(request: Request, error: ChatError):
         status = HTTP_ERROR_STATUS.get(error.code, 503)
         _log_handled(logging.WARNING, request, error.code, status, error)
+        metrics.inc(
+            "agent_chat_http_errors_total",
+            {
+                "route": getattr(request.scope.get("route"), "path", UNMATCHED),
+                "status": str(status),
+                "code": error.code,
+            },
+        )
         return error_response(error.code, status)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: Request, error: RequestValidationError):
         # FastAPI's default includes the submitted input, which can be private.
         _log_handled(logging.WARNING, request, "INVALID_REQUEST", 422, error)
+        metrics.inc(
+            "agent_chat_http_errors_total",
+            {
+                "route": getattr(request.scope.get("route"), "path", UNMATCHED),
+                "status": "422",
+                "code": "INVALID_REQUEST",
+            },
+        )
         return error_response("INVALID_REQUEST", 422)
 
     @app.exception_handler(DatabaseError)
     async def database_error(request: Request, error: DatabaseError):
         _log_handled(logging.ERROR, request, "DATABASE_UNAVAILABLE", 503, error)
+        metrics.inc(
+            "agent_chat_http_errors_total",
+            {
+                "route": getattr(request.scope.get("route"), "path", UNMATCHED),
+                "status": "503",
+                "code": "DATABASE_UNAVAILABLE",
+            },
+        )
         return error_response("DATABASE_UNAVAILABLE", 503)
 
     @app.exception_handler(HTTPException)
@@ -106,6 +132,14 @@ def create_app(
         # Unknown routes and methods. FastAPI's default {"detail": ...} is not this API's envelope.
         code = HTTPStatus(error.status_code).name
         _log_handled(logging.WARNING, request, code, error.status_code, error)
+        metrics.inc(
+            "agent_chat_http_errors_total",
+            {
+                "route": getattr(request.scope.get("route"), "path", UNMATCHED),
+                "status": str(error.status_code),
+                "code": code,
+            },
+        )
         return error_response(code, error.status_code, error.headers)
 
     @app.exception_handler(Exception)
@@ -180,7 +214,9 @@ def create_app(
             )
             response.delete_cookie(browser.LOGIN_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
             return {
-                "csrf_token": browser.csrf(session.token), "expires_in": session.expires_in, "access": session.access,
+                "csrf_token": browser.csrf(session.token),
+                "expires_in": session.expires_in,
+                "access": session.access,
             }
 
         @app.get("/v1/browser/session")
@@ -357,7 +393,10 @@ def create_app(
             # `publish` answers a repeated key before it reads the parent, so a replay survives the parent's expiry.
             parent = receipts.locate(db, actor, message)
             publication = Publication(
-                kind="reply", body=payload.body, recipients=payload.recipients, reply_to=message,
+                kind="reply",
+                body=payload.body,
+                recipients=payload.recipients,
+                reply_to=message,
                 receipts=payload.receipts,
             )
             return feed.message_view(publish(db, actor, parent["room_id"], key, publication))
@@ -433,8 +472,10 @@ def create_app(
         thread_id: UUID | None = None,
         before: str | None = None,
         ref_key: Annotated[str | None, Query(pattern=REF_KEY_PATTERN)] = None,
-        sender_role: Literal["pm", "forgejo_pm", "forgejo-pm", "github_pm", "github-pm",
-                               "delivery_manager", "delivery-manager", "dm"] | None = None,
+        sender_role: Literal[
+            "pm", "forgejo_pm", "forgejo-pm", "github_pm", "github-pm", "delivery_manager", "delivery-manager", "dm"
+        ]
+        | None = None,
     ):
         return feed.history(
             db,
@@ -483,7 +524,7 @@ def create_app(
 
         batch = await run_in_threadpool(read_batch, position, None)
 
-        async def stream():
+        async def _stream():
             nonlocal batch
             started = last_comment = time.monotonic()
             yield ": connected\n\n"
@@ -510,6 +551,14 @@ def create_app(
                     yield ": keepalive\n\n"
                     last_comment = time.monotonic()
 
+        async def stream():
+            metrics.adjust("agent_chat_sse_connections_active", 1)
+            try:
+                async for chunk in _stream():
+                    yield chunk
+            finally:
+                metrics.adjust("agent_chat_sse_connections_active", -1)
+
         return StreamingResponse(
             stream(), media_type="text/event-stream", headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
         )
@@ -524,5 +573,24 @@ def create_app(
     ):
         stored = publish(db, current_actor(request, db), room, key, payload)
         return feed.message_view(stored)
+
+    @app.get("/metrics")
+    def metrics_route(db: Annotated[Connection[dict[str, Any]], Depends(connection)]):
+        counts = db.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM agent_chat.instances WHERE ended_at IS NULL) AS instances,
+              (SELECT count(*) FROM agent_chat.recipients r
+                 JOIN agent_chat.messages m ON m.id = r.message_id
+                WHERE r.delivery_batch_id IS NULL AND m.expires_at > clock_timestamp()) AS pending,
+              (SELECT count(*) FROM agent_chat.recipients r
+                 JOIN agent_chat.messages m ON m.id = r.message_id
+                WHERE r.uncertainty_reason IS NOT NULL AND m.expires_at > clock_timestamp()) AS uncertain
+            """
+        ).fetchone()
+        metrics.gauge("agent_chat_instances_active", counts["instances"])
+        metrics.gauge("agent_chat_delivery_pending", counts["pending"])
+        metrics.gauge("agent_chat_delivery_uncertain", counts["uncertain"])
+        return Response(metrics.render(), media_type="text/plain; version=0.0.4")
 
     return app

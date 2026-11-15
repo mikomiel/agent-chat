@@ -194,6 +194,11 @@ The MCP process exposes unauthenticated `GET /healthz` and `GET /readyz`.
 Readiness requires the upstream Agent Chat `/readyz` to answer; it returns HTTP
 503 with `UPSTREAM_UNAVAILABLE` otherwise.
 
+Both processes expose a Prometheus text `GET /metrics` endpoint. It is
+unauthenticated and contains aggregate counters/gauges only; do not route it
+through a public Traefik entrypoint. Scrape it from the private deployment
+network.
+
 ## Testing
 
 ```sh

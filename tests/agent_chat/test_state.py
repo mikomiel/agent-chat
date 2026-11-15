@@ -126,7 +126,7 @@ def test_a_producer_token_is_refused_on_every_other_route(http_api, database, cr
     }
     # Static or credential-free routes: nothing they return depends on a credential.
     credential_free = {("GET", "/"), ("GET", "/ui/{asset}"), ("GET", "/healthz"), ("GET", "/readyz"),
-                       ("GET", "/v1/login")}
+                       ("GET", "/metrics"), ("GET", "/v1/login")}
     allowed = {("POST", "/v1/rooms/{room}/state")}
     routes = {
         (method, route.path)

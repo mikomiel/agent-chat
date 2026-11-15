@@ -4,6 +4,7 @@ import secrets
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from hashlib import sha256
 from http.client import HTTPConnection
 from threading import Thread
@@ -35,6 +36,18 @@ def join(http_api, credentials, *, native="synthetic-session"):
     status, binding = http_api("POST", "/v1/sessions", request, credentials.agent)
     assert status == 200
     return binding, token, request
+
+
+def test_metrics_endpoint_reports_application_gauges(process_api):
+    port = int(process_api.origin.rsplit(":", 1)[1])
+    with closing(HTTPConnection("127.0.0.1", port, timeout=8)) as connection:
+        connection.request("GET", "/metrics")
+        response = connection.getresponse()
+        body = response.read().decode()
+    assert response.status == 200
+    assert "agent_chat_instances_active " in body
+    assert "agent_chat_delivery_pending " in body
+    assert "agent_chat_delivery_uncertain " in body
 
 
 def test_api_requires_explicit_opt_in_and_does_not_migrate(database):

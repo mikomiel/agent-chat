@@ -218,6 +218,10 @@ curl -fsS "https://mcp.example.invalid/readyz"
 Agent Chat `/readyz` to answer, so it fails with HTTP 503 and
 `UPSTREAM_UNAVAILABLE` when the server or database is unavailable.
 
+Both web and MCP processes expose an unauthenticated Prometheus `/metrics`
+endpoint. Scrape it on the private container network; do not expose `/metrics`
+through a public Traefik router. It contains aggregate counts only.
+
 The MCP endpoint is `https://mcp.example.invalid/mcp` and requires:
 
 ```text
