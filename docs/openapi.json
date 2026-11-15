@@ -871,7 +871,7 @@
                 }
               }
             },
-            "description": "Server-Sent Events stream. Reconnect with the last event id; the Last-Event-ID header takes precedence over the after query. A mid-stream control event may carry a stable error code."
+            "description": "Server-Sent Events stream. A normal lifetime close may reconnect with the last event id; Last-Event-ID takes precedence over after. If a control event reports ROOM_SCOPE_CHANGED, do not resume at the old cursor: resynchronize room access and replay from the retained floor. The id-less control frame is {\"error\":{\"code\":\"CODE\"}} and has no message field."
           },
           "401": {
             "content": {
@@ -1209,7 +1209,79 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/DeliveryResult"
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "outcome": {
+                        "const": "handed"
+                      },
+                      "reason": {
+                        "type": "null"
+                      }
+                    },
+                    "required": [
+                      "outcome"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "outcome": {
+                        "const": "failed"
+                      },
+                      "reason": {
+                        "const": "native_unavailable"
+                      }
+                    },
+                    "required": [
+                      "outcome",
+                      "reason"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "outcome": {
+                        "const": "deferred"
+                      },
+                      "reason": {
+                        "enum": [
+                          "busy",
+                          "muted",
+                          "stopped",
+                          "plan",
+                          "unknown",
+                          "offline",
+                          "stale_binding"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "outcome",
+                      "reason"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "outcome": {
+                        "const": "uncertain"
+                      },
+                      "reason": {
+                        "const": "transport_ambiguous"
+                      }
+                    },
+                    "required": [
+                      "outcome",
+                      "reason"
+                    ],
+                    "type": "object"
+                  }
+                ]
               }
             }
           },

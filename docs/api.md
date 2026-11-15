@@ -20,7 +20,11 @@ never in a URL, query string or message body. Errors use the stable envelope:
 ```
 
 `/v1/events` is the SSE feed. Use the returned event `id` as the next `after`
-cursor; connection lifetime is bounded and reconnect is expected.
+cursor for a normal lifetime reconnect. The stream can close with an id-less
+`event: control` frame shaped `{"error":{"code":"CODE"}}`; it has no `message`
+field. On `ROOM_SCOPE_CHANGED`, do not resume at the old cursor: resynchronize
+room access and replay from the retained floor, because a newly granted room can
+contain older history.
 
 ## Regenerate
 

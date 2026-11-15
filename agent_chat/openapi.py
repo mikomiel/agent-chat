@@ -154,12 +154,52 @@ def build_openapi() -> dict:
                     "description": "Successful response",
                     "content": {"application/json": {"schema": {"$ref": f"#/components/schemas/{success}"}}},
                 }
+            if path == "/v1/instance/deliveries/{attempt}/result" and method == "post":
+                operation["requestBody"]["content"]["application/json"]["schema"] = {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "required": ["outcome"],
+                            "additionalProperties": False,
+                            "properties": {"outcome": {"const": "handed"}, "reason": {"type": "null"}},
+                        },
+                        {
+                            "type": "object",
+                            "required": ["outcome", "reason"],
+                            "additionalProperties": False,
+                            "properties": {"outcome": {"const": "failed"}, "reason": {"const": "native_unavailable"}},
+                        },
+                        {
+                            "type": "object",
+                            "required": ["outcome", "reason"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "outcome": {"const": "deferred"},
+                                "reason": {
+                                    "enum": ["busy", "muted", "stopped", "plan", "unknown", "offline", "stale_binding"]
+                                },
+                            },
+                        },
+                        {
+                            "type": "object",
+                            "required": ["outcome", "reason"],
+                            "additionalProperties": False,
+                            "properties": {
+                                "outcome": {"const": "uncertain"},
+                                "reason": {"const": "transport_ambiguous"},
+                            },
+                        },
+                    ]
+                }
             if path == "/v1/events" and method == "get":
                 responses["200"] = {
                     "description": (
-                        "Server-Sent Events stream. Reconnect with the last event id; the "
-                        "Last-Event-ID header takes precedence over the after query. A "
-                        "mid-stream control event may carry a stable error code."
+                        "Server-Sent Events stream. A normal lifetime close may reconnect "
+                        "with the last event id; Last-Event-ID takes precedence over after. "
+                        "If a control event reports ROOM_SCOPE_CHANGED, do not resume at the "
+                        "old cursor: resynchronize room access and replay from the retained "
+                        'floor. The id-less control frame is {"error":{"code":"CODE"}} '
+                        "and has no message field."
                     ),
                     "content": {"text/event-stream": {"schema": {"type": "string"}}},
                 }
