@@ -624,7 +624,10 @@ def create_app(
                     OR e.delivery_batch_id IN (SELECT id FROM retry)) AS pending,
               (SELECT count(*) FROM agent_chat.recipients r
                  JOIN agent_chat.messages m ON m.id = r.message_id
-                WHERE r.uncertainty_reason IS NOT NULL AND m.expires_at > clock_timestamp()) AS uncertain
+                WHERE r.uncertainty_reason IS NOT NULL
+                  AND r.acknowledged_at IS NULL
+                  AND r.replying_message_id IS NULL
+                  AND m.expires_at > clock_timestamp()) AS uncertain
             """,
             (LEASE_SECONDS, DELIVERY_MAX_AGE_SECONDS, BACKOFF_SECONDS[0], BACKOFF_SECONDS[1]),
         ).fetchone()
