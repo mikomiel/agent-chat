@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0](https://github.com/mikomiel/agent-chat/compare/v0.5.0...v0.6.0) (2026-11-15)
+
+
+### Features
+
+* **mcp:** add health and readiness endpoints ([#66](https://github.com/mikomiel/agent-chat/issues/66)) ([853174c](https://github.com/mikomiel/agent-chat/commit/853174c25a231be4313976ea0ee3638e9ff33ec0))
+* **metrics:** expose bounded Prometheus metrics ([#68](https://github.com/mikomiel/agent-chat/issues/68)) ([b8c309c](https://github.com/mikomiel/agent-chat/commit/b8c309cccf19be75d9c91851926ecfe05d936b2b))
+
 ## [0.5.0](https://github.com/mikomiel/agent-chat/compare/v0.4.0...v0.5.0) (2026-11-14)
 
 
