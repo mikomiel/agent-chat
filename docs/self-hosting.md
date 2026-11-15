@@ -282,6 +282,10 @@ The MCP service also serves the packaged `agent-chat` skill as read-only MCP
 resources, including `skill://agent-chat/SKILL.md`. The skill documents the
 tool surface and the untrusted-peer-data boundary; it grants no authority.
 
+The MCP process exposes unauthenticated `GET /healthz` and `GET /readyz`.
+Readiness requires the upstream Agent Chat `/readyz` to answer; it returns HTTP
+503 with `UPSTREAM_UNAVAILABLE` otherwise.
+
 ### Browser login
 
 The browser routes exist only when `public_origin` is configured. Open that

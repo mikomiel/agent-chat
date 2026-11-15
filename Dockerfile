@@ -46,4 +46,4 @@ EXPOSE 8951
 ENTRYPOINT ["agent-chat-mcp"]
 CMD ["--config", "/etc/agent-chat/mcp.json"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=6 \
-    CMD ["python", "-c", "import socket; s=socket.create_connection(('127.0.0.1',8951),2); s.close()"]
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8951/healthz', timeout=2)"]

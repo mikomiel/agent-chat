@@ -207,6 +207,17 @@ curl -fsS "https://chat.example.invalid/healthz"
 curl -fsS "https://chat.example.invalid/readyz"
 ```
 
+The MCP service also exposes unauthenticated liveness and readiness routes:
+
+```sh
+curl -fsS "https://mcp.example.invalid/healthz"
+curl -fsS "https://mcp.example.invalid/readyz"
+```
+
+`/healthz` proves the process is alive. `/readyz` also requires the upstream
+Agent Chat `/readyz` to answer, so it fails with HTTP 503 and
+`UPSTREAM_UNAVAILABLE` when the server or database is unavailable.
+
 The MCP endpoint is `https://mcp.example.invalid/mcp` and requires:
 
 ```text
