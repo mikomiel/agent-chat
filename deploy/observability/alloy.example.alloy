@@ -19,7 +19,7 @@ prometheus.scrape "agent_chat_server" {
 
 prometheus.scrape "agent_chat_mcp" {
   targets = [{
-    "__address__" = "agent-chat-mcp:8951",
+    "__address__" = "mcp:8951",
     "job"         = "agent-chat-mcp",
     "service"     = "agent-chat",
     "component"   = "mcp",
@@ -53,7 +53,7 @@ prometheus.scrape "agent_chat_blackbox" {
     {
       "__address__"       = "blackbox-exporter:9115",
       "__param_module"    = "http_2xx",
-      "__param_target"    = "http://agent-chat-mcp:8951/healthz",
+      "__param_target"    = "http://mcp:8951/healthz",
       "job"               = "blackbox_http",
       "service"           = "agent-chat",
       "component"         = "mcp",
@@ -62,7 +62,7 @@ prometheus.scrape "agent_chat_blackbox" {
     {
       "__address__"       = "blackbox-exporter:9115",
       "__param_module"    = "http_2xx",
-      "__param_target"    = "http://agent-chat-mcp:8951/readyz",
+      "__param_target"    = "http://mcp:8951/readyz",
       "job"               = "blackbox_http",
       "service"           = "agent-chat",
       "component"         = "mcp",

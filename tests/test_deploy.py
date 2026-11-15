@@ -90,7 +90,7 @@ def test_quadlet_guide_documents_supported_topology_and_secret_source():
 def test_observability_example_covers_metrics_probes_and_alerts():
     observability = DEPLOY / "observability"
     alloy = (observability / "alloy.example.alloy").read_text()
-    for token in ("agent-chat:8443", "agent-chat-mcp:8951", "/metrics", "/healthz", "/readyz"):
+    for token in ("agent-chat:8443", "mcp:8951", "/metrics", "/healthz", "/readyz"):
         assert token in alloy
     assert "mimir.example.invalid" in alloy
     guide = (observability / "README.md").read_text()
@@ -104,6 +104,9 @@ def test_observability_example_covers_metrics_probes_and_alerts():
     names = {rule["alert"] for group in alerts["groups"] for rule in group["rules"]}
     assert {"AgentChatServerDown", "AgentChatMCPDown", "AgentChatNotReady"} <= names
     assert "AgentChatDeliveryBacklog" in names
+    rules = {rule["alert"]: rule for group in alerts["groups"] for rule in group["rules"]}
+    assert 'component="server"' in rules["AgentChatNotReady"]["expr"]
+    assert 'component="mcp"' in rules["AgentChatMCPNotReady"]["expr"]
     assert "deployer" in (observability / "README.md").read_text()
 
 
