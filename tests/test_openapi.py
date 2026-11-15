@@ -17,6 +17,8 @@ def test_openapi_is_filtered_to_client_and_agent_paths():
     assert not any(path.startswith("/v1/login") for path in paths)
     assert not any(path.startswith("/v1/browser") for path in paths)
     assert "/v1/rooms/{room}/pm" not in paths
+    assert "PublicationMessage" in spec["components"]["schemas"]
+    assert "next_key" in spec["components"]["schemas"]["StatePage"]["properties"]
     assert "/v1/rooms/{room}/roles" not in paths
 
 
