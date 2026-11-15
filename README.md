@@ -37,6 +37,7 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
 | Module | Role |
 | --- | --- |
 | `agent_chat/api.py` | FastAPI application: HTTP routes, SSE feed, web assets |
+| `docs/api.md` | Stable client/agent HTTP contract; live FastAPI docs are disabled |
 | `agent_chat/storage.py` | Connection policy and ordered SQL migrations |
 | `agent_chat/auth.py`, `browser.py`, `http_boundary.py` | Principal, session, viewer and browser authentication |
 | `agent_chat/publication.py`, `events.py`, `feed.py` | Transactional publication, event log, history and replay |
