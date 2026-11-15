@@ -10,13 +10,13 @@ http:
         responseHeaderTimeout: 0s
   routers:
     agent-chat:
-      rule: Host(`chat.example.invalid`)
+      rule: Host(`chat.example.invalid`) && !PathPrefix(`/metrics`)
       entryPoints:
         - websecure
       service: agent-chat
       tls: {}
     agent-chat-mcp:
-      rule: Host(`mcp.example.invalid`)
+      rule: Host(`mcp.example.invalid`) && !PathPrefix(`/metrics`)
       entryPoints:
         - websecure
       service: agent-chat-mcp

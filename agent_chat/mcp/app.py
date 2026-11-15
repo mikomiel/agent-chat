@@ -15,26 +15,43 @@ from fastmcp.server.middleware import Middleware
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
 from starlette.responses import JSONResponse, Response
 
+from ..metrics import Metrics
 from .auth import AgentChatTokenVerifier
 from .config import Config
-from .tools import register
+from .tools import register, registered_tool_names
 
 
 class SafeToolErrors(Middleware):
     """Replace framework argument-validation details with a stable code."""
 
+    def __init__(self, metrics: Metrics, tools: frozenset[str]):
+        self.metrics = metrics
+        self.tools = tools
+
     async def on_call_tool(self, context, call_next):
+        requested = getattr(getattr(context, "message", None), "name", "unknown")
+        tool = requested if requested in self.tools else "unknown"
         try:
-            return await call_next(context)
+            result = await call_next(context)
         except FastMCPValidationError:
+            self.metrics.inc("agent_chat_mcp_tool_calls_total", {"tool": tool, "outcome": "error"})
             raise ToolError("INVALID_REQUEST") from None
+        except Exception:
+            self.metrics.inc("agent_chat_mcp_tool_calls_total", {"tool": tool, "outcome": "error"})
+            raise
+        payload = getattr(result, "structured_content", None)
+        outcome = "error" if getattr(result, "is_error", False) or (
+            isinstance(payload, dict) and "error" in payload
+        ) else "ok"
+        self.metrics.inc("agent_chat_mcp_tool_calls_total", {"tool": tool, "outcome": outcome})
+        return result
 
 
-def create_mcp(config: Config) -> FastMCP:
+def create_mcp(config: Config, metrics: Metrics) -> FastMCP:
     mcp = FastMCP(
         name="agent-chat",
         auth=AgentChatTokenVerifier(config.agent_chat_origin, allow_service_http=True),
-        middleware=[SafeToolErrors()],
+        middleware=[SafeToolErrors(metrics, registered_tool_names(config.enable_writes))],
         mask_error_details=True,
     )
     skills = Path(__file__).resolve().parent.parent / "skills"
@@ -71,15 +88,19 @@ finally:
 class HealthEndpoints:
     """Serve liveness and readiness outside MCP authentication."""
 
-    def __init__(self, app, config: Config):
+    def __init__(self, app, config: Config, metrics: Metrics):
         self.app = app
         self.config = config
+        self.metrics = metrics
         self._readiness: asyncio.Task[bool] | None = None
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["method"] == "GET":
             if scope["path"] == "/healthz":
                 await JSONResponse({"status": "ok"})(scope, receive, send)
+                return
+            if scope["path"] == "/metrics":
+                await Response(self.metrics.render(), media_type="text/plain; version=0.0.4")(scope, receive, send)
                 return
             if scope["path"] == "/readyz":
                 try:
@@ -153,9 +174,10 @@ def create_app(config: Config):
     if config.public_origin is not None:
         allowed_hosts.add(urlsplit(config.public_origin).hostname)
     allowed_hosts = sorted(host for host in allowed_hosts if host)
-    app = create_mcp(config).http_app(
+    metrics = Metrics()
+    app = create_mcp(config, metrics).http_app(
         path="/mcp",
         stateless_http=True,
         allowed_hosts=allowed_hosts,
     )
-    return HealthEndpoints(OriginGuard(app, config.public_origin), config)
+    return HealthEndpoints(OriginGuard(app, config.public_origin), config, metrics)

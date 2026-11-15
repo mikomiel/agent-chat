@@ -33,6 +33,14 @@ from ..models import (
 from .config import Config
 
 REQUEST_SECONDS = 20.0
+READ_TOOL_NAMES = frozenset({"rooms", "who", "history", "state", "status"})
+WRITE_TOOL_NAMES = frozenset({
+    "send", "reply", "ack", "mute", "unmute", "resolve", "unresolve", "lane", "work",
+})
+
+
+def registered_tool_names(enable_writes: bool) -> frozenset[str]:
+    return READ_TOOL_NAMES | (WRITE_TOOL_NAMES if enable_writes else frozenset())
 
 
 def _client(config: Config) -> Client:

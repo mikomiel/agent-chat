@@ -138,7 +138,8 @@ def test_traefik_routes_preserve_host_and_have_no_extra_auth():
     dynamic = yaml.safe_load((DEPLOY / "traefik" / "dynamic.example.yml").read_text())
     http = dynamic["http"]
     assert set(http["routers"]) == {"agent-chat", "agent-chat-mcp"}
-    assert http["routers"]["agent-chat-mcp"]["rule"] == "Host(`mcp.example.invalid`)"
+    assert "!PathPrefix(`/metrics`)" in http["routers"]["agent-chat"]["rule"]
+    assert "!PathPrefix(`/metrics`)" in http["routers"]["agent-chat-mcp"]["rule"]
     assert http["services"]["agent-chat-mcp"]["loadBalancer"]["passHostHeader"] is True
     assert http["services"]["agent-chat-mcp"]["loadBalancer"]["servers"] == [{"url": "http://mcp:8951"}]
     assert "basicAuth" not in str(http)

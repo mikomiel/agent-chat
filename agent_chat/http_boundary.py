@@ -47,9 +47,18 @@ async def refuse(code: str, status: int, scope: Scope, receive: Receive, send: S
 
 
 class RequestBoundary:
-    def __init__(self, app: ASGIApp, public_origin: str | None = None):
+    def __init__(self, app: ASGIApp, public_origin: str | None = None, metrics=None):
         self.app = app
+        self.metrics = metrics
         self.public_origin = public_origin.encode("ascii") if public_origin is not None else None
+
+    async def _refuse(self, code: str, status: int, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.metrics is not None:
+            self.metrics.inc(
+                "agent_chat_http_errors_total",
+                {"route": UNMATCHED, "status": str(status), "code": code},
+            )
+        await refuse(code, status, scope, receive, send)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -64,10 +73,10 @@ class RequestBoundary:
             or (cookie and self.public_origin is None)
             or (mutation and (cookie or scope["path"] == "/v1/login") and origins != [self.public_origin])
         ):
-            await refuse("SESSION_FORBIDDEN", 403, scope, receive, send)
+            await self._refuse("SESSION_FORBIDDEN", 403, scope, receive, send)
             return
         if cookie and b"authorization" in headers:
-            await refuse("UNAUTHENTICATED", 401, scope, receive, send)
+            await self._refuse("UNAUTHENTICATED", 401, scope, receive, send)
             return
         if scope["query_string"]:
             allowed = set()
@@ -95,10 +104,10 @@ class RequestBoundary:
                 if set(keys) - allowed or len(set(keys)) != len(keys):
                     raise ValueError
             except (ValueError, UnicodeError):
-                await refuse("INVALID_REQUEST", 422, scope, receive, send)
+                await self._refuse("INVALID_REQUEST", 422, scope, receive, send)
                 return
         if any(headers.count(name) > 1 for name in (b"authorization", b"cookie", b"last-event-id")):
-            await refuse("UNAUTHENTICATED", 401, scope, receive, send)
+            await self._refuse("UNAUTHENTICATED", 401, scope, receive, send)
             return
         body = bytearray()
         oversized = False
@@ -116,13 +125,13 @@ class RequestBoundary:
                     if not message.get("more_body", False):
                         break
         except TimeoutError:
-            await refuse("REQUEST_TIMEOUT", 408, scope, receive, send)
+            await self._refuse("REQUEST_TIMEOUT", 408, scope, receive, send)
             return
         if oversized:
-            await refuse("REQUEST_TOO_LARGE", 413, scope, receive, send)
+            await self._refuse("REQUEST_TOO_LARGE", 413, scope, receive, send)
             return
         if body and scope["method"] in ("GET", "HEAD"):
-            await refuse("INVALID_REQUEST", 422, scope, receive, send)
+            await self._refuse("INVALID_REQUEST", 422, scope, receive, send)
             return
         consumed = False
 

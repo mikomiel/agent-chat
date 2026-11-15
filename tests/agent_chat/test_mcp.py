@@ -157,6 +157,13 @@ def serve_mcp(process_api, *, public_origin=None, enable_writes=False, agent_cha
             assert not thread.is_alive(), "MCP server survived teardown"
 
 
+def get_text(origin, path):
+    with closing(HTTPConnection("127.0.0.1", int(origin.rsplit(":", 1)[1]), timeout=5)) as connection:
+        connection.request("GET", path)
+        response = connection.getresponse()
+        return response.status, response.read().decode()
+
+
 def get_json(origin, path):
     with closing(HTTPConnection("127.0.0.1", int(origin.rsplit(":", 1)[1]), timeout=5)) as connection:
         connection.request("GET", path)
@@ -254,6 +261,17 @@ def test_readiness_has_an_absolute_deadline(process_api):
             assert status == 503
             assert body == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
             assert time.monotonic() - started < 3
+
+
+def test_mcp_metrics_expose_tool_outcomes(process_api, credentials, register):
+    token, _ = register(process_api, credentials, "mcp-metrics")
+    with serve_mcp(process_api) as origin:
+        assert call(origin, token, "status")["session_id"]
+        status, text = get_text(origin, "/metrics")
+        assert status == 200
+        assert "agent_chat_mcp_tool_calls_total" in text
+        assert 'tool="status"' in text
+        assert 'outcome="ok"' in text
 
 
 def test_read_tools_are_scoped_to_the_calling_instance(process_api, credentials, register):
