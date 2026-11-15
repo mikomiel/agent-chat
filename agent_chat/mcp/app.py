@@ -18,17 +18,19 @@ from starlette.responses import JSONResponse, Response
 from ..metrics import Metrics
 from .auth import AgentChatTokenVerifier
 from .config import Config
-from .tools import register
+from .tools import register, registered_tool_names
 
 
 class SafeToolErrors(Middleware):
     """Replace framework argument-validation details with a stable code."""
 
-    def __init__(self, metrics: Metrics):
+    def __init__(self, metrics: Metrics, tools: frozenset[str]):
         self.metrics = metrics
+        self.tools = tools
 
     async def on_call_tool(self, context, call_next):
-        tool = getattr(getattr(context, "message", None), "name", "unknown")
+        requested = getattr(getattr(context, "message", None), "name", "unknown")
+        tool = requested if requested in self.tools else "unknown"
         try:
             result = await call_next(context)
         except FastMCPValidationError:
@@ -37,7 +39,11 @@ class SafeToolErrors(Middleware):
         except Exception:
             self.metrics.inc("agent_chat_mcp_tool_calls_total", {"tool": tool, "outcome": "error"})
             raise
-        self.metrics.inc("agent_chat_mcp_tool_calls_total", {"tool": tool, "outcome": "ok"})
+        payload = getattr(result, "structured_content", None)
+        outcome = "error" if getattr(result, "is_error", False) or (
+            isinstance(payload, dict) and "error" in payload
+        ) else "ok"
+        self.metrics.inc("agent_chat_mcp_tool_calls_total", {"tool": tool, "outcome": outcome})
         return result
 
 
@@ -45,7 +51,7 @@ def create_mcp(config: Config, metrics: Metrics) -> FastMCP:
     mcp = FastMCP(
         name="agent-chat",
         auth=AgentChatTokenVerifier(config.agent_chat_origin, allow_service_http=True),
-        middleware=[SafeToolErrors(metrics)],
+        middleware=[SafeToolErrors(metrics, registered_tool_names(config.enable_writes))],
         mask_error_details=True,
     )
     skills = Path(__file__).resolve().parent.parent / "skills"

@@ -29,6 +29,7 @@ from .http_boundary import LOG, UNMATCHED, RequestBoundary, error_response, log_
 from .metrics import Metrics
 from .models import (
     HTTP_ERROR_STATUS,
+    LEASE_SECONDS,
     REF_KEY_PATTERN,
     STATE_KEY_PATTERN,
     Actor,
@@ -84,7 +85,7 @@ def create_app(
             raise ValueError("public_origin must be a canonical HTTPS origin") from None
     metrics = Metrics()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
-    app.add_middleware(RequestBoundary, public_origin=public_origin)
+    app.add_middleware(RequestBoundary, public_origin=public_origin, metrics=metrics)
 
     @app.exception_handler(ChatError)
     async def chat_error(request: Request, error: ChatError):
@@ -579,14 +580,22 @@ def create_app(
         counts = db.execute(
             """
             SELECT
-              (SELECT count(*) FROM agent_chat.instances WHERE ended_at IS NULL) AS instances,
+              (SELECT count(*) FROM agent_chat.instances
+                WHERE ended_at IS NULL
+                  AND heartbeat_at > clock_timestamp() - make_interval(secs => %s)) AS instances,
               (SELECT count(*) FROM agent_chat.recipients r
                  JOIN agent_chat.messages m ON m.id = r.message_id
-                WHERE r.delivery_batch_id IS NULL AND m.expires_at > clock_timestamp()) AS pending,
+                WHERE r.delivery_batch_id IS NULL
+                  AND r.handed_at IS NULL
+                  AND r.acknowledged_at IS NULL
+                  AND r.replying_message_id IS NULL
+                  AND r.uncertainty_reason IS NULL
+                  AND m.expires_at > clock_timestamp()) AS pending,
               (SELECT count(*) FROM agent_chat.recipients r
                  JOIN agent_chat.messages m ON m.id = r.message_id
                 WHERE r.uncertainty_reason IS NOT NULL AND m.expires_at > clock_timestamp()) AS uncertain
-            """
+            """,
+            (LEASE_SECONDS,),
         ).fetchone()
         metrics.gauge("agent_chat_instances_active", counts["instances"])
         metrics.gauge("agent_chat_delivery_pending", counts["pending"])
