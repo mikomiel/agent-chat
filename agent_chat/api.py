@@ -28,6 +28,8 @@ from .auth import authenticate, authenticate_producer, lock_actor
 from .http_boundary import LOG, UNMATCHED, RequestBoundary, error_response, log_error
 from .metrics import Metrics
 from .models import (
+    BACKOFF_SECONDS,
+    DELIVERY_MAX_AGE_SECONDS,
     HTTP_ERROR_STATUS,
     LEASE_SECONDS,
     REF_KEY_PATTERN,
@@ -84,6 +86,7 @@ def create_app(
         except ChatError:
             raise ValueError("public_origin must be a canonical HTTPS origin") from None
     metrics = Metrics()
+    metrics.gauge("agent_chat_sse_connections_active", 0)
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     app.add_middleware(RequestBoundary, public_origin=public_origin, metrics=metrics)
 
@@ -583,19 +586,47 @@ def create_app(
               (SELECT count(*) FROM agent_chat.instances
                 WHERE ended_at IS NULL
                   AND heartbeat_at > clock_timestamp() - make_interval(secs => %s)) AS instances,
-              (SELECT count(*) FROM agent_chat.recipients r
-                 JOIN agent_chat.messages m ON m.id = r.message_id
-                WHERE r.delivery_batch_id IS NULL
-                  AND r.handed_at IS NULL
-                  AND r.acknowledged_at IS NULL
-                  AND r.replying_message_id IS NULL
-                  AND r.uncertainty_reason IS NULL
-                  AND m.expires_at > clock_timestamp()) AS pending,
+              (WITH eligible AS MATERIALIZED (
+                  SELECT r.message_id, r.session_id, r.delivery_batch_id
+                    FROM agent_chat.recipients r
+                    JOIN agent_chat.messages m ON m.id = r.message_id
+                   WHERE m.kind IN ('question', 'consultation', 'reply')
+                     AND m.body IS NOT NULL
+                     AND m.expires_at > clock_timestamp()
+                     AND r.handed_at IS NULL
+                     AND r.acknowledged_at IS NULL
+                     AND r.replying_message_id IS NULL
+                     AND r.uncertainty_reason IS NULL
+                     AND r.stored_at > clock_timestamp() - make_interval(secs => %s)
+                ), retry AS (
+                  SELECT b.id
+                    FROM agent_chat.delivery_batches b
+                    JOIN LATERAL (
+                      SELECT outcome, ordinal, completed_at
+                        FROM agent_chat.delivery_attempts
+                       WHERE batch_id = b.id ORDER BY ordinal DESC LIMIT 1
+                    ) last ON true
+                   WHERE last.outcome IN ('failed', 'deferred')
+                     AND last.ordinal < 3
+                     AND last.completed_at + make_interval(
+                       secs => CASE WHEN last.ordinal = 1 THEN %s ELSE %s END
+                     ) <= clock_timestamp()
+                     AND NOT EXISTS (
+                       SELECT 1 FROM unnest(b.message_ids) AS item(id)
+                        WHERE NOT EXISTS (
+                          SELECT 1 FROM eligible e
+                           WHERE e.message_id = item.id AND e.session_id = b.session_id
+                        )
+                     )
+                )
+                SELECT count(*) FROM eligible e
+                 WHERE e.delivery_batch_id IS NULL
+                    OR e.delivery_batch_id IN (SELECT id FROM retry)) AS pending,
               (SELECT count(*) FROM agent_chat.recipients r
                  JOIN agent_chat.messages m ON m.id = r.message_id
                 WHERE r.uncertainty_reason IS NOT NULL AND m.expires_at > clock_timestamp()) AS uncertain
             """,
-            (LEASE_SECONDS,),
+            (LEASE_SECONDS, DELIVERY_MAX_AGE_SECONDS, BACKOFF_SECONDS[0], BACKOFF_SECONDS[1]),
         ).fetchone()
         metrics.gauge("agent_chat_instances_active", counts["instances"])
         metrics.gauge("agent_chat_delivery_pending", counts["pending"])
