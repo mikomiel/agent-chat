@@ -292,6 +292,9 @@ Both web and MCP processes expose an unauthenticated Prometheus `/metrics`
 endpoint. Scrape it on the private container network; do not expose `/metrics`
 through a public Traefik router. It contains aggregate counts only.
 
+See [the observability example](../deploy/observability/README.md) for an Alloy
+scrape/probe and alert starting point.
+
 The MCP endpoint is `https://mcp.example.invalid/mcp` and requires:
 
 ```text
