@@ -51,10 +51,10 @@ class Metrics:
             lines.append(f"# TYPE {name} counter")
             for (metric, labels), value in sorted(counters.items()):
                 if metric == name:
-                    lines.append(f"{metric}{_labels(dict(labels))} {value:g}")
+                    lines.append(f"{metric}{_labels(dict(labels))} {repr(value)}")
         for name in sorted({key[0] for key in gauges}):
             lines.append(f"# TYPE {name} gauge")
             for (metric, labels), value in sorted(gauges.items()):
                 if metric == name:
-                    lines.append(f"{metric}{_labels(dict(labels))} {value:g}")
+                    lines.append(f"{metric}{_labels(dict(labels))} {repr(value)}")
         return "\n".join(lines) + "\n"
