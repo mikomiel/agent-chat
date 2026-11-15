@@ -386,6 +386,68 @@
         "title": "Publication",
         "type": "object"
       },
+      "PublicationMessage": {
+        "properties": {
+          "body": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "recipients": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reply_to": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "room_id": {
+            "type": "string"
+          },
+          "sender": {
+            "$ref": "#/components/schemas/JsonObject"
+          },
+          "thread_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_ref_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "thread_resolved_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "room_id",
+          "body",
+          "kind",
+          "created_at",
+          "sender",
+          "recipients"
+        ],
+        "type": "object"
+      },
       "Receipt": {
         "additionalProperties": true,
         "type": "object"
@@ -657,8 +719,22 @@
               "$ref": "#/components/schemas/JsonObject"
             },
             "type": "array"
+          },
+          "next_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "server_time": {
+            "type": "string"
           }
         },
+        "required": [
+          "server_time",
+          "entries",
+          "next_key"
+        ],
         "type": "object"
       },
       "StateUpsert": {
