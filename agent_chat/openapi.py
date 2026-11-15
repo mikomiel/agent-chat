@@ -242,7 +242,7 @@ def build_openapi() -> dict:
                                                 "intent",
                                             ]
                                         },
-                                        "ref_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:/-]{0,127}$"},
+                                        "ref_key": {"type": "string"},
                                         "thread_id": {"type": "null"},
                                         "reply_to": {"type": "null"},
                                     },

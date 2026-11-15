@@ -30,6 +30,8 @@ def test_openapi_is_filtered_to_client_and_agent_paths():
     assert base["recipients"]["maxItems"] == 16
     assert base["recipients"]["items"]["format"] == "uuid"
     assert any("pattern" in variant for variant in base["ref_key"].get("anyOf", []))
+    keyed = publication["oneOf"][1]["allOf"][1]["properties"]["ref_key"]
+    assert keyed == {"type": "string"}
 
 
 def test_openapi_requires_bearer_security_and_documents_errors():
