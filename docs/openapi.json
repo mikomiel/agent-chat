@@ -132,6 +132,44 @@
         "title": "Heartbeat",
         "type": "object"
       },
+      "HistoryPage": {
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "position": {
+            "type": "string"
+          },
+          "retained_floor": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "messages",
+          "next_cursor",
+          "retained_floor",
+          "position",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "InstanceStatus": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "JsonObject": {
+        "additionalProperties": true,
+        "type": "object"
+      },
       "LaneDeclaration": {
         "additionalProperties": false,
         "properties": {
@@ -170,6 +208,47 @@
         "title": "Membership",
         "type": "object"
       },
+      "Message": {
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "receipts": {
+            "items": {
+              "$ref": "#/components/schemas/JsonObject"
+            },
+            "type": "array"
+          },
+          "room_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "room_id",
+          "body",
+          "kind",
+          "created_at",
+          "cursor",
+          "receipts"
+        ],
+        "type": "object"
+      },
       "Mute": {
         "additionalProperties": false,
         "properties": {
@@ -182,6 +261,26 @@
           "muted"
         ],
         "title": "Mute",
+        "type": "object"
+      },
+      "ParticipantPage": {
+        "properties": {
+          "next_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "participants": {
+            "items": {
+              "$ref": "#/components/schemas/JsonObject"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "participants"
+        ],
         "type": "object"
       },
       "PmMark": {
@@ -285,6 +384,10 @@
           "body"
         ],
         "title": "Publication",
+        "type": "object"
+      },
+      "Receipt": {
+        "additionalProperties": true,
         "type": "object"
       },
       "ReceiptDelivery": {
@@ -424,6 +527,25 @@
         "title": "RoleMark",
         "type": "object"
       },
+      "Room": {
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "slug",
+          "label"
+        ],
+        "type": "object"
+      },
       "RoomCreation": {
         "additionalProperties": false,
         "properties": {
@@ -445,6 +567,47 @@
           "label"
         ],
         "title": "RoomCreation",
+        "type": "object"
+      },
+      "RoomList": {
+        "properties": {
+          "rooms": {
+            "items": {
+              "$ref": "#/components/schemas/Room"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "rooms"
+        ],
+        "type": "object"
+      },
+      "SessionBinding": {
+        "properties": {
+          "harness": {
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "instance_id": {
+            "type": "string"
+          },
+          "room_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "instance_id",
+          "room_id",
+          "host",
+          "harness"
+        ],
         "type": "object"
       },
       "StateEntry": {
@@ -485,6 +648,17 @@
           "ttl_seconds"
         ],
         "title": "StateEntry",
+        "type": "object"
+      },
+      "StatePage": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/JsonObject"
+            },
+            "type": "array"
+          }
+        },
         "type": "object"
       },
       "StateUpsert": {
@@ -643,6 +817,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -653,7 +847,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -701,10 +915,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -726,6 +942,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -736,7 +972,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -762,10 +1018,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -787,6 +1045,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -797,7 +1075,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -845,10 +1143,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -870,6 +1170,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -880,7 +1200,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -916,10 +1256,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -941,6 +1283,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -951,7 +1313,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -987,10 +1369,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1012,6 +1396,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1022,7 +1426,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1058,10 +1482,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1083,6 +1509,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1093,7 +1539,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1119,10 +1585,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1144,6 +1612,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1154,7 +1642,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1190,10 +1698,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1215,6 +1725,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1225,7 +1755,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1251,10 +1801,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceStatus"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1276,6 +1828,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1286,7 +1858,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1322,10 +1914,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1347,6 +1941,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1357,7 +1971,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1405,10 +2039,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/Receipt"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1430,6 +2066,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1440,7 +2096,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1498,10 +2174,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1523,6 +2201,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1533,7 +2231,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1559,10 +2277,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/RoomList"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1584,6 +2304,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1594,7 +2334,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1611,75 +2371,6 @@
           }
         ],
         "summary": "Rooms"
-      },
-      "post": {
-        "operationId": "create_room_v1_rooms_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RoomCreation"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Create Room"
       }
     },
     "/v1/rooms/{room}/history": {
@@ -1805,10 +2496,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/HistoryPage"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -1830,6 +2523,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1840,7 +2553,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -1857,89 +2590,6 @@
           }
         ],
         "summary": "History"
-      }
-    },
-    "/v1/rooms/{room}/memberships": {
-      "post": {
-        "operationId": "join_room_v1_rooms__room__memberships_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "room",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Room",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Membership"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Join Room"
       }
     },
     "/v1/rooms/{room}/messages": {
@@ -1981,10 +2631,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -2006,6 +2658,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2016,7 +2688,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -2093,10 +2785,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ParticipantPage"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -2118,6 +2812,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2128,7 +2842,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -2145,172 +2879,6 @@
           }
         ],
         "summary": "Participants"
-      }
-    },
-    "/v1/rooms/{room}/pm": {
-      "post": {
-        "operationId": "pm_mark_v1_rooms__room__pm_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "room",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Room",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PmMark"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Pm Mark"
-      }
-    },
-    "/v1/rooms/{room}/roles": {
-      "post": {
-        "operationId": "role_mark_v1_rooms__room__roles_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "room",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Room",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RoleMark"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Role Mark"
       }
     },
     "/v1/rooms/{room}/state": {
@@ -2378,10 +2946,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/StatePage"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -2403,6 +2973,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2413,7 +3003,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -2430,87 +3040,6 @@
           }
         ],
         "summary": "Read State"
-      },
-      "post": {
-        "operationId": "upsert_state_v1_rooms__room__state_post",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "room",
-            "required": true,
-            "schema": {
-              "format": "uuid",
-              "title": "Room",
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/StateUpsert"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "401": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "403": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          },
-          "503": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            },
-            "description": "Stable Agent Chat refusal envelope"
-          }
-        },
-        "security": [
-          {
-            "bearerAuth": []
-          }
-        ],
-        "summary": "Upsert State"
       }
     },
     "/v1/sessions": {
@@ -2530,10 +3059,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/SessionBinding"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -2555,6 +3086,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2565,7 +3116,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -2613,10 +3184,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -2638,6 +3211,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2648,7 +3241,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {
@@ -2696,10 +3309,12 @@
           "200": {
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JsonObject"
+                }
               }
             },
-            "description": "Successful Response"
+            "description": "Successful response"
           },
           "401": {
             "content": {
@@ -2721,6 +3336,26 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2731,7 +3366,27 @@
             },
             "description": "Stable Agent Chat refusal envelope"
           },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
           "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "description": "Stable Agent Chat refusal envelope"
+          },
+          "default": {
             "content": {
               "application/json": {
                 "schema": {

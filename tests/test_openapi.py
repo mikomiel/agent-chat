@@ -14,6 +14,10 @@ def test_openapi_is_filtered_to_client_and_agent_paths():
     assert not any(path.startswith(("/v1/login", "/v1/logout", "/v1/browser")) for path in paths)
     assert "/v1/rooms" in paths
     assert "/v1/events" in paths
+    assert not any(path.startswith("/v1/login") for path in paths)
+    assert not any(path.startswith("/v1/browser") for path in paths)
+    assert "/v1/rooms/{room}/pm" not in paths
+    assert "/v1/rooms/{room}/roles" not in paths
 
 
 def test_openapi_requires_bearer_security_and_documents_errors():
@@ -23,6 +27,12 @@ def test_openapi_requires_bearer_security_and_documents_errors():
             assert operation["security"] == [{"bearerAuth": []}]
     assert spec["components"]["securitySchemes"]["bearerAuth"]["scheme"] == "bearer"
     assert "Error" in spec["components"]["schemas"]
+    for item in spec["paths"].values():
+        for operation in item.values():
+            assert "default" in operation["responses"]
+            assert operation["responses"]["409"]["content"]["application/json"]["schema"] == {
+                "$ref": "#/components/schemas/Error"
+            }
     for item in spec["paths"].values():
         for operation in item.values():
             assert operation["responses"]["422"]["content"]["application/json"]["schema"] == {
