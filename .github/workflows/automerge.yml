@@ -24,6 +24,10 @@ concurrency:
 
 jobs:
   merge:
+    # The only fact the release workflow needs. A sweep or a gate pass that
+    # merges nothing leaves it "false", so it costs no release run.
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -32,6 +36,19 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
       - name: Revalidate and merge at most one eligible ordinary pull request
+        id: merge
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/github_pr_automation.py merge --apply
+        run: python3 scripts/github_pr_automation.py merge --apply --github-output "$GITHUB_OUTPUT"
+
+  release:
+    # Called, not observed: a `workflow_run` trigger on this workflow fired on
+    # every completion, merged or not, which cost one release run per sweep and
+    # per gate pass.
+    needs: merge
+    if: needs.merge.outputs.merged == 'true'
+    uses: ./.github/workflows/release-please.yml
+    secrets: inherit
+    permissions:
+      contents: write
+      pull-requests: write

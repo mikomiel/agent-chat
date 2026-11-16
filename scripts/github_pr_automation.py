@@ -272,10 +272,31 @@ def trusted_context(mode):
             f"{policy.REPOSITORY}/.github/workflows/{workflow}.yml@refs/heads/{policy.BASE_BRANCH}")
 
 
+def merged_report(mode, apply, decisions):
+    """True only for an applied merge run that landed one pull request.
+
+    A review run, a dry run and a sweep that admitted nothing must all report
+    false: a caller uses this to decide whether to run the release workflow.
+    """
+    return (
+        mode == "merge"
+        and apply is True
+        and any(isinstance(decision, dict) and decision.get("merged") is True for decision in decisions)
+    )
+
+
+def append_github_output(path, mode, apply, decisions):
+    """Append ``merged`` to a step output file so the calling workflow can gate on it."""
+    merged = merged_report(mode, apply, decisions)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"merged={'true' if merged else 'false'}\n")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("review", "merge"))
     parser.add_argument("--apply", action="store_true", help="trusted default-branch workflow only")
+    parser.add_argument("--github-output", help="append merged=<bool> to a workflow output file")
     args = parser.parse_args(argv)
     if args.apply and not trusted_context(args.mode):
         print("write_refused_outside_trusted_workflow", file=sys.stderr)
@@ -290,6 +311,8 @@ def main(argv=None):
         print(f"automation_refused: {exc}", file=sys.stderr)
         return 1
     print(json.dumps({"mode": args.mode, "apply": args.apply, "decisions": result}, sort_keys=True))
+    if args.github_output:
+        append_github_output(args.github_output, args.mode, args.apply, result)
     return 0
 
 

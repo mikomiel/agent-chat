@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,19 @@ def triggers(document: dict) -> dict:
     value = document.get("on", document.get(True))
     assert isinstance(value, dict), "a workflow must declare a mapping of triggers"
     return value
+
+
+def automation_module():
+    """Load scripts/github_pr_automation.py, which imports pr_policy by name."""
+    scripts = str(ROOT / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    path = ROOT / "scripts" / "github_pr_automation.py"
+    spec = importlib.util.spec_from_file_location("agent_chat_automation", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def policy_module():
@@ -61,7 +75,7 @@ def test_write_token_workflows_run_only_trusted_default_branch_code(
     assert document.get("env") is None
     assert document.get("defaults") is None
     assert document["concurrency"]["cancel-in-progress"] is False
-    for job in document["jobs"].values():
+    for job in (job for job in document["jobs"].values() if "uses" not in job):
         assert job.get("permissions") is None
         assert job.get("env") is None
         assert job.get("defaults") is None
@@ -74,8 +88,19 @@ def test_write_token_workflows_run_only_trusted_default_branch_code(
         assert len(job["steps"]) == 2, "a write-token job has an explicit two-step allowlist"
         assert PINNED_ACTION.match(checkout["uses"])
         assert checkout["with"] == {"ref": DEFAULT_BRANCH, "persist-credentials": False}
-        assert execute["run"] == f"python3 scripts/github_pr_automation.py {mode} --apply"
+        assert execute["run"] == (
+            f"python3 scripts/github_pr_automation.py {mode} --apply"
+            + (' --github-output "$GITHUB_OUTPUT"' if mode == "merge" else "")
+        )
         assert execute["env"]["GH_TOKEN"] == "${{ github.token }}"
+    # A reusable-workflow call is its own allowlist entry: it runs a trusted
+    # default-branch file and declares only the permissions that file may use.
+    for job in (job for job in document["jobs"].values() if "uses" in job):
+        assert job["uses"] == "./.github/workflows/release-please.yml"
+        assert job["secrets"] == "inherit"
+        assert job["permissions"] == {"contents": "write", "pull-requests": "write"}
+        assert job["needs"] == "merge"
+        assert job["if"] == "needs.merge.outputs.merged == 'true'"
 
 
 @pytest.mark.parametrize("name", ["review-gate.yml", "automerge.yml"])
@@ -141,7 +166,11 @@ def test_every_action_reference_is_sha_pinned() -> None:
     for path in sorted(WORKFLOWS.glob("*.yml")):
         document = yaml.safe_load(path.read_text(encoding="utf-8"))
         for job in document["jobs"].values():
-            for step in job["steps"]:
+            if "uses" in job:
+                # A reusable workflow in this repository is addressed by path: it
+                # runs the default-branch file the caller already trusts.
+                assert job["uses"] == "./.github/workflows/release-please.yml", f"{path.name}: {job['uses']}"
+            for step in job.get("steps", ()):
                 if "uses" in step:
                     assert PINNED_ACTION.match(step["uses"]), f"{path.name}: unpinned {step['uses']}"
 
@@ -182,21 +211,19 @@ def test_merge_policy_admits_only_the_intended_ordinary_areas() -> None:
     assert policy.sensitive("docs/architecture.md") is True
 
 
-def test_release_please_observes_automated_merges_and_requires_its_token() -> None:
+def test_release_please_is_called_or_pushed_and_never_observes_a_completion() -> None:
     """The push trigger alone never fires for an automerge GITHUB_TOKEN merge."""
     document = workflow("release-please.yml")
     declared = triggers(document)
     assert declared["push"]["branches"] == ["main"]
-    assert declared["workflow_run"]["workflows"] == ["automerge"]
-    assert declared["workflow_run"]["types"] == ["completed"]
+    assert "workflow_call" in declared
+    assert "workflow_dispatch" in declared
+    assert "workflow_run" not in declared
     assert document["permissions"] == {"contents": "write", "pull-requests": "write"}
     job = document["jobs"]["release-please"]
+    assert "if" not in job
     assert job["runs-on"] == DEFAULT_RUNNER
     assert job["timeout-minutes"] <= 10
-    assert " ".join(job["if"].split()) == (
-        "github.event_name != 'workflow_run' "
-        "|| github.event.workflow_run.head_branch == 'main'"
-    )
     (step,) = job["steps"]
     assert PINNED_ACTION.match(step["uses"])
     assert step["uses"].startswith("googleapis/release-please-action@")
@@ -205,6 +232,68 @@ def test_release_please_observes_automated_merges_and_requires_its_token() -> No
         "config-file": "release-please-config.json",
         "manifest-file": ".release-please-manifest.json",
     }
+
+
+def test_the_release_workflow_is_called_only_when_the_merge_landed() -> None:
+    """A `workflow_run` trigger fired on every completion, merged or not."""
+    document = workflow("automerge.yml")
+    assert document["jobs"]["merge"]["outputs"] == {
+        "merged": "${{ steps.merge.outputs.merged }}"
+    }
+    execute = next(step for step in document["jobs"]["merge"]["steps"] if step.get("id") == "merge")
+    assert execute["run"].endswith('--github-output "$GITHUB_OUTPUT"')
+    release = document["jobs"]["release"]
+    assert release["needs"] == "merge"
+    assert release["if"] == "needs.merge.outputs.merged == 'true'"
+    assert release["uses"] == "./.github/workflows/release-please.yml"
+
+
+def test_only_an_applied_merge_that_landed_reports_true() -> None:
+    module = automation_module()
+    assert module.merged_report("merge", True, [{"merged": True}]) is True
+    assert module.merged_report("merge", True, [{"merged": False}]) is False
+    assert module.merged_report("merge", True, []) is False
+    assert module.merged_report("merge", False, [{"merged": True}]) is False
+    assert module.merged_report("review", True, [{"merged": True}]) is False
+    assert module.merged_report("merge", True, [{"merged": "true"}]) is False
+    assert module.merged_report("merge", 1, [{"merged": True}]) is False
+    assert module.merged_report("merge", True, [{"merged": 1}]) is False
+    assert module.merged_report("merge", True, [{}]) is False
+    assert module.merged_report("merge", True, ["merged"]) is False
+
+
+def test_main_writes_the_output_file_after_an_applied_merge(tmp_path, monkeypatch, capsys) -> None:
+    module = automation_module()
+    monkeypatch.setattr(module, "GitHub", lambda apply: object())
+    monkeypatch.setattr(module, "trusted_context", lambda mode: True)
+    monkeypatch.setattr(module, "run_merge", lambda api, apply: [{"merged": True}])
+    target = tmp_path / "output"
+    target.write_text("", encoding="utf-8")
+    assert module.main(["merge", "--apply", "--github-output", str(target)]) == 0
+    assert target.read_text(encoding="utf-8") == "merged=true\n"
+    assert json.loads(capsys.readouterr().out)["decisions"] == [{"merged": True}]
+
+
+def test_main_writes_nothing_when_the_flag_is_absent(tmp_path, monkeypatch, capsys) -> None:
+    module = automation_module()
+    monkeypatch.setattr(module, "GitHub", lambda apply: object())
+    monkeypatch.setattr(module, "trusted_context", lambda mode: True)
+    monkeypatch.setattr(module, "run_merge", lambda api, apply: [{"merged": True}])
+    assert module.main(["merge", "--apply"]) == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_main_reports_false_and_appends_for_a_sweep_that_merged_nothing(tmp_path, monkeypatch, capsys) -> None:
+    module = automation_module()
+    monkeypatch.setattr(module, "GitHub", lambda apply: object())
+    monkeypatch.setattr(module, "trusted_context", lambda mode: True)
+    monkeypatch.setattr(module, "run_merge", lambda api, apply: [{"merged": False}])
+    target = tmp_path / "output"
+    target.write_text("earlier=true\n", encoding="utf-8")
+    assert module.main(["merge", "--apply", "--github-output", str(target)]) == 0
+    # Appended, not truncated: the runner's output file may already hold values.
+    assert target.read_text(encoding="utf-8") == "earlier=true\nmerged=false\n"
+    assert json.loads(capsys.readouterr().out)["decisions"] == [{"merged": False}]
 
 
 def test_release_metadata_is_never_auto_merged() -> None:
