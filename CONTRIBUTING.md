@@ -131,8 +131,9 @@ uploads the distribution to PyPI as `sessionyard` through trusted publishing; no
 PyPI token is stored in this repository. Its `build` job checks out the commit
 the release event names (`github.sha`, not the tag name, which a same-named
 branch or a moved tag could redirect), fails unless the tag is `v` plus the
-version in `pyproject.toml`, and runs `uv build`. Its `publish` job holds only `id-token: write` and runs in the `pypi`
-environment, where a required reviewer approves each upload. PyPI trusted
+version in `pyproject.toml`, and runs `uv build`. Its `publish` job holds only
+`id-token: write` and runs in the `pypi` environment, where a required reviewer
+approves each upload. PyPI trusted
 publishing does not support reusable workflows, and `automerge` calls
 `release-please.yml` through `workflow_call`, so publication is its own workflow
 and not a job in `release-please.yml`. The PyPI trusted publisher is bound to
