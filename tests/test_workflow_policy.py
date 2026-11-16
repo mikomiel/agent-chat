@@ -384,7 +384,9 @@ def test_publish_builds_the_release_tag_and_publishes_only_what_was_built() -> N
     publish = document["jobs"]["publish"]["steps"]
     checkout = build[0]
     assert checkout["uses"].startswith("actions/checkout@")
-    assert checkout["with"] == {"persist-credentials": False, "ref": "${{ github.event.release.tag_name }}"}
+    # The release event commit, not the tag name: a same-named branch or a
+    # moved tag must not change what is built (review of #86).
+    assert checkout["with"] == {"persist-credentials": False, "ref": "${{ github.sha }}"}
     commands = [step["run"] for step in build if "run" in step]
     install = re.compile(r"^python -m pip install --disable-pip-version-check uv==\d+\.\d+\.\d+$")
     assert any(install.match(command) for command in commands)

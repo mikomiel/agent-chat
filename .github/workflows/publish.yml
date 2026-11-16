@@ -9,8 +9,9 @@
 # this repository, this file name and the `pypi` environment, so renaming any of
 # them needs a matching change on PyPI.
 #
-# `build` is read-only, checks that the release tag is `v` plus the project
-# version and builds with the pinned uv. `publish` holds only `id-token: write`,
+# `build` is read-only, checks out the commit the release event names, checks
+# that the release tag is `v` plus the project version and builds with the
+# pinned uv. `publish` holds only `id-token: write`,
 # runs no repository code and waits in the `pypi` environment, where a required
 # reviewer is the per-release approval.
 name: publish
@@ -31,7 +32,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event.release.tag_name }}
+          # The commit the release event names, never a ref resolved again
+          # by name: a branch named like the tag, or a moved tag, would
+          # otherwise change what is built.
+          ref: ${{ github.sha }}
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
