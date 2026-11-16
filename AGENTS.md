@@ -13,6 +13,7 @@ Non-goals: a hosted service, a registry package, deployment configuration.
 uv sync --frozen
 uv lock --check
 uv run ruff check .
+uv run ty check
 uv run python -m pytest -q
 python3 scripts/check_estate_identifiers.py
 ```

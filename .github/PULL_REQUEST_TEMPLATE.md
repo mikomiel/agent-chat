@@ -9,6 +9,7 @@
 ## Checks run
 
 - `uv run ruff check .`
+- `uv run ty check`
 - `uv run python -m pytest -q`
 
 ## Checklist

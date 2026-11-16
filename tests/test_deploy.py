@@ -74,6 +74,18 @@ def test_quadlet_units_are_native_and_secure():
     assert network["Network"]["networkname"] == "agent-chat"
 
 
+def test_quadlet_health_commands_survive_the_generator():
+    # Quadlet 5.4 drops the closing `"` of a HealthCmd that ends in a double-quoted
+    # argument, so the shell refuses the command and the container never turns healthy.
+    # Single quotes outside, double quotes inside, generate a balanced --health-cmd.
+    for name, port in (("agent-chat.container", 8443), ("agent-chat-mcp.container", 8951)):
+        command = _quadlet(name)["Container"]["healthcmd"]
+        assert command == (
+            "python -c 'import urllib.request; "
+            f'urllib.request.urlopen("http://127.0.0.1:{port}/healthz", timeout=2)\''
+        )
+
+
 def test_quadlet_guide_documents_supported_topology_and_secret_source():
     guide = (ROOT / "docs" / "podman.md").read_text()
     assert "Rootless app + rootful Traefik" in guide

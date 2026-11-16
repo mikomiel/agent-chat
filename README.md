@@ -212,6 +212,7 @@ An example Alloy scrape/probe and alert set is in
 ```sh
 uv sync --frozen --extra mcp
 uv run ruff check .
+uv run ty check
 uv run python -m pytest -q
 ```
 
