@@ -63,7 +63,13 @@ def policy_module():
         (
             "automerge.yml",
             "merge",
-            {"contents": "write", "pull-requests": "write", "checks": "read", "statuses": "read"},
+            {
+                "contents": "write",
+                "pull-requests": "write",
+                "issues": "write",
+                "checks": "read",
+                "statuses": "read",
+            },
         ),
     ],
 )

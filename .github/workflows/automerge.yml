@@ -15,6 +15,11 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # This workflow's token performs the merge, and GitHub closes a pull request's
+  # linked issues only for the identity that holds `issues: write`; without it the
+  # auto-close is skipped silently and the tracking issue stays open. Nothing here
+  # parses the body -- the close is GitHub's own, from its existing keyword rules.
+  issues: write
   checks: read
   statuses: read
 
