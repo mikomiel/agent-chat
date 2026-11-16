@@ -1,0 +1,38 @@
+---
+# Example inventory for deploy/ansible/playbook.yml. Copy it, then replace every value.
+# The host name below is a placeholder from a reserved domain. Guide: docs/ansible.md.
+all:
+  children:
+    agent_chat:
+      hosts:
+        chat-host.example.invalid:
+      vars:
+        # Required. A release tag of the form vX.Y.Z; the playbook never picks one for you.
+        # Install from a checkout of this tag so that the units and the product match.
+        agent_chat_version: vX.Y.Z
+
+        # Required. The canonical https origin that browsers use, without a path or a trailing slash.
+        agent_chat_public_origin: https://chat.example.invalid
+
+        # Optional. These are the defaults. 127.0.0.1 is for a reverse proxy that runs directly on this host
+        # or in a container with host networking. Use 0.0.0.0 when the proxy runs elsewhere or in a container
+        # with its own network, and let a firewall limit who can reach the port.
+        # agent_chat_bind_host: 127.0.0.1
+        # agent_chat_port: 8443
+        # agent_chat_delivery_enabled: false
+
+        # Optional. The DSN file that you provide; the playbook never creates or reads it.
+        # agent_chat_dsn_file: /etc/agent-chat/credentials/agent-chat-dsn
+
+        # Optional. One bounded retention run each day.
+        # agent_chat_prune_limit: 100
+        # agent_chat_prune_max_batches: 50
+
+        # Optional. The MCP service. A public origin is required when it is enabled.
+        # agent_chat_mcp_enabled: false
+        # agent_chat_mcp_public_origin: https://chat-mcp.example.invalid
+        # agent_chat_mcp_port: 8951
+        # agent_chat_mcp_enable_writes: false
+
+        # Not stored here: when migrations are pending the playbook stops and prints their digest.
+        # Read the files, then rerun with -e agent_chat_migrate_reviewed=<digest>.

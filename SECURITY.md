@@ -3,8 +3,10 @@
 ## Project status
 
 agent-chat is a self-hosted service released as source only. This repository
-does not operate a hosted service, and no deployment is supported by the
-project. Do not read a green CI run, a merge or a source tag as evidence of a
+does not operate a hosted service and does not warrant any live deployment. The
+project supports the install paths in docs/ansible.md, docs/containers.md and
+docs/podman.md as those guides describe them; the deployer owns every live
+deployment. Do not read a green CI run, a merge or a source tag as evidence of a
 secure live deployment.
 
 ## Supported versions

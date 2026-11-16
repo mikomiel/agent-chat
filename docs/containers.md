@@ -3,7 +3,8 @@
 This is a LAN-oriented Compose deployment for Agent Chat and its MCP surface.
 For native Podman with systemd, use the
 [Quadlet deployment](podman.md), which avoids the Compose provider and
-documents the supported rootless/rootful Traefik topologies.
+documents the supported rootless/rootful Traefik topologies. For systemd units
+without containers, use the [Ansible deployment](ansible.md).
 It deliberately uses two external dependencies:
 
 - an existing PostgreSQL server, owned and backed up by the deployer;

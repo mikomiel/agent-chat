@@ -1,0 +1,410 @@
+---
+# Example native deployment of Agent Chat: systemd units on one Linux host.
+# Guide: docs/ansible.md. Run it from a checkout of the release that agent_chat_version
+# names, so that the templates and the product match.
+#
+# The play never reads the DSN. The deployer provides the DSN file; systemd passes it to
+# the services as a credential (LoadCredential=), so it never appears in an argument, an
+# environment variable, a configuration file or a log.
+#
+# The migration review is a gate, and the gate comes first. Up to the task "Require the reviewed
+# digest before the schema changes" the play only installs the new release next to the old one,
+# stages the new configuration inside it, and runs `migrate --check` from there against the staged
+# configuration. It writes no live configuration or unit, does not move `current`, restarts nothing
+# and queues no handler, so a refusal leaves the running version exactly as it was. Every change to
+# the live host comes after the gate.
+- name: Deploy Agent Chat under systemd
+  hosts: agent_chat
+  become: true
+  gather_facts: false
+  # A task that fails after the gate has installed a file must still restart the services: the next
+  # run would find the file unchanged and queue nothing. No task before the gate notifies a handler.
+  force_handlers: true
+
+  vars:
+    # Derived values. They are not inputs and an inventory cannot override them.
+    agent_chat_root: /usr/local/lib/agent-chat
+    agent_chat_venv: "{{ agent_chat_root }}/venvs/{{ agent_chat_version }}"
+    # The new configuration is rendered and checked here, inside the release that is being installed.
+    agent_chat_staged: "{{ agent_chat_venv }}/staged"
+    agent_chat_extras: "{{ 'server,mcp' if agent_chat_mcp_enabled else 'server' }}"
+    agent_chat_requirement: >-
+      agent-chat[{{ agent_chat_extras }}] @ git+https://github.com/mikomiel/agent-chat@{{ agent_chat_version }}
+    agent_chat_stamp: "{{ agent_chat_venv }}/.installed-{{ agent_chat_extras | replace(',', '-') }}"
+    agent_chat_unit_files: >-
+      {{ ['agent-chat.service', 'agent-chat-prune.service', 'agent-chat-prune.timer']
+         + (['agent-chat-mcp.service'] if agent_chat_mcp_enabled else []) }}
+    agent_chat_runtime_units: >-
+      {{ ['agent-chat.service', 'agent-chat-prune.timer']
+         + (['agent-chat-mcp.service'] if agent_chat_mcp_enabled else []) }}
+    # One admin command as the service user, with the DSN passed as a credential.
+    agent_chat_admin:
+      - systemd-run
+      - --wait
+      - --pipe
+      - --collect
+      - --quiet
+      - -p
+      - User=agent-chat
+      - -p
+      - "LoadCredential=agent-chat-dsn:{{ agent_chat_dsn_file }}"
+      - "{{ agent_chat_venv }}/bin/python"
+      - -I
+      - -m
+      - agent_chat.admin
+    # Read from `migrate --check`: "pending=<n>", one line per file, then "reviewed=<sha256>" when n > 0.
+    agent_chat_pending: "{{ agent_chat_check.stdout_lines | first | regex_replace('^pending=', '') | int }}"
+    agent_chat_digest: >-
+      {{ agent_chat_check.stdout_lines | select('match', '^reviewed=') | map('regex_replace', '^reviewed=', '')
+         | first | default('') }}
+
+  tasks:
+    # The play installs, migrates and probes for real; a dry run would only fail halfway.
+    - name: Refuse check mode
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+        fail_msg: Check mode is not supported by this playbook; run it without --check.
+        quiet: true
+
+    # A default in the play vars would override the inventory, so the defaults are facts: they fill
+    # only what the inventory and -e leave unset. A fact holds a number as a string and -e passes a
+    # string unless it is JSON, so the checks below accept a number in either form.
+    - name: Apply the defaults of the optional variables
+      ansible.builtin.set_fact:
+        agent_chat_bind_host: "{{ agent_chat_bind_host | default('127.0.0.1') }}"
+        agent_chat_port: "{{ agent_chat_port | default(8443) }}"
+        agent_chat_delivery_enabled: "{{ agent_chat_delivery_enabled | default(false) }}"
+        agent_chat_dsn_file: "{{ agent_chat_dsn_file | default('/etc/agent-chat/credentials/agent-chat-dsn') }}"
+        agent_chat_prune_limit: "{{ agent_chat_prune_limit | default(100) }}"
+        agent_chat_prune_max_batches: "{{ agent_chat_prune_max_batches | default(50) }}"
+        agent_chat_mcp_enabled: "{{ agent_chat_mcp_enabled | default(false) }}"
+        agent_chat_mcp_port: "{{ agent_chat_mcp_port | default(8951) }}"
+        agent_chat_mcp_enable_writes: "{{ agent_chat_mcp_enable_writes | default(false) }}"
+
+    # An origin is also checked against the product's own loader, which refuses an explicit :443 and a port
+    # above 65535. The split lines rely on the pattern above them: assert stops at the first failing item.
+    - name: Check the variables
+      ansible.builtin.assert:
+        that:
+          - agent_chat_version is defined
+          - agent_chat_version is string
+          - agent_chat_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+          - agent_chat_public_origin is defined
+          - agent_chat_public_origin is match('^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$')
+          - not agent_chat_public_origin is search(':443$')
+          - (agent_chat_public_origin.split(':')[2] | default('1')) | int <= 65535
+          - agent_chat_bind_host in ['127.0.0.1', '0.0.0.0']
+          - agent_chat_port | string is match('^[0-9]+$')
+          - agent_chat_port | int >= 1024
+          - agent_chat_port | int <= 65535
+          - agent_chat_delivery_enabled is boolean
+          - agent_chat_dsn_file is match('^/[A-Za-z0-9._/-]+$')
+          - agent_chat_prune_limit | string is match('^[0-9]+$')
+          - agent_chat_prune_limit | int >= 1
+          - agent_chat_prune_limit | int <= 1000
+          - agent_chat_prune_max_batches | string is match('^[0-9]+$')
+          - agent_chat_prune_max_batches | int >= 1
+          - agent_chat_mcp_enabled is boolean
+          - agent_chat_mcp_port | string is match('^[0-9]+$')
+          - agent_chat_mcp_port | int >= 1024
+          - agent_chat_mcp_port | int <= 65535
+          - not agent_chat_mcp_enabled or agent_chat_mcp_port | int != agent_chat_port | int
+          - agent_chat_mcp_enable_writes is boolean
+          - not agent_chat_mcp_enabled or agent_chat_mcp_public_origin is defined
+          - not agent_chat_mcp_enabled or agent_chat_mcp_public_origin is match('^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$')
+          - not agent_chat_mcp_enabled or not agent_chat_mcp_public_origin is search(':443$')
+          - not agent_chat_mcp_enabled or (agent_chat_mcp_public_origin.split(':')[2] | default('1')) | int <= 65535
+          - agent_chat_migrate_reviewed | default('') is match('^([0-9a-f]{64})?$')
+        fail_msg: >-
+          A variable is missing or invalid. The failed assertion is named in this output, and the
+          variable table in docs/ansible.md lists the valid values. A true/false flag must be a real
+          boolean: set it in the inventory, or pass it with -e as JSON, for example
+          -e '{"agent_chat_mcp_enabled": true}'. An origin has no :443 and a port of at most 65535;
+          the MCP port differs from the server port.
+        quiet: true
+
+    - name: Read the Python version of the target
+      ansible.builtin.command:
+        argv: [python3, -c, "import sys; print('%d.%d' % sys.version_info[:2])"]
+      register: agent_chat_python
+      changed_when: false
+
+    - name: Require Python 3.11 or newer
+      ansible.builtin.assert:
+        that: agent_chat_python.stdout is version('3.11', '>=')
+        fail_msg: "Agent Chat needs python3 3.11 or newer on the target; python3 is {{ agent_chat_python.stdout }}."
+        quiet: true
+
+    # The stat module reads metadata only; the checksum, MIME and attribute probes would open the file.
+    # It follows a link, as systemd does when it loads the credential.
+    - name: Check the DSN file without reading it
+      ansible.builtin.stat:
+        path: "{{ agent_chat_dsn_file }}"
+        follow: true
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: agent_chat_dsn
+      no_log: true
+
+    - name: Require the deployer's DSN file
+      ansible.builtin.assert:
+        that:
+          - agent_chat_dsn.stat.exists
+          - agent_chat_dsn.stat.isreg
+          - agent_chat_dsn.stat.mode == '0600'
+          - agent_chat_dsn.stat.uid == 0
+          - agent_chat_dsn.stat.gid == 0
+        fail_msg: >-
+          {{ agent_chat_dsn_file }} must exist as a regular file owned by root:root with mode 0600.
+          The deployer provides it from the secret manager; this playbook never creates, reads or prints it.
+        quiet: true
+
+    # Before the gate. The migration check runs as this user, so it must exist; creating it changes no
+    # running service.
+    - name: Create the service group
+      ansible.builtin.group:
+        name: agent-chat
+        system: true
+
+    - name: Create the service user
+      ansible.builtin.user:
+        name: agent-chat
+        group: agent-chat
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+        comment: Agent Chat service
+
+    - name: Create the install directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ agent_chat_root }}"
+        - "{{ agent_chat_root }}/venvs"
+
+    # One virtual environment per release, kept after an upgrade so that a rollback only repoints
+    # `current`. The stamp is written last, so an interrupted install runs again and a second run
+    # with the same variables changes nothing. The git+https install needs git and outbound HTTPS.
+    # The old release keeps serving: nothing points at this directory yet.
+    - name: Install Agent Chat into its versioned virtual environment
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          umask 022
+          python3 -m venv {{ agent_chat_venv | quote }}
+          {{ agent_chat_venv | quote }}/bin/pip install --disable-pip-version-check --no-cache-dir {{ agent_chat_requirement | quote }}
+          touch {{ agent_chat_stamp | quote }}
+        creates: "{{ agent_chat_stamp }}"
+
+    # The new configuration is rendered inside the new release and checked with that release's own loader,
+    # so a configuration that the product would refuse stops the play here. `migrate --check` reads the
+    # staged server file. After the gate the live files are copies of these same files, so the gate
+    # judged the bytes that go live.
+    - name: Create the directory for the staged configuration
+      ansible.builtin.file:
+        path: "{{ agent_chat_staged }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Stage the server configuration
+      ansible.builtin.template:
+        src: server.json.j2
+        dest: "{{ agent_chat_staged }}/server.json"
+        owner: root
+        group: agent-chat
+        mode: "0640"
+        validate: "{{ agent_chat_venv }}/bin/python -I -c 'import sys; from agent_chat.admin import load_config; load_config(sys.argv[1])' %s"
+
+    - name: Stage the MCP configuration
+      ansible.builtin.template:
+        src: mcp.json.j2
+        dest: "{{ agent_chat_staged }}/mcp.json"
+        owner: root
+        group: root
+        mode: "0640"
+        validate: "{{ agent_chat_venv }}/bin/python -I -c 'import sys; from agent_chat.mcp.config import load_config; load_config(sys.argv[1])' %s"
+      when: agent_chat_mcp_enabled
+
+    # The schema never changes at startup. `migrate --check` takes the migration lock, prints what
+    # an apply would run and rolls back. It runs from the new virtual environment against the staged
+    # configuration, so a refusal leaves the running version, its files and its units untouched.
+    - name: List the pending migrations
+      ansible.builtin.command:
+        argv: "{{ agent_chat_admin + ['migrate', '--config', agent_chat_staged + '/server.json', '--check'] }}"
+      register: agent_chat_check
+      changed_when: false
+
+    - name: Check the format of the migration listing
+      ansible.builtin.assert:
+        that:
+          - agent_chat_check.stdout_lines | first | default('') is match('^pending=[0-9]+$')
+          - agent_chat_pending | int == 0 or agent_chat_digest is match('^[0-9a-f]{64}$')
+        fail_msg: "Unexpected output from migrate --check; run it by hand and see docs/ansible.md."
+        quiet: true
+
+    # The listing is a separate task so that each file is printed on its own line.
+    - name: Show the pending migrations
+      ansible.builtin.debug:
+        msg: "{{ agent_chat_check.stdout_lines }}"
+      when:
+        - agent_chat_pending | int > 0
+        - agent_chat_migrate_reviewed | default('') != agent_chat_digest
+
+    - name: Require the reviewed digest before the schema changes
+      ansible.builtin.assert:
+        that: agent_chat_pending | int == 0 or agent_chat_migrate_reviewed | default('') == agent_chat_digest
+        fail_msg: >-
+          {{ agent_chat_pending }} migration(s) are pending and have not been reviewed. Read the files
+          listed above in the release you are installing, then rerun with
+          -e agent_chat_migrate_reviewed={{ agent_chat_digest }}
+        quiet: true
+
+    # The gate has passed. From here on the play changes the live host.
+    - name: Apply the reviewed migrations
+      ansible.builtin.command:
+        argv: >-
+          {{ agent_chat_admin + ['migrate', '--config', agent_chat_staged + '/server.json',
+                                 '--reviewed', agent_chat_migrate_reviewed] }}
+      when: agent_chat_pending | int > 0
+      notify: Restart Agent Chat
+
+    # Any user may enter this directory, so that the MCP user can reach its own file. server.json is
+    # readable by group agent-chat only, and the DSN file is readable by root only.
+    - name: Create the configuration directory
+      ansible.builtin.file:
+        path: /etc/agent-chat
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # The MCP service runs as its own user. A process that shares the server's user can read the DSN
+    # through /proc/<server pid>/root whatever it masks in its own view: ProtectProc=invisible hides
+    # only the processes of other users.
+    - name: Create the MCP service group
+      ansible.builtin.group:
+        name: agent-chat-mcp
+        system: true
+      when: agent_chat_mcp_enabled
+
+    - name: Create the MCP service user
+      ansible.builtin.user:
+        name: agent-chat-mcp
+        group: agent-chat-mcp
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+        comment: Agent Chat MCP service
+      when: agent_chat_mcp_enabled
+
+    # copy compares checksums, so a run with the same variables changes nothing.
+    - name: Install the server configuration
+      ansible.builtin.copy:
+        src: "{{ agent_chat_staged }}/server.json"
+        dest: /etc/agent-chat/server.json
+        remote_src: true
+        owner: root
+        group: agent-chat
+        mode: "0640"
+      notify: Restart Agent Chat
+
+    - name: Install the MCP configuration
+      ansible.builtin.copy:
+        src: "{{ agent_chat_staged }}/mcp.json"
+        dest: /etc/agent-chat/mcp.json
+        remote_src: true
+        owner: root
+        group: agent-chat-mcp
+        mode: "0640"
+      when: agent_chat_mcp_enabled
+      notify: Restart Agent Chat
+
+    - name: Install the systemd units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ agent_chat_unit_files }}"
+      notify:
+        - Reload systemd
+        - Restart Agent Chat
+
+    # Turning MCP off stops and disables an installed unit, or it would keep serving the code of an earlier
+    # release. The unit file and mcp.json stay on disk. The stat guard keeps a host that never had the unit
+    # away from the systemd module, which fails on an unknown unit.
+    - name: Look for an MCP unit from an earlier run
+      ansible.builtin.stat:
+        path: /etc/systemd/system/agent-chat-mcp.service
+      register: agent_chat_mcp_unit
+
+    - name: Stop and disable the MCP service while it is turned off
+      ansible.builtin.systemd:
+        name: agent-chat-mcp.service
+        state: stopped
+        enabled: false
+      when:
+        - not agent_chat_mcp_enabled
+        - agent_chat_mcp_unit.stat.exists
+
+    - name: Point current at this release
+      ansible.builtin.file:
+        src: "{{ agent_chat_venv }}"
+        dest: "{{ agent_chat_root }}/current"
+        state: link
+      notify: Restart Agent Chat
+
+    # Restart onto the new code before the readiness checks, or they would probe the old process.
+    - name: Run the queued restarts
+      ansible.builtin.meta: flush_handlers
+
+    # The reload also runs here, so that a run interrupted after it wrote a unit cannot leave the unit unknown.
+    - name: Enable and start the services and the prune timer
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        daemon_reload: true
+        enabled: true
+        state: started
+      loop: "{{ agent_chat_runtime_units }}"
+
+    - name: Wait for the server to be ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ agent_chat_port }}/readyz"
+        use_proxy: false
+      register: agent_chat_ready
+      until: agent_chat_ready.status == 200
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    - name: Wait for the MCP service to be ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ agent_chat_mcp_port }}/readyz"
+        use_proxy: false
+      register: agent_chat_mcp_ready
+      until: agent_chat_mcp_ready.status == 200
+      retries: 20
+      delay: 3
+      changed_when: false
+      when: agent_chat_mcp_enabled
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    # try-restart leaves a stopped unit stopped. The start task above owns the first start, after
+    # `current` exists.
+    - name: Restart Agent Chat
+      ansible.builtin.command:
+        argv: "{{ ['systemctl', 'try-restart'] + agent_chat_runtime_units }}"

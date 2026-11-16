@@ -2,7 +2,8 @@
 
 This is the Linux/systemd deployment path for Agent Chat and its optional MCP
 surface. It uses Podman's Quadlet generator, so systemd owns startup, ordering,
-restart and boot behaviour. It does not need a Compose provider.
+restart and boot behaviour. It does not need a Compose provider. For systemd
+units without containers, use the [Ansible deployment](ansible.md).
 
 It still uses two external dependencies:
 
@@ -124,9 +125,8 @@ Agent Chat does not read the DSN from the environment or argv. It reads
 `CREDENTIALS_DIRECTORY/agent-chat-dsn`. The units mount a Podman secret at that
 path.
 
-Infisical is the supported credential source in the homelab. Have Infisical
-materialize a private staging file readable only by the user that will create
-the Podman secret:
+Have a secret manager, such as Infisical, or an operator write a private
+staging file readable only by the user that will create the Podman secret:
 
 ```text
 # rootless: owned by the deployment user, mode 0600

@@ -1,0 +1,47 @@
+# Managed by the Agent Chat example playbook (deploy/ansible/playbook.yml). Local edits are overwritten.
+[Unit]
+Description=Agent Chat HTTP API, SSE feed and browser UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=agent-chat
+Group=agent-chat
+# systemd reads the DSN file as root and hands the service a private copy at $CREDENTIALS_DIRECTORY/agent-chat-dsn.
+LoadCredential=agent-chat-dsn:{{ agent_chat_dsn_file }}
+ExecStart={{ agent_chat_root }}/current/bin/python -I -m agent_chat.admin serve --config /etc/agent-chat/server.json
+Restart=on-failure
+RestartSec=5s
+# Exit status 2 is a configuration or credential error: restarting cannot fix it.
+RestartPreventExitStatus=2
+TimeoutStopSec=30s
+SyslogIdentifier=agent-chat
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+UMask=0077
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
