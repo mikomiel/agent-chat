@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import pwd
+import re
 import secrets
 import shutil
 import socket
@@ -233,7 +234,7 @@ def http_api(database, db, public_origin, delivery_enabled):
 
 
 @pytest.fixture
-def process_api(database, db, public_origin, delivery_enabled, service_lock_budget):
+def process_api(database, db, public_origin, delivery_enabled, service_lock_budget, tmp_path_factory):
     """One real service child; restart preserves only PostgreSQL and the listening socket."""
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -270,15 +271,18 @@ def process_api(database, db, public_origin, delivery_enabled, service_lock_budg
         def restart(*, enable_delivery=delivery_enabled, stream_poll=1):
             nonlocal child
             stop()
-            child = subprocess.Popen(
-                [sys.executable, str(Path(__file__).with_name("http_server_fixture.py"))],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                pass_fds=(listener.fileno(),),
-                env={"PATH": os.defpath, "LANG": "C.UTF-8"},
-                text=True,
-            )
+            # A new file per child, so a startup failure shows only the output of the child that failed.
+            log = tmp_path_factory.mktemp("process-api") / "output.log"
+            with log.open("wb") as output:
+                child = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).with_name("http_server_fixture.py"))],
+                    stdin=subprocess.PIPE,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    pass_fds=(listener.fileno(),),
+                    env={"PATH": os.defpath, "LANG": "C.UTF-8"},
+                    text=True,
+                )
             assert child.stdin is not None
             child.stdin.write(
                 json.dumps(
@@ -294,17 +298,32 @@ def process_api(database, db, public_origin, delivery_enabled, service_lock_budg
                 + "\n"
             )
             child.stdin.close()
-            deadline = time.monotonic() + 8
+            started = time.monotonic()
+
+            def failure(what):
+                code = child.poll()
+                # The DSN reaches the child on stdin; redact it from the output as the product redacts a credential.
+                text = re.sub(re.escape(database), "[REDACTED]", log.read_text(errors="replace"), flags=re.IGNORECASE)
+                tail = "\n".join(text.splitlines()[-40:]) or "(no output)"
+                state = "still running" if code is None else f"exit code {code}"
+                elapsed = time.monotonic() - started
+                return f"disposable HTTP process {what} after {elapsed:.1f} s ({state}); output tail:\n{tail}"
+
+            # Issue #7: bounds only a hung child; 110 local starts (-n 4) took 0.29 s min, 0.34 s median, 0.47 s max.
+            deadline = started + 30
             while time.monotonic() < deadline:
                 if child.poll() is not None:
-                    pytest.fail("disposable HTTP process exited during startup")
+                    pytest.fail(failure("exited during startup"))
                 try:
-                    if request("GET", "/healthz")[0] == 200:
-                        return child.pid
+                    # The parent keeps the listener open, so a probe of a dead child blocks until its timeout.
+                    with closing(HTTPConnection("127.0.0.1", port, timeout=2)) as probe:
+                        probe.request("GET", "/healthz")
+                        if probe.getresponse().status == 200:
+                            return child.pid
                 except (OSError, TimeoutError):
                     pass
                 time.sleep(0.02)
-            pytest.fail("disposable HTTP process did not become healthy")
+            pytest.fail(failure("did not become healthy"))
 
         try:
             restart()
