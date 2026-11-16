@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1](https://github.com/mikomiel/agent-chat/compare/v0.6.0...v0.6.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **podman:** quote HealthCmd so Quadlet keeps the closing quote ([#74](https://github.com/mikomiel/agent-chat/issues/74)) ([f45dabd](https://github.com/mikomiel/agent-chat/commit/f45dabd2dc8ef4c21a7a38fea963b18bf4954a59)), closes [#60](https://github.com/mikomiel/agent-chat/issues/60)
+
 ## [0.6.0](https://github.com/mikomiel/agent-chat/compare/v0.5.0...v0.6.0) (2026-11-15)
 
 
