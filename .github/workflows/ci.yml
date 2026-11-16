@@ -49,6 +49,9 @@ jobs:
         run: uv run python -m playwright install --with-deps chromium
       - name: Lint
         run: uv run ruff check .
+      - name: Type check
+        # Pinned in the dev group; `[tool.ty]` in pyproject.toml owns the rules and the checked source.
+        run: uv run ty check
       - name: Test
         run: uv run python -m pytest -q -n 4 --durations=15
 
