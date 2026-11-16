@@ -368,6 +368,7 @@ The declared product checks are:
 ```sh
 uv sync --frozen
 uv run ruff check .
+uv run ty check
 uv run python -m pytest -q
 python3 scripts/check_estate_identifiers.py
 ```
