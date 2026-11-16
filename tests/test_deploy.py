@@ -524,7 +524,7 @@ def test_ansible_playbook_changes_nothing_live_before_the_migration_gate():
     assert [task["name"] for task in before if any(f"ansible.builtin.{module}" in task for module in changing)] == [
         "Create the service group",
         "Create the service user",
-        "Create the install directories",
+        "Create the missing install directories",
         "Install Agent Chat into its versioned virtual environment",
         "Create the directory for the staged configuration",
         "Stage the server configuration",
@@ -566,6 +566,72 @@ def test_ansible_playbook_changes_nothing_live_before_the_migration_gate():
         for task in tasks
         if str(task.get("ansible.builtin.template", {}).get("dest", "")).startswith("/etc/agent-chat")
     ]
+
+
+def test_ansible_playbook_installs_one_immutable_environment_per_install_variant():
+    play = _playbook()
+    # Turning MCP on or off changes the extras. A name that holds the extras gives the new variant its own
+    # environment next to the running one, so no pip run reaches the environment that `current` points at.
+    venv = play["vars"]["agent_chat_venv"]
+    assert venv == "{{ agent_chat_root }}/venvs/{{ agent_chat_version }}-{{ agent_chat_extras | replace(',', '-') }}"
+    assert "'server,mcp' if agent_chat_mcp_enabled else 'server'" in play["vars"]["agent_chat_extras"]
+    assert "agent-chat[{{ agent_chat_extras }}]" in _flat(play["vars"]["agent_chat_requirement"])
+
+    def environment(extras: str) -> str:
+        return (
+            venv.replace("{{ agent_chat_root }}", "/base")
+            .replace("{{ agent_chat_version }}", "TAG")
+            .replace("{{ agent_chat_extras | replace(',', '-') }}", extras.replace(",", "-"))
+        )
+
+    assert environment("server") == "/base/venvs/TAG-server"
+    assert environment("server,mcp") == "/base/venvs/TAG-server-mcp"
+
+    # The stamp is one file inside its environment, with no extras in the name: the directory is the variant. It is
+    # written last, so an interrupted install runs again, and a stamped environment is never installed into again.
+    assert play["vars"]["agent_chat_stamp"] == "{{ agent_chat_venv }}/.installed"
+    install = _task("Install Agent Chat into its versioned virtual environment")["ansible.builtin.shell"]
+    assert install["creates"] == "{{ agent_chat_stamp }}"
+    assert install["cmd"].strip().splitlines()[-1] == "touch {{ agent_chat_stamp | quote }}"
+    assert "{{ agent_chat_venv | quote }}/bin/pip install" in install["cmd"]
+
+
+def test_ansible_playbook_leaves_an_existing_install_directory_alone_until_the_gate_passes():
+    tasks = _playbook()["tasks"]
+    names = [task["name"] for task in tasks]
+    gate = names.index("Require the reviewed digest before the schema changes")
+    directories = ["{{ agent_chat_root }}", "{{ agent_chat_root }}/venvs"]
+
+    # Before the gate each directory is looked up and only a missing one is created. The create task never runs for
+    # an existing directory, so a refused upgrade cannot reset an owner or mode that the deployer chose.
+    look = _task("Look for the install directories")
+    assert look["ansible.builtin.stat"]["path"] == "{{ item }}"
+    assert look["loop"] == directories
+    create = _task("Create the missing install directories")
+    assert create["loop"] == "{{ " + look["register"] + ".results }}"
+    assert create["when"] == "not item.stat.exists"
+    created = create["ansible.builtin.file"]
+    assert (created["path"], created["state"]) == ("{{ item.item }}", "directory")
+    assert (created["owner"], created["group"], created["mode"]) == ("root", "root", "0755")
+    assert names.index(look["name"]) < names.index(create["name"]) < gate
+    # No other file task before the gate may name the install tree: the staged directory is inside the new environment.
+    assert [task["ansible.builtin.file"]["path"] for task in tasks[:gate] if "ansible.builtin.file" in task] == [
+        "{{ item.item }}",
+        "{{ agent_chat_staged }}",
+    ]
+
+    # After the gate one task declares root:root 0755 for both, among the live writes and before the configuration.
+    reconcile = _task("Reconcile the install directories")
+    assert gate < names.index(reconcile["name"]) < names.index("Install the server configuration")
+    assert "when" not in reconcile
+    assert reconcile["loop"] == directories
+    assert reconcile["ansible.builtin.file"] == {
+        "path": "{{ item }}",
+        "state": "directory",
+        "owner": "root",
+        "group": "root",
+        "mode": "0755",
+    }
 
 
 def test_ansible_playbook_never_reads_the_dsn_and_passes_it_as_a_credential():
@@ -628,8 +694,10 @@ def test_ansible_playbook_reports_no_change_on_a_rerun_and_restarts_on_a_config_
     for name in ("Install the server configuration", "Install the MCP configuration", "Install the systemd units"):
         notify = _task(name)["notify"]
         assert "Restart Agent Chat" in ([notify] if isinstance(notify, str) else notify), name
-    # One environment per release: the rollback and the install stamp both depend on it.
-    assert _playbook()["vars"]["agent_chat_venv"].endswith("/venvs/{{ agent_chat_version }}")
+    # One environment per release and per set of extras: the rollback and the install stamp both depend on it.
+    assert _playbook()["vars"]["agent_chat_venv"].endswith(
+        "/venvs/{{ agent_chat_version }}-{{ agent_chat_extras | replace(',', '-') }}"
+    )
 
 
 def test_ansible_playbook_stops_and_disables_the_mcp_service_while_it_is_turned_off():
@@ -659,6 +727,56 @@ def test_ansible_playbook_restarts_on_new_code_and_waits_for_readiness():
     assert "agent-chat-mcp.service" in units and "if agent_chat_mcp_enabled" in units
     for path in (*TEMPLATES.iterdir(), ANSIBLE / "playbook.yml", ANSIBLE / "inventory.example.yml"):
         assert "/metrics" not in path.read_text(), path
+
+
+def test_ansible_playbook_finishes_an_interrupted_activation_on_the_next_run():
+    play = _playbook()
+    tasks = play["tasks"]
+    names = [task["name"] for task in tasks]
+    gate = names.index("Require the reviewed digest before the schema changes")
+    assert play["vars"]["agent_chat_marker"] == "{{ agent_chat_root }}/activation-pending"
+
+    # The three tasks right after the gate come before the migrations and every other live write, so a run that dies
+    # at any later point leaves the marker. A run that the gate refuses never reaches them and never writes it.
+    look, resume, mark = tasks[gate + 1 : gate + 4]
+    assert [task["name"] for task in (look, resume, mark)] == [
+        "Look for an unfinished activation",
+        "Resume an unfinished activation",
+        "Mark the activation as pending",
+    ]
+    assert look["ansible.builtin.stat"]["path"] == "{{ agent_chat_marker }}"
+    assert resume["when"] == f"{look['register']}.stat.exists"
+    assert resume["changed_when"] is True  # a reported change is what queues the handlers
+    # The restart is the one that the unit and configuration tasks queue. The reload comes with it, in handler order:
+    # an earlier run may have written a unit file and stopped before systemd read it.
+    assert resume["notify"] == ["Reload systemd", "Restart Agent Chat"]
+    assert [handler["name"] for handler in play["handlers"]] == ["Reload systemd", "Restart Agent Chat"]
+    written = mark["ansible.builtin.copy"]
+    assert (written["dest"], written["owner"], written["group"], written["mode"]) == (
+        "{{ agent_chat_marker }}",
+        "root",
+        "root",
+        "0600",
+    )
+    assert written["content"] == "{{ agent_chat_venv }}\n"
+    # The marker is bookkeeping, so a clean rerun still reports changed=0 and the write queues no handler.
+    assert mark["changed_when"] is False
+    assert not {"when", "notify"} & set(mark)
+
+    # The last task removes it, after both readiness waits, so only a run that finished leaves none behind.
+    clear = _task("Clear the activation marker")
+    assert clear["ansible.builtin.file"] == {"path": "{{ agent_chat_marker }}", "state": "absent"}
+    assert clear["changed_when"] is False
+    assert "when" not in clear
+    waits = ("Wait for the server to be ready", "Wait for the MCP service to be ready")
+    assert max(names.index(wait) for wait in waits) < names.index(clear["name"]) == len(names) - 1
+    # Nothing else may write or remove the marker, and it holds no secret.
+    assert {task["name"] for task in tasks if "agent_chat_marker" in json.dumps(task)} == {
+        look["name"],
+        mark["name"],
+        clear["name"],
+    }
+    assert not re.search(r"dsn", json.dumps([look, resume, mark, clear]), re.IGNORECASE)
 
 
 # Every variable that `Check the variables` tests with `match`, with strings its pattern must accept and refuse.
@@ -751,6 +869,51 @@ def test_ansible_guide_documents_the_supported_native_path_and_every_variable():
     for name in ("containers.md", "podman.md", "self-hosting.md"):
         assert "ansible.md" in (ROOT / "docs" / name).read_text(), name
     assert "does not describe a supported deployment" not in (ROOT / "docs" / "self-hosting.md").read_text()
+
+
+def test_ansible_guide_documents_the_environments_the_activation_marker_and_the_dsn_rotation():
+    guide = _flat((ROOT / "docs" / "ansible.md").read_text())
+    play = _playbook()
+    root = play["vars"]["agent_chat_root"]
+    marker = play["vars"]["agent_chat_marker"].replace("{{ agent_chat_root }}", root)
+    mode = _task("Mark the activation as pending")["ansible.builtin.copy"]["mode"]
+    assert (root, marker) == ("/usr/local/lib/agent-chat", "/usr/local/lib/agent-chat/activation-pending")
+
+    # The layout, the upgrade and the rollback text name the directory of an install variant, not of a release.
+    assert f"`{root}/venvs/<tag>-<extras>`" in guide
+    assert f"`{root}/venvs/<old tag>-<extras>`" in guide
+    assert "venvs/<tag>`" not in guide and "venvs/<old tag>`" not in guide
+    assert "record the activation marker" in guide and "and remove the marker." in guide
+    assert "any install directory that is missing" in guide and "An install directory that exists keeps" in guide
+    assert "set the install directories to `root:root` with mode 0755" in guide
+
+    # Switching MCP no longer runs pip in the environment that the services use.
+    assert "The install step is recorded per release" not in guide
+    assert "runs `pip install` again in the virtual environment the services use" not in guide
+    assert (
+        "- Switching `agent_chat_mcp_enabled` on or off installs a separate virtual environment"
+        " and activates it like an upgrade."
+    ) in guide
+
+    # The play is not transactional after the gate; the marker is what makes the rerun restart the services.
+    assert (
+        "The play is not transactional after the gate. If a task fails between installing the configuration"
+        " and switching `current`, the forced handlers can restart the old release with the new configuration."
+        " Rerun the play to finish."
+    ) in guide
+    assert (
+        f"The play writes the activation marker `{marker}` right after the gate (owner root, mode {mode}, no secret)"
+    ) in guide
+    assert "The marker makes that rerun restart the services" in guide
+
+    # The DSN rotation: the playbook never reads the file, so it cannot notice a new value.
+    assert "### Rotate the DSN" in guide
+    assert (
+        "Replace the contents of the DSN file in place: keep the path, the owner `root:root` and the mode 0600."
+    ) in guide
+    assert "sudo systemctl restart agent-chat.service" in guide
+    assert "The prune service reads the new credential at its next start, and the MCP service has no DSN." in guide
+    assert "The playbook does not detect a changed DSN, because it never reads the file." in guide
 
 
 def test_security_policy_and_readme_name_the_install_paths_that_the_guides_support():

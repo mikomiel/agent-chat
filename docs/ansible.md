@@ -16,7 +16,7 @@ first run; it explains each step that this playbook automates.
 | Item | Where |
 | --- | --- |
 | Service user and group | `agent-chat`, no login shell; also `agent-chat-mcp` when MCP is enabled |
-| Release | `/usr/local/lib/agent-chat/venvs/<tag>`, selected by the `current` link next to it |
+| Release | `/usr/local/lib/agent-chat/venvs/<tag>-<extras>`, selected by the `current` link in `/usr/local/lib/agent-chat`; `<extras>` is `server`, or `server-mcp` when MCP is enabled |
 | Configuration | `/etc/agent-chat/server.json` (owner root, group `agent-chat`) and, when MCP is enabled, `/etc/agent-chat/mcp.json` (owner root, group `agent-chat-mcp`); both mode 0640 |
 | Server | `agent-chat.service` |
 | Retention | `agent-chat-prune.service`, started daily by `agent-chat-prune.timer` |
@@ -139,16 +139,18 @@ The migration review comes before every change to the live host. The tasks run
 in this order:
 
 1. Check the variables, the Python version and the DSN file.
-2. Create the service user and the install directories, and install the release
-   into its own virtual environment. The old release keeps serving.
+2. Create the service user and any install directory that is missing, and
+   install the release into its own virtual environment. An install directory
+   that exists keeps its owner and mode. The old release keeps serving.
 3. Render the new configuration into that environment and check it with the
    release's own loader.
 4. Run `migrate --check` from the new release against that configuration, and
    stop unless the reviewed digest matches.
-5. Only then change the live host: apply the reviewed migrations, write the
-   configuration and the units, stop the MCP service if MCP is turned off,
-   switch `current`, restart what changed, enable and start the services, and
-   wait for `/readyz`.
+5. Only then change the live host: record the activation marker, apply the
+   reviewed migrations, set the install directories to `root:root` with mode
+   0755, write the configuration and the units, stop the MCP service if MCP is
+   turned off, switch `current`, restart what changed, enable and start the
+   services, wait for `/readyz`, and remove the marker.
 
 A second run with the same variables reports `changed=0`.
 
@@ -175,8 +177,8 @@ ansible-playbook -i inventory.yml deploy/ansible/playbook.yml \
 A refusal changes nothing that runs: the live configuration, the units, the
 `current` link, the schema and the running services stay as they were. The play
 has only installed the new release next to the old one and rendered the new
-configuration inside it, and on a first install it has created the service user
-and the install directories. A rerun starts from there.
+configuration inside it, and it has created the service user and any install
+directory that was missing. A rerun starts from there.
 
 The playbook applies the set with `migrate --reviewed`. A digest that does not
 match the pending set stops the play before anything runs. The product checks
@@ -236,20 +238,35 @@ PostgreSQL with your normal `pg_dump` or physical-backup process before you
 rerun with the digest. The apply cannot be reverted, and the rollback below
 needs that backup.
 
-The new release installs next to the old one, its configuration is rendered
-inside it, and `migrate --check` runs from there while the old release still
+The new release installs next to the old one, in its own virtual environment
+`venvs/<tag>-<extras>`. The play installs the packages of an environment once
+and never runs `pip` in it again. The configuration is rendered inside the new
+environment, and `migrate --check` runs from there while the old release still
 serves. Nothing live changes until the review gate passes: a refusal leaves
-`current`, the schema, the live configuration, the units and the running
-services alone.
+`current`, the schema, the live configuration, the units, the owner and mode of
+an existing install directory and the running services alone.
+
+The play is not transactional after the gate. If a task fails between
+installing the configuration and switching `current`, the forced handlers can
+restart the old release with the new configuration. Rerun the play to finish.
+The play writes the activation marker
+`/usr/local/lib/agent-chat/activation-pending` right after the gate (owner
+root, mode 0600, no secret) and removes it as its last task, after the
+readiness checks pass. The marker makes that rerun restart the services, also
+when the controller died before its handlers ran and every file already
+matches.
 
 To roll back, set the previous tag and run again. The previous release must be
-one the playbook covers. Its virtual environment is still on disk, so only
-`current` moves. Migrations are
-append-only and are not reverted. If the database records more migrations than
-the older release ships, `migrate --check` stops with `SCHEMA_MISMATCH` before
-anything live changes; restore a database backup taken before the upgrade first.
-The playbook never deletes an old virtual environment: remove
-`/usr/local/lib/agent-chat/venvs/<old tag>` by hand once you no longer need it.
+one the playbook covers. When `agent_chat_mcp_enabled` has the value that the
+older run used, its virtual environment is still on disk, and the run only
+repoints `current` at that directory. With the other value the play installs
+that variant first. Migrations are append-only and are not reverted. If the
+database records more migrations than the older release ships,
+`migrate --check` stops with `SCHEMA_MISMATCH` before anything live changes;
+restore a database backup taken before the upgrade first. The playbook never
+deletes an old virtual environment: remove
+`/usr/local/lib/agent-chat/venvs/<old tag>-<extras>` by hand once you no longer
+need it.
 
 ## Check and operate
 
@@ -266,6 +283,19 @@ The last command starts one bounded retention run now. The run stops after
 timer starts it daily with a random delay of up to an hour and catches up after
 downtime. The MCP unit logs as `agent-chat-mcp`.
 
+### Rotate the DSN
+
+Replace the contents of the DSN file in place: keep the path, the owner
+`root:root` and the mode 0600. Then restart the server:
+
+```sh
+sudo systemctl restart agent-chat.service
+```
+
+The prune service reads the new credential at its next start, and the MCP
+service has no DSN. The playbook does not detect a changed DSN, because it
+never reads the file.
+
 ## Limits
 
 - One host and one instance. The playbook does not create PostgreSQL, TLS,
@@ -278,11 +308,8 @@ downtime. The MCP unit logs as `agent-chat-mcp`.
 - Setting `agent_chat_mcp_enabled` to `false` stops and disables the MCP service
   but leaves its unit, `/etc/agent-chat/mcp.json` and the `agent-chat-mcp` user
   on the host; delete them by hand if you do not need them.
-- The install step is recorded per release and per set of extras. Turning
-  `agent_chat_mcp_enabled` on or off for the release that is already running
-  therefore runs `pip install` again in the virtual environment the services
-  use, before the migration gate. It installs the same release and only adds
-  the packages of the new extras, so the running services keep working.
+- Switching `agent_chat_mcp_enabled` on or off installs a separate virtual
+  environment and activates it like an upgrade.
 - The install resolves the Python dependencies from the package index at run
   time. The lock file is for development only.
 - The server and the prune unit share the `agent-chat` user; the MCP unit has

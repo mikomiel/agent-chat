@@ -10,27 +10,34 @@
 # The migration review is a gate, and the gate comes first. Up to the task "Require the reviewed
 # digest before the schema changes" the play only installs the new release next to the old one,
 # stages the new configuration inside it, and runs `migrate --check` from there against the staged
-# configuration. It writes no live configuration or unit, does not move `current`, restarts nothing
-# and queues no handler, so a refusal leaves the running version exactly as it was. Every change to
-# the live host comes after the gate.
+# configuration. It creates an install directory only when that directory is missing, writes no live
+# configuration or unit, does not move `current`, restarts nothing and queues no handler, so a refusal
+# leaves the running version exactly as it was. Every change to the live host comes after the gate. The first
+# tasks after it record an activation marker and the last task removes it, so that a run which stops
+# in between is finished by the next run.
 - name: Deploy Agent Chat under systemd
   hosts: agent_chat
   become: true
   gather_facts: false
-  # A task that fails after the gate has installed a file must still restart the services: the next
-  # run would find the file unchanged and queue nothing. No task before the gate notifies a handler.
+  # A task that fails after the gate has installed a file must still restart the services. A run that is
+  # killed before its handlers run is finished by the activation marker below. No task before the gate
+  # notifies a handler.
   force_handlers: true
 
   vars:
     # Derived values. They are not inputs and an inventory cannot override them.
     agent_chat_root: /usr/local/lib/agent-chat
-    agent_chat_venv: "{{ agent_chat_root }}/venvs/{{ agent_chat_version }}"
+    # One virtual environment per release and per set of extras. Its packages are installed once, when the stamp
+    # is written, so turning MCP on or off builds a new environment next to the running one.
+    agent_chat_venv: "{{ agent_chat_root }}/venvs/{{ agent_chat_version }}-{{ agent_chat_extras | replace(',', '-') }}"
     # The new configuration is rendered and checked here, inside the release that is being installed.
     agent_chat_staged: "{{ agent_chat_venv }}/staged"
     agent_chat_extras: "{{ 'server,mcp' if agent_chat_mcp_enabled else 'server' }}"
     agent_chat_requirement: >-
       agent-chat[{{ agent_chat_extras }}] @ git+https://github.com/mikomiel/agent-chat@{{ agent_chat_version }}
-    agent_chat_stamp: "{{ agent_chat_venv }}/.installed-{{ agent_chat_extras | replace(',', '-') }}"
+    agent_chat_stamp: "{{ agent_chat_venv }}/.installed"
+    # Written right after the review gate and removed after the readiness checks; see the tasks that use it.
+    agent_chat_marker: "{{ agent_chat_root }}/activation-pending"
     agent_chat_unit_files: >-
       {{ ['agent-chat.service', 'agent-chat-prune.service', 'agent-chat-prune.timer']
          + (['agent-chat-mcp.service'] if agent_chat_mcp_enabled else []) }}
@@ -177,21 +184,35 @@
         create_home: false
         comment: Agent Chat service
 
-    - name: Create the install directories
-      ansible.builtin.file:
+    # Before the gate the play creates an install directory only when it does not exist. It never changes the
+    # owner or mode of one that does, which a deployer may have hardened, so a refused upgrade leaves it as it
+    # was. "Reconcile the install directories" sets root:root 0755 on both once the gate has passed.
+    - name: Look for the install directories
+      ansible.builtin.stat:
         path: "{{ item }}"
+      loop:
+        - "{{ agent_chat_root }}"
+        - "{{ agent_chat_root }}/venvs"
+      register: agent_chat_dirs
+
+    - name: Create the missing install directories
+      ansible.builtin.file:
+        path: "{{ item.item }}"
         state: directory
         owner: root
         group: root
         mode: "0755"
-      loop:
-        - "{{ agent_chat_root }}"
-        - "{{ agent_chat_root }}/venvs"
+      loop: "{{ agent_chat_dirs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: not item.stat.exists
 
-    # One virtual environment per release, kept after an upgrade so that a rollback only repoints
-    # `current`. The stamp is written last, so an interrupted install runs again and a second run
-    # with the same variables changes nothing. The git+https install needs git and outbound HTTPS.
-    # The old release keeps serving: nothing points at this directory yet.
+    # One virtual environment per release and per set of extras, kept after an upgrade so that a rollback only
+    # repoints `current`. The stamp is one file inside that environment and is written last, so an interrupted
+    # install runs again and a second run with the same variables changes nothing. Once it is stamped, pip never
+    # runs in the environment again: turning MCP on or off installs a new environment instead of running pip in
+    # the one that `current` points at. The git+https install needs git and outbound HTTPS. The old release
+    # keeps serving: nothing points at this directory yet.
     - name: Install Agent Chat into its versioned virtual environment
       ansible.builtin.shell:
         cmd: |
@@ -268,6 +289,38 @@
         quiet: true
 
     # The gate has passed. From here on the play changes the live host.
+    #
+    # The activation marker is recorded first, before any other live write, and removed by the last task once the
+    # readiness checks pass. A run that stops in between (a failed task, or a controller that dies before its
+    # handlers run) leaves it, and the next run restarts the services even when every file already matches and
+    # nothing queues a handler. A run that the gate refuses never reaches these tasks.
+    - name: Look for an unfinished activation
+      ansible.builtin.stat:
+        path: "{{ agent_chat_marker }}"
+      register: agent_chat_unfinished
+
+    # The reload comes with the restart, as for a changed unit: the earlier run may have written a unit file and
+    # stopped before systemd read it.
+    - name: Resume an unfinished activation
+      ansible.builtin.debug:
+        msg: An earlier run passed the review gate and did not finish its activation; the services restart.
+      when: agent_chat_unfinished.stat.exists
+      changed_when: true
+      notify:
+        - Reload systemd
+        - Restart Agent Chat
+
+    # Bookkeeping, not a change of the host, so a clean rerun still reports changed=0. The content is the
+    # environment that this run activates; it holds no secret.
+    - name: Mark the activation as pending
+      ansible.builtin.copy:
+        content: "{{ agent_chat_venv }}\n"
+        dest: "{{ agent_chat_marker }}"
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+
     - name: Apply the reviewed migrations
       ansible.builtin.command:
         argv: >-
@@ -275,6 +328,19 @@
                                  '--reviewed', agent_chat_migrate_reviewed] }}
       when: agent_chat_pending | int > 0
       notify: Restart Agent Chat
+
+    # The play declares root:root 0755 for the install tree. It applies that only now, after the review: before
+    # the gate it left an existing directory as the deployer made it.
+    - name: Reconcile the install directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ agent_chat_root }}"
+        - "{{ agent_chat_root }}/venvs"
 
     # Any user may enter this directory, so that the MCP user can reach its own file. server.json is
     # readable by group agent-chat only, and the DSN file is readable by root only.
@@ -397,6 +463,13 @@
       delay: 3
       changed_when: false
       when: agent_chat_mcp_enabled
+
+    # The last task: the services run the new code and have answered their readiness checks.
+    - name: Clear the activation marker
+      ansible.builtin.file:
+        path: "{{ agent_chat_marker }}"
+        state: absent
+      changed_when: false
 
   handlers:
     - name: Reload systemd
