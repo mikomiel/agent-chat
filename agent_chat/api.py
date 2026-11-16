@@ -631,6 +631,8 @@ def create_app(
             """,
             (LEASE_SECONDS, DELIVERY_MAX_AGE_SECONDS, BACKOFF_SECONDS[0], BACKOFF_SECONDS[1]),
         ).fetchone()
+        if counts is None:  # an aggregate SELECT always yields a row; this is the same refusal as `events._take`
+            raise ChatError("SCHEMA_MISMATCH")
         metrics.gauge("agent_chat_instances_active", counts["instances"])
         metrics.gauge("agent_chat_delivery_pending", counts["pending"])
         metrics.gauge("agent_chat_delivery_uncertain", counts["uncertain"])
