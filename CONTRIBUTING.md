@@ -24,7 +24,7 @@ issue.
 
 | Context | What it proves |
 | --- | --- |
-| `checks` | Lint and the test suite passed on the primary Python version. |
+| `checks` | Lint, the type check and the test suite passed on the primary Python version. |
 | `public-content` | The pinned secret scan and the estate-identifier guard passed. |
 | `review` | An independent approval exists at this exact commit. |
 | `dependency-review` | The change does not add a dependency with a known vulnerability. |
@@ -48,8 +48,16 @@ signal. Making either a required context is a maintainer decision.
    uv sync --frozen
    uv lock --check
    uv run ruff check .
+   uv run ty check
    uv run python -m pytest -q
    ```
+
+   `ty` is pinned in the dev group and configured under `[tool.ty]` in
+   `pyproject.toml`. It checks all of `agent_chat` with `redundant-cast`,
+   `unused-ignore-comment` and `blanket-ignore-comment` as errors, and it
+   ignores `# type: ignore` comments. Fix a diagnostic in the code; use a
+   `# ty: ignore[rule]` with a one-line reason only for a genuine checker
+   limitation.
 
 4. Push the branch and open one pull request against `main`. Expect the required
    checks (`checks`, `public-content`, `review`, `dependency-review`) and an
