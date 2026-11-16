@@ -7,8 +7,10 @@ without turning chat into authority.
 
 This repository is the product source: the HTTP service, the web UI, the
 command-line client, the adapter lifecycle client and the database migrations.
-It is source-only. No hosted service, package registry release or deployment
-is provided by this repository.
+No hosted service or deployment is provided by this repository. From the first
+release made after the rename, releases are published to PyPI as `sessionyard`;
+the import package, the commands and every runtime identifier keep the name
+`agent_chat` or `agent-chat`.
 
 Licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
 
@@ -61,11 +63,28 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
 
 ## Install and run
 
-A deployment should pin an exact release tag; the `server` extra adds psycopg,
-while a bare client install stays psycopg-free.
+Releases are published to PyPI as `sessionyard`, starting with the first release
+made after the rename. The import package stays `agent_chat` and the commands stay
+`agent-chat` and `agent-chat-mcp`. Do not install `agent-chat` from PyPI: that
+name belongs to an unrelated project.
+
+A deployment should pin an exact version (`sessionyard[server]==<version>`). The
+`server` extra adds psycopg, while a bare client install stays psycopg-free.
 
 ```sh
-uv pip install "agent-chat[server] @ git+https://github.com/mikomiel/agent-chat@v0.1.0"
+uv venv
+uv pip install "sessionyard[server]"
+```
+
+`uv tool install sessionyard` installs the `agent-chat` command-line client on
+its own.
+
+To install an exact tag from source, use the git form. Tags up to and including
+`v0.6.0` predate the rename and install under the old name `agent-chat`; a tag
+made after the rename installs as `sessionyard[server] @ git+...@<tag>`.
+
+```sh
+uv pip install "agent-chat[server] @ git+https://github.com/mikomiel/agent-chat@v0.6.0"
 ```
 
 For a source checkout:
@@ -234,8 +253,11 @@ and the real PostgreSQL/Chromium boundaries remain.
 Releases use Git tags named `vMAJOR.MINOR.PATCH` on `main`; `v0.1.0` is the
 first release. The release-please workflow creates the tag and the GitHub
 Release; release-please creates lightweight tags. [CHANGELOG.md](CHANGELOG.md)
-owns the human-readable notes. This repository does not publish a package to a
-registry. Release and tag creation are maintainer decisions.
+owns the human-readable notes. Publishing a GitHub Release builds the
+distribution from its tag and uploads it to PyPI as `sessionyard`, once a
+maintainer approves the upload. Tags up to `v0.6.0` carry the old distribution
+name `agent-chat` and were not published under `sessionyard`. Release and tag
+creation are maintainer decisions.
 
 ## Security model
 

@@ -3,7 +3,7 @@ requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-chat"
+name = "sessionyard"
 version = "0.6.0"
 description = "Self-hosted coordination chat for multiple AI agent sessions"
 readme = "README.md"
@@ -55,6 +55,7 @@ agent-chat-mcp = "agent_chat.mcp.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/mikomiel/agent-chat"
+Source = "https://github.com/mikomiel/agent-chat"
 Issues = "https://github.com/mikomiel/agent-chat/issues"
 Changelog = "https://github.com/mikomiel/agent-chat/blob/main/CHANGELOG.md"
 
