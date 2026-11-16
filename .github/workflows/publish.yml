@@ -1,0 +1,74 @@
+# Publishes the distribution to PyPI as `sessionyard` when a GitHub Release is
+# published. release-please creates that release with a personal access token,
+# so the `release` event does start this workflow; a release created with the
+# default GITHUB_TOKEN would not.
+#
+# PyPI trusted publishing does not support reusable workflows, and `automerge`
+# calls release-please.yml through `workflow_call`, so publication is its own
+# workflow and not a job in release-please.yml. No token is stored: PyPI trusts
+# this repository, this file name and the `pypi` environment, so renaming any of
+# them needs a matching change on PyPI.
+#
+# `build` is read-only, checks out the commit the release event names, checks
+# that the release tag is `v` plus the project version and builds with the
+# pinned uv. `publish` holds only `id-token: write`,
+# runs no repository code and waits in the `pypi` environment, where a required
+# reviewer is the per-release approval.
+name: publish
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The commit the release event names, never a ref resolved again
+          # by name: a branch named like the tag, or a moved tag, would
+          # otherwise change what is built.
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Install pinned uv
+        run: python -m pip install --disable-pip-version-check uv==0.13.8
+      - name: Release tag matches the project version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$RELEASE_TAG" != "v${version}" ]; then
+            echo "The release tag must be v${version}, the version in pyproject.toml." >&2
+            exit 1
+          fi
+      - name: Build the distribution
+        run: uv build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

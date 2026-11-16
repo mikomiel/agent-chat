@@ -5,12 +5,12 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "package-name": "agent-chat",
+      "package-name": "sessionyard",
       "extra-files": [
         {
           "type": "toml",
           "path": "uv.lock",
-          "jsonpath": "$.package[?(@.name.value=='agent-chat')].version"
+          "jsonpath": "$.package[?(@.name.value=='sessionyard')].version"
         }
       ],
       "changelog-sections": [

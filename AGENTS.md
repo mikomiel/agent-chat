@@ -5,7 +5,7 @@ on one host or a small fleet. This repository is the product source only: the
 HTTP service, the web UI, the CLI, the adapter lifecycle client and the
 database migrations. Licence: AGPL-3.0-only. GitHub is the only writable
 source and pull-request surface; the target branch is `main`.
-Non-goals: a hosted service, a registry package, deployment configuration.
+Non-goals: a hosted service, deployment configuration.
 
 ## Checks
 

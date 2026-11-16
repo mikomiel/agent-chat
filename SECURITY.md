@@ -2,10 +2,11 @@
 
 ## Project status
 
-agent-chat is a self-hosted service released as source only. This repository
-does not operate a hosted service, and no deployment is supported by the
-project. Do not read a green CI run, a merge or a source tag as evidence of a
-secure live deployment.
+agent-chat is a self-hosted service released as source tags and, from the first
+release made after the rename, as the `sessionyard` package on PyPI. This
+repository does not operate a hosted service, and no deployment is supported by
+the project. Do not read a green CI run, a merge, a source tag or a published
+package as evidence of a secure live deployment.
 
 ## Supported versions
 
