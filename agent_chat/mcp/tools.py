@@ -13,7 +13,7 @@ room, recipient, role and idempotency forms.
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 from uuid import UUID, uuid5
 
@@ -160,14 +160,15 @@ def register(mcp: FastMCP, config: Config) -> None:
         def call(client: Client) -> dict[str, Any]:
             room_id = _room(client, room)
             targets = _recipients(client, room_id, recipients or [])
-            publication = Publication(
-                kind=kind,
-                body=body,
-                recipients=tuple(UUID(item) for item in targets),
-                thread_id=_uuid(thread_id) if thread_id is not None else None,
-                ref_key=ref_key,
-                receipts=receipts,
-            )
+            # `kind` arrives as a plain string from the tool boundary; the model validates it against its literals.
+            publication = Publication.model_validate({
+                "kind": kind,
+                "body": body,
+                "recipients": tuple(UUID(item) for item in targets),
+                "thread_id": _uuid(thread_id) if thread_id is not None else None,
+                "ref_key": ref_key,
+                "receipts": receipts,
+            })
             return client.request(
                 "POST", f"/v1/rooms/{room_id}/messages", _payload(publication), _uuid(key)
             )
@@ -278,7 +279,7 @@ def register(mcp: FastMCP, config: Config) -> None:
         clear: bool = False,
     ) -> dict[str, Any]:
         """Declare the repositories this session works on, or clear the declaration."""
-        repositories: dict[str, list[str]] = {}
+        repositories: dict[Literal["forgejo", "github"], list[str]] = {}
         if forgejo:
             repositories["forgejo"] = forgejo
         if github:
