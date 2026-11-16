@@ -109,8 +109,9 @@ The workflow authenticates with a fine-grained personal access token stored as
 `RELEASE_PLEASE_TOKEN`, with Contents and pull-request write on this repository.
 The default `GITHUB_TOKEN` cannot be used: a pull request it creates does not
 trigger the pull-request workflows, so the required checks never run, and a
-merge it makes suppresses the `push`-triggered run, which is why the workflow
-also observes the completed `automerge` run. Renew the token before it expires:
+merge it makes suppresses the `push`-triggered run, which is why the `automerge`
+workflow calls this one when its own run landed a pull request. Renew the token
+before it expires:
 a missing or empty secret fails the run with `Input required and not supplied:
 token`, and an expired one fails authentication.
 
