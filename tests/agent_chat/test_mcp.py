@@ -78,13 +78,13 @@ class BadGatewayHandler(BaseHTTPRequestHandler):
         pass
 
 
-class OkBodyHandler(BaseHTTPRequestHandler):
-    """A complete 200 whose JSON body is `self.server.body`."""
+class RawStatusHandler(BaseHTTPRequestHandler):
+    """A complete answer: `self.server.status`, `self.server.content_type` and `self.server.body`."""
 
     def do_GET(self):
         body = self.server.body
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
+        self.send_response(self.server.status)
+        self.send_header("Content-Type", self.server.content_type)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -588,17 +588,34 @@ def test_unreachable_or_failing_server_answers_503_not_401(process_api, caplog, 
     assert token not in caplog.text
 
 
-@pytest.mark.parametrize("body", [b"[]", b"null", b"not json"])
-def test_a_complete_200_with_an_unreadable_status_is_a_rejection_not_an_outage(process_api, caplog, body):
+@pytest.mark.parametrize(
+    ("status", "content_type", "body", "expected"),
+    [
+        (200, "application/json", b"[]", 401),
+        (200, "application/json", b"null", 401),
+        (200, "application/json", b"not json", 401),
+        (401, "text/plain", b"Unauthorized", 401),
+        (403, "text/html", b"<h1>Forbidden</h1>", 401),
+        (404, "text/html", b"", 401),
+        (403, "application/json", b"[]", 401),
+        (429, "text/plain", b"Too Many Requests", 503),
+        (408, "text/plain", b"", 503),
+        (502, "text/html", b"<h1>Bad Gateway</h1>", 503),
+        (503, "text/plain", b"", 503),
+    ],
+)
+def test_a_complete_answer_without_the_service_envelope_is_classified_by_status(
+    process_api, caplog, status, content_type, body, expected
+):
     token = secrets.token_hex(32)
     caplog.set_level(logging.WARNING, logger="agent_chat.api")
-    with http_server(OkBodyHandler) as upstream:
-        upstream.body = body
+    with http_server(RawStatusHandler) as upstream:
+        upstream.status, upstream.content_type, upstream.body = status, content_type, body
         with serve_mcp(process_api, agent_chat_origin=f"http://127.0.0.1:{upstream.server_port}") as mcp:
-            status, headers, _body = post_tool_call(mcp, token)
-    assert status == 401
-    assert "Retry-After" not in headers
-    assert not error_log_records(caplog)
+            answer, headers, _body = post_tool_call(mcp, token)
+    assert answer == expected
+    assert ("Retry-After" in headers) == (expected == 503)
+    assert len(error_log_records(caplog)) == (expected == 503)
 
 
 def test_rejected_tokens_still_answer_401_while_the_service_is_up(process_api, credentials, register, db, caplog):

@@ -117,5 +117,6 @@ class AgentChatTokenVerifier(TokenVerifier):
             deadline=time.monotonic() + VERIFY_SECONDS,
             allow_service_http=self._allow_service_http,
         )
-        # A complete 200 whose body is not a status object is a verdict the client cannot read, not an outage.
-        return client.request("GET", "/v1/instance/status", invalid="INVALID_RESPONSE")
+        # A complete answer the client cannot read is not an outage: a 200 whose body is not a status object, or a
+        # 4xx without the service's envelope, such as a proxy's HTML 403. Both stay rejections.
+        return client.request("GET", "/v1/instance/status", invalid="INVALID_RESPONSE", refused="HTTP_REFUSED")

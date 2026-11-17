@@ -151,6 +151,7 @@ class Client:
         key: str | None = None,
         *,
         invalid: str | None = None,
+        refused: str | None = None,
     ) -> Any:
         origin = urlsplit(self._origin)
         assert origin.hostname is not None
@@ -264,6 +265,16 @@ class Client:
             # outages names it `invalid`; every other caller keeps the classification below.
             if invalid is not None and status == 200 and isinstance(error, (ValueError, RecursionError)):
                 raise ChatError(invalid) from None
+            # Likewise a complete 4xx whose body is not this service's envelope, such as a proxy's HTML 403, is a
+            # refusal. A caller that must tell refusals from outages names it `refused`. 408 and 429 stay outages.
+            if (
+                refused is not None
+                and status is not None
+                and 400 <= status < 500
+                and status not in (408, 429)
+                and isinstance(error, (ValueError, RecursionError))
+            ):
+                raise ChatError(refused) from None
             raise ChatError("REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE") from None
         finally:
             if watchdog is not None:
