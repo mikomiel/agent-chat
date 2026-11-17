@@ -326,7 +326,7 @@ The service MUST leave a recipient entry stored more than 24 hours ago, with no 
 #### Scenario: Claim for an expired message
 - **WHEN** delivery is enabled and an adapter makes a first claim for a message stored more than 24 hours ago, from a session that is not blocked and has no attempt in flight
 - **THEN** the claim is refused with `DELIVERY_INELIGIBLE` and creates no attempt
-- **AND** the entry is settled `expired_undelivered` even though the claim was refused
+- **AND** the refusal does not roll back the expiry sweeps of that claim, so the entry is settled `expired_undelivered` if it is among the entries those sweeps take
 - **AND** a blocked session, one with an attempt in flight, or a message with earlier attempts receives `DELIVERY_BLOCKED`, `DELIVERY_IN_FLIGHT` or a retry refusal such as `DELIVERY_BACKOFF` instead, and an entry that no open attempt covers is still settled
 
 ### Requirement: Expired questions, consultations and replies are settled
@@ -334,7 +334,7 @@ The service MUST settle a recipient entry of a `question`, `consultation` or `re
 
 #### Scenario: Settlement is not clock-driven
 - **WHEN** a claim made while delivery is enabled, or a result call, runs for the session, or the prune operation runs
-- **THEN** the oldest `question`, `consultation` and `reply` entries past 24 hours that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to the batch limit of that call (100 for a claim or a result)
+- **THEN** the oldest `question`, `consultation` and `reply` entries past 24 hours that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep; a claim or a result call runs one sweep, and a second one when it is refused
 - **AND** a later call settles the rest
 - **AND** an entry covered by an open attempt is not settled
 

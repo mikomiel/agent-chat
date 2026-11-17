@@ -136,13 +136,17 @@ When a POST may have been sent and ends without a definitive answer, the CLI MUS
 - **WHEN** the CLI cannot connect to the service
 - **THEN** it fails with `TRANSPORT_UNAVAILABLE` and exits with 1, whatever the command
 
-### Requirement: A 20-second alarm bounds every command
-The CLI MUST arm a 20-second alarm for the whole command. When it fires outside an HTTP request, such as while the CLI waits for standard input, the CLI MUST print `CLI_INTERRUPTED` and exit with 1. When it fires after the connection is made, the request MUST end as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method; when it fires before, as `TRANSPORT_UNAVAILABLE` for every method.
+### Requirement: A 20-second alarm bounds command execution
+The CLI MUST arm a 20-second alarm after parsing the arguments and cancel it before printing the result. When it fires outside an HTTP request, such as while waiting for standard input, the CLI MUST print `CLI_INTERRUPTED` and exit with 1. When it fires after the connection is made, the request MUST end as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method; when it fires before, as `TRANSPORT_UNAVAILABLE` for every method.
 
 #### Scenario: Standard input stalls
 - **WHEN** standard input stays open and silent until the alarm fires
 - **THEN** the CLI prints `CLI_INTERRUPTED` and exits with 1
 - **AND** it has sent no request
+
+#### Scenario: Output is outside the alarm
+- **WHEN** the command has finished and the reader of standard output stops reading a large result
+- **THEN** the alarm no longer applies, and the CLI waits on the write
 
 #### Scenario: Alarm during a request
 - **WHEN** the alarm fires after the connection is made, while the request is still in progress
