@@ -1,9 +1,10 @@
 """Server launcher and administration: `python -m agent_chat.admin <subcommand> --config PATH`.
 
 Every expected failure prints one `agent-chat-admin: <CODE>` line to stderr and exits nonzero
-(2 for configuration or usage, 1 for operational). Nothing here prints a DSN, token, digest,
-message body or raw database exception text. The DSN comes only from the systemd credential
-named by the configuration; there is no argv or environment fallback.
+(2 for configuration or usage, 1 for operational). A `migrate` that applies waits for a database that does not
+answer, and prints one `agent-chat-admin: WAITING_FOR_DATABASE (attempt N)` line per retry before that line.
+Nothing here prints a DSN, token, digest, message body or raw database exception text. The DSN comes only from the
+systemd credential named by the configuration; there is no argv or environment fallback.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Any, TextIO
 from uuid import UUID, uuid5
 
@@ -43,6 +45,17 @@ MAX_CREDENTIAL_BYTES = 4096
 # limit of `storage.connect`, so a request cut at the deadline is the rare case. A cut stream reconnects with its
 # last event id.
 GRACEFUL_SHUTDOWN_SECONDS = 10
+
+# An applying `migrate` waits for a database that does not answer yet, for example one that starts after the migrate
+# unit at boot. The budget is wall-clock seconds from the first attempt. One attempt can take longer than the 3 s
+# connect timeout, which `storage.connect` applies per address while name resolution has no bound of its own, so a
+# retry starts only when an attempt as long as the last one still ends inside the budget. It is a constant, not a
+# configuration field, because the migrate unit's TimeoutStartSec must stay above it (`tests/test_deploy.py` pins
+# that) and the three deployment guides state it as 5 minutes. The delay between attempts doubles from the first
+# value up to the limit.
+MIGRATE_WAIT_SECONDS = 300
+MIGRATE_RETRY_FIRST_SECONDS = 1.0
+MIGRATE_RETRY_LIMIT_SECONDS = 10.0
 
 # The schema stores no principal name, so a name maps to the deterministic id uuid5(PRINCIPAL_NAMESPACE, name).
 # The primary key then backs the name's uniqueness. NEVER change this constant: every provisioned id would move
@@ -171,8 +184,8 @@ def _parser() -> argparse.ArgumentParser:
         ("serve", "Run the HTTP server. Inert unless the configuration sets enabled=true."),
         (
             "migrate",
-            "Apply the schema migrations; idempotent. --check applies nothing and lists the pending ones; "
-            "--reviewed refuses to apply any other pending set.",
+            "Apply the schema migrations; idempotent. An apply waits for an unreachable database. --check applies "
+            "nothing, lists the pending ones and does not wait; --reviewed refuses to apply any other pending set.",
         ),
         ("prune", "Run bounded retention batches."),
     ):
@@ -285,10 +298,53 @@ def _serve(config: Config, environ: Mapping[str, str], stderr: TextIO) -> int:
     return 0
 
 
+def _connect_when_reachable(
+    dsn: str, environ: Mapping[str, str], stderr: TextIO
+) -> psycopg.Connection[dict[str, Any]]:
+    """`connect`, retried while the database refuses it, for at most `MIGRATE_WAIT_SECONDS`.
+
+    Only the connect is retried. It has run no statement, so a retry cannot repeat or half-apply a migration. Whatever
+    fails after it (a lock timeout, a connection lost mid-apply) is outside this loop and ends the run as before.
+    `psycopg.OperationalError` is what `connect` raises for an unreachable server, a server that is starting up and a
+    rejected login. Those are not told apart, because the code never reads libpq's text, so a wrong password waits out
+    the whole budget. A DSN that libpq cannot parse raises another class and fails at once. When the budget is spent,
+    the last attempt's error propagates and the caller reports `DATABASE_UNAVAILABLE` as after a single attempt. A
+    budget of 0 is that single attempt: no retry line and no sleep.
+    """
+    deadline = monotonic() + MIGRATE_WAIT_SECONDS
+    delay = MIGRATE_RETRY_FIRST_SECONDS
+    attempt = 1
+    while True:
+        started = monotonic()
+        try:
+            return connect(dsn)
+        except psycopg.OperationalError:
+            took = monotonic() - started
+            remaining = deadline - monotonic()
+            # Retry only if an attempt as long as this one still ends inside the budget: a DSN with many addresses
+            # or a slow name lookup ends the wait early instead of overrunning it.
+            if remaining <= took:
+                raise
+        # N is the number of attempts made. The line carries no host, user or error: libpq's text can hold them.
+        _diagnose(stderr, environ, f"{PROGRAM}: WAITING_FOR_DATABASE (attempt {attempt})", 6)
+        sleep(min(delay, remaining - took))
+        delay = min(delay * 2, MIGRATE_RETRY_LIMIT_SECONDS)
+        attempt += 1
+
+
 def _migrate(
-    config: Config, environ: Mapping[str, str], stdout: TextIO, *, check: bool = False, reviewed: str | None = None
+    config: Config,
+    environ: Mapping[str, str],
+    stdout: TextIO,
+    stderr: TextIO,
+    *,
+    check: bool = False,
+    reviewed: str | None = None,
 ) -> int:
-    with connect(read_dsn(config, environ)) as db:
+    dsn = read_dsn(config, environ)
+    # An apply waits for a database that is not up yet. `--check` is an inspection and fails at once.
+    connection = connect(dsn) if check else _connect_when_reachable(dsn, environ, stderr)
+    with connection as db:
         before = _applied_versions(db)
         pending = migrate(db, check=check, reviewed=reviewed)
         if check:
@@ -511,7 +567,7 @@ def main(
         if args.command == "serve":
             return _serve(config, environ, stderr)
         if args.command == "migrate":
-            return _migrate(config, environ, stdout, check=args.check, reviewed=args.reviewed)
+            return _migrate(config, environ, stdout, stderr, check=args.check, reviewed=args.reviewed)
         if args.command == "prune":
             return _prune(config, environ, args.limit, args.max_batches, stdout)
         if args.action == "ensure":

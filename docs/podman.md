@@ -248,6 +248,13 @@ sudo systemctl start agent-chat-mcp.service
 The migration unit is a one-shot service with `RemainAfterExit=yes`. The server
 unit requires it, so a failed migration prevents the server from starting.
 
+If PostgreSQL does not answer yet, for example after a boot, the migration waits
+for it for up to 5 minutes and logs one `WAITING_FOR_DATABASE` line per retry,
+while the server units wait for the migration. After that it fails with
+`DATABASE_UNAVAILABLE` and the server units fail with it. A wrong host, user,
+password or database name is the same refusal, so a wrong DSN fails only after
+that wait.
+
 ## Traefik
 
 Add the routes from
