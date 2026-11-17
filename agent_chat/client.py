@@ -250,6 +250,9 @@ class Client:
                     raise ChatError(code)
                 if response.status >= 500:
                     raise ChatError("REQUEST_UNCERTAIN" if submitted else "SERVICE_UNAVAILABLE")
+                # A caller that tells refusals from outages (`refused`) reads an unnamed 408 or 429 as an outage.
+                if refused is not None and response.status in (408, 429) and not submitted:
+                    raise ChatError("SERVICE_UNAVAILABLE")
                 raise ChatError("REQUEST_UNCERTAIN" if submitted else "HTTP_REFUSED")
             return result
         except ChatError:
