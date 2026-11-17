@@ -47,10 +47,12 @@ MAX_CREDENTIAL_BYTES = 4096
 GRACEFUL_SHUTDOWN_SECONDS = 10
 
 # An applying `migrate` waits for a database that does not answer yet, for example one that starts after the migrate
-# unit at boot. The budget is wall-clock seconds from the first attempt; the last attempt can overrun it by one
-# connect timeout (`storage.connect`, 3 s). It is a constant, not a configuration field, because the migrate unit's
-# TimeoutStartSec must stay above it (`tests/test_deploy.py` pins that) and the three deployment guides state it as
-# 5 minutes. The delay between attempts doubles from the first value up to the limit.
+# unit at boot. The budget is wall-clock seconds from the first attempt. One attempt can take longer than the 3 s
+# connect timeout, which `storage.connect` applies per address while name resolution has no bound of its own, so a
+# retry starts only when an attempt as long as the last one still ends inside the budget. It is a constant, not a
+# configuration field, because the migrate unit's TimeoutStartSec must stay above it (`tests/test_deploy.py` pins
+# that) and the three deployment guides state it as 5 minutes. The delay between attempts doubles from the first
+# value up to the limit.
 MIGRATE_WAIT_SECONDS = 300
 MIGRATE_RETRY_FIRST_SECONDS = 1.0
 MIGRATE_RETRY_LIMIT_SECONDS = 10.0
@@ -301,15 +303,19 @@ def _connect_when_reachable(
     delay = MIGRATE_RETRY_FIRST_SECONDS
     attempt = 1
     while True:
+        started = monotonic()
         try:
             return connect(dsn)
         except psycopg.OperationalError:
+            took = monotonic() - started
             remaining = deadline - monotonic()
-            if remaining <= 0:
+            # Retry only if an attempt as long as this one still ends inside the budget: a DSN with many addresses
+            # or a slow name lookup ends the wait early instead of overrunning it.
+            if remaining <= took:
                 raise
         # N is the number of attempts made. The line carries no host, user or error: libpq's text can hold them.
         _diagnose(stderr, environ, f"{PROGRAM}: WAITING_FOR_DATABASE (attempt {attempt})", 6)
-        sleep(min(delay, remaining))
+        sleep(min(delay, remaining - took))
         delay = min(delay * 2, MIGRATE_RETRY_LIMIT_SECONDS)
         attempt += 1
 

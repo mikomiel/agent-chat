@@ -1416,6 +1416,26 @@ def test_migrate_gives_up_after_the_wait_budget_with_the_unchanged_failure(workd
     assert "sentinel" not in err and "nonexistent" not in err
 
 
+def test_slow_attempts_end_the_wait_inside_the_budget(workdir, clock, monkeypatch):
+    # A DSN with many addresses, or a slow name lookup, makes one attempt take far longer than 3 s.
+    attempts = []
+
+    def slow_refusal(dsn):
+        attempts.append(clock.now)
+        clock.now += 90
+        raise psycopg.OperationalError("sentinel-libpq-text")
+
+    monkeypatch.setattr(admin, "connect", slow_refusal)
+    started = clock.now
+    environ = write_dsn(workdir, SECRET_DSN)
+    code, out, err = run(["migrate", "--config", write_config(workdir)], environ=environ)
+    assert (code, out) == (1, "")
+    assert err.splitlines()[-1] == "agent-chat-admin: DATABASE_UNAVAILABLE"
+    # Attempts at 0, 91 and 183 s; a fourth would end after the budget, so the wait stops at 273 s.
+    assert [at - started for at in attempts] == [0, 91, 183]
+    assert clock.now - started <= admin.MIGRATE_WAIT_SECONDS
+
+
 def test_a_zero_wait_budget_is_a_single_attempt_without_a_waiting_line(workdir, clock, monkeypatch):
     monkeypatch.setattr(admin, "MIGRATE_WAIT_SECONDS", 0)
     attempts = refuse_connections(monkeypatch)
