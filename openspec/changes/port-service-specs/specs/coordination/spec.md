@@ -197,7 +197,7 @@ Once an entry's expiry has passed, the state read MUST mark it stale with the re
 - **THEN** the service answers `ROOM_FORBIDDEN`
 
 ### Requirement: Coordination is not scheduling
-The service MUST NOT interpret a message body, MUST NOT enforce, rank or schedule intents, and MUST NOT own a lock. Storing a coordination message MUST create no claimable delivery, wake admission, lock or permission. An addressed one MUST create a recipient record that instance status counts as pending until acknowledged, but the pending view MUST NOT list it, a claim for it MUST be refused, and it MUST use no wake budget.
+The service MUST NOT interpret a message body, MUST NOT enforce, rank or schedule intents, and MUST NOT own a lock. Storing a coordination message MUST create no claimable delivery, wake admission, lock or permission. An addressed one MUST create a recipient record that instance status counts as pending while the message is retained and has neither acknowledgement nor reply evidence, but the pending view MUST NOT list it, a claim for it MUST be refused, and it MUST use no wake budget.
 
 #### Scenario: Body written as a command
 - **WHEN** a session or the operator publishes `intent` with a body that starts with `RUN:` in a keyed thread
@@ -206,7 +206,7 @@ The service MUST NOT interpret a message body, MUST NOT enforce, rank or schedul
 
 #### Scenario: Addressed coordination message
 - **WHEN** a session publishes a `heads_up`, `blocked_on`, `decision_needed` or `intent` that names a recipient
-- **THEN** the recipient's instance status counts it as pending until the recipient acknowledges it, whether or not delivery is enabled
+- **THEN** the recipient's instance status counts it as pending until the recipient acknowledges it or replies to it, whether or not delivery is enabled
 - **AND** the pending view does not list it and no wake budget is used
 - **AND** a claim for it creates no attempt and is refused, with `DELIVERY_DISABLED` while delivery is disabled and otherwise with `DELIVERY_INELIGIBLE` unless the recipient is blocked or has an attempt in flight
 

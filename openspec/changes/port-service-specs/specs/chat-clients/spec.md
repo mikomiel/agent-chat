@@ -232,7 +232,7 @@ The CLI MUST let `reply MESSAGE` without `--key`, and `ack MESSAGE`, work from t
 
 #### Scenario: Reply repeated after a lost response
 - **WHEN** the session runs the same one-step reply again after losing the answer
-- **THEN** it receives the first reply back and no second reply exists
+- **THEN** it receives the first reply back and no second reply exists, while the first reply is retained
 
 #### Scenario: Same derived key with another body
 - **WHEN** the session repeats the one-step reply for that message but with different text

@@ -128,7 +128,7 @@ The service MUST let only the owning live instance, or an operator whose grants 
 - **AND** the mute is unchanged
 
 ### Requirement: Publication is atomic and idempotent
-The service MUST commit a message, its recipients, its thread membership, its role stamp, its idempotency record and its replay event in one transaction. A repeated Idempotency-Key with an identical request MUST return the stored message and create nothing new; the same key with a different request MUST fail with `IDEMPOTENCY_CONFLICT`.
+The service MUST commit a message, its recipients, its thread membership, its role stamp, its idempotency record and its replay event in one transaction. Within the key's scope, while the stored message is retained, a repeated key with an identical request MUST return the stored message and create nothing new, and the same key with a different request MUST fail with `IDEMPOTENCY_CONFLICT`.
 
 #### Scenario: Response lost after commit
 - **WHEN** a client loses the response and sends the same request again under the same key
@@ -138,6 +138,18 @@ The service MUST commit a message, its recipients, its thread membership, its ro
 #### Scenario: Same key, different request
 - **WHEN** a caller repeats a key with other content, recipients or room
 - **THEN** the service refuses with `IDEMPOTENCY_CONFLICT` and stores nothing new
+
+### Requirement: Idempotency keys are scoped and end with the message
+An Idempotency-Key MUST be scoped to the caller's principal and session, or to the principal alone for a caller without a session. After the stored message expires, a repeat of its key MUST fail with `MESSAGE_EXPIRED` until pruning removes the key record; the key MUST then create a new message.
+
+#### Scenario: Same key from another session
+- **WHEN** another session of the same principal publishes with a key that the first session already used
+- **THEN** the service treats it as a new request in that session's scope
+
+#### Scenario: Repeat after the message expired
+- **WHEN** a caller repeats a key whose message has expired but has not been pruned
+- **THEN** the service refuses with `MESSAGE_EXPIRED` and creates nothing
+- **AND** after pruning removes the key record, the same key creates a new message
 
 #### Scenario: Input outside the bounds
 - **WHEN** a request has an empty body, a body over 16384 UTF-8 bytes, a body containing NUL, a recipient list of more than 16 entries or an unknown field
@@ -304,7 +316,7 @@ The service MUST offer a message for delivery only when its kind is `question`, 
 - **THEN** the service answers as it does when delivery is enabled
 
 ### Requirement: Undelivered messages expire after 24 hours
-The service MUST leave a recipient entry stored more than 24 hours ago, with no handed, acknowledged or reply evidence, out of the pending view and, while delivery is enabled, MUST refuse its claim with `DELIVERY_INELIGIBLE`, unless an earlier refusal such as `DELIVERY_BLOCKED` applies. It MUST settle the entry with uncertainty reason `expired_undelivered` and a receipt event, and MUST NOT wake a session or charge wake budget for it.
+The service MUST leave a recipient entry stored more than 24 hours ago, with no handed, acknowledged or reply evidence, out of the pending view and, while delivery is enabled, MUST refuse its claim with `DELIVERY_INELIGIBLE`, unless an earlier refusal such as `DELIVERY_BLOCKED` applies. It MUST NOT wake a session or charge wake budget for it.
 
 #### Scenario: Resumed session with an old pending message
 - **WHEN** delivery is enabled and a session comes back and holds a pending message that was stored over 24 hours earlier
@@ -317,11 +329,18 @@ The service MUST leave a recipient entry stored more than 24 hours ago, with no 
 - **AND** the entry is settled `expired_undelivered` even though the claim was refused
 - **AND** a blocked session, one with an attempt in flight, or a message with earlier attempts receives `DELIVERY_BLOCKED`, `DELIVERY_IN_FLIGHT` or a retry refusal such as `DELIVERY_BACKOFF` instead, and an entry that no open attempt covers is still settled
 
+### Requirement: Expired questions, consultations and replies are settled
+The service MUST settle a recipient entry of a `question`, `consultation` or `reply` that is stored more than 24 hours ago, has no handed, acknowledged or reply evidence and has no uncertainty reason yet, with uncertainty reason `expired_undelivered` and a receipt event. It MUST NOT settle an entry of another kind, and MUST NOT replace an existing uncertainty reason such as `transport_ambiguous`.
+
 #### Scenario: Settlement is not clock-driven
 - **WHEN** a claim made while delivery is enabled, or a result call, runs for the session, or the prune operation runs
-- **THEN** the oldest entries past 24 hours that have no evidence and no open attempt are settled `expired_undelivered`, up to the batch limit of that call (100 for a claim or a result)
+- **THEN** the oldest `question`, `consultation` and `reply` entries past 24 hours that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to the batch limit of that call (100 for a claim or a result)
 - **AND** a later call settles the rest
 - **AND** an entry covered by an open attempt is not settled
+
+#### Scenario: Entries that are never settled
+- **WHEN** an addressed `message` entry, or an entry already marked `transport_ambiguous`, is older than 24 hours
+- **THEN** settlement leaves it unchanged
 
 ### Requirement: Sender receipts do not wake
 The service MUST record a sender receipt, at most once per message, recipient and state, when an eligible message reaches `handed` or `acked`. Recording it MUST NOT itself wake a session, append a replay event or charge wake budget; the acknowledgement or handoff that causes it appends its own `receipt` event as usual. Receipts MUST have the states `handed` and `acked` only: answering a message creates no receipt, because the reply message is that signal.
@@ -387,7 +406,7 @@ The service MUST answer every refusal with `{"error":{"code":C,"message":C}}` wh
 - **THEN** the HTTP status is 503
 
 ### Requirement: Health and readiness are distinct
-The service MUST answer `/healthz` without database access, and MUST answer `/readyz` ready only when the database is reachable, holds the application tables and records exactly migration versions 1 through the number of shipped migrations. `/readyz` does not compare digests. Both routes MUST be unauthenticated and MUST NOT return stored content.
+The service MUST answer `/healthz` without database access, and MUST answer `/readyz` ready only when the database is reachable, holds the `event_clock` singleton row and records in `schema_migrations` exactly migration versions 1 through the number of shipped migrations. `/readyz` does not compare digests and does not check other tables. Both routes MUST be unauthenticated and MUST NOT return stored content.
 
 #### Scenario: Database down
 - **WHEN** PostgreSQL cannot serve a bounded operation
@@ -398,7 +417,7 @@ The service MUST answer `/healthz` without database access, and MUST answer `/re
 - **THEN** `/readyz` refuses with `SCHEMA_MISMATCH`
 
 #### Scenario: Application tables missing
-- **WHEN** the database is reachable but the application tables do not exist, for example because no migration was ever applied
+- **WHEN** the database is reachable but the `event_clock` or `schema_migrations` table does not exist, for example because no migration was ever applied
 - **THEN** `/readyz` answers 503 `DATABASE_UNAVAILABLE` and `/healthz` still answers `ok`
 
 #### Scenario: Recovery
