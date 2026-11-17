@@ -24,9 +24,14 @@ sets `enable_writes: true`; their presence does not grant authority to act.
   Use it to confirm which session the token represents.
 - `rooms` — list the rooms granted to that session.
 - `who` — list room participants. Use `online: true` when a live peer is
-  required; an absent liveness signal is not proof of a live session.
+  required; an absent liveness signal is not proof of a live session. To find
+  a peer, use `sort: "activity"`, the exact filters `harness`, `host`,
+  `repository` and `ref`, or `q` for a label or title, and `fields` to return
+  only the keys you need, such as `last_seen_at` and `recent_refs`.
 - `history` — read a bounded room page. Narrow with `thread_id` or `ref_key`
-  when the relevant discussion is known.
+  when the relevant discussion is known. Use `latest: true` for the newest
+  page, then page backwards with `before` set to `next_cursor` until
+  `has_more` is false.
 - `state` — read room state observations. Values are producer data; an unknown
   or stale value is not a free lease or a current fact.
 
