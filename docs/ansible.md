@@ -82,6 +82,15 @@ not. systemd reads the file as root and hands each unit a private copy through
 `LoadCredential=agent-chat-dsn:<path>`. The DSN never appears in an argument, an
 environment variable, a configuration file, a template or a log.
 
+Keep the file outside the paths that the play writes: the install tree
+`/usr/local/lib/agent-chat`, `/etc/agent-chat/server.json`,
+`/etc/agent-chat/mcp.json` and `/etc/systemd`. The play writes to these paths
+and would replace the credential. It refuses such a path, and a link that leads
+into one, before it changes anything. The path has no segment `.` or `..`. The
+play compares path names and does not resolve its own directories: if one of
+them is a symlink on your host, keep the file out of its target too. The default
+path is fine.
+
 The server, the prune run and the admin commands connect to PostgreSQL as the
 OS user `agent-chat`. Its home directory is `/nonexistent` and the units set no
 `PG*` variable, so `~/.pgpass` and `PGPASSWORD` are not available. Put every
@@ -111,7 +120,7 @@ lists all of them.
 | `agent_chat_bind_host` | `127.0.0.1` | Listener address of both services: `127.0.0.1` or `0.0.0.0`. |
 | `agent_chat_port` | `8443` | Server port, 1024-65535. |
 | `agent_chat_delivery_enabled` | `false` | Enables the HTTP delivery-reservation routes. |
-| `agent_chat_dsn_file` | `/etc/agent-chat/credentials/agent-chat-dsn` | The DSN file that you provide. An absolute path of letters, digits, `.`, `_`, `/` and `-` only. |
+| `agent_chat_dsn_file` | `/etc/agent-chat/credentials/agent-chat-dsn` | The DSN file that you provide. An absolute path of letters, digits, `.`, `_`, `/` and `-` only, with no segment `.` or `..`. It must sit outside the paths that the play writes: `/usr/local/lib/agent-chat`, `/etc/agent-chat/server.json`, `/etc/agent-chat/mcp.json` and `/etc/systemd`. The play resolves links and applies the same rule to the real path, so a link into one of them is refused too. |
 | `agent_chat_prune_limit` | `100` | Rows per retention batch, 1-1000. |
 | `agent_chat_prune_max_batches` | `50` | Batches per retention run, at least 1. |
 | `agent_chat_mcp_enabled` | `false` | Installs and starts the MCP service. `false` stops and disables an installed one. Either change installs another virtual environment and activates it like an upgrade, so the server restarts too. |
@@ -142,15 +151,18 @@ mode is not supported and the playbook refuses it.
 The migration review comes before every change to the live host. The tasks run
 in this order:
 
-1. Check the variables, the Python version and the DSN file.
+1. Check the variables, the Python version and the DSN file, and resolve the
+   links on the DSN path.
 2. Create the service user and any install directory that is missing, and
    install the release into its own virtual environment. An install directory
    that exists keeps its owner and mode, but the `agent-chat` user must be able
    to enter it: mode 0755, or mode 0750 with group `agent-chat`. The play
    refuses one that the user cannot enter, before it creates a directory or
    installs the release, with the message
-   `<directory> must stay traversable by the agent-chat user`. The old release
-   keeps serving.
+   `<directory> must stay traversable by the agent-chat user`. The check judges
+   the plain mode bits for the owner, the primary group `agent-chat` and others.
+   It does not model ACLs, supplementary groups or symlinked roots, so such a
+   layout is unsupported. The old release keeps serving.
 3. Render the new configuration into that environment and check it with the
    release's own loader.
 4. Run `migrate --check` from the new release against that configuration, and
@@ -260,6 +272,13 @@ directory must stay traversable by that user: mode 0755, or mode 0750 with group
 `agent-chat`. The play refuses a directory that is not, before the gate, with
 the message `<directory> must stay traversable by the agent-chat user`. It does
 not change the mode for you: change it by hand and rerun.
+
+The check judges the plain mode bits for the owner, the primary group
+`agent-chat` and others. It does not model ACLs, supplementary groups or
+symlinked roots, and in those cases it can be wrong in either direction. For
+example, with `agent-chat` in the supplementary group `deployment`, a directory
+`root:deployment` with mode 0705 passes the check and the kernel still denies the
+user. Such a layout is unsupported.
 
 The play is not transactional after the gate. If a task fails between
 installing the configuration and switching `current`, the forced handlers can

@@ -5,7 +5,8 @@
 #
 # The play never reads the DSN. The deployer provides the DSN file; systemd passes it to
 # the services as a credential (LoadCredential=), so it never appears in an argument, an
-# environment variable, a configuration file or a log.
+# environment variable, a configuration file or a log. The DSN file must sit outside every path that the
+# play writes. The play refuses such a path, and a link that leads into one, before it changes anything.
 #
 # The migration review is a gate, and the gate comes first. Up to the task "Require the reviewed
 # digest before the schema changes" the play only installs the new release next to the old one,
@@ -38,6 +39,9 @@
     agent_chat_stamp: "{{ agent_chat_venv }}/.installed"
     # Written right after the review gate and removed after the readiness checks; see the tasks that use it.
     agent_chat_marker: "{{ agent_chat_root }}/activation-pending"
+    # The paths that the play writes, as one pattern: the install tree, the systemd configuration and the two live
+    # configuration files. The DSN file matches none of them, as written and after its links are resolved.
+    agent_chat_written_paths: '^({{ agent_chat_root }}|/etc/systemd)(/|$)|^/etc/agent-chat/(server|mcp)\.json$'
     agent_chat_unit_files: >-
       {{ ['agent-chat.service', 'agent-chat-prune.service', 'agent-chat-prune.timer']
          + (['agent-chat-mcp.service'] if agent_chat_mcp_enabled else []) }}
@@ -89,7 +93,9 @@
         agent_chat_mcp_enable_writes: "{{ agent_chat_mcp_enable_writes | default(false) }}"
 
     # An origin is also checked against the product's own loader, which refuses an explicit :443 and a port
-    # above 65535. The split lines rely on the pattern above them: assert stops at the first failing item.
+    # above 65535. The split lines rely on the pattern above them: assert stops at the first failing item. The two
+    # lines behind the DSN pattern refuse a segment `.` or `..` and a path that the play writes. A link into
+    # such a path is caught by the two tasks behind the DSN checks.
     - name: Check the variables
       ansible.builtin.assert:
         that:
@@ -107,6 +113,8 @@
           - agent_chat_port | int <= 65535
           - agent_chat_delivery_enabled is boolean
           - agent_chat_dsn_file is match('^/[A-Za-z0-9._/-]+$')
+          - not agent_chat_dsn_file is search('/\.{1,2}(/|$)')
+          - not agent_chat_dsn_file is search(agent_chat_written_paths)
           - agent_chat_prune_limit | string is match('^[0-9]+$')
           - agent_chat_prune_limit | int >= 1
           - agent_chat_prune_limit | int <= 1000
@@ -129,6 +137,8 @@
           boolean: set it in the inventory, or pass it with -e as JSON, for example
           -e '{"agent_chat_mcp_enabled": true}'. An origin has no :443 and a port of at most 65535;
           the MCP port differs from the server port. Releases before 0.7.0 are not on PyPI as sessionyard.
+          The path in agent_chat_dsn_file is absolute, has no segment . or .., and sits outside the paths
+          that the play writes: the install tree, the live configuration files and the systemd configuration.
         quiet: true
 
     - name: Read the Python version of the target
@@ -168,6 +178,27 @@
           The deployer provides it from the secret manager; this playbook never creates, reads or prints it.
         quiet: true
 
+    # The variable check compares the path as written. A link leads elsewhere than its name says, and the stat
+    # above and systemd both follow links, so the path is resolved here and held to the same rule before the first
+    # task that writes anything. realpath looks at the links on the way and never opens the file. These two tasks
+    # write nothing and queue no handler.
+    - name: Resolve the DSN path without reading the file
+      ansible.builtin.command:
+        argv: [realpath, -e, --, "{{ agent_chat_dsn_file }}"]
+      register: agent_chat_dsn_real
+      changed_when: false
+      no_log: true
+
+    - name: Require the DSN file outside the paths the play writes
+      ansible.builtin.assert:
+        that: not agent_chat_dsn_real.stdout is search(agent_chat_written_paths)
+        fail_msg: >-
+          agent_chat_dsn_file resolves to {{ agent_chat_dsn_real.stdout }}, which the play writes. The DSN file must
+          sit outside the paths that the play writes: the install tree {{ agent_chat_root }}, the live
+          configuration files and the systemd configuration. The same holds for every link on the way to it.
+          The variable table in docs/ansible.md lists the paths.
+        quiet: true
+
     # Before the gate. The migration check runs as this user, so it must exist; creating it changes no
     # running service.
     - name: Create the service group
@@ -202,7 +233,9 @@
     # the task that sets 0755 only comes after the gate. So the play refuses such a directory here and changes
     # nothing. It reads the mode bits that the look-up recorded. The kernel applies one class of them to the
     # user: the owner's if the user owns the directory, else the group's if the directory has the group
-    # agent-chat, else the others'. A missing directory passes, because the next task creates it 0755.
+    # agent-chat, else the others'. That is the whole model: it does not know ACLs, supplementary groups or
+    # symlinked roots, and the guide calls such a layout unsupported. A missing directory passes, because the
+    # next task creates it 0755.
     - name: Require the install directories to be traversable by the service user
       ansible.builtin.assert:
         that: >-

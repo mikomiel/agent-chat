@@ -581,9 +581,11 @@ def test_ansible_playbook_changes_nothing_live_before_the_migration_gate():
         "Stage the server configuration",
         "Stage the MCP configuration",
     ]
-    # The only processes before the gate are two reads: the Python version and `migrate --check`.
+    # The only processes before the gate are three reads: the Python version, the resolved DSN path and
+    # `migrate --check`.
     assert [task["name"] for task in before if "ansible.builtin.command" in task] == [
         "Read the Python version of the target",
+        "Resolve the DSN path without reading the file",
         "List the pending migrations",
     ]
     # No handler can be queued before the review, so force_handlers cannot restart anything after a refusal.
@@ -762,17 +764,21 @@ def test_ansible_playbook_never_reads_the_dsn_and_passes_it_as_a_credential():
     spawning = ("ansible.builtin.command", "ansible.builtin.shell")
     assert {(key, step["name"]) for step in steps for key in step if key in spawning} == {
         ("ansible.builtin.command", "Read the Python version of the target"),
+        ("ansible.builtin.command", "Resolve the DSN path without reading the file"),
         ("ansible.builtin.shell", "Install Agent Chat into its versioned virtual environment"),
         ("ansible.builtin.command", "List the pending migrations"),
         ("ansible.builtin.command", "Apply the reviewed migrations"),
         ("ansible.builtin.command", "Restart Agent Chat"),
     }
-    # Only the stat task, its checks and the defaults name the DSN file; agent_chat_admin passes it as a credential.
+    # Only the stat task, its checks, the path resolution and the defaults name the DSN file; agent_chat_admin passes
+    # it as a credential. The resolution is pinned argument by argument in the DSN path test below.
     assert {step["name"] for step in steps if re.search(r"dsn_file|agent-chat-dsn", str(step))} == {
         "Apply the defaults of the optional variables",
         "Check the variables",
         "Check the DSN file without reading it",
         "Require the deployer's DSN file",
+        "Resolve the DSN path without reading the file",
+        "Require the DSN file outside the paths the play writes",
     }
     text = (ANSIBLE / "playbook.yml").read_text()
     for banned in ("slurp", "lookup(", "fetch", "password"):
@@ -954,6 +960,207 @@ def test_ansible_playbook_checks_every_variable_it_interpolates_before_changing_
         for name in group:
             assert all(re.match(patterns[name], sample) for sample in accepted), name
             assert not [sample for sample in refused if re.match(patterns[name], sample)], name
+
+
+# The DSN path rule. Its conditions are the playbook's own text: `Check the variables` holds the two lexical ones right
+# behind the character pattern, and the task behind `Resolve the DSN path without reading the file` holds the same
+# pattern for the real path. Jinja is not a dependency, so `_holds` runs the three forms that they use with `re`, as
+# Ansible's `match` and `search` tests do, and fails on any other form until a case for it is added there. Each sample
+# below was also run through the real `Check the variables` task and the real resolved-path assert with ansible-core
+# 2.18 on localhost, and ansible-core agreed with `re` on every one. The two tasks and the stat before them also ran
+# end to end on temporary files: the DSN file kept its SHA-256 when a link chain, a directory link, `..` or `//`
+# led into the staged server.json or the activation marker, and a stand-in for the first write replaced it when the
+# same paths ran through the play without these tasks.
+DSN_PATH_SAMPLES = (
+    # Accepted: the default and a path in a private directory, then names that only look like a refused path or like
+    # a dot segment: a sibling of the install tree, a neighbour of a live file, a dotted name.
+    (
+        "/etc/agent-chat/credentials/agent-chat-dsn",
+        "/root/agent-chat-dsn",
+        "/run/keys/dsn.v2",
+        "/usr/local/lib/agent-chat-dsn",
+        "/usr/local/lib/agent-chat.dsn",
+        "/etc/agent-chat/server.json.bak",
+        "/etc/agent-chat/credentials/server.json",
+        "/etc/agent-chat/credentials/mcp.json",
+        "/etc/systemd-dsn",
+        "/etc/.dsn",
+        "/etc/..dsn",
+        "/etc/dsn..",
+        "/etc/...",
+    ),
+    # Refused: the install tree and what the play writes in it, the two live configuration files, the systemd
+    # configuration, and a path whose dot segment hides one of them.
+    (
+        "/usr/local/lib/agent-chat",
+        "/usr/local/lib/agent-chat/activation-pending",
+        "/usr/local/lib/agent-chat/venvs/v0.7.0-server/staged/server.json",
+        "/etc/agent-chat/server.json",
+        "/etc/agent-chat/mcp.json",
+        "/etc/systemd",
+        "/etc/systemd/system/x",
+        "/etc/systemd/system/agent-chat.service",
+        "/etc/agent-chat/credentials/../server.json",
+        "/etc/./agent-chat/server.json",
+        "/root/dsn/..",
+        "/root/./dsn",
+    ),
+)
+# A link: the name passes the lexical rule, so the real path that `realpath` prints decides. It has no dot segment and
+# no repeated slash. The last two aliases only the resolution shows: a repeated slash, and a directory link on the way
+# (here `/etc/agent-chat/credentials` as a link to `/etc/agent-chat`; `stat` with `follow: false` reports no
+# `lnk_source` for such a path because the last name is not a link, which is why the play runs `realpath`).
+DSN_LINK_SAMPLES = (
+    ("/root/dsn-link", "/run/secrets/dsn", True),
+    ("/root/dsn-link", "/etc/agent-chat/credentials/agent-chat-dsn", True),
+    ("/root/dsn-link", "/usr/local/lib/agent-chat/venvs/v0.7.0-server/staged/server.json", False),
+    ("/root/dsn-link", "/usr/local/lib/agent-chat/activation-pending", False),
+    ("/root/dsn-link", "/etc/agent-chat/server.json", False),
+    ("/root/dsn-link", "/etc/agent-chat/mcp.json", False),
+    ("/root/dsn-link", "/etc/systemd/system/agent-chat.service", False),
+    ("//etc/agent-chat/server.json", "/etc/agent-chat/server.json", False),
+    ("/etc/agent-chat/credentials/server.json", "/etc/agent-chat/server.json", False),
+)
+
+
+def _expand(text: str) -> str:
+    """Fill the play's derived path variables into a template. Only the forms that the play uses are replaced."""
+    play_vars = _playbook()["vars"]
+    fixed = {"{{ agent_chat_version }}": "v0.7.0", "{{ agent_chat_extras | replace(',', '-') }}": "server"}
+    while "{{" in text:
+        before = text
+        for template, value in fixed.items():
+            text = text.replace(template, value)
+        text = re.sub(r"\{\{ (agent_chat_\w+) \}\}", lambda match: play_vars.get(match[1], match[0]), text)
+        assert text != before, text  # a form that is not handled here
+    return text
+
+
+def _holds(condition: str, name: str, value: str) -> bool:
+    """Run one DSN condition on `value`, as Ansible's `match` and `search` tests do."""
+    form = re.fullmatch(
+        rf"(not )?{re.escape(name)} is (match|search)\((?:'(.+)'|(agent_chat_written_paths))\)", condition
+    )
+    assert form, condition
+    negated, test, literal, variable = form.groups()
+    pattern = literal or _expand(_playbook()["vars"][variable])
+    return (getattr(re, test)(pattern, value) is not None) != bool(negated)
+
+
+def _dsn_path_accepted(path: str, real: str | None = None) -> bool:
+    """The verdict of the DSN conditions on `path`, then of the task that checks the real path (`path` if no link)."""
+    checks = _task("Check the variables")["ansible.builtin.assert"]["that"]
+    real_check = _task("Require the DSN file outside the paths the play writes")["ansible.builtin.assert"]["that"]
+    return all(_holds(check, "agent_chat_dsn_file", path) for check in checks if "agent_chat_dsn_file" in check) and (
+        _holds(real_check, "agent_chat_dsn_real.stdout", path if real is None else real)
+    )
+
+
+def test_ansible_playbook_refuses_a_dsn_path_that_the_play_writes():
+    # The DSN file is overwritten by a later task when it sits at a path that the play writes: the staged
+    # server.json before the review gate, the activation marker and the live files after it. Systemd and the metadata
+    # stat follow links, so the rule holds for the real path too.
+    accepted, refused = DSN_PATH_SAMPLES
+    assert [path for path in accepted if not _dsn_path_accepted(path)] == []
+    assert [path for path in refused if _dsn_path_accepted(path)] == []
+    assert [link for link in DSN_LINK_SAMPLES if _dsn_path_accepted(link[0], link[1]) is not link[2]] == []
+
+    # Every file that the play writes is covered, so a new write task outside the pattern fails here. A directory is
+    # left out because the play requires a regular file. The units come from a loop over their names.
+    written = []
+    for task in _playbook()["tasks"]:
+        for module in ("file", "copy", "template"):
+            args = task.get(f"ansible.builtin.{module}")
+            if args is not None and args.get("state") != "directory":
+                written.append(_expand((args.get("dest") or args["path"]).replace("{{ item }}", "agent-chat.service")))
+    assert {
+        "/usr/local/lib/agent-chat/venvs/v0.7.0-server/staged/server.json",
+        "/usr/local/lib/agent-chat/activation-pending",
+        "/etc/agent-chat/server.json",
+        "/etc/agent-chat/mcp.json",
+        "/etc/systemd/system/agent-chat.service",
+    } <= set(written)
+    assert [path for path in written if _dsn_path_accepted(path)] == []
+
+
+def test_ansible_playbook_resolves_the_dsn_path_read_only_before_the_first_write():
+    play = _playbook()
+    tasks = play["tasks"]
+    names = [task["name"] for task in tasks]
+    stat = _task("Check the DSN file without reading it")
+    require = _task("Require the deployer's DSN file")
+    resolve = _task("Resolve the DSN path without reading the file")
+    outside = _task("Require the DSN file outside the paths the play writes")
+
+    # The metadata stat follows links, as systemd does; that is why the real path is resolved. `realpath -e` reads the
+    # metadata of each link on the way and never opens the file. The task keeps no_log like the stat, reports no
+    # change and has no `when`, `ignore_errors`, `failed_when` or `notify`.
+    assert stat["ansible.builtin.stat"]["follow"] is True
+    assert set(resolve) == {"name", "ansible.builtin.command", "register", "changed_when", "no_log"}
+    assert resolve["ansible.builtin.command"] == {"argv": ["realpath", "-e", "--", "{{ agent_chat_dsn_file }}"]}
+    assert resolve["changed_when"] is False
+    assert resolve["no_log"] is True
+    # The assert only evaluates. It has no `when`, `ignore_errors`, `failed_when` or `notify`, so it can be neither
+    # skipped nor ignored, and the same pattern as in the variable check decides.
+    assert set(outside) == {"name", "ansible.builtin.assert"}
+    assertion = outside["ansible.builtin.assert"]
+    assert set(assertion) == {"that", "fail_msg", "quiet"}
+    assert assertion["that"] == f"not {resolve['register']}.stdout is search(agent_chat_written_paths)"
+    message = _flat(assertion["fail_msg"])
+    refusal = "agent_chat_dsn_file resolves to {{ agent_chat_dsn_real.stdout }}, which the play writes."
+    assert message.startswith(refusal)
+    assert "must sit outside the paths that the play writes" in message and "every link on the way" in message
+
+    # The order: the metadata checks, then the resolution and its assert, then every task that writes or creates
+    # anything, which starts with the service group, and the look-up of the install directories.
+    changing = ("group", "user", "file", "shell", "template", "copy", "systemd", "meta")
+    first_write = min(
+        index for index, task in enumerate(tasks) if any(f"ansible.builtin.{module}" in task for module in changing)
+    )
+    assert names[first_write] == "Create the service group"
+    order = [names.index(task["name"]) for task in (stat, require, resolve, outside)]
+    assert order == sorted(order)
+    assert order[-1] < first_write
+    assert order[-1] < names.index("Look for the install directories")
+
+    # `Check the variables` holds the two lexical conditions right behind the character pattern, because assert stops
+    # at the first failing item. The pattern is derived, not an input, and only the two asserts use it.
+    check = _task("Check the variables")["ansible.builtin.assert"]
+    shape = check["that"].index("agent_chat_dsn_file is match('^/[A-Za-z0-9._/-]+$')")
+    assert check["that"][shape + 1 : shape + 3] == [
+        "not agent_chat_dsn_file is search('/\\.{1,2}(/|$)')",
+        "not agent_chat_dsn_file is search(agent_chat_written_paths)",
+    ]
+    assert "agent_chat_dsn_file is absolute, has no segment . or .." in _flat(check["fail_msg"])
+    assert "outside the paths that the play writes" in _flat(check["fail_msg"])
+    assert "agent_chat_written_paths" in play["vars"]
+    assert not [name for name, value in play["vars"].items() if "agent_chat_written_paths" in str(value)]
+    assert {step["name"] for step in [*tasks, *play["handlers"]] if "agent_chat_written_paths" in str(step)} == {
+        "Check the variables",
+        outside["name"],
+    }
+    assert "dsn" not in play["vars"]["agent_chat_written_paths"]
+
+
+def test_ansible_guide_states_the_dsn_path_rule_and_the_limits_of_the_directory_check():
+    guide = (ROOT / "docs" / "ansible.md").read_text()
+    flat = _flat(guide)
+    row = next(line for line in guide.splitlines() if line.startswith("| `agent_chat_dsn_file`"))
+    for path in (_playbook()["vars"]["agent_chat_root"], "/etc/agent-chat/server.json", "/etc/agent-chat/mcp.json"):
+        assert f"`{path}`" in row, path
+    assert "`/etc/systemd`" in row and "with no segment `.` or `..`" in row
+    assert "must sit outside the paths that the play writes" in row
+    assert "applies the same rule to the real path, so a link into one of them is refused too" in row
+    # The prerequisites section says it again, with the one layout that the check cannot see.
+    assert "Keep the file outside the paths that the play writes" in flat
+    assert "It refuses such a path, and a link that leads into one, before it changes anything." in flat
+    assert "does not resolve its own directories: if one of them is a symlink on your host" in flat
+
+    # The traversal check judges plain mode bits only. Both places that state the rule say where it is wrong.
+    assert flat.count("does not model ACLs, supplementary groups or symlinked roots") == 2
+    assert "with `agent-chat` in the supplementary group `deployment`," in flat
+    assert "a directory `root:deployment` with mode 0705" in flat
+    assert "passes the check and the kernel still denies the user. Such a layout is unsupported." in flat
 
 
 def test_ansible_guide_documents_the_supported_native_path_and_every_variable():
