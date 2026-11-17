@@ -140,7 +140,14 @@ python -m agent_chat.admin migrate --config "$D/config.json" --check
 
 `--check` takes the migration lock, reports the pending files and prints a
 reviewed digest, then rolls back. It creates no schema and no bookkeeping table.
-A current database prints `pending=0` and no reviewed digest.
+A current database prints `pending=0` and no reviewed digest. `--check` fails at
+once with `DATABASE_UNAVAILABLE` when the database does not answer.
+
+An apply, with or without `--reviewed`, waits instead. It retries the connection
+for up to 5 minutes, with a delay that grows from 1 to 10 seconds, and prints one
+`WAITING_FOR_DATABASE` line per retry. It then fails with `DATABASE_UNAVAILABLE`
+as before. The tool does not tell an unreachable database from a wrong host,
+user, password or database name, so a wrong DSN fails only after that wait.
 
 Review the listed files and digest, then apply that exact set:
 
@@ -362,6 +369,7 @@ Common admin refusals:
 | `SCHEMA_MISMATCH` | The recorded migration ledger does not match this release. |
 | `REVIEW_MISMATCH` | The pending migration set differs from the reviewed digest. |
 | `DISABLED` | `serve` ran with `enabled: false`; this is not a listener failure. |
+| `WAITING_FOR_DATABASE` | An applying `migrate` got no connection and retries; this is not yet a failure. `DATABASE_UNAVAILABLE` follows if the wait ends. |
 | `LISTENER_UNAVAILABLE` | The listener could not start. |
 | `DATABASE_UNAVAILABLE` | A database operation failed; connection details are not printed. |
 | `TOKEN_INVALID` | The stdin token is not 64 lowercase hexadecimal characters. |
