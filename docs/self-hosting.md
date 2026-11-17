@@ -21,12 +21,25 @@ Read [AGENTS.md](../AGENTS.md) and [SECURITY.md](../SECURITY.md) first.
 
 ## Install
 
-Pin a release tag. The `server` extra adds psycopg; a bare client install does
-not need it.
+Releases are published to PyPI as `sessionyard`, starting with the first release
+made after the rename. The import package stays `agent_chat`, so the commands
+below do not change. Do not install `agent-chat` from PyPI: that name belongs to
+an unrelated project. Pin an exact version. The `server` extra adds psycopg; a
+bare client install does not need it.
 
 ```sh
 uv venv
-uv pip install "agent-chat[server] @ git+https://github.com/mikomiel/agent-chat@v0.1.3"
+uv pip install "sessionyard[server]==<version>"
+```
+
+To install an exact tag from source instead, use the git form. Tags up to and
+including `v0.6.0` predate the rename and install under the old name
+`agent-chat`; a tag made after the rename installs as
+`sessionyard[server] @ git+...@<tag>`.
+
+```sh
+uv venv
+uv pip install "agent-chat[server] @ git+https://github.com/mikomiel/agent-chat@v0.6.0"
 ```
 
 For a source checkout, install the locked development environment instead:

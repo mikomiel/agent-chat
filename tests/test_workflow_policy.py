@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -322,7 +325,7 @@ def test_release_please_updates_the_lockfile_project_version() -> None:
     assert entry == {
         "type": "toml",
         "path": "uv.lock",
-        "jsonpath": "$.package[?(@.name.value=='agent-chat')].version",
+        "jsonpath": "$.package[?(@.name.value=='sessionyard')].version",
     }
 
 
@@ -342,3 +345,128 @@ def test_checks_asserts_the_lockfile_is_current() -> None:
     runs = [item.get("run") for item in steps]
     sync = runs.index("uv sync --frozen")
     assert runs.index("uv lock --check") == sync + 1
+
+
+TAG_CHECK_STEP = "Release tag matches the project version"
+
+
+def test_publish_runs_only_for_a_published_release_with_per_job_scopes() -> None:
+    """Publication is its own top-level workflow, because PyPI trusted publishing has no reusable-workflow support.
+
+    The only trigger is a published release. Nothing is granted by default,
+    ``build`` may read the repository, and only ``publish`` may mint the OIDC
+    token, inside the ``pypi`` environment where a required reviewer approves
+    each release.
+    """
+    document = workflow("publish.yml")
+    assert triggers(document) == {"release": {"types": ["published"]}}
+    assert document["permissions"] == {}
+    assert document.get("env") is None
+    assert document.get("defaults") is None
+    jobs = document["jobs"]
+    assert set(jobs) == {"build", "publish"}
+    for job in jobs.values():
+        assert job["runs-on"] == DEFAULT_RUNNER
+        assert job["timeout-minutes"] <= 15
+        assert job.get("env") is None
+        assert job.get("container") is None
+        assert job.get("services") is None
+    assert jobs["build"]["permissions"] == {"contents": "read"}
+    assert jobs["build"].get("environment") is None
+    assert jobs["publish"]["permissions"] == {"id-token": "write"}
+    assert jobs["publish"]["environment"] == "pypi"
+    assert jobs["publish"]["needs"] == "build"
+
+
+def test_publish_builds_the_release_tag_and_publishes_only_what_was_built() -> None:
+    document = workflow("publish.yml")
+    build = document["jobs"]["build"]["steps"]
+    publish = document["jobs"]["publish"]["steps"]
+    checkout = build[0]
+    assert checkout["uses"].startswith("actions/checkout@")
+    # The release event commit, not the tag name: a same-named branch or a
+    # moved tag must not change what is built (review of #86).
+    assert checkout["with"] == {"persist-credentials": False, "ref": "${{ github.sha }}"}
+    commands = [step["run"] for step in build if "run" in step]
+    install = re.compile(r"^python -m pip install --disable-pip-version-check uv==\d+\.\d+\.\d+$")
+    assert any(install.match(command) for command in commands)
+    (build_step,) = [step for step in build if step.get("run") == "uv build"]
+    (upload,) = [step for step in build if step.get("uses", "").startswith("actions/upload-artifact@")]
+    assert build.index(build_step) < build.index(upload)
+    assert upload["with"] == {"name": "dist", "path": "dist/", "if-no-files-found": "error"}
+    # The job that holds the OIDC token runs no shell and no repository code, and
+    # the publisher takes no password: trusted publishing is its only credential.
+    assert [step["uses"].split("@")[0] for step in publish] == [
+        "actions/download-artifact",
+        "pypa/gh-action-pypi-publish",
+    ]
+    assert all("run" not in step for step in publish)
+    assert publish[0]["with"] == {"name": "dist", "path": "dist/"}
+    assert "password" not in (publish[1].get("with") or {})
+    for step in (*build, *publish):
+        if "uses" in step:
+            assert PINNED_ACTION.match(step["uses"]), step["uses"]
+
+
+def test_publish_refuses_a_tag_that_is_not_the_project_version() -> None:
+    """A release names its version by tag, so a mismatch must stop the build before ``uv build``.
+
+    The tag reaches the shell through ``env:`` and never inside ``run:``,
+    because a tag name may carry shell metacharacters. Like the lock check, the
+    step has no ``if`` or ``continue-on-error`` that would turn it into a no-op.
+    """
+    steps = workflow("publish.yml")["jobs"]["build"]["steps"]
+    (step,) = [item for item in steps if item.get("name") == TAG_CHECK_STEP]
+    assert "if" not in step
+    assert "continue-on-error" not in step
+    assert step["env"] == {"RELEASE_TAG": "${{ github.event.release.tag_name }}"}
+    assert "${{" not in step["run"]
+    assert "set -euo pipefail" in step["run"]
+    runs = [item.get("run") for item in steps]
+    assert runs.index(step["run"]) < runs.index("uv build")
+
+
+def test_publish_tag_check_passes_only_the_exact_project_version(tmp_path: Path) -> None:
+    """Run the committed script: the text assertions cannot catch an inverted comparison."""
+    steps = workflow("publish.yml")["jobs"]["build"]["steps"]
+    (step,) = [item for item in steps if item.get("name") == TAG_CHECK_STEP]
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python").symlink_to(sys.executable)
+    marker = tmp_path / "injected"
+
+    def check(tag: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            cwd=ROOT,
+            env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "RELEASE_TAG": tag},
+        )
+
+    assert check(f"v{version}").returncode == 0
+    for tag in (version, f"v{version}.1", f"v{version}-rc1", "", f"v{version}$(touch {marker})"):
+        result = check(tag)
+        assert result.returncode == 1, tag
+        assert f"v{version}" in result.stderr
+    assert not marker.exists()
+
+
+def test_uv_is_pinned_to_one_version_everywhere() -> None:
+    """The workflows install the uv that the container image copies.
+
+    CI once built and tested with one uv while the image was built with
+    another; this keeps every workflow pin and the image tag on one version.
+    """
+    pins = {
+        version
+        for path in sorted(WORKFLOWS.glob("*.yml"))
+        for version in re.findall(r"\buv==(\d+\.\d+\.\d+)\b", path.read_text(encoding="utf-8"))
+    }
+    (image,) = re.findall(
+        r"ghcr\.io/astral-sh/uv:(\d+\.\d+\.\d+)\b", (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    )
+    assert pins == {image}

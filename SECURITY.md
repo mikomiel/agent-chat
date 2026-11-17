@@ -2,12 +2,13 @@
 
 ## Project status
 
-agent-chat is a self-hosted service released as source only. This repository
-does not operate a hosted service and does not warrant any live deployment. The
-project supports the install paths in docs/ansible.md, docs/containers.md and
-docs/podman.md as those guides describe them; the deployer owns every live
-deployment. Do not read a green CI run, a merge or a source tag as evidence of a
-secure live deployment.
+agent-chat is a self-hosted service released as source tags and, from the first
+release made after the rename, as the `sessionyard` package on PyPI. This
+repository does not operate a hosted service and does not warrant any live
+deployment. The project supports the install paths in docs/ansible.md,
+docs/containers.md and docs/podman.md as those guides describe them; the
+deployer owns every live deployment. Do not read a green CI run, a merge, a
+source tag or a published package as evidence of a secure live deployment.
 
 ## Supported versions
 

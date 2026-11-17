@@ -124,9 +124,25 @@ a missing or empty secret fails the run with `Input required and not supplied:
 token`, and an expired one fails authentication.
 
 The release pull request always changes a sensitive path, so the merge policy
-never auto-merges it: a maintainer merges it. A tag or a release is not a
-deployment; package, image and deployment decisions remain separate operator
-decisions recorded outside this repository.
+never auto-merges it: a maintainer merges it.
+
+Publishing the GitHub Release starts `.github/workflows/publish.yml`, which
+uploads the distribution to PyPI as `sessionyard` through trusted publishing; no
+PyPI token is stored in this repository. Its `build` job checks out the commit
+the release event names (`github.sha`, not the tag name, which a same-named
+branch or a moved tag could redirect), fails unless the tag is `v` plus the
+version in `pyproject.toml`, and runs `uv build`. Its `publish` job holds only
+`id-token: write` and runs in the `pypi` environment, where a required reviewer
+approves each upload. PyPI trusted
+publishing does not support reusable workflows, and `automerge` calls
+`release-please.yml` through `workflow_call`, so publication is its own workflow
+and not a job in `release-please.yml`. The PyPI trusted publisher is bound to
+this repository, the file name `publish.yml` and the environment `pypi`;
+renaming any of them needs a matching change on PyPI. Tags up to `v0.6.0`
+predate the rename and carry the distribution name `agent-chat`.
+
+A tag or a release is not a deployment; image and deployment decisions remain
+separate operator decisions recorded outside this repository.
 
 ## Database migrations
 
