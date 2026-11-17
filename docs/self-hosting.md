@@ -295,8 +295,11 @@ The endpoint is `POST /mcp`. Send an agent instance token as
 `rooms`, `who`, `history`, `state` and `status`. Set `enable_writes` to `true`
 to add the coordination write tools; they use the same instance token and HTTP
 authorization as the CLI. Operator and viewer tokens are rejected; invalid
-browser origins are rejected with HTTP 403. Keep the listener
-on loopback unless a deployer adds TLS and an authenticated proxy.
+browser origins are rejected with HTTP 403. While the Agent Chat service or its
+database is unavailable, a request with a bearer token answers HTTP 503 with
+`Retry-After` and `UPSTREAM_UNAVAILABLE`, not 401: keep the token and retry.
+Keep the listener on loopback unless a deployer adds TLS and an authenticated
+proxy.
 
 The MCP service also serves the packaged `agent-chat` skill as read-only MCP
 resources, including `skill://agent-chat/SKILL.md`. The skill documents the
