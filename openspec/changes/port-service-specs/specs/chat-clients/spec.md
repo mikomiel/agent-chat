@@ -137,21 +137,28 @@ When a POST may have been sent and ends without a definitive answer, the CLI MUS
 - **THEN** it fails with `TRANSPORT_UNAVAILABLE` and exits with 1, whatever the command
 
 ### Requirement: A 20-second alarm bounds every command
-The CLI MUST arm a 20-second alarm for the whole command. When it fires outside an HTTP request, such as while the CLI waits for standard input, the CLI MUST print `CLI_INTERRUPTED` and exit with 1. When it fires during a request, the request MUST end as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method. Each connect, send and receive step of a request MUST time out after 3 seconds.
+The CLI MUST arm a 20-second alarm for the whole command. When it fires outside an HTTP request, such as while the CLI waits for standard input, the CLI MUST print `CLI_INTERRUPTED` and exit with 1. When it fires after the connection is made, the request MUST end as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method; when it fires before, as `TRANSPORT_UNAVAILABLE` for every method.
 
 #### Scenario: Standard input stalls
 - **WHEN** standard input stays open and silent until the alarm fires
 - **THEN** the CLI prints `CLI_INTERRUPTED` and exits with 1
 - **AND** it has sent no request
 
+#### Scenario: Alarm during a request
+- **WHEN** the alarm fires after the connection is made, while the request is still in progress
+- **THEN** the request ends as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method
+- **AND** the CLI does not print `CLI_INTERRUPTED` for it
+
+#### Scenario: Alarm before the connection is made
+- **WHEN** host name resolution stalls until the alarm fires
+- **THEN** the CLI fails with `TRANSPORT_UNAVAILABLE` and exits with 1, for a POST too
+
+### Requirement: Socket steps time out after 3 seconds
+The CLI MUST time out each socket connect, send and receive step of a request after 3 seconds. The bound does not cover host name resolution; only the 20-second alarm limits it.
+
 #### Scenario: Peer stops answering
 - **WHEN** the service accepts a connection and then sends nothing for 3 seconds
 - **THEN** the step times out, and the CLI reports `REQUEST_UNCERTAIN` for a POST or `TRANSPORT_UNAVAILABLE` for any other method
-
-#### Scenario: Alarm during a request
-- **WHEN** the alarm fires while a request is still in progress
-- **THEN** the request ends as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method
-- **AND** the CLI does not print `CLI_INTERRUPTED` for it
 
 ### Requirement: Recipients resolve to concrete sessions
 The CLI MUST resolve each `--to` selector, a session UUID, a label, `harness@host` or `harness@host/native-id`, to a concrete session UUID. It MUST refuse a selector that matches several sessions, online or offline, with `AMBIGUOUS_RECIPIENT` and the candidates, and MUST NOT choose one. It MUST refuse more than 16 selectors.
