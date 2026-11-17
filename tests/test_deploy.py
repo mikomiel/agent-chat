@@ -685,6 +685,68 @@ def test_ansible_playbook_leaves_an_existing_install_directory_alone_until_the_g
     }
 
 
+def test_ansible_playbook_refuses_an_install_directory_the_service_user_cannot_enter_before_the_gate():
+    # `migrate --check` runs as `agent-chat` from a virtual environment inside the install tree, so that user must be
+    # able to enter every directory on the way. A deployer may have hardened an existing root to 0700 root:root: the
+    # check then exits 203 (EXEC) before the gate, no digest can clear it, and the task that sets 0755 comes after
+    # the gate. The play refuses such a directory first, from the stat results of the look-up, and changes nothing.
+    # The condition needs ansible-core, which the suite does not install, so this pins the exact text, its place
+    # and its message. Both tasks were run with ansible-core 2.18 on temporary directories, with `agent-chat` swapped
+    # for an existing account that has a group of its own, and agreed with the kernel (`setpriv` as that account):
+    # refused for 0700 root:root, 0750 root:root, a 0700 `venvs` and 0705 with the account's group; allowed for 0755,
+    # 0711, 0750 with the account's group and 0700 owned by the account. A missing directory and an id without a
+    # passwd or group entry were run too, and the unswapped task on hand-made stat results for `agent-chat` itself.
+    tasks = _playbook()["tasks"]
+    names = [task["name"] for task in tasks]
+    gate = names.index("Require the reviewed digest before the schema changes")
+    look = _task("Look for the install directories")
+    check = _task("Require the install directories to be traversable by the service user")
+
+    # It reads the stat results of the look-up and nothing else. The module only evaluates, so the task writes
+    # nothing, and it has no `when`, `ignore_errors`, `failed_when` or `notify`: it can be neither skipped nor ignored.
+    assert set(check) == {"name", "ansible.builtin.assert", "loop", "loop_control"}
+    assert check["loop"] == "{{ " + look["register"] + ".results }}"
+    assert check["loop_control"] == {"label": "{{ item.item }}"}
+    assertion = check["ansible.builtin.assert"]
+    assert set(assertion) == {"that", "fail_msg", "quiet"}
+    # A missing directory passes, because the next task creates it 0755. Otherwise the class of mode bits that the
+    # kernel applies to the service user decides: the owner's, else the group's, else the others'. `stat` leaves out
+    # the name of an id that has no passwd or group entry, so each name has a default.
+    assert _flat(assertion["that"]) == (
+        "not item.stat.exists"
+        " or (item.stat.xusr if item.stat.pw_name | default('') == 'agent-chat'"
+        " else item.stat.xgrp if item.stat.gr_name | default('') == 'agent-chat'"
+        " else item.stat.xoth)"
+    )
+    message = _flat(assertion["fail_msg"])
+    refusal = "{{ item.item }} must stay traversable by the agent-chat user"
+    assert message.startswith(refusal + " (for example mode 0755, or mode 0750 with group agent-chat), ")
+    assert "does not change an existing install directory before the review gate" in message
+
+    # The order: the look-up, this check, then the first task that creates a directory or installs anything, then the
+    # first run as the service user (the migration check), all before the gate. The virtual environment directory
+    # comes from `python3 -m venv` under `umask 022`; the play gives it no mode, so only the two directories are read.
+    first_run = next(index for index, task in enumerate(tasks) if "agent_chat_admin" in json.dumps(task))
+    assert names[first_run] == "List the pending migrations"
+    chain = [
+        names.index(look["name"]),
+        names.index(check["name"]),
+        names.index("Create the missing install directories"),
+        names.index("Install Agent Chat into its versioned virtual environment"),
+        first_run,
+        gate,
+    ]
+    assert chain == sorted(chain)
+
+    # The guide states the requirement where it describes the order and where it promises that a refusal leaves an
+    # existing directory alone, in the words of the message.
+    guide = _flat((ROOT / "docs" / "ansible.md").read_text())
+    assert guide.count("mode 0755, or mode 0750 with group `agent-chat`") == 2
+    assert guide.count("`" + refusal.replace("{{ item.item }}", "<directory>") + "`") == 2
+    assert "refuses one that the user cannot enter, before it creates a directory or installs the release" in guide
+    assert "The play refuses a directory that is not, before the gate, with the message" in guide
+
+
 def test_ansible_playbook_never_reads_the_dsn_and_passes_it_as_a_credential():
     play = _playbook()
     # A play-level key such as pre_tasks or roles would hold steps that the checks below do not see.

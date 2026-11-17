@@ -10,11 +10,11 @@
 # The migration review is a gate, and the gate comes first. Up to the task "Require the reviewed
 # digest before the schema changes" the play only installs the new release next to the old one,
 # stages the new configuration inside it, and runs `migrate --check` from there against the staged
-# configuration. It creates an install directory only when that directory is missing, writes no live
-# configuration or unit, does not move `current`, restarts nothing and queues no handler, so a refusal
-# leaves the running version exactly as it was. Every change to the live host comes after the gate. The first
-# tasks after it record an activation marker and the last task removes it, so that a run which stops
-# in between is finished by the next run.
+# configuration. It creates an install directory only when that directory is missing, refuses an existing one
+# that the service user cannot enter, writes no live configuration or unit, does not move `current`, restarts
+# nothing and queues no handler, so a refusal leaves the running version exactly as it was. Every change to
+# the live host comes after the gate. The first tasks after it record an activation marker and the last task
+# removes it, so that a run which stops in between is finished by the next run.
 - name: Deploy Agent Chat under systemd
   hosts: agent_chat
   become: true
@@ -195,6 +195,29 @@
         - "{{ agent_chat_root }}"
         - "{{ agent_chat_root }}/venvs"
       register: agent_chat_dirs
+
+    # The migration check below runs as the service user, from a virtual environment inside these directories,
+    # so that user must be able to enter both. If a deployer hardened one of them (0700 root:root, say), the
+    # check would fail with a permission error (exit 203, EXEC) before the gate, no digest could clear it, and
+    # the task that sets 0755 only comes after the gate. So the play refuses such a directory here and changes
+    # nothing. It reads the mode bits that the look-up recorded. The kernel applies one class of them to the
+    # user: the owner's if the user owns the directory, else the group's if the directory has the group
+    # agent-chat, else the others'. A missing directory passes, because the next task creates it 0755.
+    - name: Require the install directories to be traversable by the service user
+      ansible.builtin.assert:
+        that: >-
+          not item.stat.exists
+          or (item.stat.xusr if item.stat.pw_name | default('') == 'agent-chat'
+          else item.stat.xgrp if item.stat.gr_name | default('') == 'agent-chat'
+          else item.stat.xoth)
+        fail_msg: >-
+          {{ item.item }} must stay traversable by the agent-chat user (for example mode 0755, or mode 0750 with
+          group agent-chat), because that user runs the migration check from the new virtual environment. The play
+          does not change an existing install directory before the review gate. Change this one by hand and rerun.
+        quiet: true
+      loop: "{{ agent_chat_dirs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
 
     - name: Create the missing install directories
       ansible.builtin.file:

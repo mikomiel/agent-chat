@@ -90,10 +90,13 @@ one. If the server uses `peer` authentication for local sockets, a DSN with
 `host=/run/postgresql` is accepted only when the role name equals the OS user
 name, so the role `agent_chat` from section 1 of
 [self-hosting.md](self-hosting.md) is refused. Name the role `agent-chat`, add a
-`pg_ident.conf` map, or connect over TCP with a password. A refused login or an
-empty file shows only as a code in the task "List the pending migrations":
-`DATABASE_UNAVAILABLE` or `DSN_CREDENTIAL_UNREADABLE`. The product prints no
-cause for the first; the PostgreSQL server log names it. See
+`pg_ident.conf` map, or connect over TCP with a password. A refused login, an
+empty file and a credential that systemd could not deliver show only as a code
+in the task "List the pending migrations": `DATABASE_UNAVAILABLE` for the first,
+`DSN_CREDENTIAL_UNREADABLE` for the other two. systemd can fail to deliver the
+credential, for example inside a container whose root mount is private:
+`LoadCredential=` then yields an empty directory. The product prints no cause
+for the first; the PostgreSQL server log names it. See
 [Logs and refusals](self-hosting.md#logs-and-refusals).
 
 ## Variables
@@ -111,7 +114,7 @@ lists all of them.
 | `agent_chat_dsn_file` | `/etc/agent-chat/credentials/agent-chat-dsn` | The DSN file that you provide. An absolute path of letters, digits, `.`, `_`, `/` and `-` only. |
 | `agent_chat_prune_limit` | `100` | Rows per retention batch, 1-1000. |
 | `agent_chat_prune_max_batches` | `50` | Batches per retention run, at least 1. |
-| `agent_chat_mcp_enabled` | `false` | Installs and starts the MCP service. `false` stops and disables an installed one. |
+| `agent_chat_mcp_enabled` | `false` | Installs and starts the MCP service. `false` stops and disables an installed one. Either change installs another virtual environment and activates it like an upgrade, so the server restarts too. |
 | `agent_chat_mcp_public_origin` | none, required with MCP | HTTPS origin of the MCP hostname on your reverse proxy, in the same form as `agent_chat_public_origin`. The MCP service adds this host name to the loopback names it accepts. |
 | `agent_chat_mcp_port` | `8951` | MCP port, 1024-65535. Must differ from `agent_chat_port` when MCP is enabled. |
 | `agent_chat_mcp_enable_writes` | `false` | Adds the coordination write tools to MCP. |
@@ -142,7 +145,12 @@ in this order:
 1. Check the variables, the Python version and the DSN file.
 2. Create the service user and any install directory that is missing, and
    install the release into its own virtual environment. An install directory
-   that exists keeps its owner and mode. The old release keeps serving.
+   that exists keeps its owner and mode, but the `agent-chat` user must be able
+   to enter it: mode 0755, or mode 0750 with group `agent-chat`. The play
+   refuses one that the user cannot enter, before it creates a directory or
+   installs the release, with the message
+   `<directory> must stay traversable by the agent-chat user`. The old release
+   keeps serving.
 3. Render the new configuration into that environment and check it with the
    release's own loader.
 4. Run `migrate --check` from the new release against that configuration, and
@@ -247,6 +255,12 @@ serves. Nothing live changes until the review gate passes: a refusal leaves
 `current`, the schema, the live configuration, the units, the owner and mode of
 an existing install directory and the running services alone.
 
+`migrate --check` runs as the `agent-chat` user, so an existing install
+directory must stay traversable by that user: mode 0755, or mode 0750 with group
+`agent-chat`. The play refuses a directory that is not, before the gate, with
+the message `<directory> must stay traversable by the agent-chat user`. It does
+not change the mode for you: change it by hand and rerun.
+
 The play is not transactional after the gate. If a task fails between
 installing the configuration and switching `current`, the forced handlers can
 restart the old release with the new configuration. Rerun the play to finish.
@@ -301,16 +315,22 @@ never reads the file.
 
 - One host and one instance. The playbook does not create PostgreSQL, TLS,
   firewall rules, backups or log shipping.
-- It was run end to end on Debian 12 (systemd 252, Python 3.11) inside a
-  systemd container with ansible-core 2.18. That run installed the release from
-  a local directory; a sandbox install from PyPI has not been run yet.
-  Other distributions with systemd 247 or newer and Python 3.11 should work but
-  were not exercised.
+- It was run end to end on Debian 12 (systemd 252, Python 3.11, PostgreSQL 15)
+  inside a systemd container with ansible-core 2.18. That run installed
+  `sessionyard` 0.7.0 from PyPI and upgraded to a simulated 0.7.1 that adds one
+  migration. It covered the refusal of a tag before 0.7.0, the gate refusal on
+  a fresh host and on an upgrade (the live state stayed byte-identical), the
+  apply, a rerun with `changed=0`, MCP turned on and off, an interrupted
+  activation that the next run finished, and the `SCHEMA_MISMATCH` refusal of a
+  rollback. It did not cover a real host or another distribution. Other
+  distributions with systemd 247 or newer and Python 3.11 should work but were
+  not exercised.
 - Setting `agent_chat_mcp_enabled` to `false` stops and disables the MCP service
   but leaves its unit, `/etc/agent-chat/mcp.json` and the `agent-chat-mcp` user
   on the host; delete them by hand if you do not need them.
 - Switching `agent_chat_mcp_enabled` on or off installs a separate virtual
-  environment and activates it like an upgrade.
+  environment and activates it like an upgrade. The server restarts too, not
+  only the MCP service.
 - The install resolves the Python dependencies from the package index at run
   time. The lock file is for development only.
 - The server and the prune unit share the `agent-chat` user; the MCP unit has
