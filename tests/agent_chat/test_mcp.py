@@ -78,6 +78,21 @@ class BadGatewayHandler(BaseHTTPRequestHandler):
         pass
 
 
+class OkBodyHandler(BaseHTTPRequestHandler):
+    """A complete 200 whose JSON body is `self.server.body`."""
+
+    def do_GET(self):
+        body = self.server.body
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args):
+        pass
+
+
 class SlowHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         time.sleep(4)
@@ -573,6 +588,19 @@ def test_unreachable_or_failing_server_answers_503_not_401(process_api, caplog, 
     assert token not in caplog.text
 
 
+@pytest.mark.parametrize("body", [b"[]", b"null", b"not json"])
+def test_a_complete_200_with_an_unreadable_status_is_a_rejection_not_an_outage(process_api, caplog, body):
+    token = secrets.token_hex(32)
+    caplog.set_level(logging.WARNING, logger="agent_chat.api")
+    with http_server(OkBodyHandler) as upstream:
+        upstream.body = body
+        with serve_mcp(process_api, agent_chat_origin=f"http://127.0.0.1:{upstream.server_port}") as mcp:
+            status, headers, _body = post_tool_call(mcp, token)
+    assert status == 401
+    assert "Retry-After" not in headers
+    assert not error_log_records(caplog)
+
+
 def test_rejected_tokens_still_answer_401_while_the_service_is_up(process_api, credentials, register, db, caplog):
     token, binding = register(process_api, credentials, "mcp-rejected")
     lapsed, lapsed_binding = register(process_api, credentials, "mcp-lapsed")
@@ -768,5 +796,13 @@ def test_the_verifier_keeps_fastmcp_default_middleware_and_only_adds_on_error():
     # default set must fail here rather than silently drop a middleware.
     verifier = AgentChatTokenVerifier.__new__(AgentChatTokenVerifier)
     ours = verifier.get_middleware()
-    assert [m.cls for m in ours] == [m.cls for m in fastmcp_auth.TokenVerifier.get_middleware(verifier)]
+    default = fastmcp_auth.TokenVerifier.get_middleware(verifier)
+    assert [m.cls for m in ours] == [m.cls for m in default]
     assert ours[0].kwargs["on_error"] is _upstream_unavailable
+    for mine, theirs in zip(ours, default, strict=True):
+        assert mine.args == theirs.args
+        added = {key: value for key, value in mine.kwargs.items() if key != "on_error"}
+        assert added.keys() == theirs.kwargs.keys()
+        for key, value in added.items():
+            assert type(value) is type(theirs.kwargs[key])
+            assert vars(value) == vars(theirs.kwargs[key])
