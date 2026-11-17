@@ -8,6 +8,7 @@ from pathlib import Path
 
 import yaml
 
+from agent_chat.admin import MIGRATE_WAIT_SECONDS
 from agent_chat.admin import Config as ServerConfig
 from agent_chat.mcp.config import Config as McpConfig
 
@@ -76,6 +77,14 @@ def test_quadlet_units_are_native_and_secure():
 
     network = _quadlet("agent-chat.network")
     assert network["Network"]["networkname"] == "agent-chat"
+
+
+def test_migrate_unit_start_limit_outlasts_the_database_wait():
+    # `migrate` waits up to MIGRATE_WAIT_SECONDS for a late database. A one-shot unit has no start limit unless it sets
+    # one, and a limit at or below the wait would have systemd end a wait that is still inside its budget. The margin
+    # is the last connect timeout, the container start and the migration run that follows the wait.
+    limit = int(_quadlet("agent-chat-migrate.container")["Service"]["timeoutstartsec"])
+    assert limit >= MIGRATE_WAIT_SECONDS + 60
 
 
 def test_quadlet_health_commands_survive_the_generator():
