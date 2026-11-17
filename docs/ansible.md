@@ -2,7 +2,7 @@
 
 This page installs Agent Chat as systemd services on one Linux host. It is the
 supported native path. The example playbook in `deploy/ansible/` creates the
-service users, installs a tagged release into a versioned virtual environment,
+service users, installs a tagged release from PyPI into a versioned virtual environment,
 checks and applies reviewed migrations, writes the configuration and the units,
 and waits for `/readyz`. PostgreSQL, TLS termination, secret storage, network
 policy and backups stay with the deployer.
@@ -49,8 +49,9 @@ On the target host:
 - Linux with systemd 247 or newer, which is the first release with
   `LoadCredential=`.
 - `python3` 3.11 or newer with the `venv` module (Debian and Ubuntu:
-  `python3-venv`) and `git`. The install uses a git URL that names the tag.
-- Outbound HTTPS to GitHub and to the Python package index during the install.
+  `python3-venv`). The install needs no `git`.
+- Outbound HTTPS to the Python package index (`pypi.org` and
+  `files.pythonhosted.org`) during the install.
 - Root access through `become`.
 - A PostgreSQL server that the host can reach, with an empty database and the
   role that owns it. The playbook creates neither; see section 1 of
@@ -102,7 +103,7 @@ lists all of them.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `agent_chat_version` | none, required | Release tag `vX.Y.Z`. Any other form is refused. The playbook never picks a version. |
+| `agent_chat_version` | none, required | Release tag `vX.Y.Z`, with X.Y.Z at least 0.7.0: it is installed from PyPI as `sessionyard`, and earlier releases are not published there. Any other form is refused. The playbook never picks a version. |
 | `agent_chat_public_origin` | none, required | Canonical HTTPS origin that browsers use, with no path and no default port: `:443` is refused. The host name uses lowercase letters, digits, dots and hyphens; an optional port is at most 65535. |
 | `agent_chat_bind_host` | `127.0.0.1` | Listener address of both services: `127.0.0.1` or `0.0.0.0`. |
 | `agent_chat_port` | `8443` | Server port, 1024-65535. |
@@ -302,7 +303,7 @@ never reads the file.
   firewall rules, backups or log shipping.
 - It was run end to end on Debian 12 (systemd 252, Python 3.11) inside a
   systemd container with ansible-core 2.18. That run installed the release from
-  a local directory, so the `git+https` install from the tag was not exercised.
+  a local directory; a sandbox install from PyPI has not been run yet.
   Other distributions with systemd 247 or newer and Python 3.11 should work but
   were not exercised.
 - Setting `agent_chat_mcp_enabled` to `false` stops and disables the MCP service

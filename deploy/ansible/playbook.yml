@@ -34,7 +34,7 @@
     agent_chat_staged: "{{ agent_chat_venv }}/staged"
     agent_chat_extras: "{{ 'server,mcp' if agent_chat_mcp_enabled else 'server' }}"
     agent_chat_requirement: >-
-      agent-chat[{{ agent_chat_extras }}] @ git+https://github.com/mikomiel/agent-chat@{{ agent_chat_version }}
+      sessionyard[{{ agent_chat_extras }}]=={{ agent_chat_version[1:] }}
     agent_chat_stamp: "{{ agent_chat_venv }}/.installed"
     # Written right after the review gate and removed after the readiness checks; see the tasks that use it.
     agent_chat_marker: "{{ agent_chat_root }}/activation-pending"
@@ -96,6 +96,7 @@
           - agent_chat_version is defined
           - agent_chat_version is string
           - agent_chat_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+          - agent_chat_version[1:] is version('0.7.0', '>=')
           - agent_chat_public_origin is defined
           - agent_chat_public_origin is match('^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$')
           - not agent_chat_public_origin is search(':443$')
@@ -127,7 +128,7 @@
           variable table in docs/ansible.md lists the valid values. A true/false flag must be a real
           boolean: set it in the inventory, or pass it with -e as JSON, for example
           -e '{"agent_chat_mcp_enabled": true}'. An origin has no :443 and a port of at most 65535;
-          the MCP port differs from the server port.
+          the MCP port differs from the server port. Releases before 0.7.0 are not on PyPI as sessionyard.
         quiet: true
 
     - name: Read the Python version of the target
@@ -211,8 +212,8 @@
     # repoints `current`. The stamp is one file inside that environment and is written last, so an interrupted
     # install runs again and a second run with the same variables changes nothing. Once it is stamped, pip never
     # runs in the environment again: turning MCP on or off installs a new environment instead of running pip in
-    # the one that `current` points at. The git+https install needs git and outbound HTTPS. The old release
-    # keeps serving: nothing points at this directory yet.
+    # the one that `current` points at. The PyPI install needs outbound HTTPS to pypi.org and
+    # files.pythonhosted.org, and no git. The old release keeps serving: nothing points at this directory yet.
     - name: Install Agent Chat into its versioned virtual environment
       ansible.builtin.shell:
         cmd: |

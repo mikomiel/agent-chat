@@ -456,7 +456,24 @@ def test_ansible_playbook_requires_a_release_tag_and_never_pins_one():
     placeholder = inventory["all"]["children"]["agent_chat"]["vars"]["agent_chat_version"]
     assert not re.match(pattern, placeholder)
     requirement = _playbook()["vars"]["agent_chat_requirement"]
-    assert "git+https://github.com/mikomiel/agent-chat@{{ agent_chat_version }}" in _flat(requirement)
+    assert _flat(requirement) == "sessionyard[{{ agent_chat_extras }}]=={{ agent_chat_version[1:] }}"
+
+
+def test_ansible_playbook_installs_only_releases_that_are_on_pypi_as_sessionyard():
+    # Releases before 0.7.0 carry the distribution name agent-chat and are not on PyPI. The version test needs
+    # ansible-core, which the suite does not install, so this pins the exact condition, its place right behind
+    # the tag pattern (assert stops at the first failing item), and the reason it gives. The `version` test was
+    # run with ansible-core 2.18 on 0.6.0 (False), 0.7.0, 0.10.0 and 1.0.0 (True).
+    task = _task("Check the variables")["ansible.builtin.assert"]
+    checks = task["that"]
+    shape = next(index for index, check in enumerate(checks) if "agent_chat_version is match(" in check)
+    assert checks[shape + 1] == "agent_chat_version[1:] is version('0.7.0', '>=')"
+    assert "Releases before 0.7.0 are not on PyPI as sessionyard" in _flat(task["fail_msg"])
+    assert "git" not in _flat(_playbook()["vars"]["agent_chat_requirement"])
+    # The guide states the same minimum next to the variable.
+    guide = (ROOT / "docs" / "ansible.md").read_text().splitlines()
+    row = next(line for line in guide if line.startswith("| `agent_chat_version`"))
+    assert "at least 0.7.0" in row and "`sessionyard`" in row
 
 
 def test_ansible_playbook_applies_only_a_reviewed_migration_set_before_the_switch():
@@ -575,7 +592,7 @@ def test_ansible_playbook_installs_one_immutable_environment_per_install_variant
     venv = play["vars"]["agent_chat_venv"]
     assert venv == "{{ agent_chat_root }}/venvs/{{ agent_chat_version }}-{{ agent_chat_extras | replace(',', '-') }}"
     assert "'server,mcp' if agent_chat_mcp_enabled else 'server'" in play["vars"]["agent_chat_extras"]
-    assert "agent-chat[{{ agent_chat_extras }}]" in _flat(play["vars"]["agent_chat_requirement"])
+    assert "sessionyard[{{ agent_chat_extras }}]" in _flat(play["vars"]["agent_chat_requirement"])
 
     def environment(extras: str) -> str:
         return (
