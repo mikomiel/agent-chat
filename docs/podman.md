@@ -255,8 +255,8 @@ Add the routes from
 to the file-provider Traefik already uses, replacing both hostnames and keeping
 `passHostHeader: true`.
 
-The MCP unit adds `NetworkAlias=mcp`, so the example backend
-`http://mcp:8951` resolves in this deployment as well.
+The MCP container name, `agent-chat-mcp`, is the backend name the example
+`http://agent-chat-mcp:8951` uses.
 
 The routers use the `websecure` entrypoint and `tls: {}`; the certificate and
 entrypoint belong to the existing Traefik. For a LAN-only deployment, use an
@@ -360,11 +360,17 @@ automatically. `--room` is accepted only for viewer principals.
 
 ## Upgrades
 
-After pulling the source and rebuilding both images:
+After pulling the source, rebuild both images and install the unit files
+again. The installed units are copies, so a release that changes
+`deploy/podman` reaches a running install only through this step. Repeat the
+`install` commands from
+[Install and start the units](#install-and-start-the-units) for your mode,
+with the MCP unit only if it is installed, then reload systemd and restart.
 
 Rootless:
 
 ```sh
+systemctl --user daemon-reload
 systemctl --user restart \
   agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
 ```
@@ -372,6 +378,7 @@ systemctl --user restart \
 Rootful:
 
 ```sh
+sudo systemctl daemon-reload
 sudo systemctl restart \
   agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
 ```
@@ -379,11 +386,20 @@ sudo systemctl restart \
 The migration runs before the new server. Restart the MCP unit only if it is
 installed.
 
+When upgrading from a release whose MCP unit set `NetworkAlias=mcp`, also
+change the MCP backend in the Traefik file-provider configuration, and in any
+Alloy scrape or probe target, from `mcp:8951` to `agent-chat-mcp:8951`, then
+reload them. MCP requests fail until this step is done.
+
 ## Security properties
 
 - No PostgreSQL or MCP host port is published.
 - The containers run as UID/GID `10001:10001`, including under rootful Podman.
-- Root filesystems are read-only; only `/tmp` is a bounded tmpfs.
+- Root filesystems are read-only. `/tmp` is a 16 MiB `noexec` tmpfs, and the
+  two units that carry the DSN mount a 1 MiB `noexec` tmpfs on `/run/secrets`
+  that holds only the secret. Podman's read-only mode also mounts its own tmpfs
+  on `/run`, `/var/tmp` and `/dev/shm`; `/var/tmp` is neither `noexec` nor
+  size-bounded.
 - All capabilities are dropped and `no-new-privileges` is set.
 - The DSN is a Podman secret, not an environment value or image layer.
 - The MCP container has no database secret and no PostgreSQL driver.
@@ -395,3 +411,8 @@ Quadlet requires Linux and systemd. It is not a macOS or Windows deployment
 path; use the Compose stack there. This guide also does not turn a rootful
 Traefik into a rootless-compatible edge. Choose one of the supported topologies
 above.
+
+The server and the MCP service are reachable on the shared edge network as
+`agent-chat` and `agent-chat-mcp`. No other container on that network may use
+those names. A second deployment on the same edge network needs its own
+container names and matching Traefik backends.

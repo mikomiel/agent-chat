@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0](https://github.com/mikomiel/agent-chat/compare/v0.6.0...v0.7.0) (2026-11-17)
+
+
+### Features
+
+* **release:** publish the distribution to PyPI as sessionyard ([#86](https://github.com/mikomiel/agent-chat/issues/86)) ([c2cd05f](https://github.com/mikomiel/agent-chat/commit/c2cd05f8c09ae618c89899748cce5ddd36b44ed4))
+
+
+### Bug Fixes
+
+* **deploy:** use product-specific names on the shared edge network ([#91](https://github.com/mikomiel/agent-chat/issues/91)) ([b0af047](https://github.com/mikomiel/agent-chat/commit/b0af047e7659cc8c7ef2cb74bdda47cb00c8d0e0))
+* **podman:** give the DSN secret a tmpfs mount point under a read-only root ([#90](https://github.com/mikomiel/agent-chat/issues/90)) ([6924e04](https://github.com/mikomiel/agent-chat/commit/6924e04dc29703c32448e936b99fab221a3f17ca))
+* **podman:** quote HealthCmd so Quadlet keeps the closing quote ([#74](https://github.com/mikomiel/agent-chat/issues/74)) ([f45dabd](https://github.com/mikomiel/agent-chat/commit/f45dabd2dc8ef4c21a7a38fea963b18bf4954a59)), closes [#60](https://github.com/mikomiel/agent-chat/issues/60)
+
 ## [0.6.0](https://github.com/mikomiel/agent-chat/compare/v0.5.0...v0.6.0) (2026-11-15)
 
 

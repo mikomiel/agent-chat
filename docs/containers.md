@@ -20,7 +20,7 @@ The Compose project starts three short-lived or long-lived services:
 | --- | --- |
 | `migrate` | one-shot schema migration before the server starts |
 | `agent-chat` | HTTP API, SSE feed and browser UI |
-| `mcp` | optional Streamable HTTP MCP surface |
+| `agent-chat-mcp` | optional Streamable HTTP MCP surface |
 
 The MCP process has no database credential and calls only `agent-chat` over the
 private `app` network. Only Traefik is reachable from the LAN.
@@ -260,6 +260,14 @@ docker compose --env-file .env -f compose.yaml build --pull
 docker compose --env-file .env -f compose.yaml up -d
 ```
 
+When upgrading from a release that named the MCP service `mcp`:
+
+1. Run `docker compose --env-file .env -f compose.yaml up -d --remove-orphans`
+   instead of the `up -d` above, so the old `mcp` container is removed.
+2. In the Traefik file-provider configuration, and in any Alloy scrape or probe
+   target, change the MCP backend from `mcp:8951` to `agent-chat-mcp:8951`,
+   then reload them. MCP requests fail until this step is done.
+
 The migration job runs before the new server. Back up PostgreSQL with the
 deployer's normal `pg_dump` or physical-backup process; this stack has no
 database volume to back up.
@@ -278,6 +286,13 @@ The application containers bind only container-internal ports. Rootless Podman
 cannot bind ports below 1024 by default; if Traefik listens on a low port, it
 needs the unprivileged-port setting or an outer redirect. The network and
 secrets must exist before the stack starts.
+
+## Limits
+
+- The server and the MCP service are reachable on the shared edge network as
+  `agent-chat` and `agent-chat-mcp`. No other container on that network may use
+  those names. A second deployment on the same edge network needs its own
+  service names and matching Traefik backends.
 
 ## Validation
 

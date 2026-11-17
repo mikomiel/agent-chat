@@ -63,12 +63,17 @@ def test_quadlet_units_are_native_and_secure():
     assert migrate["Service"]["remainafterexit"] == "yes"
     assert migrate["Container"]["exec"].startswith("migrate ")
 
+    # A read-only root gives crun 1.31+ and runc 1.5.2 no mount point for the secret.
+    for name in ("agent-chat.container", "agent-chat-migrate.container"):
+        lines = (QUADLET / name).read_text().splitlines()
+        assert "Tmpfs=/run/secrets:rw,noexec,nosuid,size=1m,mode=0755" in lines
+
     mcp = _quadlet("agent-chat-mcp.container")
     assert mcp["Container"]["image"] == "localhost/agent-chat-mcp:local"
     assert mcp["Container"]["exec"].startswith("--config ")
     assert "secret" not in mcp["Container"]
     assert "agent-chat.service" in mcp["Unit"]["requires"]
-    assert "NetworkAlias=mcp" in (QUADLET / "agent-chat-mcp.container").read_text()
+    assert "NetworkAlias" not in (QUADLET / "agent-chat-mcp.container").read_text()
 
     network = _quadlet("agent-chat.network")
     assert network["Network"]["networkname"] == "agent-chat"
@@ -103,7 +108,7 @@ def test_quadlet_guide_documents_supported_topology_and_secret_source():
 def test_observability_example_covers_metrics_probes_and_alerts():
     observability = DEPLOY / "observability"
     alloy = (observability / "alloy.example.alloy").read_text()
-    for token in ("agent-chat:8443", "mcp:8951", "/metrics", "/healthz", "/readyz"):
+    for token in ("agent-chat:8443", "agent-chat-mcp:8951", "/metrics", "/healthz", "/readyz"):
         assert token in alloy
     assert "mimir.example.invalid" in alloy
     guide = (observability / "README.md").read_text()
@@ -126,7 +131,7 @@ def test_observability_example_covers_metrics_probes_and_alerts():
 def test_compose_uses_external_postgres_and_traefik_only():
     compose = _compose()
     services = compose["services"]
-    assert set(services) == {"migrate", "agent-chat", "mcp"}
+    assert set(services) == {"migrate", "agent-chat", "agent-chat-mcp"}
     assert "postgres" not in services
     assert "traefik" not in services
     assert compose["networks"]["edge"]["external"] is True
@@ -139,15 +144,44 @@ def test_compose_uses_external_postgres_and_traefik_only():
         assert "no-new-privileges:true" in service["security_opt"]
 
 
+def test_edge_network_names_are_product_specific():
+    # Every name a deployment owns on the shared edge network must be unique there.
+    services = _compose()["services"]
+    assert "mcp" not in services
+    edge = [name for name, service in services.items() if "edge" in service.get("networks", [])]
+    assert set(edge) == {"agent-chat", "agent-chat-mcp"}
+    for name in edge:
+        assert name.startswith("agent-chat")
+        assert "container_name" not in services[name]
+        assert "aliases" not in str(services[name]["networks"])
+
+    on_edge = set()
+    for path in sorted(QUADLET.glob("*.container")):
+        raw = path.read_text()
+        assert "NetworkAlias" not in raw
+        if "Network=traefik" in raw:
+            on_edge.add(_quadlet(path.name)["Container"]["containername"])
+    assert on_edge == set(edge)
+
+    # The examples address exactly these names.
+    http = yaml.safe_load((DEPLOY / "traefik" / "dynamic.example.yml").read_text())["http"]
+    backends = {
+        server["url"].removeprefix("http://").split(":")[0]
+        for service in http["services"].values()
+        for server in service["loadBalancer"]["servers"]
+    }
+    assert backends == set(edge)
+
+
 def test_compose_wires_migration_health_and_mcp_scope():
     services = _compose()["services"]
     assert services["migrate"]["command"][:2] == ["migrate", "--config"]
     assert services["agent-chat"]["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
-    assert services["mcp"]["depends_on"]["agent-chat"]["condition"] == "service_healthy"
-    assert "secrets" not in services["mcp"]
-    assert services["mcp"]["networks"] == ["app", "edge"]
+    assert services["agent-chat-mcp"]["depends_on"]["agent-chat"]["condition"] == "service_healthy"
+    assert "secrets" not in services["agent-chat-mcp"]
+    assert services["agent-chat-mcp"]["networks"] == ["app", "edge"]
     assert services["agent-chat"]["networks"] == ["app", "edge"]
-    assert "/healthz" in " ".join(services["mcp"]["healthcheck"]["test"])
+    assert "/healthz" in " ".join(services["agent-chat-mcp"]["healthcheck"]["test"])
 
 
 def test_example_configs_validate_with_the_product_models():
@@ -177,7 +211,7 @@ def test_traefik_routes_preserve_host_and_have_no_extra_auth():
     assert "!PathPrefix(`/metrics`)" in http["routers"]["agent-chat"]["rule"]
     assert "!PathPrefix(`/metrics`)" in http["routers"]["agent-chat-mcp"]["rule"]
     assert http["services"]["agent-chat-mcp"]["loadBalancer"]["passHostHeader"] is True
-    assert http["services"]["agent-chat-mcp"]["loadBalancer"]["servers"] == [{"url": "http://mcp:8951"}]
+    assert http["services"]["agent-chat-mcp"]["loadBalancer"]["servers"] == [{"url": "http://agent-chat-mcp:8951"}]
     assert "basicAuth" not in str(http)
 
 
