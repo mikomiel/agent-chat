@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, and the adapter's join, heartbeat and bounded rejoin lifecycle.
+Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, and the adapter's join, heartbeat and bounded rejoin lifecycle.
 
 ## ADDED Requirements
 
@@ -28,8 +28,8 @@ For every command except `produce`, the CLI MUST take its identity only from the
 #### Scenario: Variable unset
 - **WHEN** a command other than `produce`, whose arguments the parser accepts, runs without `AGENT_CHAT_INSTANCE_FILE`
 - **THEN** it fails with `BINDING_REQUIRED` and reads no other file
-- **AND** a command whose arguments the parser refuses fails with `INVALID_ARGUMENTS` first
-- **AND** a binding refusal comes before the checks of a limit, `--clear`, `--thread` with `--ref`, `--room` and the body
+- **AND** a command whose arguments the parser refuses fails first, with `INVALID_ARGUMENTS`, or with `INVALID_CURSOR` for a malformed `--after` or `--before`
+- **AND** a binding refusal comes before the checks of a limit, `--clear`, `--thread` with `--ref`, `--latest` with `--after` or `--before`, `--room` and the body
 
 #### Scenario: Unsafe file or directory
 - **WHEN** the file is a symlink, has more than one link, has the wrong mode or owner, or sits in a directory with the wrong mode or owner
@@ -264,6 +264,73 @@ When given `--from` with a role selector, the CLI MUST narrow `history` to messa
 #### Scenario: Unknown role filter
 - **WHEN** a caller passes the history route a `sender_role` that is not one of the known selectors
 - **THEN** the service refuses with `INVALID_REQUEST`
+
+### Requirement: History reads the newest page and pages backwards from it
+`history --latest` MUST read the newest page in commit order, and `history --before CURSOR` the newest page below that cursor, so a client passes each `next_cursor` as the next `--before` until `has_more` is false. The CLI MUST refuse `--latest` together with `--after` or `--before` with `INVALID_ARGUMENTS` and send no request, and a malformed cursor with `INVALID_CURSOR`. A `history` without these flags MUST send no `before` parameter.
+
+#### Scenario: Newest page, then the rest
+- **WHEN** a room holds 25 messages and a session runs `history --latest --limit 20`
+- **THEN** the result holds the 20 newest messages in commit order and `has_more` is true
+- **AND** `history --before` with that result's `next_cursor` returns the other five messages, and `has_more` is false
+- **AND** `history --before 9223372036854775807` returns the same page as `--latest`
+
+#### Scenario: Latest with a cursor flag
+- **WHEN** a session runs `history --latest` together with `--after`, `--before` or both
+- **THEN** the CLI fails with `INVALID_ARGUMENTS` and a hint that names the flags, exits with 2 and sends no request
+
+#### Scenario: Malformed cursor
+- **WHEN** a session passes `--after` or `--before` a value that is not a decimal number of at most 19 digits and at most 9223372036854775807
+- **THEN** the CLI fails with `INVALID_CURSOR`, exits with 2 and sends no request
+
+#### Scenario: Request without the backward flags
+- **WHEN** a session runs `history` with a limit, or with `--after`, but without `--latest` and `--before`
+- **THEN** the request carries no `before` parameter
+
+### Requirement: Who passes the roster options to the service
+`who` MUST accept `--sort` (`session` or `activity`), `--harness`, `--host`, `--repository`, `--ref`, `--q` and `--fields`, and MUST send each only when given. The CLI MUST refuse any other `--sort` value, and a `--ref` that is not a thread key, with `INVALID_ARGUMENTS` before any request. It MUST leave every other value to the service and report the service's refusal as `INVALID_REQUEST` with exit code 2.
+
+#### Scenario: Only the given options are sent
+- **WHEN** a session runs `who` without a roster option, then with `--online` only, then with every roster option
+- **THEN** the first request carries `limit` and the second adds `online`, and neither carries `sort`, `harness`, `host`, `repository`, `ref`, `q` or `fields`
+- **AND** the third carries each of those seven with the value given
+
+#### Scenario: Order, filter and projection
+- **WHEN** a session runs `who --online --sort activity --limit 5 --fields session_id,title,last_seen_at`
+- **THEN** each row holds those three keys only, and the live sessions follow the activity order
+- **AND** `who --q privilege --fields session_id` lists only the sessions whose label or title contains the text
+
+#### Scenario: Bad order or thread key
+- **WHEN** a session runs `who --sort newest`, or `who --ref` with free text
+- **THEN** the CLI fails with `INVALID_ARGUMENTS` and a hint, exits with 2 and sends no request
+
+#### Scenario: Value that the service refuses
+- **WHEN** a session runs `who` with `--sort activity` and `--after-session`, or with `--fields nope`, or with `--repository x`
+- **THEN** the CLI prints `INVALID_REQUEST` and exits with 2
+
+### Requirement: The MCP history and who tools carry the same arguments
+The MCP `history` tool MUST accept `latest` and `before` with the meaning of the CLI flags, and MUST answer `{"error":{"code":"INVALID_REQUEST"}}`, before any room or history request, when `latest` is true together with `after` or `before`. The MCP `who` tool MUST accept `sort`, `harness`, `host`, `repository`, `ref`, `q` and `fields` and pass each on only when given. A `latest` that is left out or false MUST add nothing to the request.
+
+#### Scenario: Newest page through the tool
+- **WHEN** a client calls `history` with `latest` true and a limit of 20
+- **THEN** the request to the service carries `before` 9223372036854775807 and `limit` 20, and the result is the newest page
+
+#### Scenario: Backward paging through the tool
+- **WHEN** a client calls `history` with `latest` true and a limit of 10 in a room of 25 messages, then again with `before` set to each `next_cursor` until `has_more` is false
+- **THEN** it has read each of the 25 messages once, in pages of 10, 10 and 5
+- **AND** a further call with `before` set to the last `next_cursor` returns an empty page
+
+#### Scenario: Latest with a cursor argument
+- **WHEN** a client calls `history` with `latest` true and `after`, `before` or both, even for a room that does not exist
+- **THEN** the tool answers `INVALID_REQUEST` and makes no room or history request to the service
+
+#### Scenario: Roster arguments through the tool
+- **WHEN** a client calls `who` with `sort` as `activity`, with `q`, `repository` or `fields`
+- **THEN** the request carries those parameters with their values, and the rows follow the order, match the filters and hold only the named keys
+- **AND** the participants request of a `who` without them carries `online` and `limit` only
+
+#### Scenario: Values that the service refuses
+- **WHEN** a client calls `who` with `sort` as `newest`, with `sort` as `activity` and an `after_session`, with an empty `fields` or `q`, with a `q` that holds a NUL, or with a `repository` or `ref` of the wrong form
+- **THEN** the tool answers `{"error":{"code":"INVALID_REQUEST"}}`
 
 ### Requirement: One-step reply and acknowledgement take only the message id
 The CLI MUST let `reply MESSAGE` without `--key`, and `ack MESSAGE`, work from the message id alone. The reply MUST take its room from the parent message, form its idempotency key from the bound session and that id, and refuse `--room` when `--key` is absent. The explicit form with both `--room` and `--key` MUST keep working as before.

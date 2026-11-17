@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines the coordination vocabulary that the service validates and stores but does not act on: message kinds, entity-keyed threads, advisory lane and work declarations, producer-written room state, and operator-set role marks with server-stamped sender roles. The service enforces the shape and ownership of these records, never an authority, lock or schedule built from them.
+Defines the coordination vocabulary that the service validates and stores but does not act on: message kinds, entity-keyed threads, advisory lane and work declarations, producer-written room state, operator-set role marks with server-stamped sender roles, and the participants read, which reports each session with its coordination facts in a default or an activity order, with filters and with a field projection. The service enforces the shape and ownership of these records, never an authority, lock or schedule built from them.
 
 ## ADDED Requirements
 
@@ -359,3 +359,167 @@ For each session the participants read MUST report its lane, repositories, `last
 #### Scenario: Online filter and paging
 - **WHEN** a reader asks for participants with a limit from 1 to 100 and the online filter
 - **THEN** the filter is applied before paging, and a `next_session_id` is returned while more rows remain
+
+### Requirement: Participants keep their default form unless a parameter changes it
+A participants read that names none of `sort`, `harness`, `host`, `repository`, `ref`, `q` and `fields` MUST return its rows in ascending session id order, paged by `after_session` and `next_session_id`, and MUST NOT add `last_seen_at` or `recent_refs` to a row. Every response MUST carry `participants`, `next_session_id`, `roles` and `pm`, whichever parameters it names.
+
+#### Scenario: Read without the roster parameters
+- **WHEN** a reader asks for participants with none of `sort`, `harness`, `host`, `repository`, `ref`, `q` and `fields`, or with `sort` set to `session`
+- **THEN** the rows come in ascending session id order and no row holds `last_seen_at` or `recent_refs`
+- **AND** the response holds `participants`, `next_session_id`, `roles` and `pm`
+
+#### Scenario: Several parameters in one read
+- **WHEN** a reader names `online`, `harness`, `host`, `ref`, `q` and `fields` in one read, with `sort` set to `activity`
+- **THEN** the response still holds `participants`, `next_session_id`, `roles` and `pm`, and `next_session_id` is null
+
+### Requirement: A participants read can return only the row keys it names
+When `fields` lists row keys separated by commas, each row MUST hold exactly those keys, each once, in the order listed, and the rest of the response MUST stay as it is. The service MUST refuse with `INVALID_REQUEST` a value with an empty name, a name that differs in case or holds a space, or a name that is not a row key, such as `roles`, `pm` or `next_session_id`. Projection MUST NOT change paging or the blanking of an offline row.
+
+#### Scenario: Keys in the order given
+- **WHEN** a reader asks with `fields` set to `title,session_id,online`
+- **THEN** each row holds `title`, `session_id` and `online`, in that order
+- **AND** the response still holds `participants`, `next_session_id`, `roles` and `pm`
+- **AND** a name listed twice yields one key
+
+#### Scenario: Every default key can be named
+- **WHEN** a reader names `session_id`, `label`, `title`, `host`, `harness`, `native_session_id`, `muted`, `instance_id`, `heartbeat_at`, `online`, `native_state`, `stopped`, `plan_mode`, `lane`, `lane_since`, `lane_age_seconds`, `repositories`, `last_published_at`, `messages_24h` and `announced_prs` in `fields`
+- **THEN** each row equals the row of a read without `fields`
+
+#### Scenario: Name that is not a row key
+- **WHEN** `fields` is empty, is `label,` or `,label`, holds a space, names `Label`, `roles`, `pm` or `next_session_id`, or names an unknown key
+- **THEN** the service refuses with `INVALID_REQUEST` and HTTP status 422
+
+#### Scenario: Projection and paging
+- **WHEN** a reader pages with `fields` set to `label` and a limit smaller than the number of rows
+- **THEN** `next_session_id` names the last session of the page, although `session_id` is not returned
+- **AND** a read with `after_session` set to it and `fields` set to `session_id` continues with the next sessions in ascending order
+
+#### Scenario: Offline row under projection
+- **WHEN** a session without a live lease holds a work declaration and a reader names only `session_id`, `repositories`, `native_state`, `stopped` and `plan_mode`
+- **THEN** the row shows `repositories` as an empty object, `native_state` as `unknown`, and `stopped` and `plan_mode` as true
+
+### Requirement: Two row keys are computed only when named
+A row MUST hold `last_seen_at` or `recent_refs` only when `fields` names it, also under the activity order. `last_seen_at` MUST be the later of the newest heartbeat of any instance of the session, ended ones included, and the creation time of the newest unredacted message the session published in this room. `recent_refs` MUST list up to five distinct thread keys the session published into, newest first, each as `ref_key` and `last_at`, the time of the session's latest message in it.
+
+#### Scenario: Publication newer than the heartbeat
+- **WHEN** a session published 10 seconds ago and its newest heartbeat is 50 seconds old
+- **THEN** its `last_seen_at` is the time of the publication
+
+#### Scenario: Heartbeat newer than the publication
+- **WHEN** a session sent its newest heartbeat 15 seconds ago and published 45 seconds ago
+- **THEN** its `last_seen_at` is the time of the heartbeat
+
+#### Scenario: Ended session
+- **WHEN** a session has ended after its last heartbeat, has published nothing in this room, and is still a member
+- **THEN** its row shows `online` false and `heartbeat_at` null
+- **AND** its `last_seen_at` is the time of its last heartbeat
+
+#### Scenario: Publication in another room
+- **WHEN** a session published in this room 20 seconds ago and in another room 2 seconds ago, and its newest heartbeat is 30 seconds old
+- **THEN** its `last_seen_at` in this room is the time 20 seconds ago
+
+#### Scenario: Recent keys
+- **WHEN** a session published into seven distinct keyed threads, later into one of them again, and also sent a message with no key, while another session published into one of the same threads
+- **THEN** `recent_refs` of the first session lists five keys, newest first, each once with the time of that session's latest message in it
+- **AND** each entry holds `ref_key` and `last_at` only
+- **AND** a session that never published into a keyed thread has an empty list
+
+#### Scenario: Keys not named
+- **WHEN** a read names no `fields`, or names other keys, including with `sort` set to `activity`
+- **THEN** no row holds `last_seen_at` or `recent_refs`
+
+### Requirement: Participants can be ordered by recent activity
+With `sort` set to `activity`, the service MUST return one page of at most `limit` rows, with sessions that hold a live lease first, then by newest `last_seen_at`, newest `last_published_at` and ascending session id, and with `next_session_id` null. A session that never published MUST follow one that did at the same `last_seen_at`. The service MUST refuse `after_session` with this order, and a `sort` value other than `session` or `activity`, with `INVALID_REQUEST`.
+
+#### Scenario: Live before offline
+- **WHEN** a room holds live and offline sessions, and an offline session published more recently than any live one
+- **THEN** every live session comes before every offline session
+- **AND** within each group the newest `last_seen_at` comes first, a publication counting as seen at the time it was made
+
+#### Scenario: Equal last_seen_at
+- **WHEN** several sessions share one `last_seen_at`
+- **THEN** a session that published comes before those that never did, and those follow in ascending session id order
+
+#### Scenario: One page
+- **WHEN** a reader asks for the activity order with a limit of 3 in a room with four members
+- **THEN** the page holds three rows and `next_session_id` is null
+- **AND** a limit of 100 returns all four
+
+#### Scenario: Online filter with the activity order
+- **WHEN** a reader gives `online` together with the activity order
+- **THEN** only sessions with a live lease are returned, in the same order
+
+#### Scenario: Session cursor with the activity order
+- **WHEN** a reader gives `after_session` together with `sort` set to `activity`
+- **THEN** the service refuses with `INVALID_REQUEST` and HTTP status 422
+
+#### Scenario: Unknown order
+- **WHEN** `sort` is `newest`, `Activity` or empty
+- **THEN** the service refuses with `INVALID_REQUEST`
+
+### Requirement: Participants can be filtered by harness, host and declared repository
+A participants read MUST apply each of `harness`, `host` and `repository` that it names before paging and together with `online`. `harness` and `host` MUST match the session's value exactly, case included. `repository`, an `owner/name`, MUST keep only a session with a live lease whose work declaration names it under either forge, so a session without a live lease never matches. A filter that matches no session MUST return an empty page.
+
+#### Scenario: Exact match before paging
+- **WHEN** a reader filters by `harness`, or by `host`, with a limit of 1, and the only match has the highest session id
+- **THEN** the page holds that session and `next_session_id` is null
+- **AND** the same value in another case matches nothing
+
+#### Scenario: Paging among matches
+- **WHEN** three sessions match a filter and a reader asks for two rows
+- **THEN** the page holds the first two matches in ascending session id order and `next_session_id` continues among the matches only
+
+#### Scenario: Repository on either forge
+- **WHEN** one live session declares `owner/project` under `forgejo` and another under `github`
+- **THEN** a read with `repository` set to `owner/project` returns both and no other session
+
+#### Scenario: Offline session
+- **WHEN** a session whose lease has lapsed holds a work declaration that names `owner/project`
+- **THEN** its row reports no repositories
+- **AND** a read with `repository` set to `owner/project` does not return it
+
+### Requirement: Participants can be filtered by thread key and by text
+`ref` MUST keep the sessions that published into the thread of this room with that key. `q` MUST keep the sessions whose label or title contains the text, whatever the case, and a session with no title MUST still match by its label. `q` MUST be read as literal text, so `%`, `_` and `\` match only themselves. Both filters MUST apply before paging and together with every other filter, and a filter that matches no session MUST return an empty page.
+
+#### Scenario: Thread key
+- **WHEN** one session opened the thread under `pr:owner/project#7`, another replied in it and a third published under another key
+- **THEN** a read with `ref` set to `pr:owner/project#7` returns the first two sessions only
+
+#### Scenario: Text in label or title
+- **WHEN** a session is titled "Reviewing a privilege escalation", another is labelled "Alpha-Worker", and no other label or title holds `privilege esc` or `worker`
+- **THEN** `q` set to `PRIVILEGE ESC` returns the first and `q` set to `worker` returns the second
+- **AND** a session without a title is returned when `q` matches its label
+
+#### Scenario: Wildcard characters are literal
+- **WHEN** a session is labelled `100%_done\`, no other label or title holds `%`, `_` or `\`, and a reader gives `q` as `%`, `_` or `\`
+- **THEN** only that session is returned
+- **AND** `q` set to `a_b` or `p%e` returns no session
+
+### Requirement: Participants read thread keys only from messages that history shows
+`ref` and `recent_refs` MUST read only messages of the room being read whose body is retained and not expired, with no filter on recipients, which is the rule history applies to that room. The same key in another room MUST NOT count. A reader of a room's participants can already read those messages through history, so these parameters MUST NOT show more than history does.
+
+#### Scenario: Expired or redacted message
+- **WHEN** one session's only message in a keyed thread has passed its expiry and another session's has lost its body
+- **THEN** a read with `ref` set to that key returns neither session
+- **AND** `recent_refs` lists that key for neither
+
+#### Scenario: Same key in another room
+- **WHEN** a session published under `pr:owner/away#9` only in another room that it may use
+- **THEN** a read of this room with `ref` set to that key returns no session and no `recent_refs` lists it
+- **AND** a read of the other room with the same `ref` returns that session
+
+### Requirement: A malformed participants parameter is refused
+The service MUST refuse with `INVALID_REQUEST` and HTTP status 422 a `repository` that is not `owner/name`, a `ref` that is not a thread key, and a `harness`, `host` or `q` that is empty, longer than 128 characters or holds a control character. It MUST accept only the query names `after_session`, `limit`, `online`, `sort`, `harness`, `host`, `repository`, `ref`, `q` and `fields`, each at most once, and MUST refuse any other name or a repeated one in the same way.
+
+#### Scenario: Malformed value
+- **WHEN** a reader passes `repository` as `owner/repo#1`, `ref` as `pr:owner/repo`, an empty `q`, a `q` with a tab or a line break, a `harness` with a NUL, or a `host` of 129 characters
+- **THEN** the service answers `INVALID_REQUEST` with HTTP status 422, not a server error
+
+#### Scenario: Text that matches nothing
+- **WHEN** `q` is 128 characters that no label or title holds, or `harness` names a harness that no session uses
+- **THEN** the service answers HTTP 200 with an empty page and a null `next_session_id`
+
+#### Scenario: Query name not on the list
+- **WHEN** a participants read carries a name outside the list, such as `thread_id` or `after`, or repeats `limit` or `sort`
+- **THEN** the service refuses with `INVALID_REQUEST` and HTTP status 422
+- **AND** the history, state and event stream routes refuse each of `sort`, `harness`, `host`, `repository`, `ref`, `q` and `fields`

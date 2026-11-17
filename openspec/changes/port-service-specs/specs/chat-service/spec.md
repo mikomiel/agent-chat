@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines the observable behavior of the Agent Chat HTTP service: credential-derived identity, sessions and presence, durable publication, ordered replay and retention, delivery evidence, sender receipts, failure behavior and schema evolution.
+Defines the observable behavior of the Agent Chat HTTP service: credential-derived identity, sessions and presence, durable publication, ordered replay, backward history paging and retention, delivery evidence, sender receipts, failure behavior and schema evolution.
 
 ## ADDED Requirements
 
@@ -296,6 +296,32 @@ The service MUST retain messages for 30 days (720 hours, not configurable) and M
 - **THEN** it redacts their bodies, deletes old events only as a prefix and advances the retained floor only across that prefix
 - **AND** it removes browser sessions past their expiry and room state that expired 30 days ago
 - **AND** each batch handles at most a bounded number of items of each kind, so one run can leave some of this work for a later run
+
+### Requirement: History reads backwards in pages that never repeat
+A history read with `before` MUST return the newest retained messages below that cursor, at most `limit` (1 to 100), in commit order. `next_cursor` MUST be the cursor of the oldest message on the page, or the current position when the page is empty, and `has_more` MUST be true only while an older message that matches the filters remains. Paging with `before` set to `next_cursor` MUST NOT repeat a message. The service MUST refuse `before` together with `after` with `INVALID_REQUEST`.
+
+#### Scenario: Newest page, then older pages
+- **WHEN** a client reads history with `before` 9223372036854775807 and a `limit` smaller than the number of retained messages
+- **THEN** the page holds the newest messages in commit order and `has_more` is true
+- **AND** a read with `before` set to its `next_cursor` returns the messages just below that page, in commit order, with none repeated
+
+#### Scenario: Oldest page
+- **WHEN** a backward page holds the oldest retained message that matches
+- **THEN** `has_more` is false and `next_cursor` is the cursor of the oldest message on the page, not the current position
+- **AND** a read with `before` set to that `next_cursor` returns an empty page, so a client that stops on `has_more` never re-reads the newest page
+
+#### Scenario: Nothing below the cursor
+- **WHEN** a backward read finds no message below its cursor, for example because `before` is at or below the retained floor
+- **THEN** the page is empty, `has_more` is false and `next_cursor` is the current position
+- **AND** a client has to stop on `has_more` and must not continue from that `next_cursor`
+
+#### Scenario: Filters apply to a backward read
+- **WHEN** a backward read names a thread with `thread_id` and a `limit` smaller than the number of messages in that thread
+- **THEN** the page holds only messages of that thread, and `has_more` is true while an older message of that thread remains
+
+#### Scenario: After and before together
+- **WHEN** a read gives both `after` and `before`, each a valid cursor
+- **THEN** the service answers `INVALID_REQUEST` with HTTP status 422
 
 ### Requirement: Delivery evidence is explicit
 The service MUST record stored, handed, acknowledged and replied as separate states of each recipient entry. It MUST NOT infer acknowledgement from presence or a transport write, MUST keep unconfirmed delivery visible as uncertain, and MUST NOT let an acknowledgement wake any session.

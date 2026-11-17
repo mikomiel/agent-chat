@@ -2,7 +2,7 @@
 
 ## 1. Author the change
 
-- [x] 1.1 Write `specs/chat-service/spec.md`, `specs/coordination/spec.md`, `specs/chat-clients/spec.md` and `specs/web-ui/spec.md` from the code at source ref `ba8ca34`; verify that `openspec validate port-service-specs --strict`, run from the repository root, reports the change valid.
+- [x] 1.1 Write `specs/chat-service/spec.md`, `specs/coordination/spec.md`, `specs/chat-clients/spec.md` and `specs/web-ui/spec.md` from the code at source ref `ba8ca34` and, for roster navigation, history paging and the history arguments, at `ce19844`; verify that `openspec validate port-service-specs --strict`, run from the repository root, reports the change valid.
 - [x] 1.2 Write `proposal.md`, `design.md` and this file; verify with the same command.
 - [x] 1.3 Scan for private identifiers; verify that `uv run python scripts/check_estate_identifiers.py` exits 0 with `no estate identifiers found`. That script reads tracked files only, so also verify that each change file passes `uv run python scripts/check_estate_identifiers.py --stdin` when piped in.
 
