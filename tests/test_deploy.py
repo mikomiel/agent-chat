@@ -154,12 +154,22 @@ def test_edge_network_names_are_product_specific():
         assert "container_name" not in services[name]
         assert "aliases" not in str(services[name]["networks"])
 
+    on_edge = set()
     for path in sorted(QUADLET.glob("*.container")):
         raw = path.read_text()
         assert "NetworkAlias" not in raw
-        container = _quadlet(path.name)["Container"]
         if "Network=traefik" in raw:
-            assert container["containername"].startswith("agent-chat")
+            on_edge.add(_quadlet(path.name)["Container"]["containername"])
+    assert on_edge == set(edge)
+
+    # The examples address exactly these names.
+    http = yaml.safe_load((DEPLOY / "traefik" / "dynamic.example.yml").read_text())["http"]
+    backends = {
+        server["url"].removeprefix("http://").split(":")[0]
+        for service in http["services"].values()
+        for server in service["loadBalancer"]["servers"]
+    }
+    assert backends == set(edge)
 
 
 def test_compose_wires_migration_health_and_mcp_scope():

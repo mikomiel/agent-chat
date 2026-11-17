@@ -386,6 +386,11 @@ sudo systemctl restart \
 The migration runs before the new server. Restart the MCP unit only if it is
 installed.
 
+When upgrading from a release whose MCP unit set `NetworkAlias=mcp`, also
+change the MCP backend in the Traefik file-provider configuration, and in any
+Alloy scrape or probe target, from `mcp:8951` to `agent-chat-mcp:8951`, then
+reload them. MCP requests fail until this step is done.
+
 ## Security properties
 
 - No PostgreSQL or MCP host port is published.

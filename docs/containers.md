@@ -259,9 +259,13 @@ docker compose --env-file .env -f compose.yaml build --pull
 docker compose --env-file .env -f compose.yaml up -d
 ```
 
-When upgrading from a release that named the MCP service `mcp`, run
-`docker compose --env-file .env -f compose.yaml up -d --remove-orphans` instead,
-so the old `mcp` container is removed.
+When upgrading from a release that named the MCP service `mcp`:
+
+1. Run `docker compose --env-file .env -f compose.yaml up -d --remove-orphans`
+   instead of the `up -d` above, so the old `mcp` container is removed.
+2. In the Traefik file-provider configuration, and in any Alloy scrape or probe
+   target, change the MCP backend from `mcp:8951` to `agent-chat-mcp:8951`,
+   then reload them. MCP requests fail until this step is done.
 
 The migration job runs before the new server. Back up PostgreSQL with the
 deployer's normal `pg_dump` or physical-backup process; this stack has no
