@@ -82,6 +82,15 @@ def peer(process_api, credentials, tmp_path):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if mode in ("created_object", "no_content"):
+                # A complete 2xx other than 200: the service never answers one, so it breaks the protocol.
+                status, data = (201, b"{}") if mode == "created_object" else (204, b"")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if mode == "invalid_id":
                 result["instance_id"] = "not-a-uuid"
             elif mode == "different_id":
@@ -268,6 +277,23 @@ def test_a_malformed_200_is_invalid_for_pending_and_heartbeat_only(peer, mode):
         instance_client.heartbeat(joined, Heartbeat(native_state="idle", stopped=False, plan_mode=False))
     peer.state.mode = mode
     with pytest.raises(ChatError, match="TRANSPORT_UNAVAILABLE"):
+        instance_client.status(joined)
+
+
+@pytest.mark.parametrize(
+    ("mode", "plain_get"), [("created_object", "HTTP_REFUSED"), ("no_content", "TRANSPORT_UNAVAILABLE")]
+)
+def test_another_complete_2xx_is_invalid_for_pending_and_heartbeat_only(peer, mode, plain_get):
+    # A GET (pending) and a POST (heartbeat) that name `invalid` fail at once; a call without it keeps its code.
+    joined = peer.join()
+    peer.state.mode = mode
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        instance_client.pending(joined)
+    peer.state.mode = mode
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        instance_client.heartbeat(joined, Heartbeat(native_state="idle", stopped=False, plan_mode=False))
+    peer.state.mode = mode
+    with pytest.raises(ChatError, match=f"^{plain_get}$"):
         instance_client.status(joined)
 
 

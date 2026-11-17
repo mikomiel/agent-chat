@@ -244,6 +244,9 @@ class Client:
             if not isinstance(result, dict):
                 raise ValueError("invalid response object")
             if response.status != 200:
+                # Any other complete 2xx is a protocol violation, for a caller that names one (`invalid`).
+                if invalid is not None and 200 <= response.status < 300:
+                    raise ChatError(invalid)
                 error = result.get("error", {})
                 code = error.get("code") if isinstance(error, dict) else None
                 if isinstance(code, str) and HTTP_ERROR_STATUS.get(code) == response.status:
