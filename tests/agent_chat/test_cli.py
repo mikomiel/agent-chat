@@ -939,3 +939,137 @@ def test_tls_verifies_peer_and_never_enables_keylog(transport_cli, local_certifi
             == "TRANSPORT_UNAVAILABLE"
         )
     assert accepted == [True]
+
+
+def recording_server(reads, answer):
+    """A fake service that records each GET path and answers `answer`."""
+
+    class Recording(QuietHandler):
+        def do_GET(self):
+            reads.append(self.path)
+            payload = json.dumps(answer).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    return Recording
+
+
+def test_history_and_who_requests_keep_their_default_query_and_add_only_what_is_asked(transport_cli):
+    room = str(uuid4())
+    reads: list[str] = []
+    runs = (
+        ("history", "--room", room),
+        ("history", "--room", room, "--latest", "--limit", "20"),
+        ("history", "--room", room, "--before", "42", "--limit", "5"),
+        ("history", "--room", room, "--after", "42"),
+        ("who", "--room", room),
+        ("who", "--room", room, "--online"),
+        (
+            "who", "--room", room, "--sort", "activity", "--harness", "claude", "--host", "alpha",
+            "--repository", "owner/repo", "--ref", "pr:owner/repo#7", "--q", "a b%",
+            "--fields", "session_id,last_seen_at",
+        ),
+    )
+    with protocol_server(recording_server(reads, {"messages": [], "participants": []})) as origin:
+        for args in runs:
+            code, result = transport_cli(origin, args)
+            assert code == 0, result
+    assert reads == [
+        f"/v1/rooms/{room}/history?limit=100",
+        f"/v1/rooms/{room}/history?limit=20&before=9223372036854775807",
+        f"/v1/rooms/{room}/history?limit=5&before=42",
+        f"/v1/rooms/{room}/history?limit=100&after=42",
+        f"/v1/rooms/{room}/participants?limit=100",
+        f"/v1/rooms/{room}/participants?limit=100&online=true",
+        f"/v1/rooms/{room}/participants?limit=100&sort=activity&harness=claude&host=alpha&repository=owner%2Frepo"
+        "&ref=pr%3Aowner%2Frepo%237&q=a+b%25&fields=session_id%2Clast_seen_at",
+    ]
+
+
+@pytest.mark.parametrize("flags", [("--after", "5"), ("--before", "5"), ("--after", "5", "--before", "6")])
+def test_history_latest_refuses_after_and_before_without_a_request(transport_cli, flags):
+    reads: list[str] = []
+    with protocol_server(recording_server(reads, {})) as origin:
+        code, result = transport_cli(origin, ("history", "--room", str(uuid4()), "--latest", *flags))
+    assert code == 2
+    assert result["error"] == {
+        "code": "INVALID_ARGUMENTS",
+        "hint": "--latest cannot be combined with --after or --before",
+    }
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    "args,code,hint",
+    [
+        (("history", "--before", "nope"), "INVALID_CURSOR", None),
+        (("history", "--before", "9223372036854775808"), "INVALID_CURSOR", None),
+        (
+            ("history", "--latest=yes"),
+            "INVALID_ARGUMENTS",
+            "--latest takes no value; pass --latest on its own; see `agent-chat history --help`",
+        ),
+        (
+            ("who", "--sort", "newest"),
+            "INVALID_ARGUMENTS",
+            "--sort: must be one of session, activity; see `agent-chat who --help`",
+        ),
+        (
+            ("who", "--ref", "free text"),
+            "INVALID_ARGUMENTS",
+            "--ref must be pr:OWNER/REPO#N, lane:<lane-ref> or resource:<host>:<name>",
+        ),
+    ],
+)
+def test_the_new_flags_refuse_a_bad_value_before_any_request(transport_cli, args, code, hint):
+    reads: list[str] = []
+    with protocol_server(recording_server(reads, {})) as origin:
+        exit_code, result = transport_cli(origin, (*args, "--room", str(uuid4())))
+    assert exit_code == 2 and reads == []
+    assert result["error"] == ({"code": code} if hint is None else {"code": code, "hint": hint})
+
+
+def test_history_latest_then_before_reads_the_whole_room_newest_first_without_repeats(
+    cli, process_api, credentials, send
+):
+    bodies = [f"message {number:02d}" for number in range(25)]
+    for body in bodies:
+        send(process_api, credentials, body)
+    code, newest = cli.run("history", "--latest", "--limit", "20")
+    assert code == 0
+    first = newest["result"]
+    assert [message["body"] for message in first["messages"]] == bodies[5:] and first["has_more"] is True
+    code, older = cli.run("history", "--before", first["next_cursor"], "--limit", "20")
+    assert code == 0
+    last = older["result"]
+    assert [message["body"] for message in last["messages"]] == bodies[:5] and last["has_more"] is False
+    # The newest page is the one the server answers to a cursor above the clock, and it is read as one page.
+    code, direct = cli.run("history", "--before", "9223372036854775807", "--limit", "20")
+    assert code == 0 and direct["result"] == first
+
+
+def test_who_sorts_filters_and_projects_through_the_service(cli, process_api, credentials, register, db):
+    _, peer = register(process_api, credentials, "cli-peer")
+    db.execute("UPDATE agent_chat.sessions SET title = 'Reviewing privileges' WHERE id = %s", (peer["session_id"],))
+    db.execute(
+        "UPDATE agent_chat.instances SET heartbeat_at = clock_timestamp() - interval '30 seconds'"
+        " WHERE session_id = %s",
+        (cli.registered["session_id"],),
+    )
+    code, ordered = cli.run(
+        "who", "--online", "--sort", "activity", "--limit", "5", "--fields", "session_id,title,last_seen_at"
+    )
+    assert code == 0
+    rows = ordered["result"]["participants"]
+    assert [row["session_id"] for row in rows] == [peer["session_id"], cli.registered["session_id"]]
+    assert all(list(row) == ["session_id", "title", "last_seen_at"] for row in rows)
+    code, found = cli.run("who", "--q", "PRIVILEGE", "--fields", "session_id")
+    assert code == 0 and found["result"]["participants"] == [{"session_id": peer["session_id"]}]
+    assert cli.run("who", "--harness", "pi", "--host", "synthetic-host", "--fields", "session_id")[0] == 0
+    assert cli.run("who", "--harness", "codex", "--fields", "session_id")[1]["result"]["participants"] == []
+    for args in (("--sort", "activity", "--after-session", str(uuid4())), ("--fields", "nope"), ("--repository", "x")):
+        code, refused = cli.run("who", *args)
+        assert code == 2 and refused["error"] == {"code": "INVALID_REQUEST"}, args

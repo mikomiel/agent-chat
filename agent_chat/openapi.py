@@ -76,11 +76,27 @@ def build_openapi() -> dict:
                 "required": ["rooms"],
                 "properties": {"rooms": {"type": "array", "items": {"$ref": "#/components/schemas/Room"}}},
             },
+            "Participant": {
+                "type": "object",
+                "additionalProperties": True,
+                "properties": {
+                    # Present only when the request names them in `fields`.
+                    "last_seen_at": {"type": ["string", "null"]},
+                    "recent_refs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["ref_key", "last_at"],
+                            "properties": {"ref_key": {"type": "string"}, "last_at": {"type": "string"}},
+                        },
+                    },
+                },
+            },
             "ParticipantPage": {
                 "type": "object",
                 "required": ["participants"],
                 "properties": {
-                    "participants": {"type": "array", "items": {"$ref": "#/components/schemas/JsonObject"}},
+                    "participants": {"type": "array", "items": {"$ref": "#/components/schemas/Participant"}},
                     "next_session_id": {"type": ["string", "null"]},
                 },
             },
