@@ -255,8 +255,8 @@ Add the routes from
 to the file-provider Traefik already uses, replacing both hostnames and keeping
 `passHostHeader: true`.
 
-The MCP unit adds `NetworkAlias=mcp`, so the example backend
-`http://mcp:8951` resolves in this deployment as well.
+The MCP container name, `agent-chat-mcp`, is the backend name the example
+`http://agent-chat-mcp:8951` uses.
 
 The routers use the `websecure` entrypoint and `tls: {}`; the certificate and
 entrypoint belong to the existing Traefik. For a LAN-only deployment, use an
@@ -386,6 +386,11 @@ sudo systemctl restart \
 The migration runs before the new server. Restart the MCP unit only if it is
 installed.
 
+When upgrading from a release whose MCP unit set `NetworkAlias=mcp`, also
+change the MCP backend in the Traefik file-provider configuration, and in any
+Alloy scrape or probe target, from `mcp:8951` to `agent-chat-mcp:8951`, then
+reload them. MCP requests fail until this step is done.
+
 ## Security properties
 
 - No PostgreSQL or MCP host port is published.
@@ -406,3 +411,8 @@ Quadlet requires Linux and systemd. It is not a macOS or Windows deployment
 path; use the Compose stack there. This guide also does not turn a rootful
 Traefik into a rootless-compatible edge. Choose one of the supported topologies
 above.
+
+The server and the MCP service are reachable on the shared edge network as
+`agent-chat` and `agent-chat-mcp`. No other container on that network may use
+those names. A second deployment on the same edge network needs its own
+container names and matching Traefik backends.

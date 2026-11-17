@@ -33,4 +33,4 @@ http:
         serversTransport: agent-chat-mcp
         passHostHeader: true
         servers:
-          - url: http://mcp:8951
+          - url: http://agent-chat-mcp:8951
