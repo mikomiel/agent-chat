@@ -298,6 +298,36 @@
         "title": "Mute",
         "type": "object"
       },
+      "Participant": {
+        "additionalProperties": true,
+        "properties": {
+          "last_seen_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recent_refs": {
+            "items": {
+              "properties": {
+                "last_at": {
+                  "type": "string"
+                },
+                "ref_key": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ref_key",
+                "last_at"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "ParticipantPage": {
         "properties": {
           "next_session_id": {
@@ -308,7 +338,7 @@
           },
           "participants": {
             "items": {
-              "$ref": "#/components/schemas/JsonObject"
+              "$ref": "#/components/schemas/Participant"
             },
             "type": "array"
           }
@@ -3051,6 +3081,124 @@
               "default": false,
               "title": "Online",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "sort",
+            "required": false,
+            "schema": {
+              "default": "session",
+              "enum": [
+                "session",
+                "activity"
+              ],
+              "title": "Sort",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "harness",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Harness"
+            }
+          },
+          {
+            "in": "query",
+            "name": "host",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Host"
+            }
+          },
+          {
+            "in": "query",
+            "name": "repository",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[A-Za-z0-9_.-]{1,40}/[A-Za-z0-9_.-]{1,80}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Repository"
+            }
+          },
+          {
+            "in": "query",
+            "name": "ref",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^(pr:[A-Za-z0-9_.-]{1,40}/[A-Za-z0-9_.-]{1,80}#[1-9][0-9]{0,9}|lane:[A-Za-z0-9_./-]{1,80}::[A-Za-z0-9-]{1,40}|resource:[a-z0-9][a-z0-9-]{0,62}:[a-z0-9][a-z0-9-]{0,62})$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Ref"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "pattern": "^[^\\x00-\\x1f\\x7f]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          },
+          {
+            "in": "query",
+            "name": "fields",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fields"
             }
           }
         ],

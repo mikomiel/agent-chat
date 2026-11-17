@@ -88,7 +88,10 @@ class RequestBoundary:
                 elif re.fullmatch(r"/v1/rooms/[^/]+/state", scope["path"]):
                     allowed = {"ref_key", "after_key", "limit"}
                 elif re.fullmatch(r"/v1/rooms/[^/]+/participants", scope["path"]):
-                    allowed = {"after_session", "limit", "online"}
+                    allowed = {
+                        "after_session", "limit", "online",
+                        "sort", "harness", "host", "repository", "ref", "q", "fields",
+                    }
             try:
                 if len(scope["query_string"]) > 4096:
                     raise ValueError
