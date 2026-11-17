@@ -33,6 +33,7 @@ from .models import (
     HTTP_ERROR_STATUS,
     LEASE_SECONDS,
     REF_KEY_PATTERN,
+    REPOSITORY_PATTERN,
     STATE_KEY_PATTERN,
     Actor,
     ChatError,
@@ -58,6 +59,9 @@ from .models import (
 from .protocol import cursor, validate_origin
 from .publication import publish
 from .storage import MIGRATIONS, connect
+
+# A free-text roster filter: bounded, and free of control characters, so a NUL never reaches the database.
+RosterText = Annotated[str | None, Query(max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")]
 
 
 def _log_handled(
@@ -463,8 +467,18 @@ def create_app(
         after_session: UUID | None = None,
         limit: Annotated[int, Query(ge=1, le=100)] = 100,
         online: bool = False,
+        sort: Literal["session", "activity"] = "session",
+        harness: RosterText = None,
+        host: RosterText = None,
+        repository: Annotated[str | None, Query(pattern=REPOSITORY_PATTERN)] = None,
+        ref: Annotated[str | None, Query(pattern=REF_KEY_PATTERN)] = None,
+        q: RosterText = None,
+        fields: str | None = None,
     ):
-        return room_store.participants(db, current_actor(request, db), room, after_session, limit, online)
+        return room_store.participants(
+            db, current_actor(request, db), room, after_session, limit, online,
+            sort=sort, harness=harness, host=host, repository=repository, ref=ref, q=q, fields=fields,
+        )
 
     @app.get("/v1/rooms/{room}/history")
     def history(
