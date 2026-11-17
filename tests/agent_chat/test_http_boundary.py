@@ -122,3 +122,22 @@ def test_a_query_string_is_refused_on_a_mutation():
     refused(
         cross(method="POST", path="/v1/events", query=b"after=1", headers=[("origin", ORIGIN)]), 422, "INVALID_REQUEST"
     )
+
+
+ROSTER_QUERY = (
+    b"after_session=00000000-0000-4000-8000-000000000002&limit=5&online=true&sort=session&harness=pi&host=a"
+    b"&repository=owner%2Frepo&ref=pr%3Aowner%2Frepo%231&q=text&fields=label"
+)
+
+
+def test_the_roster_accepts_its_filters_and_no_other_route_does():
+    assert cross(path=ROOM + "/participants", query=ROSTER_QUERY) == (200, None, True)
+    for name in (b"sort", b"harness", b"host", b"repository", b"ref", b"q", b"fields"):
+        assert cross(path=ROOM + "/participants", query=name + b"=x") == (200, None, True)
+        refused(cross(path=ROOM + "/participants", query=name + b"=x&" + name + b"=y"), 422, "INVALID_REQUEST")
+        refused(cross(path=ROOM + "/history", query=name + b"=x"), 422, "INVALID_REQUEST")
+        refused(cross(path=ROOM + "/state", query=name + b"=x"), 422, "INVALID_REQUEST")
+        refused(cross(path="/v1/events", query=name + b"=x"), 422, "INVALID_REQUEST")
+    # A name the roster does not know stays refused, and so does every route's own name on the wrong route.
+    refused(cross(path=ROOM + "/participants", query=b"sort=activity&role=pm"), 422, "INVALID_REQUEST")
+    refused(cross(path=ROOM + "/participants", query=b"thread_id=1&sort=activity"), 422, "INVALID_REQUEST")

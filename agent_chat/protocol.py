@@ -18,8 +18,13 @@ def token_digest(token: str) -> str:
     return sha256(token.encode("ascii")).hexdigest()
 
 
+# The largest cursor `cursor()` accepts. As a `before` cursor it lies above the event clock, which `history`
+# reads as "the newest page"; clients use it to start a backward read without knowing the clock.
+MAX_CURSOR = 9223372036854775807
+
+
 def cursor(value: str) -> int:
-    if re.fullmatch(r"[0-9]{1,19}", value) is None or int(value) > 9223372036854775807:
+    if re.fullmatch(r"[0-9]{1,19}", value) is None or int(value) > MAX_CURSOR:
         raise ChatError("INVALID_CURSOR")
     return int(value)
 
