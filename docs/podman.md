@@ -360,11 +360,17 @@ automatically. `--room` is accepted only for viewer principals.
 
 ## Upgrades
 
-After pulling the source and rebuilding both images:
+After pulling the source, rebuild both images and install the unit files
+again. The installed units are copies, so a release that changes
+`deploy/podman` reaches a running install only through this step. Repeat the
+`install` commands from
+[Install and start the units](#install-and-start-the-units) for your mode,
+with the MCP unit only if it is installed, then reload systemd and restart.
 
 Rootless:
 
 ```sh
+systemctl --user daemon-reload
 systemctl --user restart \
   agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
 ```
@@ -372,6 +378,7 @@ systemctl --user restart \
 Rootful:
 
 ```sh
+sudo systemctl daemon-reload
 sudo systemctl restart \
   agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
 ```
@@ -383,7 +390,11 @@ installed.
 
 - No PostgreSQL or MCP host port is published.
 - The containers run as UID/GID `10001:10001`, including under rootful Podman.
-- Root filesystems are read-only; only `/tmp` is a bounded tmpfs.
+- Root filesystems are read-only. `/tmp` is a 16 MiB `noexec` tmpfs, and the
+  two units that carry the DSN mount a 1 MiB `noexec` tmpfs on `/run/secrets`
+  that holds only the secret. Podman's read-only mode also mounts its own tmpfs
+  on `/run`, `/var/tmp` and `/dev/shm`; `/var/tmp` is neither `noexec` nor
+  size-bounded.
 - All capabilities are dropped and `no-new-privileges` is set.
 - The DSN is a Podman secret, not an environment value or image layer.
 - The MCP container has no database secret and no PostgreSQL driver.

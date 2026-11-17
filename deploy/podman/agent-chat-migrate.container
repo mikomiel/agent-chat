@@ -14,6 +14,9 @@ Network=agent-chat.network
 User=10001:10001
 ReadOnly=true
 Tmpfs=/tmp:rw,noexec,nosuid,size=16m
+# The root filesystem is read-only, and crun 1.31 or later and runc 1.5.2 cannot
+# create the secret's mount point in it; this tmpfs provides one.
+Tmpfs=/run/secrets:rw,noexec,nosuid,size=1m,mode=0755
 DropCapability=ALL
 NoNewPrivileges=true
 StopTimeout=30
