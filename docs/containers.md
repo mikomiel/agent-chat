@@ -158,6 +158,12 @@ podman-compose --env-file .env -f compose.yaml up -d --build
 ```
 
 The `migrate` service runs first. If migrations fail, the server is not started.
+
+If PostgreSQL does not answer yet, `migrate` waits for it for up to 5 minutes
+and then fails with `DATABASE_UNAVAILABLE`, so a late database delays the stack
+by up to that long. A wrong host, user, password or database name is the same
+refusal, so a wrong DSN fails only after that wait.
+
 To inspect an apply before bringing the full stack up:
 
 ```sh
@@ -166,7 +172,8 @@ docker compose --env-file .env -f compose.yaml run --rm migrate \
 ```
 
 Review the printed pending files and digest. The normal `migrate` service applies
-the pending set; the check does not.
+the pending set; the check does not, and unlike an apply it does not wait for an
+unreachable database.
 
 ## First principal
 
