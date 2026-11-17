@@ -264,9 +264,14 @@ class Client:
                 raise ChatError("CLI_INTERRUPTED") from None
             if self._deadline is not None and time.monotonic() >= self._deadline:
                 raise ChatError("CLI_INTERRUPTED") from None
-            # A complete 200 whose body breaks the protocol is not an outage. A caller that tolerates
+            # A complete 2xx whose body breaks the protocol is not an outage. A caller that tolerates
             # outages names it `invalid`; every other caller keeps the classification below.
-            if invalid is not None and status == 200 and isinstance(error, (ValueError, RecursionError)):
+            if (
+                invalid is not None
+                and status is not None
+                and 200 <= status < 300
+                and isinstance(error, (ValueError, RecursionError))
+            ):
                 raise ChatError(invalid) from None
             # Likewise a complete 4xx whose body is not this service's envelope, such as a proxy's HTML 403, is a
             # refusal. A caller that must tell refusals from outages names it `refused`. 408 and 429 stay outages.
