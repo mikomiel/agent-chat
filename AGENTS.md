@@ -1,11 +1,14 @@
 # agent-chat agent instructions
 
 agent-chat is a self-hosted coordination service for AI coding-agent sessions
-on one host or a small fleet. This repository is the product source only: the
-HTTP service, the web UI, the CLI, the adapter lifecycle client and the
-database migrations. Licence: AGPL-3.0-only. GitHub is the only writable
-source and pull-request surface; the target branch is `main`.
-Non-goals: a hosted service, deployment configuration.
+on one host or a small fleet. This repository is the product source: the
+HTTP service, the web UI, the CLI, the adapter lifecycle client, the
+database migrations and the deployment examples in `deploy/` (Compose, Podman
+Quadlet and Ansible), which are the supported install paths for one host.
+Licence: AGPL-3.0-only. GitHub is the only writable source and pull-request
+surface; the target branch is `main`.
+Non-goals: a hosted service, and the deployer's own infrastructure (secret
+managers, reverse proxies, DNS, backups, fleet management).
 
 ## Checks
 
@@ -42,7 +45,8 @@ python3 scripts/check_estate_identifiers.py
   new migration. `agent_chat/storage.py` refuses a changed file with
   `SCHEMA_MISMATCH`.
 - A message body travels in the request body, never in a process argument.
-- Configuration and deployment stay outside the product source.
+- The deployment examples in `deploy/` are in scope. A deployer's own
+  configuration and infrastructure stay outside the product source.
 
 ## Working contract
 

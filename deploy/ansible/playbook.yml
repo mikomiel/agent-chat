@@ -12,10 +12,11 @@
 # digest before the schema changes" the play only installs the new release next to the old one,
 # stages the new configuration inside it, and runs `migrate --check` from there against the staged
 # configuration. It creates an install directory only when that directory is missing, refuses an existing one
-# that the service user cannot enter, writes no live configuration or unit, does not move `current`, restarts
-# nothing and queues no handler, so a refusal leaves the running version exactly as it was. Every change to
-# the live host comes after the gate. The first tasks after it record an activation marker and the last task
-# removes it, so that a run which stops in between is finished by the next run.
+# that the service user cannot enter or that anyone but root can write, refuses an existing release environment
+# that is not a root-owned directory closed to every other writer, writes no live configuration or unit, does not
+# move `current`, restarts nothing and queues no handler, so a refusal leaves the running version exactly as it
+# was. Every change to the live host comes after the gate. The first tasks after it record an activation marker
+# and the last task removes it, so that a run which stops in between is finished by the next run.
 - name: Deploy Agent Chat under systemd
   hosts: agent_chat
   become: true
@@ -235,7 +236,7 @@
     # user: the owner's if the user owns the directory, else the group's if the directory has the group
     # agent-chat, else the others'. That is the whole model: it does not know ACLs, supplementary groups or
     # symlinked roots, and the guide calls such a layout unsupported. A missing directory passes, because the
-    # next task creates it 0755.
+    # task that creates the missing directories follows these checks and makes it 0755.
     - name: Require the install directories to be traversable by the service user
       ansible.builtin.assert:
         that: >-
@@ -251,6 +252,59 @@
       loop: "{{ agent_chat_dirs.results }}"
       loop_control:
         label: "{{ item.item }}"
+
+    # The play runs Python from the new virtual environment as root before the review gate: the install step skips on
+    # the stamp inside the environment, and the `validate:` of each staged configuration file runs the environment's
+    # `bin/python`. A user who can write to the install root or to `venvs` can plant an environment there with a
+    # forged stamp and a `bin/python` of its own, and the play would run it as root. So an existing install
+    # directory must be a real directory owned by root that neither its group nor others can write to. That holds
+    # for anyone, not only the service user. `stat` without `follow` reports a link as a link, with mode 0777 and no
+    # word about its target, so a link is refused too. This reads the mode bits that the look-up recorded and
+    # changes nothing. A POSIX ACL entry that lets another user write raises the group bits, which hold the ACL
+    # mask, so it is refused as well. A missing directory passes: the play creates it as root, 0755, after these checks.
+    - name: Require the install directories to be owned by root and closed to other writers
+      ansible.builtin.assert:
+        that: >-
+          not item.stat.exists
+          or (item.stat.isdir and item.stat.uid == 0 and not item.stat.wgrp and not item.stat.woth)
+        fail_msg: >-
+          {{ item.item }} must be a real directory owned by root that neither its group nor others can write to (for
+          example mode 0755 owned by root:root). The play runs code from the new virtual environment as root before
+          the review gate, and whoever can write here could plant that code. The play does not change an existing
+          install directory before the review gate. Change this one by hand and rerun.
+        quiet: true
+      loop: "{{ agent_chat_dirs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # The release environment is the other half of the same trust. If it exists, the install step skips on its stamp
+    # and the staged files are validated with its `bin/python` as root, so it must be a real directory owned by root
+    # that neither its group nor others can write to. The play reads neither the stamp nor the `bin/python` link
+    # target, because the directory is the trust root: the checks above close the install root and `venvs` to every
+    # other writer, this check closes the environment itself, and then only root can have put a file in it.
+    # `follow: false` makes a link report as a link. Like the DSN stat, it turns the checksum, MIME and attribute
+    # probes off, so it reads metadata only. The play does not repair an environment that fails the check, because it
+    # cannot know what ran from it. A missing environment passes: the install step creates it as root.
+    - name: Look for the release virtual environment
+      ansible.builtin.stat:
+        path: "{{ agent_chat_venv }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: agent_chat_venv_dir
+
+    - name: Require the release virtual environment to be owned by root and closed to other writers
+      ansible.builtin.assert:
+        that: >-
+          not agent_chat_venv_dir.stat.exists
+          or (agent_chat_venv_dir.stat.isdir and agent_chat_venv_dir.stat.uid == 0
+          and not agent_chat_venv_dir.stat.wgrp and not agent_chat_venv_dir.stat.woth)
+        fail_msg: >-
+          {{ agent_chat_venv }} must be a real directory owned by root that neither its group nor others can write to.
+          The play does not trust or repair an existing release environment that is not, because it runs code from it
+          as root before the review gate. Remove it by hand and rerun.
+        quiet: true
 
     - name: Create the missing install directories
       ansible.builtin.file:

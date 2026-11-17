@@ -162,7 +162,15 @@ in this order:
    `<directory> must stay traversable by the agent-chat user`. The check judges
    the plain mode bits for the owner, the primary group `agent-chat` and others.
    It does not model ACLs, supplementary groups or symlinked roots, so such a
-   layout is unsupported. The old release keeps serving.
+   layout is unsupported. Only root may write to the install root, to `venvs`
+   and to an existing release environment: each is a real directory owned by
+   root that neither its group nor others can write to, for example `root:root`
+   with mode 0755 or `root:agent-chat` with mode 0750. The play refuses one that
+   is not, before it creates a directory or installs the release, with the
+   message
+   `<directory> must be a real directory owned by root that neither its group nor others can write to`.
+   It does not trust or repair a release environment that it refuses: remove it
+   by hand and rerun. The old release keeps serving.
 3. Render the new configuration into that environment and check it with the
    release's own loader.
 4. Run `migrate --check` from the new release against that configuration, and
@@ -280,6 +288,21 @@ example, with `agent-chat` in the supplementary group `deployment`, a directory
 `root:deployment` with mode 0705 passes the check and the kernel still denies the
 user. Such a layout is unsupported.
 
+The play also runs code from the new release environment as root before the
+gate: it validates each staged configuration file with that environment's own
+Python. So the install root, the `venvs` directory and an existing release
+environment must each be a real directory owned by root that neither its group
+nor others can write to, for example `root:root` with mode 0755 or
+`root:agent-chat` with mode 0750. Otherwise the `agent-chat` user, or anyone
+else who can write there, could plant an environment with a forged install stamp
+and a `bin/python` of its own, and root would run it. The play refuses such a
+directory, before the gate, with the message
+`<directory> must be a real directory owned by root that neither its group nor others can write to`.
+A link in place of one of them is refused too, because the play cannot see who
+can write to its target. The play does not change the owner or mode of an
+install directory, and it does not repair a release environment that it
+refuses: change the directory, or remove the environment, by hand and rerun.
+
 The play is not transactional after the gate. If a task fails between
 installing the configuration and switching `current`, the forced handlers can
 restart the old release with the new configuration. Rerun the play to finish.
@@ -294,7 +317,10 @@ To roll back, set the previous tag and run again. The previous release must be
 one the playbook covers. When `agent_chat_mcp_enabled` has the value that the
 older run used, its virtual environment is still on disk, and the run only
 repoints `current` at that directory. With the other value the play installs
-that variant first. Migrations are append-only and are not reverted. If the
+that variant first. The ownership rule above holds for an existing environment
+of either variant, so the play refuses an old one that is no longer a real
+directory owned by root that neither its group nor others can write to.
+Migrations are append-only and are not reverted. If the
 database records more migrations than the older release ships,
 `migrate --check` stops with `SCHEMA_MISMATCH` before anything live changes;
 restore a database backup taken before the upgrade first. The playbook never

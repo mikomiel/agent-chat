@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import configparser
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import yaml
 
@@ -727,7 +729,8 @@ def test_ansible_playbook_refuses_an_install_directory_the_service_user_cannot_e
 
     # The order: the look-up, this check, then the first task that creates a directory or installs anything, then the
     # first run as the service user (the migration check), all before the gate. The virtual environment directory
-    # comes from `python3 -m venv` under `umask 022`; the play gives it no mode, so only the two directories are read.
+    # comes from `python3 -m venv` under `umask 022`; the play gives it no mode, so this check reads only the two
+    # directories. The ownership check in the next test also reads the environment.
     first_run = next(index for index, task in enumerate(tasks) if "agent_chat_admin" in json.dumps(task))
     assert names[first_run] == "List the pending migrations"
     chain = [
@@ -747,6 +750,214 @@ def test_ansible_playbook_refuses_an_install_directory_the_service_user_cannot_e
     assert guide.count("`" + refusal.replace("{{ item.item }}", "<directory>") + "`") == 2
     assert "refuses one that the user cannot enter, before it creates a directory or installs the release" in guide
     assert "The play refuses a directory that is not, before the gate, with the message" in guide
+
+
+# The install tree is trusted. Root runs Python from the release environment before the review gate (the `validate:` of
+# each staged file) and the install step skips on the stamp inside it, so a directory that another user can write to
+# would let that user plant code that root runs. These are the tasks that refuse such a tree, by name.
+INSTALL_TREE_CHECK = "Require the install directories to be owned by root and closed to other writers"
+RELEASE_ENV_LOOK = "Look for the release virtual environment"
+RELEASE_ENV_CHECK = "Require the release virtual environment to be owned by root and closed to other writers"
+CLOSED_TO_OTHERS = "must be a real directory owned by root that neither its group nor others can write to"
+
+# What the `stat` module reports for the fields that the two ownership conditions read, as (label, mode, uid, kind).
+# `mode` None is a missing path. Linux reports a link as a link, with mode 0777; the second link sample shows that
+# `isdir`, not the mode, refuses it.
+CLOSED_TREE_SAMPLES = (
+    # Accepted: a missing path (the play creates it as root), then root-owned directories that neither the group nor
+    # others can write to, whatever their read and execute bits, group or special bits are.
+    (
+        ("missing path", None, 0, "dir"),
+        ("root 0755", 0o755, 0, "dir"),
+        ("root 0750, group agent-chat", 0o750, 0, "dir"),
+        ("root 0711", 0o711, 0, "dir"),
+        ("root 0700", 0o700, 0, "dir"),
+        ("root 0555", 0o555, 0, "dir"),
+        ("root 2755, setgid", 0o2755, 0, "dir"),
+        ("root 1755, sticky", 0o1755, 0, "dir"),
+    ),
+    # Refused: the group or others can write, the owner is not root (the service user too, with any mode), or the
+    # path is not a real directory.
+    (
+        ("root 0775, the group can write", 0o775, 0, "dir"),
+        ("root 0770", 0o770, 0, "dir"),
+        ("root 0720", 0o720, 0, "dir"),
+        ("root 0757, others can write", 0o757, 0, "dir"),
+        ("root 0707", 0o707, 0, "dir"),
+        ("root 0702", 0o702, 0, "dir"),
+        ("root 0777", 0o777, 0, "dir"),
+        ("root 1777, sticky and writable", 0o1777, 0, "dir"),
+        ("service user 0755", 0o755, 1001, "dir"),
+        ("service user 0700", 0o700, 1001, "dir"),
+        ("another user 0755", 0o755, 1, "dir"),
+        ("link, as Linux reports it", 0o777, 0, "link"),
+        ("link with a mode that looks closed", 0o755, 0, "link"),
+        ("regular file", 0o644, 0, "file"),
+    ),
+)
+
+
+def _stat(mode: int | None, uid: int, kind: str) -> SimpleNamespace:
+    """The fields of a `stat` result that the install-tree conditions read."""
+    if mode is None:
+        return SimpleNamespace(exists=False)
+    return SimpleNamespace(exists=True, isdir=kind == "dir", uid=uid, wgrp=bool(mode & 0o020), woth=bool(mode & 0o002))
+
+
+def _truth(condition: str, **names: object) -> bool:
+    """Run one condition of the play on stat results, as Jinja does. Jinja is not a dependency, so this runs only the
+    forms that the install-tree conditions use (and, or, not, ==, attribute access, a literal) with `ast`, lazily as
+    Jinja does, and fails on any other form until a case for it is added here."""
+
+    def run(node: ast.AST) -> object:
+        match node:
+            case ast.BoolOp(op=ast.And(), values=values):
+                return all(run(value) for value in values)
+            case ast.BoolOp(op=ast.Or(), values=values):
+                return any(run(value) for value in values)
+            case ast.UnaryOp(op=ast.Not(), operand=operand):
+                return not run(operand)
+            case ast.Compare(left=left, ops=[ast.Eq()], comparators=[right]):
+                return run(left) == run(right)
+            case ast.Attribute(value=value, attr=attr):
+                return getattr(run(value), attr)
+            case ast.Name(id=name):
+                return names[name]
+            case ast.Constant(value=value):
+                return value
+        raise AssertionError(f"a form that _truth does not handle: {ast.dump(node)}")
+
+    return bool(run(ast.parse(_flat(condition), mode="eval").body))
+
+
+def _closed_to_others(name: str) -> str:
+    """The condition on one stat result: a real directory, owned by root, that neither group nor others can write."""
+    return f"{name}.stat.isdir and {name}.stat.uid == 0 and not {name}.stat.wgrp and not {name}.stat.woth"
+
+
+def test_ansible_playbook_refuses_an_install_tree_that_another_user_can_write_before_it_runs_anything_from_it():
+    # The play runs Python from the new release environment as root before the review gate: the `validate:` of each
+    # staged file runs its `bin/python`, and the install step skips on the stamp inside it. A user who can write to
+    # the install root or to `venvs` can plant an environment there, with a forged `.installed` and a `bin/python`
+    # of its own, and the play would run it as root. So, before anything uses the environment, the play refuses an
+    # existing install root or `venvs` that is not a real directory owned by root with no write bit for the group
+    # or for others, and an existing release environment that is not one either. It reads neither the stamp nor the
+    # `bin/python` link target: the directory is the trust root, because only root can have put a file into a
+    # directory that only root can write to. The conditions need ansible-core, which the suite does not install, so
+    # this pins their exact text, their place and their messages. The next test runs them on samples, and both
+    # tasks ran with ansible-core 2.18 on temporary trees (see the comment of that test).
+    tasks = _playbook()["tasks"]
+    names = [task["name"] for task in tasks]
+    gate = names.index("Require the reviewed digest before the schema changes")
+    look = _task("Look for the install directories")
+    traversal = _task("Require the install directories to be traversable by the service user")
+    owned = _task(INSTALL_TREE_CHECK)
+    environment_look = _task(RELEASE_ENV_LOOK)
+    environment = _task(RELEASE_ENV_CHECK)
+
+    # The two asserts only evaluate stat results of earlier tasks, so they write nothing. Neither has a `when`,
+    # `ignore_errors`, `failed_when` or `notify`: they can be neither skipped nor ignored. The look-up of the
+    # environment reads metadata only (no checksum, MIME or attribute probe), does not follow a link and queues no
+    # handler.
+    assert set(owned) == {"name", "ansible.builtin.assert", "loop", "loop_control"}
+    assert owned["loop"] == "{{ " + look["register"] + ".results }}"
+    assert owned["loop_control"] == {"label": "{{ item.item }}"}
+    assert set(owned["ansible.builtin.assert"]) == {"that", "fail_msg", "quiet"}
+    assert set(environment) == {"name", "ansible.builtin.assert"}
+    assert set(environment["ansible.builtin.assert"]) == {"that", "fail_msg", "quiet"}
+    assert set(environment_look) == {"name", "ansible.builtin.stat", "register"}
+    assert environment_look["ansible.builtin.stat"] == {
+        "path": "{{ agent_chat_venv }}",
+        "follow": False,
+        "get_checksum": False,
+        "get_mime": False,
+        "get_attributes": False,
+    }
+    # The look-up of the two directories does not follow a link either (the module's default), so a link at the install
+    # root or at `venvs` is reported as a link, with `isdir` false, and the check of `isdir` below refuses it.
+    assert look["ansible.builtin.stat"].get("follow", False) is False
+
+    # A missing path passes, because the play creates it as root. Anything else must be a real directory (a link is
+    # reported as a link), owned by root, with neither the group write bit nor the others' write bit. The group of the
+    # directory does not matter; whether the service user can enter it is the traversal check's business.
+    register = environment_look["register"]
+    assert _flat(owned["ansible.builtin.assert"]["that"]) == f"not item.stat.exists or ({_closed_to_others('item')})"
+    assert _flat(environment["ansible.builtin.assert"]["that"]) == (
+        f"not {register}.stat.exists or ({_closed_to_others(register)})"
+    )
+    message = _flat(owned["ansible.builtin.assert"]["fail_msg"])
+    assert message.startswith("{{ item.item }} " + CLOSED_TO_OTHERS + " (for example mode 0755 owned by root:root).")
+    assert "does not change an existing install directory before the review gate" in message
+    message = _flat(environment["ansible.builtin.assert"]["fail_msg"])
+    assert message.startswith("{{ agent_chat_venv }} " + CLOSED_TO_OTHERS + ".")
+    assert "does not trust or repair an existing release environment that is not" in message
+    assert message.endswith("Remove it by hand and rerun.")
+
+    # The order: the look-up of the directories, both checks of them, the look-up of the environment and its check,
+    # then the first task that creates a directory, then the first task that trusts the stamp or runs from the
+    # environment, all before the gate. That first task is found from the variables that name the environment, not
+    # from a task name, so a task that starts to use them ahead of the checks fails here. The stamp, the staged
+    # directory and the admin command all sit inside the environment or run from it.
+    checks = (look, traversal, owned, environment_look, environment)
+    uses_environment = re.compile(r"agent_chat_(venv|stamp|staged|admin)\b")
+    users = [
+        index
+        for index, task in enumerate(tasks)
+        if task["name"] not in {check["name"] for check in checks} and uses_environment.search(json.dumps(task))
+    ]
+    assert names[users[0]] == "Install Agent Chat into its versioned virtual environment"
+    chain = [
+        *(names.index(check["name"]) for check in checks),
+        names.index("Create the missing install directories"),
+        users[0],
+        gate,
+    ]
+    assert chain == sorted(chain)
+    # Every task that validates a staged file with the environment's python, or runs the admin command, comes after.
+    assert {names[index] for index in users if index < gate} == {
+        "Install Agent Chat into its versioned virtual environment",
+        "Create the directory for the staged configuration",
+        "Stage the server configuration",
+        "Stage the MCP configuration",
+        "List the pending migrations",
+    }
+
+
+def test_ansible_install_tree_conditions_accept_a_closed_root_owned_directory_and_refuse_every_other_writer():
+    # `_truth` runs the two conditions of the play on each sample, as Jinja does. Each sample was also run through the
+    # real asserts with ansible-core 2.18 on localhost, as a hand-made stat result, and ansible-core agreed. The
+    # asserts also ran on real temporary trees, with the existing `daemon` account standing in for the service user:
+    # a root:daemon 0775 install root, a `venvs` directory owned by `daemon`, and a release environment owned by
+    # `daemon` with a forged `.installed` and an executable `bin/python` that writes a marker file were refused, and
+    # the marker file was never created; the same tasks without these asserts created it. A tree owned by root with
+    # mode 0755 or 0750 passed, and so did a missing one.
+    accepted, refused = CLOSED_TREE_SAMPLES
+    owned = _task(INSTALL_TREE_CHECK)["ansible.builtin.assert"]["that"]
+    environment = _task(RELEASE_ENV_CHECK)["ansible.builtin.assert"]["that"]
+    register = _task(RELEASE_ENV_LOOK)["register"]
+    for expected, samples in ((True, accepted), (False, refused)):
+        for label, mode, uid, kind in samples:
+            stat = _stat(mode, uid, kind)
+            assert _truth(owned, item=SimpleNamespace(stat=stat)) is expected, label
+            assert _truth(environment, **{register: SimpleNamespace(stat=stat)}) is expected, label
+
+
+def test_ansible_guide_states_the_ownership_rule_next_to_the_traversal_rule():
+    guide = _flat((ROOT / "docs" / "ansible.md").read_text())
+    # The run order says it where it states the traversal rule, in the words of the message; the upgrade text says it
+    # again, with the reason, and the rollback text applies it to an old environment.
+    assert guide.count("`<directory> " + CLOSED_TO_OTHERS + "`") == 2
+    assert "such a layout is unsupported. Only root may write to the install root, to `venvs` and to an" in guide
+    assert "existing release environment: each is a real directory owned by root that neither its group" in guide
+    assert guide.count("for example `root:root` with mode 0755 or `root:agent-chat` with mode 0750") == 2
+    for sentence in (
+        "It does not trust or repair a release environment that it refuses: remove it by hand and rerun.",
+        "could plant an environment with a forged install stamp and a `bin/python` of its own, and root would run it",
+        "A link in place of one of them is refused too, because the play cannot see who can write to its target.",
+        "it does not repair a release environment that it refuses: change the directory, or remove the environment",
+        "The ownership rule above holds for an existing environment of either variant",
+    ):
+        assert sentence in guide, sentence
 
 
 def test_ansible_playbook_never_reads_the_dsn_and_passes_it_as_a_credential():
