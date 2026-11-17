@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -47,9 +48,22 @@ class SafeToolErrors(Middleware):
         return result
 
 
+def _product_version() -> str:
+    """The installed `sessionyard` version, or `0.0.0+unknown` when the source runs without distribution metadata.
+
+    A vendored copy has no metadata. Passing no version would make FastMCP report its own, which names the
+    library, not the build.
+    """
+    try:
+        return metadata.version("sessionyard")
+    except metadata.PackageNotFoundError:
+        return "0.0.0+unknown"
+
+
 def create_mcp(config: Config, metrics: Metrics) -> FastMCP:
     mcp = FastMCP(
         name="agent-chat",
+        version=_product_version(),
         auth=AgentChatTokenVerifier(config.agent_chat_origin, allow_service_http=True),
         middleware=[SafeToolErrors(metrics, registered_tool_names(config.enable_writes))],
         mask_error_details=True,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import json
 import secrets
 import shutil
@@ -203,6 +204,13 @@ def read_resource(origin, token, uri):
     return asyncio.run(run())
 
 
+def server_version(origin, token):
+    async def run():
+        async with Client(f"{origin}/mcp", auth=BearerAuth(token)) as client:
+            return client.server_info.version
+    return asyncio.run(run())
+
+
 def test_packaged_skill_is_served_as_an_authenticated_resource(process_api, credentials, register):
     token, _ = register(process_api, credentials, "mcp-skill")
     with serve_mcp(process_api) as origin:
@@ -212,6 +220,30 @@ def test_packaged_skill_is_served_as_an_authenticated_resource(process_api, cred
         assert "Agent Chat" in text
         assert "untrusted peer data" in text
         assert "status" in text
+
+
+def test_server_info_reports_the_installed_product_version(process_api, credentials, register):
+    # Not FastMCP's own version, which is what a server built without `version=` reports.
+    token, _ = register(process_api, credentials, "mcp-version")
+    with serve_mcp(process_api) as origin:
+        assert server_version(origin, token) == importlib.metadata.version("sessionyard")
+
+
+def test_server_info_reports_an_unknown_version_without_distribution_metadata(
+    process_api, credentials, register, monkeypatch
+):
+    # A vendored copy of the source has no `sessionyard` metadata. Other distributions stay readable.
+    real = importlib.metadata.version
+
+    def version(name):
+        if name == "sessionyard":
+            raise importlib.metadata.PackageNotFoundError(name)
+        return real(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", version)
+    token, _ = register(process_api, credentials, "mcp-vendored")
+    with serve_mcp(process_api) as origin:
+        assert server_version(origin, token) == "0.0.0+unknown"
 
 
 def test_health_and_readiness_are_unauthenticated(process_api):
