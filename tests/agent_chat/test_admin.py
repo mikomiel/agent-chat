@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
+import psycopg
 import pytest
 import uvicorn
 from psycopg import Connection
@@ -321,7 +322,9 @@ def test_serve_does_not_connect_to_the_database_at_startup(workdir, no_listener,
     assert run(["serve", "--config", write_config(workdir, enabled=True)], environ=environ)[0] == 0
 
 
-def test_database_failure_is_coded_and_hides_connection_details(workdir):
+def test_database_failure_is_coded_and_hides_connection_details(workdir, monkeypatch):
+    # A zero budget is the single attempt without a waiting line, as before the wait existed.
+    monkeypatch.setattr(admin, "MIGRATE_WAIT_SECONDS", 0)
     environ = write_dsn(workdir, SECRET_DSN)
     code, out, err = run(["migrate", "--config", write_config(workdir)], environ=environ)
     assert (code, out, err) == (1, "", "agent-chat-admin: DATABASE_UNAVAILABLE\n")
@@ -1287,8 +1290,10 @@ def run_on_journal_stderr(argv, workdir, *, environ, journal=True):
 
 
 @pytest.mark.parametrize("command", [["prune"], ["migrate"]])
-def test_unreachable_database_diagnostic_carries_the_error_priority(workdir, command):
-    # Fails before Uvicorn's formatter exists: the process prefixes its own line.
+def test_unreachable_database_diagnostic_carries_the_error_priority(workdir, command, monkeypatch):
+    # Fails before Uvicorn's formatter exists: the process prefixes its own line. A zero budget keeps migrate's
+    # output to that line; the waiting lines have their own test.
+    monkeypatch.setattr(admin, "MIGRATE_WAIT_SECONDS", 0)
     environ = write_dsn(workdir, SECRET_DSN)
     code, out, err = run_on_journal_stderr([*command, "--config", write_config(workdir)], workdir, environ=environ)
     assert (code, out, err) == (1, "", "<3>agent-chat-admin: DATABASE_UNAVAILABLE\n")
@@ -1322,3 +1327,152 @@ def test_diagnostic_has_no_priority_prefix_outside_the_journal_stream(workdir):
         ["prune", "--config", write_config(workdir)], workdir, environ=environ, journal=False
     )
     assert (code, out, err) == (1, "", "agent-chat-admin: DATABASE_UNAVAILABLE\n")
+
+
+# An applying `migrate` waits for a late database. `admin.monotonic`, `admin.sleep` and `admin.connect` are replaced
+# in the module under test only: the database fixtures keep real time and nothing here sleeps.
+
+
+class FakeClock:
+    """A sleep only moves the clock, so a wait of minutes takes no time and its length is exact."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        # A loop that never ends fails here instead of spinning.
+        assert len(self.slept) < 1000, "the wait did not end"
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = FakeClock()
+    monkeypatch.setattr(admin, "monotonic", fake.monotonic)
+    monkeypatch.setattr(admin, "sleep", fake.sleep)
+    return fake
+
+
+def refuse_connections(monkeypatch, times=None):
+    """Make `admin.connect` raise OperationalError `times` times (every time when None), then connect for real.
+
+    Returns the list of attempts. The error text is a marker that no output may carry.
+    """
+    attempts = []
+    real = admin.connect
+
+    def refusing(dsn):
+        attempts.append(dsn)
+        if times is None or len(attempts) <= times:
+            raise psycopg.OperationalError("sentinel-libpq-text host=sentinel-host")
+        return real(dsn)
+
+    monkeypatch.setattr(admin, "connect", refusing)
+    return attempts
+
+
+APPLIED_ALL = "applied=1,2,3,4,5,6,7,8,9,10,11 current=11\n"
+
+
+def test_migrate_waits_for_a_database_that_becomes_reachable(workdir, database, clock, monkeypatch):
+    attempts = refuse_connections(monkeypatch, times=3)
+    environ = write_dsn(workdir, database)
+    code, out, err = run(["migrate", "--config", write_config(workdir)], environ=environ)
+    assert (code, out) == (0, APPLIED_ALL)
+    assert err == "".join(f"agent-chat-admin: WAITING_FOR_DATABASE (attempt {n})\n" for n in (1, 2, 3))
+    assert (len(attempts), clock.slept) == (4, [1, 2, 4])
+    assert _schema_state(database) == list(range(1, 12))
+
+
+def test_a_reviewed_apply_waits_for_the_database_too(workdir, database, clock, monkeypatch):
+    environ = write_dsn(workdir, database)
+    config = write_config(workdir)
+    (digest,) = _reviewed_digest(environ, config)
+    attempts = refuse_connections(monkeypatch, times=1)
+    code, out, err = _apply_reviewed(environ, config, digest)
+    assert (code, out) == (0, APPLIED_ALL)
+    assert err == "agent-chat-admin: WAITING_FOR_DATABASE (attempt 1)\n"
+    assert (len(attempts), clock.slept) == (2, [1])
+
+
+def test_migrate_gives_up_after_the_wait_budget_with_the_unchanged_failure(workdir, clock, monkeypatch):
+    attempts = refuse_connections(monkeypatch)
+    environ = write_dsn(workdir, SECRET_DSN)
+    code, out, err = run(["migrate", "--config", write_config(workdir)], environ=environ)
+    assert (code, out) == (1, "")
+    *waiting, failure = err.splitlines()
+    # Same line and exit status as a single failed attempt; one retry line per wait before it.
+    assert failure == "agent-chat-admin: DATABASE_UNAVAILABLE"
+    assert waiting == [f"agent-chat-admin: WAITING_FOR_DATABASE (attempt {n})" for n in range(1, len(attempts))]
+    assert len(clock.slept) == len(attempts) - 1
+    # The delay doubles from 1 s to the 10 s limit, and the waits add up to the budget and no more.
+    assert clock.slept[:6] == [1, 2, 4, 8, 10, 10] and max(clock.slept) == 10
+    assert sum(clock.slept) == admin.MIGRATE_WAIT_SECONDS
+    assert "sentinel" not in err and "nonexistent" not in err
+
+
+def test_a_zero_wait_budget_is_a_single_attempt_without_a_waiting_line(workdir, clock, monkeypatch):
+    monkeypatch.setattr(admin, "MIGRATE_WAIT_SECONDS", 0)
+    attempts = refuse_connections(monkeypatch)
+    environ = write_dsn(workdir, SECRET_DSN)
+    result = run(["migrate", "--config", write_config(workdir)], environ=environ)
+    assert result == (1, "", "agent-chat-admin: DATABASE_UNAVAILABLE\n")
+    assert (len(attempts), clock.slept) == (1, [])
+
+
+def test_a_failure_after_the_connection_is_not_retried(workdir, database, clock, monkeypatch):
+    # Only the connect is retried. It runs no statement, so a retry cannot repeat or half-apply a migration.
+    attempts = refuse_connections(monkeypatch, times=0)
+
+    def lose_the_connection(*_args, **_kwargs):
+        raise psycopg.OperationalError("sentinel-libpq-text")
+
+    monkeypatch.setattr(admin, "migrate", lose_the_connection)
+    environ = write_dsn(workdir, database)
+    result = run(["migrate", "--config", write_config(workdir)], environ=environ)
+    assert result == (1, "", "agent-chat-admin: DATABASE_UNAVAILABLE\n")
+    assert (len(attempts), clock.slept) == (1, [])
+
+
+def test_a_dsn_libpq_cannot_parse_fails_at_once(workdir, clock):
+    environ = write_dsn(workdir, "this is not a connection string")
+    result = run(["migrate", "--config", write_config(workdir)], environ=environ)
+    assert result == (1, "", "agent-chat-admin: DATABASE_UNAVAILABLE\n")
+    assert clock.slept == []
+
+
+@pytest.mark.parametrize(
+    ("command", "flags"),
+    [
+        (["migrate"], ["--check"]),
+        (["prune"], []),
+        (["principal", "revoke"], ["--name", "alpha"]),
+        (["principal", "ensure"], ["--name", "alpha", "--kind", "operator"]),
+    ],
+)
+def test_only_an_applying_migrate_waits_for_the_database(workdir, clock, monkeypatch, command, flags):
+    attempts = refuse_connections(monkeypatch)
+    environ = write_dsn(workdir, SECRET_DSN)
+    argv = [*command, "--config", write_config(workdir), *flags]
+    result = run(argv, environ=environ, stdin=secrets.token_hex(32) + "\n")
+    assert result == (1, "", "agent-chat-admin: DATABASE_UNAVAILABLE\n")
+    assert (len(attempts), clock.slept) == (1, [])
+
+
+def test_migrate_wait_lines_are_informational_and_the_final_failure_an_error_on_the_journal(
+    workdir, clock, monkeypatch
+):
+    refuse_connections(monkeypatch)
+    environ = write_dsn(workdir, SECRET_DSN)
+    code, out, err = run_on_journal_stderr(["migrate", "--config", write_config(workdir)], workdir, environ=environ)
+    *waiting, failure = err.splitlines()
+    assert (code, out) == (1, "")
+    assert failure == "<3>agent-chat-admin: DATABASE_UNAVAILABLE"
+    assert waiting and all(
+        line == f"<6>agent-chat-admin: WAITING_FOR_DATABASE (attempt {n})" for n, line in enumerate(waiting, 1)
+    )
