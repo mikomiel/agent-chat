@@ -30,6 +30,7 @@ from ..models import (
     Reply,
     WorkDeclaration,
 )
+from ..protocol import MAX_CURSOR
 from .config import Config
 
 REQUEST_SECONDS = 20.0
@@ -95,11 +96,28 @@ def register(mcp: FastMCP, config: Config) -> None:
         online: bool = False,
         limit: int = 100,
         after_session: str | None = None,
+        sort: str | None = None,
+        harness: str | None = None,
+        host: str | None = None,
+        repository: str | None = None,
+        ref: str | None = None,
+        q: str | None = None,
+        fields: str | None = None,
     ) -> dict[str, Any]:
-        """List participants in a room, in ascending session-id order."""
+        """List participants in a room. By default rows come in ascending session-id order and page with
+        ``after_session``. ``sort="activity"`` returns one page of at most ``limit`` rows (no ``after_session``, no
+        continuation): live sessions first, then the most recently seen. Filters apply before paging and combine:
+        ``online``, exact ``harness`` and ``host``, ``repository`` (``owner/repo`` in the work declaration of a live
+        session), ``ref`` (a thread key the session published into) and ``q`` (case-insensitive substring of label or
+        title). ``fields`` is a comma-separated list of row keys; only those keys are returned. ``last_seen_at``
+        (last heartbeat or publication) and ``recent_refs`` (up to 5 thread keys the session published into, newest
+        first, each as ``ref_key`` and ``last_at``) are returned only when named in ``fields``."""
         def call(client: Client) -> dict[str, Any]:
             room_id = _room(client, room)
-            query = _query(online=online, limit=limit, after_session=after_session)
+            query = _query(
+                online=online, limit=limit, after_session=after_session, sort=sort, harness=harness, host=host,
+                repository=repository, ref=ref, q=q, fields=fields,
+            )
             return client.request("GET", f"/v1/rooms/{room_id}/participants?{query}")
         return _run(config, call)
 
@@ -112,12 +130,21 @@ def register(mcp: FastMCP, config: Config) -> None:
         thread_id: str | None = None,
         ref_key: str | None = None,
         sender_role: str | None = None,
+        latest: bool = False,
     ) -> dict[str, Any]:
-        """Read a bounded room history page, optionally narrowed to a thread or key."""
+        """Read a bounded room history page, optionally narrowed to a thread or key. Messages come in commit order.
+        By default pages read forward from ``after`` (the oldest retained message when absent). ``latest`` reads the
+        newest page instead; its ``next_cursor`` is the ``before`` value of the next older page. Continue backwards
+        with ``before`` set to the previous ``next_cursor``, and stop when ``has_more`` is false: that page holds the
+        oldest messages. A backward read never repeats a message. ``latest`` cannot be combined with ``after`` or
+        ``before``."""
+        if latest and (after is not None or before is not None):
+            return {"error": {"code": "INVALID_REQUEST"}}
+
         def call(client: Client) -> dict[str, Any]:
             room_id = _room(client, room)
             query = _query(
-                after=after, before=before, limit=limit, thread_id=thread_id,
+                after=after, before=str(MAX_CURSOR) if latest else before, limit=limit, thread_id=thread_id,
                 ref_key=ref_key, sender_role=sender_role,
             )
             return client.request("GET", f"/v1/rooms/{room_id}/history?{query}")

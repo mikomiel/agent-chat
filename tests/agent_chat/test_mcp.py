@@ -614,3 +614,157 @@ def test_write_tools_declare_lane_work_and_mute(process_api, credentials, regist
         assert "error" not in call(origin, token, "work", {"clear": True})
         assert "error" not in call(origin, token, "mute")
         assert "error" not in call(origin, token, "unmute")
+
+
+def record_requests(monkeypatch):
+    """Every path the in-process MCP service asks the Agent Chat service for, in order."""
+    seen = []
+    original = ChatClient.request
+
+    def recording(self, method, path, *args, **kwargs):
+        seen.append(path)
+        return original(self, method, path, *args, **kwargs)
+
+    monkeypatch.setattr(ChatClient, "request", recording)
+    return seen
+
+
+def read_paths(seen, name):
+    return [path.split("/", 4)[-1] for path in seen if f"/{name}?" in path]
+
+
+def test_history_latest_returns_the_newest_page_and_pages_backwards_without_repeats(
+    process_api, credentials, register, send
+):
+    token, _ = register(process_api, credentials, "mcp-history-latest")
+    bodies = [f"message {number:02d}" for number in range(25)]
+    for body in bodies:
+        send(process_api, credentials, body)
+    with serve_mcp(process_api) as origin:
+        newest = call(origin, token, "history", {"room": "homelab", "latest": True, "limit": 20})
+        assert [message["body"] for message in newest["messages"]] == bodies[5:]
+        assert newest["has_more"] is True
+        everything = call(origin, token, "history", {"room": "homelab", "limit": 100})
+        assert [message["cursor"] for message in newest["messages"]] == [
+            message["cursor"] for message in everything["messages"][5:]
+        ]
+        # Backward paging: each page is older than the last, never re-reads the head, and ends on has_more.
+        pages, cursor = [newest], newest["next_cursor"]
+        while pages[-1]["has_more"]:
+            pages.append(call(origin, token, "history", {"room": "homelab", "before": cursor, "limit": 8}))
+            cursor = pages[-1]["next_cursor"]
+        assert [message["body"] for message in pages[1]["messages"]] == bodies[:5]
+        assert len(pages) == 2 and pages[1]["has_more"] is False
+        small = [call(origin, token, "history", {"room": "homelab", "latest": True, "limit": 10})]
+        while small[-1]["has_more"]:
+            small.append(
+                call(origin, token, "history", {"room": "homelab", "before": small[-1]["next_cursor"], "limit": 10})
+            )
+        seen = [message["body"] for page in reversed(small) for message in page["messages"]]
+        assert seen == bodies and len(seen) == len(set(seen))
+        assert [len(page["messages"]) for page in small] == [10, 10, 5]
+        # A room read to its start answers an empty page on the next step, so callers must stop on has_more.
+        past_the_start = {"room": "homelab", "before": small[-1]["next_cursor"]}
+        assert call(origin, token, "history", past_the_start)["messages"] == []
+
+
+@pytest.mark.parametrize("extra", [{"after": "1"}, {"before": "9223372036854775807"}, {"after": "1", "before": "2"}])
+def test_history_latest_refuses_after_and_before_before_any_request(
+    process_api, credentials, register, monkeypatch, extra
+):
+    token, _ = register(process_api, credentials, "mcp-history-exclusive")
+    with serve_mcp(process_api) as origin:
+        seen = record_requests(monkeypatch)
+        # A room that does not exist: only the local refusal answers INVALID_REQUEST without asking the service.
+        assert call(origin, token, "history", {"room": "no-such-room", "latest": True, **extra}) == {
+            "error": {"code": "INVALID_REQUEST"}
+        }
+        assert call(origin, token, "history", {"room": "homelab", "latest": True, **extra}) == {
+            "error": {"code": "INVALID_REQUEST"}
+        }
+        assert [path for path in seen if path.startswith("/v1/rooms")] == []
+        assert call(origin, token, "history", {"room": "no-such-room"})["error"]["code"] != "INVALID_REQUEST"
+
+
+def test_history_and_who_keep_their_requests_unless_a_new_argument_is_given(
+    process_api, credentials, register, monkeypatch
+):
+    token, _ = register(process_api, credentials, "mcp-request-lines")
+    with serve_mcp(process_api) as origin:
+        seen = record_requests(monkeypatch)
+        call(origin, token, "history", {"room": "homelab"})
+        call(origin, token, "history", {"room": "homelab", "latest": False})
+        call(origin, token, "history", {"room": "homelab", "latest": True, "limit": 20})
+        call(origin, token, "history", {"room": "homelab", "before": "42", "limit": 5})
+        call(origin, token, "who", {"room": "homelab"})
+        call(origin, token, "who", {"room": "homelab", "online": True, "limit": 5})
+        call(
+            origin, token, "who",
+            {
+                "room": "homelab", "limit": 5, "sort": "activity", "harness": "claude", "host": "alpha",
+                "repository": "owner/repo", "ref": "pr:owner/repo#7", "q": "a b%", "fields": "session_id,last_seen_at",
+            },
+        )
+    assert read_paths(seen, "history") == [
+        "history?limit=100",
+        "history?limit=100",
+        "history?before=9223372036854775807&limit=20",
+        "history?before=42&limit=5",
+    ]
+    assert read_paths(seen, "participants") == [
+        "participants?online=false&limit=100",
+        "participants?online=true&limit=5",
+        "participants?online=false&limit=5&sort=activity&harness=claude&host=alpha&repository=owner%2Frepo"
+        "&ref=pr%3Aowner%2Frepo%237&q=a+b%25&fields=session_id%2Clast_seen_at",
+    ]
+
+
+def test_who_sorts_filters_and_projects_through_the_tool(process_api, credentials, register, db):
+    token, own = register(process_api, credentials, "mcp-who-navigation")
+    _, peer = register(process_api, credentials, "mcp-who-peer")
+    db.execute(
+        "UPDATE agent_chat.sessions SET title = 'Reviewing privileges' WHERE id = %s", (peer["session_id"],)
+    )
+    db.execute(
+        "UPDATE agent_chat.instances SET heartbeat_at = clock_timestamp() - interval '30 seconds'"
+        " WHERE session_id = %s",
+        (own["session_id"],),
+    )
+    with serve_mcp(process_api, enable_writes=True) as origin:
+        newest = call(
+            origin, token, "who",
+            {
+                "room": "homelab", "online": True, "sort": "activity", "limit": 5,
+                "fields": "session_id,title,harness,last_seen_at",
+            },
+        )
+        assert [row["session_id"] for row in newest["participants"]] == [peer["session_id"], own["session_id"]]
+        assert all(list(row) == ["session_id", "title", "harness", "last_seen_at"] for row in newest["participants"])
+        assert newest["next_session_id"] is None
+        by_title = call(origin, token, "who", {"room": "homelab", "q": "PRIVILEGE", "fields": "session_id"})
+        assert by_title["participants"] == [{"session_id": peer["session_id"]}]
+        assert call(origin, token, "who", {"room": "homelab", "q": "%"})["participants"] == []
+        assert "error" not in call(origin, token, "work", {"github": ["owner/repo"]})
+        working = call(origin, token, "who", {"room": "homelab", "repository": "owner/repo", "fields": "session_id"})
+        assert working["participants"] == [{"session_id": own["session_id"]}]
+        assert call(origin, token, "who", {"room": "homelab", "repository": "owner/other"})["participants"] == []
+        keyed = {"room": "homelab", "body": "keyed", "key": str(uuid4()), "ref_key": "pr:owner/repo#7"}
+        assert "error" not in call(origin, token, "send", keyed)
+        published = {"room": "homelab", "ref": "pr:owner/repo#7", "fields": "session_id,recent_refs"}
+        refs = call(origin, token, "who", published)
+        assert [row["session_id"] for row in refs["participants"]] == [own["session_id"]]
+        assert [entry["ref_key"] for entry in refs["participants"][0]["recent_refs"]] == ["pr:owner/repo#7"]
+        default = call(origin, token, "who", {"room": "homelab"})
+        assert {"last_seen_at", "recent_refs"}.isdisjoint(default["participants"][0])
+        for refused in (
+            {"sort": "newest"},
+            {"sort": "activity", "after_session": peer["session_id"]},
+            {"fields": "nope"},
+            {"fields": ""},
+            {"repository": "not-a-repository"},
+            {"ref": "not-a-ref"},
+            {"q": ""},
+            {"q": "\x00"},
+        ):
+            answer = call(origin, token, "who", {"room": "homelab", **refused})
+            assert answer == {"error": {"code": "INVALID_REQUEST"}}, refused
