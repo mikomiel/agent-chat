@@ -62,6 +62,11 @@ def test_quadlet_units_are_native_and_secure():
     assert migrate["Service"]["remainafterexit"] == "yes"
     assert migrate["Container"]["exec"].startswith("migrate ")
 
+    # A read-only root gives crun 1.31+ and runc 1.5.2 no mount point for the secret.
+    for name in ("agent-chat.container", "agent-chat-migrate.container"):
+        lines = (QUADLET / name).read_text().splitlines()
+        assert "Tmpfs=/run/secrets:rw,noexec,nosuid,size=1m,mode=0755" in lines
+
     mcp = _quadlet("agent-chat-mcp.container")
     assert mcp["Container"]["image"] == "localhost/agent-chat-mcp:local"
     assert mcp["Container"]["exec"].startswith("--config ")
