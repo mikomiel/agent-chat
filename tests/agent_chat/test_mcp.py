@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import shutil
 import socket
@@ -21,12 +22,15 @@ import uvicorn
 from fastmcp import Client
 from fastmcp.client.auth import BearerAuth
 from fastmcp.exceptions import ToolError
+from fastmcp.server import auth as fastmcp_auth
+from psycopg import sql
 
 from agent_chat.client import Client as ChatClient
 from agent_chat.mcp.app import create_app
-from agent_chat.mcp.auth import AgentChatTokenVerifier
+from agent_chat.mcp.auth import AgentChatTokenVerifier, UpstreamUnavailable, _upstream_unavailable
 from agent_chat.mcp.config import Config
 from agent_chat.models import ChatError
+from agent_chat.storage import connect
 
 
 class DestinationHandler(BaseHTTPRequestHandler):
@@ -60,6 +64,15 @@ class ReadyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(b'{"status":"ready"}')
+
+    def log_message(self, *_args):
+        pass
+
+
+class BadGatewayHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(502)
+        self.end_headers()
 
     def log_message(self, *_args):
         pass
@@ -203,6 +216,52 @@ def read_resource(origin, token, uri):
     return asyncio.run(run())
 
 
+TOOL_CALL = json.dumps(
+    {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "status", "arguments": {}}}
+).encode()
+UPSTREAM_UNAVAILABLE_LINE = "code=UPSTREAM_UNAVAILABLE route=unmatched status=503 exc=UpstreamUnavailable"
+
+
+def post_tool_call(origin, token):
+    """One raw `tools/call` of `status`: the HTTP status, the response headers and the body."""
+    with closing(HTTPConnection("127.0.0.1", int(origin.rsplit(":", 1)[1]), timeout=8)) as connection:
+        connection.request(
+            "POST", "/mcp", body=TOOL_CALL,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+                "Authorization": "Bearer " + token,
+            },
+        )
+        response = connection.getresponse()
+        body = response.read()
+        return response.status, response.headers, body
+
+
+def tool_call_counters(origin):
+    status, text = get_text(origin, "/metrics")
+    assert status == 200
+    return [line for line in text.splitlines() if line.startswith("agent_chat_mcp_tool_calls_total")]
+
+
+@contextmanager
+def database_refusing_connections(cluster, db):
+    """As when PostgreSQL is stopped: a new connection to the test database fails at once."""
+    name = db.execute("SELECT current_database() AS name").fetchone()["name"]
+    # PostgreSQL refuses to change the current database's setting, so a connection to the cluster's own does it.
+    with connect(cluster) as admin:
+        admin.execute(sql.SQL("ALTER DATABASE {} ALLOW_CONNECTIONS false").format(sql.Identifier(name)))
+        try:
+            yield
+        finally:
+            admin.execute(sql.SQL("ALTER DATABASE {} ALLOW_CONNECTIONS true").format(sql.Identifier(name)))
+
+
+def error_log_records(caplog):
+    """The lines of the shared error log, the one the API writes `code=... route=... status=... exc=...` to."""
+    return [record for record in caplog.records if record.name == "agent_chat.api"]
+
+
 def test_packaged_skill_is_served_as_an_authenticated_resource(process_api, credentials, register):
     token, _ = register(process_api, credentials, "mcp-skill")
     with serve_mcp(process_api) as origin:
@@ -333,6 +392,52 @@ def test_complete_liveness_evidence_is_accepted(monkeypatch):
     assert "instance_id" in token.claims
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ChatError("TRANSPORT_UNAVAILABLE"),
+        ChatError("SERVICE_UNAVAILABLE"),
+        ChatError("CLI_INTERRUPTED"),
+        ChatError("DATABASE_UNAVAILABLE"),
+        OSError("synthetic-private-detail"),
+    ],
+    ids=["transport", "server_5xx", "deadline", "database", "os_error"],
+)
+def test_no_verdict_from_the_service_is_not_a_rejection(monkeypatch, failure):
+    verifier = AgentChatTokenVerifier("http://127.0.0.1:1")
+
+    def unavailable(_token):
+        raise failure
+
+    monkeypatch.setattr(verifier, "_status", unavailable)
+    with pytest.raises(UpstreamUnavailable) as error:
+        asyncio.run(verifier.verify_token(secrets.token_hex(32)))
+    assert error.value.args == ()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ChatError("UNAUTHENTICATED"),
+        ChatError("SESSION_FORBIDDEN"),
+        ChatError("STALE_INSTANCE"),
+        ChatError("HTTP_REFUSED"),
+        ChatError("REDIRECT_REFUSED"),
+        ValueError("synthetic"),
+        TypeError("synthetic"),
+    ],
+    ids=["401", "403", "409", "unnamed_refusal", "redirect", "value_error", "type_error"],
+)
+def test_a_refusal_stays_a_rejection(monkeypatch, failure):
+    verifier = AgentChatTokenVerifier("http://127.0.0.1:1")
+
+    def refused(_token):
+        raise failure
+
+    monkeypatch.setattr(verifier, "_status", refused)
+    assert asyncio.run(verifier.verify_token(secrets.token_hex(32))) is None
+
+
 def test_internal_service_origin_authenticates_and_calls_a_tool(process_api, credentials, register, monkeypatch):
     token, binding = register(process_api, credentials, "mcp-service-origin")
     port = int(process_api.origin.rsplit(":", 1)[1])
@@ -419,6 +524,80 @@ def test_revoked_instance_is_rejected(process_api, credentials, register, db):
         (binding["session_id"],),
     )
     assert asyncio.run(verifier.verify_token(token)) is None
+
+
+def test_database_outage_answers_503_and_the_same_token_works_after_it(
+    process_api, credentials, register, db, postgres_cluster, caplog
+):
+    token, binding = register(process_api, credentials, "mcp-outage")
+    caplog.set_level(logging.WARNING, logger="agent_chat.api")
+    with serve_mcp(process_api) as origin:
+        # The control: this exact request authenticates and runs the tool.
+        status, _headers, _body = post_tool_call(origin, token)
+        assert status == 200
+        executed = tool_call_counters(origin)
+        assert executed and all('tool="status"' in line for line in executed)
+        with database_refusing_connections(postgres_cluster, db):
+            # The service's own answer to the same token, as the issue records it.
+            status, refusal = process_api.request("GET", "/v1/instance/status", token=token)
+            assert (status, refusal["error"]["code"]) == (503, "DATABASE_UNAVAILABLE")
+            status, headers, body = post_tool_call(origin, token)
+            assert status == 503
+            assert headers["Retry-After"] == "5"
+            assert headers["Content-Type"] == "application/json"
+            assert json.loads(body) == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
+            assert "WWW-Authenticate" not in headers
+        assert tool_call_counters(origin) == executed
+        # The outage was not remembered as a bad token: the same token needs no new registration.
+        assert call(origin, token, "status")["session_id"] == binding["session_id"]
+    (record,) = error_log_records(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == UPSTREAM_UNAVAILABLE_LINE
+    assert record.exc_info is None
+    assert token not in caplog.text
+
+
+@pytest.mark.parametrize("upstream", ["refused", "bad_gateway"])
+def test_unreachable_or_failing_server_answers_503_not_401(process_api, caplog, upstream):
+    token = secrets.token_hex(32)
+    caplog.set_level(logging.WARNING, logger="agent_chat.api")
+    with http_server(BadGatewayHandler) as gateway:
+        origin = "http://127.0.0.1:1" if upstream == "refused" else f"http://127.0.0.1:{gateway.server_port}"
+        with serve_mcp(process_api, agent_chat_origin=origin) as mcp:
+            status, headers, body = post_tool_call(mcp, token)
+            assert status == 503
+            assert headers["Retry-After"] == "5"
+            assert json.loads(body) == {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"}
+    (record,) = error_log_records(caplog)
+    assert record.getMessage() == UPSTREAM_UNAVAILABLE_LINE
+    assert token not in caplog.text
+
+
+def test_rejected_tokens_still_answer_401_while_the_service_is_up(process_api, credentials, register, db, caplog):
+    token, binding = register(process_api, credentials, "mcp-rejected")
+    lapsed, lapsed_binding = register(process_api, credentials, "mcp-lapsed")
+    caplog.set_level(logging.WARNING, logger="agent_chat.api")
+    with serve_mcp(process_api) as origin:
+        # Both tokens are live until the service refuses or lapses them.
+        assert post_tool_call(origin, token)[0] == post_tool_call(origin, lapsed)[0] == 200
+        executed = tool_call_counters(origin)
+        db.execute(
+            "UPDATE agent_chat.principals SET revoked = true WHERE id = "
+            "(SELECT principal_id FROM agent_chat.sessions WHERE id = %s)",
+            (binding["session_id"],),
+        )
+        db.execute(
+            "UPDATE agent_chat.instances SET heartbeat_at = clock_timestamp() - interval '10 minutes' "
+            "WHERE session_id = %s",
+            (lapsed_binding["session_id"],),
+        )
+        for rejected in (token, lapsed, secrets.token_hex(32), credentials.operator, "not-a-token"):
+            status, headers, _body = post_tool_call(origin, rejected)
+            assert status == 401
+            assert 'error="invalid_token"' in headers["WWW-Authenticate"]
+            assert "Retry-After" not in headers
+        assert tool_call_counters(origin) == executed
+    assert error_log_records(caplog) == []
 
 
 def test_mcp_requires_a_bearer_token(process_api):
@@ -582,3 +761,12 @@ def test_write_tools_declare_lane_work_and_mute(process_api, credentials, regist
         assert "error" not in call(origin, token, "work", {"clear": True})
         assert "error" not in call(origin, token, "mute")
         assert "error" not in call(origin, token, "unmute")
+
+
+def test_the_verifier_keeps_fastmcp_default_middleware_and_only_adds_on_error():
+    # get_middleware copies FastMCP's default pair to add `on_error`. A FastMCP upgrade that changes the
+    # default set must fail here rather than silently drop a middleware.
+    verifier = AgentChatTokenVerifier.__new__(AgentChatTokenVerifier)
+    ours = verifier.get_middleware()
+    assert [m.cls for m in ours] == [m.cls for m in fastmcp_auth.TokenVerifier.get_middleware(verifier)]
+    assert ours[0].kwargs["on_error"] is _upstream_unavailable
