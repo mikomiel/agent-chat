@@ -50,10 +50,17 @@ The service MUST give a browser session only for a non-revoked operator or viewe
 #### Scenario: Malformed credential
 - **WHEN** the presented value is not 64 lowercase hexadecimal characters
 - **THEN** the service answers `INVALID_REQUEST` and creates no session
+- **AND** it counts no failed sign-in, and the refusal comes before the challenge is compared
 
 #### Scenario: Challenge missing or wrong
-- **WHEN** a sign-in has no exact public origin, or a missing or wrong CSRF value
+- **WHEN** a sign-in has no exact public origin, or its CSRF value is missing, is not 64 lowercase hexadecimal characters or does not match a present login cookie
 - **THEN** the service answers HTTP 403 and creates no session
+- **AND** it counts no failed sign-in
+
+#### Scenario: Login cookie missing or malformed
+- **WHEN** a sign-in carries a well-formed CSRF value but the login cookie is missing or is not 64 lowercase hexadecimal characters
+- **THEN** the service answers HTTP 401 `UNAUTHENTICATED` and creates no session
+- **AND** it counts no failed sign-in
 
 #### Scenario: Challenge is compared, not remembered
 - **WHEN** a sign-in presents a login cookie value together with the CSRF value derived from that value
@@ -71,16 +78,21 @@ The service MUST give a browser session only for a non-revoked operator or viewe
 - **AND** the next request with that cookie answers `UNAUTHENTICATED`
 
 ### Requirement: Failed sign-ins are limited service-wide
-The service MUST count failed sign-ins service-wide, in its database. After 10 failed sign-ins within 60 seconds it MUST answer every sign-in with `LOGIN_RATE_LIMITED` until those failures are older than 60 seconds, even when the credential is valid.
+The service MUST count a sign-in as failed only when a well-formed credential is refused as `UNAUTHENTICATED`, service-wide and in its database; an origin, body or challenge refusal is not counted. While 10 or more failures are younger than 60 seconds it MUST answer every sign-in that passes those checks with `LOGIN_RATE_LIMITED`, even when the credential is valid, and it MUST evaluate sign-ins normally again as soon as fewer than 10 remain.
 
 #### Scenario: Failures reach the limit
 - **WHEN** 10 failed sign-ins fall within 60 seconds
 - **THEN** the next sign-in, even with a valid credential, is refused with `LOGIN_RATE_LIMITED` and HTTP status 429
 - **AND** the count is service-wide and kept in the database, so a restart does not reset it
-- **AND** sign-in works again once those failures are older than 60 seconds
+- **AND** the window slides: sign-in works again as soon as fewer than 10 failures are younger than 60 seconds
+
+#### Scenario: Refusals that are not counted
+- **WHEN** 10 failures fall within 60 seconds and a sign-in then arrives with a wrong challenge, with a missing login cookie or with a malformed credential
+- **THEN** the service answers 403, 401 `UNAUTHENTICATED` or 422 `INVALID_REQUEST` respectively, not `LOGIN_RATE_LIMITED`
+- **AND** none of these refusals is counted as a failed sign-in
 
 ### Requirement: Cookie requests need the exact origin and a CSRF value
-The service MUST refuse a request whose `Origin` differs from the configured public origin, and a state-changing request that carries a session cookie, or that signs in, unless its `Origin` equals that origin exactly. Without a public origin it MUST refuse every request with an `Origin` or a `Cookie` header. A cookie-authenticated state change MUST carry the CSRF value derived from the session cookie. A request with both a session cookie and an `Authorization` header MUST be refused.
+The service MUST refuse a request whose `Origin` differs from the configured public origin, and a state-changing request that carries any `Cookie` header, or that signs in, unless its `Origin` equals that origin exactly. Without a public origin it MUST refuse every request with an `Origin` or a `Cookie` header. A cookie-authenticated state change MUST carry the CSRF value derived from the session cookie. A request with both a `Cookie` header and an `Authorization` header MUST be refused.
 
 #### Scenario: Foreign origin
 - **WHEN** a state-changing request has a valid session cookie and CSRF value but its `Origin` is another site, is `null` or is absent
@@ -88,8 +100,13 @@ The service MUST refuse a request whose `Origin` differs from the configured pub
 - **AND** the session stays valid
 
 #### Scenario: CSRF value missing or wrong
-- **WHEN** a cookie-authenticated state change carries no CSRF value or a wrong one
+- **WHEN** an otherwise valid cookie-authenticated state change carries no CSRF value or a wrong one
 - **THEN** the service answers HTTP 403 `CSRF_FORBIDDEN` and stores nothing
+
+#### Scenario: Malformed request without a CSRF value
+- **WHEN** a cookie-authenticated state change has no CSRF value and an invalid body, a missing required header or a malformed path parameter
+- **THEN** the service answers HTTP 422 `INVALID_REQUEST`
+- **AND** the CSRF value is compared only for a request that passes validation
 
 #### Scenario: Foreign origin on a preflight
 - **WHEN** a request with the method OPTIONS carries a foreign `Origin`
@@ -100,8 +117,13 @@ The service MUST refuse a request whose `Origin` differs from the configured pub
 - **THEN** the service answers HTTP 403 `SESSION_FORBIDDEN` before routing
 
 #### Scenario: Cookie and bearer together
-- **WHEN** a request that passes the origin checks carries a session cookie and an `Authorization` header
+- **WHEN** a request that passes the origin checks carries a `Cookie` header, with a session cookie or not, and an `Authorization` header
 - **THEN** the service answers `UNAUTHENTICATED` and changes nothing
+
+#### Scenario: Unrelated cookie on a bearer write
+- **WHEN** a state-changing request with an `Authorization` header also carries a `Cookie` header that holds no session cookie
+- **THEN** the service answers HTTP 403 `SESSION_FORBIDDEN` unless its `Origin` equals the public origin exactly
+- **AND** with the exact `Origin` it answers `UNAUTHENTICATED`, because of the `Authorization` header
 
 #### Scenario: Credentials are not interchangeable
 - **WHEN** a caller presents a session cookie value as a bearer token, or an operator credential as a bearer token to the browser-session route
@@ -258,10 +280,10 @@ After an error of a stream that is not being re-established, the page MUST show 
 - **AND** it keeps showing the last snapshot and the draft meanwhile
 
 ### Requirement: Operator publication is one immutable attempt that is never retried automatically
-The page MUST validate a draft before any request: a body of 1 to 16384 UTF-8 bytes without NUL, a chosen recipient for a question, a consultation or a reply to a session's message, and a thread key only on a new post that is not a question. It MUST then freeze one attempt with its own idempotency key, resend only that attempt and only when the operator asks, and report the write saved only when the response matches the attempt.
+The page MUST validate a draft before any request: a body of 1 to 16384 UTF-8 bytes without NUL, a chosen recipient for a question, a consultation or a reply to a session's message, and a thread key only on a new post that is neither a question nor a consultation. It MUST then freeze one attempt with its own idempotency key, resend only that attempt and only when the operator asks, and report the write saved only when the response matches the attempt.
 
 #### Scenario: Draft refused locally
-- **WHEN** the body is empty, over 16384 bytes or holds a NUL, or a question has no recipient, or a thread key is malformed or set on a reply or a question
+- **WHEN** the body is empty, over 16384 bytes or holds a NUL, or a question has no recipient, or a thread key is malformed or set on a reply, a question or a consultation
 - **THEN** the page shows a fixed notice and sends no request
 
 #### Scenario: Attempt frozen
@@ -270,10 +292,15 @@ The page MUST validate a draft before any request: a body of 1 to 16384 UTF-8 by
 - **AND** a later edit of the form does not change a retry
 
 #### Scenario: Response lost or not matching
-- **WHEN** the response is lost, malformed, or differs from the attempt in room, body, kind, recipients, reply target, thread or thread key, or does not name the operator as sender
+- **WHEN** the response is lost, malformed, or differs from the attempt in room, body, kind, recipients or reply target, or in thread or thread key when the attempt named one, or does not name the operator as sender
 - **THEN** the page says the write is unconfirmed and keeps the attempt visible with its key
 - **AND** it disables the draft, the room selector and refresh until the attempt is retried or discarded
 - **AND** a retry sends the identical request, so the service stores one message
+
+#### Scenario: Refusal of an attempt
+- **WHEN** the service refuses an attempt for any reason, such as `INVALID_RECIPIENT`, a rate limit or a server error
+- **THEN** the page says the write is unconfirmed, as for a lost response, and shows no text from the refusal
+- **AND** it keeps the attempt visible with its key and disables the draft, the room selector and refresh until the attempt is retried or discarded
 
 #### Scenario: Refusal after earlier uncertainty
 - **WHEN** a retry is refused because access was lost
@@ -288,7 +315,8 @@ The page MUST validate a draft before any request: a body of 1 to 16384 UTF-8 by
 #### Scenario: Saved but read-back fails
 - **WHEN** the response matches the attempt and the following read fails
 - **THEN** the page reports the message as saved with its identifier and adds the read failure to that report
-- **AND** it tells the operator not to send the message again
+- **AND** unless the read was refused for lost access or a rate limit, it tells the operator not to send the message again
+- **AND** after lost access it also locks the page and shows the sign-in form, and after a rate limit it adds the rate-limit notice instead
 
 #### Scenario: Saved is not delivered
 - **WHEN** a write is confirmed
@@ -327,7 +355,8 @@ The page MUST offer mute, role marks, thread resolution, room creation and room 
 
 #### Scenario: Write pending
 - **WHEN** a write is pending
-- **THEN** other writes and navigation are blocked
+- **THEN** other writes, room selection, refresh, paging and the thread filter are blocked
+- **AND** the view tabs and sign-out stay available, and sign-out asks for confirmation first
 - **AND** a late answer cannot repopulate a page that has since been signed out
 
 #### Scenario: Unknown mute state
@@ -373,6 +402,7 @@ A refresh MUST revalidate the session and scope in place and keep the selected r
 #### Scenario: Access lost
 - **WHEN** a read other than a live refresh is refused with HTTP 401 or 403
 - **THEN** the page locks, clears content and draft and shows the sign-in form with a notice that the session expired or access was revoked
+- **AND** while an uncertain publication attempt or an administrative write is pending, such a refusal does not lock the page or clear the draft, and the attempt stays visible
 
 #### Scenario: Page left
 - **WHEN** the browser reports `pagehide` because the page is unloaded, navigated away from or put into the back-forward cache
@@ -414,7 +444,9 @@ The roster and sessions views MUST list online sessions before offline ones, nam
 
 #### Scenario: Sessions view for a viewer and an operator
 - **WHEN** a viewer opens the sessions view
-- **THEN** it shows each session's work declarations by forge, role marks, last publication time, message count for 24 hours and announced pull requests, and no role control
+- **THEN** it shows each session's role marks, last publication time and message count for 24 hours, and no role control
+- **AND** it shows the work declaration of an online session by forge, up to 8 repositories per forge with the rest as a count, and an offline session shows none
+- **AND** it shows up to 3 announced pull requests per session, with the rest of the loaded list as a count
 - **AND** an operator sees the same view with role controls
 
 #### Scenario: Advisory lane

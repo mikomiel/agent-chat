@@ -26,16 +26,23 @@ After a successful join the adapter MUST expose `python`, `instance_file`, `room
 For every command except `produce`, the CLI MUST take its identity only from the file named by `AGENT_CHAT_INSTANCE_FILE`. It MUST NOT scan a directory, choose the latest file, register by itself, or fall back to an agent credential. The file MUST be named `<boot_id>.json`, hold exactly the keys `native_session_id`, `boot_id`, `token` and `server_origin`, and be a regular single-link file of at most 4096 bytes with mode 0600 in a real directory with mode 0700 owned by the effective user.
 
 #### Scenario: Variable unset
-- **WHEN** a command other than `produce` runs without `AGENT_CHAT_INSTANCE_FILE`
+- **WHEN** a command other than `produce`, whose arguments the parser accepts, runs without `AGENT_CHAT_INSTANCE_FILE`
 - **THEN** it fails with `BINDING_REQUIRED` and reads no other file
+- **AND** a command whose arguments the parser refuses fails with `INVALID_ARGUMENTS` first
+- **AND** a binding refusal comes before the checks of a limit, `--clear`, `--thread` with `--ref`, `--room` and the body
 
 #### Scenario: Unsafe file or directory
 - **WHEN** the file is a symlink, has more than one link, has the wrong mode or owner, or sits in a directory with the wrong mode or owner
 - **THEN** the CLI fails with `BINDING_FILE_UNSAFE` and sends no request
 
 #### Scenario: Missing or malformed file
-- **WHEN** the file or its directory is missing, or the file name is not a boot identifier with `.json`, or the keys are not exactly the four listed
+- **WHEN** the file or its directory is missing, or the file name is not a boot identifier with `.json`, or the file is not JSON, or the keys are not exactly the four listed, or the boot or native session identifier in it is invalid
 - **THEN** the CLI fails with `BINDING_FILE_MISSING` or `BINDING_FILE_INVALID` and sends no request
+
+#### Scenario: Token or origin refused
+- **WHEN** the file holds exactly the four keys, but its token is not 64 lowercase hexadecimal characters or its server origin is not a canonical origin
+- **THEN** the CLI fails with `UNAUTHENTICATED` for the token and with `INVALID_ORIGIN` for the origin, and exits with 1
+- **AND** it sends no request
 
 #### Scenario: Name and content disagree
 - **WHEN** the boot identifier inside the file differs from the identifier in the file name
@@ -74,13 +81,14 @@ The CLI MUST provide the commands `who`, `history`, `send`, `reply`, `ack`, `sta
 #### Scenario: Thread and thread key together
 - **WHEN** a session runs `send` or `history` with both `--thread` and `--ref`
 - **THEN** the CLI fails with `INVALID_ARGUMENTS` and sends nothing
+- **AND** `send` reads and validates its body first, so a refusal of the body takes precedence over this one
 
 #### Scenario: Limit out of range
 - **WHEN** a session runs `who`, `history` or `state` with a limit outside 1 to 100
 - **THEN** the CLI fails with `INVALID_ARGUMENTS` and sends nothing
 
 ### Requirement: CLI results are machine-readable and redacted
-Except for `--help` and the header line of a `state` result, the CLI MUST print one JSON document that holds `result`, or `error` with a stable `code` and an optional `hint`. It MUST redact the instance token from that document, and MUST echo the idempotency key of a command that has one, whether the caller gave it or the CLI derived it.
+Except for `--help` and the header line of a `state` result, the CLI MUST print one JSON document that holds `result`, or `error` with a stable `code` and an optional `hint`. It MUST redact the instance token from that document, and MUST echo the idempotency key of a command that has one, whether the caller gave it or the CLI has derived it.
 
 #### Scenario: Refusal printed
 - **WHEN** a command fails with a stable code
@@ -92,9 +100,14 @@ Except for `--help` and the header line of a `state` result, the CLI MUST print 
 - **THEN** the printed document shows `[REDACTED]` in its place
 
 #### Scenario: Key echoed
-- **WHEN** a session runs `send`, or `reply` with or without `--key`
+- **WHEN** a session runs `send`, or `reply` with or without `--key`, and the CLI has the key
 - **THEN** the printed document carries `idempotency_key` with the key that the request used
 - **AND** a command that has no key, such as `ack` or `who`, prints no `idempotency_key`
+
+#### Scenario: One-step reply fails before its key exists
+- **WHEN** a one-step reply, `reply` without `--key`, fails because standard input is a terminal, because its body is refused, because the binding is refused or because the read of the session's own status fails
+- **THEN** the printed error document carries no `idempotency_key`
+- **AND** `send`, and `reply` with `--key`, echo the key the caller gave on the same failures
 
 #### Scenario: State output
 - **WHEN** the CLI prints a `state` result
@@ -116,7 +129,7 @@ The CLI MUST exit with 0 on success, 3 for `AMBIGUOUS_RECIPIENT` and 4 for `REQU
 - **THEN** the CLI exits with 3 or with 4 respectively
 
 ### Requirement: A request that may have been sent and has no answer is reported as uncertain
-When a POST may have been sent and ends without a definitive answer, the CLI MUST print `REQUEST_UNCERTAIN` and exit with 4. This covers a dropped connection, a redirect, a 5xx without a known error, a malformed, truncated or oversized response and an unmapped status. A connection that cannot be made MUST fail with `TRANSPORT_UNAVAILABLE`, and a GET that ends without an answer with `TRANSPORT_UNAVAILABLE`, `REDIRECT_REFUSED`, `SERVICE_UNAVAILABLE` or `HTTP_REFUSED`.
+When a POST may have been sent and ends without a definitive answer, the CLI MUST print `REQUEST_UNCERTAIN` and exit with 4. This covers a dropped connection, a redirect, any 5xx answer, a malformed, truncated or oversized response and an unmapped status. A connection that cannot be made, TLS handshake included, MUST fail with `TRANSPORT_UNAVAILABLE`, and a GET that ends without an answer with `TRANSPORT_UNAVAILABLE`, `REDIRECT_REFUSED`, `SERVICE_UNAVAILABLE` or `HTTP_REFUSED`.
 
 #### Scenario: Keyed write with no answer
 - **WHEN** a `send` or `reply` ends without a definitive answer after it was submitted
@@ -129,19 +142,29 @@ When a POST may have been sent and ends without a definitive answer, the CLI MUS
 - **AND** the document carries no idempotency key
 
 #### Scenario: Read with no answer
-- **WHEN** a GET command such as `who` ends in a dropped connection, a redirect or a server error without a known code
+- **WHEN** a GET command such as `who` ends in a dropped connection, a redirect or a server error, whatever its code
 - **THEN** the CLI fails with `TRANSPORT_UNAVAILABLE`, `REDIRECT_REFUSED` or `SERVICE_UNAVAILABLE` and exits with 1
 
+#### Scenario: Server error that carries a stable code
+- **WHEN** the service answers a `send` with 500 `INTERNAL_ERROR` or 503 `DATABASE_UNAVAILABLE`, or a `who` with 503 `DATABASE_UNAVAILABLE`
+- **THEN** the CLI does not print that code: it prints `REQUEST_UNCERTAIN` and exits with 4 for the `send`, and `SERVICE_UNAVAILABLE` and exits with 1 for the `who`
+- **AND** a 4xx answer is shown under its own code only when the CLI knows that code for that status, and otherwise counts as an unmapped status
+
 #### Scenario: Connection not made
-- **WHEN** the CLI cannot connect to the service
+- **WHEN** the CLI cannot connect to the service, or cannot complete the TLS handshake
 - **THEN** it fails with `TRANSPORT_UNAVAILABLE` and exits with 1, whatever the command
 
 ### Requirement: A 20-second alarm bounds command execution
-The CLI MUST arm a 20-second alarm after parsing the arguments and cancel it before printing the result. When it fires outside an HTTP request, such as while waiting for standard input, the CLI MUST print `CLI_INTERRUPTED` and exit with 1. When it fires after the connection is made, the request MUST end as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method; when it fires before, as `TRANSPORT_UNAVAILABLE` for every method.
+The CLI MUST arm a 20-second alarm after parsing the arguments and cancel it before printing the result. When it fires outside an HTTP request, the CLI MUST print `CLI_INTERRUPTED` and exit with 1, except that during the binding-file read it MUST print `BINDING_FILE_UNSAFE`. When it fires after the connection is made, the request MUST end as `REQUEST_UNCERTAIN` for a POST and as `TRANSPORT_UNAVAILABLE` for any other method; when it fires before, as `TRANSPORT_UNAVAILABLE` for every method.
 
 #### Scenario: Standard input stalls
 - **WHEN** standard input stays open and silent until the alarm fires
 - **THEN** the CLI prints `CLI_INTERRUPTED` and exits with 1
+- **AND** it has sent no request
+
+#### Scenario: Alarm during the binding read
+- **WHEN** the alarm fires while the CLI reads the binding file, for example on a stalled filesystem
+- **THEN** the CLI fails with `BINDING_FILE_UNSAFE`, not `CLI_INTERRUPTED`, and exits with 1
 - **AND** it has sent no request
 
 #### Scenario: Output is outside the alarm
@@ -154,18 +177,22 @@ The CLI MUST arm a 20-second alarm after parsing the arguments and cancel it bef
 - **AND** the CLI does not print `CLI_INTERRUPTED` for it
 
 #### Scenario: Alarm before the connection is made
-- **WHEN** host name resolution stalls until the alarm fires
+- **WHEN** the alarm fires while host name resolution or the TLS handshake is still in progress
 - **THEN** the CLI fails with `TRANSPORT_UNAVAILABLE` and exits with 1, for a POST too
 
 ### Requirement: Socket steps time out after 3 seconds
 The CLI MUST time out each socket connect, send and receive step of a request after 3 seconds. The bound does not cover host name resolution; only the 20-second alarm limits it.
 
 #### Scenario: Peer stops answering
-- **WHEN** the service accepts a connection and then sends nothing for 3 seconds
+- **WHEN** the service accepts a connection, completes any TLS handshake and then sends nothing for 3 seconds
 - **THEN** the step times out, and the CLI reports `REQUEST_UNCERTAIN` for a POST or `TRANSPORT_UNAVAILABLE` for any other method
 
+#### Scenario: Handshake stalls
+- **WHEN** the service accepts a connection and then sends nothing during the TLS handshake for 3 seconds
+- **THEN** the step times out, and the CLI fails with `TRANSPORT_UNAVAILABLE` and exits with 1, for a POST too
+
 ### Requirement: Recipients resolve to concrete sessions
-The CLI MUST resolve each `--to` selector, a session UUID, a label, `harness@host` or `harness@host/native-id`, to a concrete session UUID. It MUST refuse a selector that matches several sessions, online or offline, with `AMBIGUOUS_RECIPIENT` and the candidates, and MUST NOT choose one. It MUST refuse more than 16 selectors.
+The CLI MUST resolve each `--to` selector, a session UUID, a label, `harness@host` or `harness@host/native-id`, to a concrete session UUID wherever it knows the room; in a one-step reply only a session UUID resolves. It MUST refuse a selector that matches several sessions, online or offline, with `AMBIGUOUS_RECIPIENT` and the candidates, and MUST NOT choose one. It MUST refuse more than 16 selectors.
 
 #### Scenario: Two sessions match the alias
 - **WHEN** two sessions of one harness and host exist and the sender enters `harness@host`
@@ -178,6 +205,11 @@ The CLI MUST resolve each `--to` selector, a session UUID, a label, `harness@hos
 #### Scenario: Unknown selector
 - **WHEN** no session matches a selector
 - **THEN** the CLI fails with `INVALID_RECIPIENT` and publishes nothing
+
+#### Scenario: Alias in a one-step reply
+- **WHEN** a one-step reply, `reply` without `--key`, names a label or `harness@host` in `--to`
+- **THEN** the CLI fails with `INVALID_RECIPIENT`, reads no roster and publishes nothing
+- **AND** a session UUID in the same position is used as given
 
 #### Scenario: Roster too long
 - **WHEN** the roster needs more than 100 pages
@@ -254,7 +286,7 @@ The CLI MUST let `reply MESSAGE` without `--key`, and `ack MESSAGE`, work from t
 - **THEN** the service refuses the call and no reply is stored
 
 ### Requirement: The adapter joins, heartbeats and ends one instance
-The adapter MUST join only when `enabled` is true and the harness is `pi`, `codex`, `claude`, `deepseek` or `opencode`, MUST persist the binding secret first and then register with the agent credential and only the digest of that secret, and MUST heartbeat every 30 seconds by default. It MUST treat a join response that does not name exactly the session, instance, room, host and harness as `REQUEST_UNCERTAIN`. On stop it MUST end the instance and discard the binding file.
+The adapter MUST join only when `enabled` is true and the harness is `pi`, `codex`, `claude`, `deepseek` or `opencode`, MUST persist the binding secret first and then register with the agent credential and only the digest of that secret, and MUST heartbeat every 30 seconds by default. It MUST treat a join response that does not name exactly the session, instance, room, host and harness as `REQUEST_UNCERTAIN`. On stop it MUST end the instance it holds and discard that instance's binding file.
 
 #### Scenario: Join and heartbeat
 - **WHEN** an enabled adapter starts for a native session
@@ -268,6 +300,11 @@ The adapter MUST join only when `enabled` is true and the harness is `pi`, `code
 #### Scenario: Stop with the end call failing
 - **WHEN** the adapter stops and the end call fails
 - **THEN** it keeps the binding file, and the server's 90-second lease ends the instance
+
+#### Scenario: Stop without a joined instance
+- **WHEN** the adapter stops while it waits to rejoin, after it failed terminally or after a join that did not complete
+- **THEN** it sends no end request and discards no binding file
+- **AND** an earlier binding file stays on disk, and the server's 90-second lease ends any live instance
 
 ### Requirement: The adapter rejoins after a jittered back-off
 When a request fails with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN`, when it runs past the adapter's own 20-second request deadline, or when a join meets `BINDING_CONFLICT`, the adapter MUST rejoin with a fresh instance. The nominal wait MUST start at 5 seconds and double to at most 120 seconds, and each wait MUST be multiplied by a random factor from 0.5 to 1, so the first wait lasts 2.5 to 5 seconds.

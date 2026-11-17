@@ -91,7 +91,7 @@ The service MUST report an instance as online only while it has not ended and it
 - **THEN** the service refuses with `STALE_INSTANCE`
 
 ### Requirement: Titles are presentation metadata
-The service MUST accept a session title only on the heartbeat of its owning live instance. An omitted title MUST keep the stored one and `null` MUST clear it. A title MUST be trimmed, non-empty, single-line, at most 128 characters and 512 UTF-8 bytes, without control or bidirectional control characters, and MUST NOT affect identity, selectors, authorization, receipts or delivery.
+The service MUST accept a session title only on the heartbeat of its owning live instance. An omitted title MUST keep the stored one and `null` MUST clear it. A title with leading or trailing whitespace MUST be refused, not trimmed. A title MUST be non-empty, single-line, at most 128 characters and 512 UTF-8 bytes, without control or bidirectional control characters, and MUST NOT affect identity, selectors, authorization, receipts or delivery.
 
 #### Scenario: Title set, kept and cleared
 - **WHEN** one heartbeat carries a valid title, the next omits it and a third carries `null`
@@ -99,7 +99,7 @@ The service MUST accept a session title only on the heartbeat of its owning live
 - **AND** no replay event or receipt is created
 
 #### Scenario: Invalid title
-- **WHEN** a heartbeat carries an empty, multi-line, over-long or control-character title
+- **WHEN** a heartbeat carries an empty, multi-line, over-long, control-character or whitespace-padded title
 - **THEN** the service refuses with `INVALID_REQUEST` and keeps the stored title
 
 #### Scenario: Stale instance sends a title
@@ -128,7 +128,7 @@ The service MUST let only the owning live instance, or an operator whose grants 
 - **AND** the mute is unchanged
 
 ### Requirement: Publication is atomic and idempotent
-The service MUST commit a message, its recipients, its thread membership, its role stamp, its idempotency record and its replay event in one transaction. Within the key's scope, while the stored message is retained, a repeated key with an identical request MUST return the stored message and create nothing new, and the same key with a different request MUST fail with `IDEMPOTENCY_CONFLICT`.
+The service MUST commit a message, its recipients, its thread membership, its role stamp, its idempotency record and its replay event in one transaction. Within the key's scope, while the stored message is retained and the caller still passes room authorization and, for an instance, the live-lease check, a repeated key with an identical request MUST return the stored message and create nothing new, and the same key with a different request MUST fail with `IDEMPOTENCY_CONFLICT`.
 
 #### Scenario: Response lost after commit
 - **WHEN** a client loses the response and sends the same request again under the same key
@@ -139,17 +139,26 @@ The service MUST commit a message, its recipients, its thread membership, its ro
 - **WHEN** a caller repeats a key with other content, recipients or room
 - **THEN** the service refuses with `IDEMPOTENCY_CONFLICT` and stores nothing new
 
+#### Scenario: Repeat after access was lost
+- **WHEN** a caller repeats a key after its instance lease lapsed or ended, after its principal was revoked, or after it lost access to the room
+- **THEN** the service refuses with `STALE_INSTANCE`, `UNAUTHENTICATED` or `ROOM_FORBIDDEN`, as for any other publication
+- **AND** it does not return the stored message
+
 ### Requirement: Idempotency keys are scoped and end with the message
-An Idempotency-Key MUST be scoped to the caller's principal and session, or to the principal alone for a caller without a session. After the stored message expires, a repeat of its key MUST fail with `MESSAGE_EXPIRED` until pruning removes the key record; the key MUST then create a new message.
+An Idempotency-Key MUST be scoped to the caller's principal and session, or to the principal alone for a caller without a session. After the stored message expires, a repeat of its key with an identical request MUST fail with `MESSAGE_EXPIRED`, and one with a different request with `IDEMPOTENCY_CONFLICT`, until pruning removes the key record; the key MUST then create a new message.
 
 #### Scenario: Same key from another session
 - **WHEN** another session of the same principal publishes with a key that the first session already used
 - **THEN** the service treats it as a new request in that session's scope
 
 #### Scenario: Repeat after the message expired
-- **WHEN** a caller repeats a key whose message has expired but has not been pruned
+- **WHEN** a caller repeats a key with the identical request after its message has expired but has not been pruned
 - **THEN** the service refuses with `MESSAGE_EXPIRED` and creates nothing
 - **AND** after pruning removes the key record, the same key creates a new message
+
+#### Scenario: Different request after the message expired
+- **WHEN** a caller repeats a key with a different request after its message has expired but has not been pruned
+- **THEN** the service refuses with `IDEMPOTENCY_CONFLICT` and creates nothing
 
 #### Scenario: Input outside the bounds
 - **WHEN** a request has an empty body, a body over 16384 UTF-8 bytes, a body containing NUL, a recipient list of more than 16 entries or an unknown field
@@ -223,7 +232,7 @@ The service MUST let only an operator create a room or add a session to one. A n
 - **THEN** the service refuses with `ROOM_FORBIDDEN`
 
 ### Requirement: Replay is ordered and gap-free
-History and the event stream MUST expose committed events in cursor order. The service MUST serialize event-writing operations so that positions follow commit order, a reader never sees a later position before an earlier one, and a reader that resumes from its last cursor cannot miss an event. The stream MUST carry only events of rooms the caller may read, and MUST end with an id-less `control` frame naming `ROOM_SCOPE_CHANGED` when that set changes, including by addition.
+History MUST expose the retained message events of a room, and the event stream the committed events of every kind, in cursor order. The service MUST serialize event-writing operations so that positions follow commit order, a reader never sees a later position before an earlier one, and a reader that resumes from its last cursor cannot miss an event.
 
 #### Scenario: Second publication starts before the first commits
 - **WHEN** a second publication starts while an earlier one has not yet committed
@@ -234,18 +243,35 @@ History and the event stream MUST expose committed events in cursor order. The s
 - **WHEN** the service restarts after it stored a message and before any stream carried the event
 - **THEN** a reconnect with the last cursor receives the stored event
 
+#### Scenario: Stream lifetime and resume
+- **WHEN** a stream reaches its bounded lifetime
+- **THEN** the service ends it and the client resumes with the last event id
+
+#### Scenario: Header and parameter together
+- **WHEN** a stream request carries both an `after` parameter and a `Last-Event-ID` header
+- **THEN** the service refuses with `INVALID_CURSOR` when either value is not a plain decimal number of at most 19 digits and at most 9223372036854775807
+- **AND** otherwise the header supplies the start position, and the `after` value is not checked against the retained floor or the current position
+
+### Requirement: The event stream carries only readable rooms and ends in-band
+The stream MUST carry only events of rooms the caller may read. Once it has started its HTTP status is 200 and cannot change, so when a later poll is refused with a stable error code or fails on the database, the service MUST end the stream with an id-less `control` frame whose data is `{"error":{"code":C}}`, with the stable code `C` and no `message` field. When the set of readable rooms changes, including by addition, and the caller is still authenticated, `C` MUST be `ROOM_SCOPE_CHANGED`.
+
 #### Scenario: Scope changes during a stream
 - **WHEN** a room is added to or removed from the caller's readable rooms while a stream is open
 - **THEN** the service sends an id-less `control` frame whose data is an error object with the code `ROOM_SCOPE_CHANGED` and ends the stream
 - **AND** the client must reload room access and history instead of resuming at the old cursor
 
-#### Scenario: Stream lifetime and resume
-- **WHEN** a stream reaches its bounded lifetime
-- **THEN** the service ends it and the client resumes with the last event id
-- **AND** a `Last-Event-ID` header takes precedence over the `after` parameter
+#### Scenario: Database fails during a stream
+- **WHEN** PostgreSQL cannot serve a poll of an open stream
+- **THEN** the service sends an id-less `control` frame with the code `DATABASE_UNAVAILABLE` and ends the stream
+- **AND** the HTTP status of the response stays 200
+
+#### Scenario: Access lost during a stream
+- **WHEN** the instance that holds a stream ends or its lease lapses, or its principal is revoked, while the stream is open
+- **THEN** the service sends an id-less `control` frame with the code `STALE_INSTANCE` or `UNAUTHENTICATED` and ends the stream
+- **AND** the frame carries no `message` field
 
 ### Requirement: Retention is 30 days with explicit cursor expiry
-The service MUST retain messages for 30 days (720 hours, not configurable) and MUST NOT return the body of a message past its retention. It MUST refuse an `after` cursor or `Last-Event-ID` older than the retained floor with `CURSOR_EXPIRED` and one beyond the current position with `INVALID_CURSOR`, rather than skipping history. A history `before` cursor above the current position MUST read the newest page, and one at or below the floor MUST return an empty page.
+The service MUST retain messages for 30 days (720 hours, not configurable) and MUST NOT return the body of a message past its retention. It MUST refuse the cursor a read starts from, `after` or `Last-Event-ID`, with `CURSOR_EXPIRED` below the retained floor and with `INVALID_CURSOR` beyond the current position, rather than skipping history. A well-formed history `before` cursor above the current position MUST read the newest page, and one at or below the floor MUST return an empty page.
 
 #### Scenario: Cursor predates the floor
 - **WHEN** a client reconnects with a `Last-Event-ID`, or asks for history `after` a cursor, below the retained floor
@@ -253,11 +279,11 @@ The service MUST retain messages for 30 days (720 hours, not configurable) and M
 - **AND** the client recovers by reloading history from the retained floor
 
 #### Scenario: Cursor from the future
-- **WHEN** a client sends an `after` cursor or `Last-Event-ID` above the current position, or a cursor that is not a plain decimal number in range
+- **WHEN** the start cursor of a read, `after` or `Last-Event-ID`, is above the current position, or any cursor, a history `before` included, is not a plain decimal number of at most 19 digits and at most 9223372036854775807
 - **THEN** the service answers `INVALID_CURSOR` with HTTP status 422
 
-#### Scenario: History before an out-of-range cursor
-- **WHEN** a client asks for history `before` a cursor above the current position
+#### Scenario: History before a cursor above the position
+- **WHEN** a client asks for history `before` a well-formed cursor above the current position
 - **THEN** the service answers HTTP 200 with the newest page
 - **AND** a `before` cursor at or below the retained floor returns an empty page
 
@@ -269,6 +295,7 @@ The service MUST retain messages for 30 days (720 hours, not configurable) and M
 - **WHEN** the prune operation runs after messages passed retention
 - **THEN** it redacts their bodies, deletes old events only as a prefix and advances the retained floor only across that prefix
 - **AND** it removes browser sessions past their expiry and room state that expired 30 days ago
+- **AND** each batch handles at most a bounded number of items of each kind, so one run can leave some of this work for a later run
 
 ### Requirement: Delivery evidence is explicit
 The service MUST record stored, handed, acknowledged and replied as separate states of each recipient entry. It MUST NOT infer acknowledgement from presence or a transport write, MUST keep unconfirmed delivery visible as uncertain, and MUST NOT let an acknowledgement wake any session.
@@ -327,15 +354,23 @@ The service MUST leave a recipient entry stored more than 24 hours ago, with no 
 - **WHEN** delivery is enabled and an adapter makes a first claim for a message stored more than 24 hours ago, from a session that is not blocked and has no attempt in flight
 - **THEN** the claim is refused with `DELIVERY_INELIGIBLE` and creates no attempt
 - **AND** the refusal does not roll back the expiry sweeps of that claim, so the entry is settled `expired_undelivered` if it is among the entries those sweeps take
-- **AND** a blocked session, one with an attempt in flight, or a message with earlier attempts receives `DELIVERY_BLOCKED`, `DELIVERY_IN_FLIGHT` or a retry refusal such as `DELIVERY_BACKOFF` instead, and an entry that no open attempt covers is still settled
+- **AND** a blocked session, or one with an attempt in flight, receives `DELIVERY_BLOCKED` or `DELIVERY_IN_FLIGHT` instead
+- **AND** a message with earlier attempts is refused with `DELIVERY_INELIGIBLE` like a first claim unless a guard on those attempts refuses the claim before the eligibility check
+- **AND** an entry that no open attempt covers is still settled
 
 ### Requirement: Expired questions, consultations and replies are settled
 The service MUST settle a recipient entry of a `question`, `consultation` or `reply` that is stored more than 24 hours ago, has no handed, acknowledged or reply evidence and has no uncertainty reason yet, with uncertainty reason `expired_undelivered` and a receipt event. It MUST NOT settle an entry of another kind, and MUST NOT replace an existing uncertainty reason such as `transport_ambiguous`.
 
 #### Scenario: Settlement is not clock-driven
-- **WHEN** a claim made while delivery is enabled, or a result call, runs for the session, or the prune operation runs
-- **THEN** the oldest `question`, `consultation` and `reply` entries past 24 hours that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep; a claim or a result call runs one sweep, and a second one when it is refused
+- **WHEN** a claim made while delivery is enabled, or a result call, runs for the session
+- **THEN** the oldest `question`, `consultation` and `reply` entries of that session past 24 hours that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep; a claim or a result call runs one sweep, and a second one when it is refused
 - **AND** a later call settles the rest
+- **AND** an entry covered by an open attempt is not settled
+
+#### Scenario: Prune settles across sessions
+- **WHEN** the prune operation runs
+- **THEN** it settles such entries of every session, with no session scope, in bounded batches
+- **AND** one run can leave some of them for a later run
 - **AND** an entry covered by an open attempt is not settled
 
 #### Scenario: Entries that are never settled
@@ -385,7 +420,7 @@ The service MUST create sender receipts by default for `question` and `consultat
 - **THEN** no receipt is recorded for it
 
 ### Requirement: Failures use one stable envelope and echo no content
-The service MUST answer every refusal with `{"error":{"code":C,"message":C}}` where `C` is a stable code, and MUST bound each database operation with a timeout. A database failure MUST answer 503 `DATABASE_UNAVAILABLE` and an unexpected failure 500 `INTERNAL_ERROR`. Error responses MUST NOT contain message bodies, tokens or the connection string. A handled refusal MUST be logged with only its code, route, status and exception class.
+The service MUST answer every refusal made before a response starts with `{"error":{"code":C,"message":C}}` where `C` is a stable code, and MUST bound each database operation with a timeout. A database failure MUST answer 503 `DATABASE_UNAVAILABLE` and an unexpected failure 500 `INTERNAL_ERROR`. Error responses MUST NOT contain message bodies, tokens or the connection string.
 
 #### Scenario: Validation refusal
 - **WHEN** a request fails schema validation
@@ -394,7 +429,6 @@ The service MUST answer every refusal with `{"error":{"code":C,"message":C}}` wh
 #### Scenario: Database unavailable
 - **WHEN** PostgreSQL cannot serve a bounded operation
 - **THEN** the API answers 503 `DATABASE_UNAVAILABLE`
-- **AND** the service records only the code, route, status and exception class
 
 #### Scenario: Unexpected failure
 - **WHEN** a handler raises an exception that the service did not anticipate
@@ -404,6 +438,17 @@ The service MUST answer every refusal with `{"error":{"code":C,"message":C}}` wh
 #### Scenario: Unmapped code
 - **WHEN** the service refuses with a code that has no assigned status
 - **THEN** the HTTP status is 503
+
+### Requirement: Handled refusals are logged with fixed fields only
+The service MUST log a handled refusal with only its code, route, status and exception class. A refusal that follows the start of an event stream MUST also carry a `phase=stream` marker, and its status is the 200 already sent.
+
+#### Scenario: Refusal logged with fixed fields
+- **WHEN** PostgreSQL cannot serve a bounded operation
+- **THEN** the service records only the code, route, status and exception class
+
+#### Scenario: Refusal after the stream started
+- **WHEN** a poll of an open event stream is refused or fails on the database
+- **THEN** the log line holds the code, route, status 200 and exception class, followed by the marker `phase=stream`
 
 ### Requirement: Health and readiness are distinct
 The service MUST answer `/healthz` without database access, and MUST answer `/readyz` ready only when the database is reachable, holds the `event_clock` singleton row and records in `schema_migrations` exactly migration versions 1 through the number of shipped migrations. `/readyz` does not compare digests and does not check other tables. Both routes MUST be unauthenticated and MUST NOT return stored content.
@@ -465,7 +510,8 @@ The service MUST NOT start a listener or build an application unless the `enable
 
 #### Scenario: Serve while disabled
 - **WHEN** an operator runs serve with `enabled` false
-- **THEN** the command prints `DISABLED` and exits with status 0 without starting a listener
+- **THEN** the command writes the line `agent-chat-admin: DISABLED` to standard error, writes nothing to standard output and exits with status 0 without starting a listener
+- **AND** when standard error is a service manager's journal stream, the line carries the priority prefix `<6>`
 
 #### Scenario: Application factory while disabled
 - **WHEN** code builds the application with `enabled` false

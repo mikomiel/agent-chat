@@ -24,7 +24,7 @@ Each publication MUST name exactly one kind, and the kind MUST be `message`, `st
 - **THEN** the service answers `INVALID_REQUEST` and stores nothing
 
 ### Requirement: A thread may be named by one entity key
-A thread MAY carry a `ref_key` in one of three forms: `pr:<owner>/<repo>#<number>`, `lane:<reference>::<id>` or `resource:<host>:<name>`. Within one room a key MUST name at most one thread. The service MUST refuse a `ref_key` that fits none of the forms, such as free text.
+A thread MAY carry a `ref_key` in one of three forms: `pr:<owner>/<repo>#<number>`, `lane:<reference>::<id>` or `resource:<host>:<name>`. Within one room a key MUST name at most one thread. The service MUST refuse a `ref_key` that does not fit one of the forms within its limits, such as free text.
 
 #### Scenario: Free text as a key
 - **WHEN** a publication gives the `ref_key` "fix the lease"
@@ -34,8 +34,15 @@ A thread MAY carry a `ref_key` in one of three forms: `pr:<owner>/<repo>#<number
 - **WHEN** two different rooms each open a thread under one `ref_key`
 - **THEN** each room has its own thread for that key
 
+### Requirement: Each form of thread key has exact limits
+A `pr:` key MUST have an owner of 1 to 40 and a repository of 1 to 80 letters, digits, `_`, `.` or `-`, and a number of 1 to 10 digits that does not start with 0. A `lane:` key MUST have a reference of 1 to 80 letters, digits, `_`, `.`, `/` or `-` and an id of 1 to 40 letters, digits or `-`. A `resource:` key MUST have a host and a name that are each 1 to 63 lowercase letters, digits or `-` and start with a letter or digit.
+
+#### Scenario: Key with the shape of a form but outside its limits
+- **WHEN** a publication gives a `pr:` key whose number is `0` or has 11 digits, a `pr:` key with an owner of 41 characters, a `lane:` key whose id contains an underscore, or a `resource:` key with an uppercase letter in a part
+- **THEN** the service answers `INVALID_REQUEST` and stores nothing
+
 ### Requirement: A keyed publication joins or opens the keyed thread
-When a publication names a `ref_key`, the service MUST, inside the transaction that stores the message, add the message to the room's thread for that key, or open that thread with this message as its root. The publication MUST NOT also name a thread or a reply parent, and a `question` or `consultation` MUST NOT carry a key. Once retention has removed a keyed thread, the next publication under that key MUST open a new thread.
+When a publication names a `ref_key`, the service MUST, inside the transaction that stores the message, add the message to the room's thread for that key, or open that thread with this message as its root, unless the thread's agent-reply limit refuses the message. The publication MUST NOT also name a thread or a reply parent, and a `question` or `consultation` MUST NOT carry a key. Once retention has removed a keyed thread, the next publication under that key MUST open a new thread.
 
 #### Scenario: Concurrent publications under one pull request key
 - **WHEN** two sessions publish under `pr:acme/widgets#7` in one room at the same moment
@@ -92,7 +99,7 @@ A live instance MUST be able to replace or remove its lane reference, and a regi
 - **THEN** the service answers `INVALID_REQUEST` and keeps the lane it had
 
 ### Requirement: A session's work declaration is advisory
-A live instance MAY declare its work. A declaration MUST be one map from forge, either `forgejo` or `github`, to repositories named `owner/name`, with at most 16 repositories per forge, 32 in all, and 4096 bytes of JSON. A declaration MUST replace the previous one and MUST NOT authorize, deliver, assign ownership or lock anything. A registration request MUST NOT carry one.
+A live instance MAY declare its work. A declaration MUST be one map from forge, either `forgejo` or `github`, to repositories named `owner/name`, with at most 16 entries per forge and 32 in all, counted as submitted before duplicates are dropped, and 4096 bytes of JSON for the stored map. A declaration MUST replace the previous one and MUST NOT authorize, deliver, assign ownership or lock anything. A registration request MUST NOT carry one.
 
 #### Scenario: New declaration replaces the old
 - **WHEN** a live session declares a repository on each forge and later declares another map
@@ -103,8 +110,13 @@ A live instance MAY declare its work. A declaration MUST be one map from forge, 
 - **THEN** the session's participant row lists no repository
 
 #### Scenario: Declaration outside the rules
-- **WHEN** a live session declares an unknown forge, a repository that is not `owner/name`, more than 16 repositories for one forge, or no map at all
+- **WHEN** a live session declares an unknown forge, a repository that is not `owner/name`, more than 16 entries for one forge, or no map at all
 - **THEN** the service answers `INVALID_REQUEST` and keeps the declaration it had
+
+#### Scenario: Duplicates count toward the limits
+- **WHEN** a live session declares 17 entries for one forge that name only 2 distinct repositories
+- **THEN** the service answers `INVALID_REQUEST` and keeps the declaration it had
+- **AND** a declaration of at most 16 entries that repeats a repository is accepted and reports that repository once
 
 #### Scenario: Declaration at registration
 - **WHEN** a registration request carries a work declaration
@@ -167,7 +179,7 @@ For each room and key the service MUST hold one latest value with its producer, 
 
 #### Scenario: Value repeated while fresh
 - **WHEN** a producer upserts the identical value for an entry that has not expired
-- **THEN** the expiry moves forward and no event is appended
+- **THEN** the observation time and the expiry are reset from the server clock and the TTL of this request, which can give an earlier expiry than before, and no event is appended
 
 #### Scenario: Return from staleness
 - **WHEN** a producer upserts the same value after the entry expired
@@ -178,7 +190,7 @@ For each room and key the service MUST hold one latest value with its producer, 
 - **THEN** every stored time comes from the server clock
 
 ### Requirement: Expired room state is reported as stale and grants nothing
-Once an entry's expiry has passed, the state read MUST mark it stale with the reason `expired`. It MUST mark every entry last written by a revoked producer credential stale with the reason `revoked`, also before expiry, and `revoked` MUST win when both apply. Each entry MUST carry its age and remaining lifetime computed on the server clock. The service MUST NOT treat room state as a grant, an ordering, a reservation or a release of any resource.
+Once an entry's expiry has passed, the state read MUST mark it stale with the reason `expired` until it is removed. It MUST mark every entry last written by a revoked producer credential stale with the reason `revoked`, also before expiry, and `revoked` MUST win when both apply. Each entry MUST carry its age and remaining lifetime computed on the server clock. The service MUST NOT treat room state as a grant, an ordering, a reservation or a release of any resource.
 
 #### Scenario: Producer goes quiet
 - **WHEN** an entry's expiry passes and no new upsert has arrived
@@ -187,6 +199,10 @@ Once an entry's expiry has passed, the state read MUST mark it stale with the re
 #### Scenario: Producer revoked with time left
 - **WHEN** a producer credential is revoked while an entry it last wrote has not yet expired
 - **THEN** the read shows `stale` true and the reason `revoked`
+
+#### Scenario: Entry removed by maintenance
+- **WHEN** an entry's expiry passed more than 30 days ago and the prune operation has run
+- **THEN** the state read no longer lists it, whether it was reported as expired or as revoked
 
 #### Scenario: Paged read
 - **WHEN** a reader asks for state with a `ref_key` filter, an `after_key` (a state key) and a limit between 1 and 100
