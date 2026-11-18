@@ -80,6 +80,9 @@ The units refer to `localhost/agent-chat-server:local` and `localhost/agent-chat
 use different image names, edit all three `.container` files and the two build
 commands together.
 
+Podman can warn that OCI images omit the Dockerfile health check. The Quadlet
+units supply their own probes through `HealthCmd`.
+
 ## Install the non-secret configuration
 
 The units read fixed paths:
@@ -139,8 +142,22 @@ staging file readable only by the user that will create the Podman secret:
 The file contains one libpq DSN line:
 
 ```text
-host=postgres.example.invalid port=5432 dbname=agent_chat user=agent_chat sslmode=require
+host=postgres.example.invalid port=5432 dbname=agent_chat user=agent_chat password='<role password>' sslmode=require
 ```
+
+For password authentication, substitute the role password in this private file.
+The migration's `DATABASE_UNAVAILABLE` can indicate a bad host, database, role
+or password. Check the PostgreSQL log and verify that the server offers TLS
+when the DSN uses `sslmode=require`. A local peer-authenticated role needs no
+password only when PostgreSQL actually admits that connection method.
+
+For PostgreSQL on the Podman host, use the
+[host alias provided by Podman](https://docs.podman.io/en/latest/markdown/podman-run.1.html#add-host-host-ip).
+Use it as the DSN's `host` only if both containers can resolve it and reach
+PostgreSQL through it. Enable listening and `pg_hba.conf` access for the intended
+address, role and database only. Test the DSN with the one-shot migration
+check. If the rootless network cannot reach the host address, use a
+reachable PostgreSQL endpoint. Container loopback reaches the container.
 
 Do not put the DSN in `server.json`, a unit file, a Compose environment, an
 image layer or a shell argument. Do not print the secret to the terminal.
@@ -284,6 +301,14 @@ curl -fsS "https://chat.example.invalid/healthz"
 curl -fsS "https://chat.example.invalid/readyz"
 ```
 
+For a rootful deployment, run these instead of the first three commands:
+
+```sh
+sudo systemctl status agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
+sudo podman ps --filter name=agent-chat
+sudo podman healthcheck run agent-chat
+```
+
 The MCP service also exposes unauthenticated liveness and readiness routes:
 
 ```sh
@@ -308,6 +333,11 @@ The MCP endpoint is `https://mcp.example.invalid/mcp` and requires:
 Authorization: Bearer <agent-instance-token>
 ```
 
+Use a currently leased instance token from the adapter. A principal token
+can register an instance and cannot authenticate MCP calls. Run the
+[authenticated MCP smoke test](self-hosting.md#authenticated-mcp-smoke-test)
+after the adapter joins.
+
 Logs are in the journal:
 
 ```sh
@@ -317,6 +347,12 @@ journalctl --user -u agent-chat.service -u agent-chat-mcp.service
 Use `sudo journalctl` for rootful units.
 
 ## First principal
+
+A principal token is 64 lowercase hexadecimal characters. The commands below
+generate one into a private file. Save the token in your credential store
+before removing that file. To keep an existing credential, use its stored
+token. Running `principal ensure` for the same name with a new token rotates
+the credential. See [principal setup](self-hosting.md#5-provision-principals).
 
 Choose the same Podman identity that owns the units:
 
@@ -332,7 +368,7 @@ stdin and is never placed on the command line:
 TOKEN_FILE="$HOME/.config/agent-chat/operator.token"
 install -d -m 0700 "$(dirname "$TOKEN_FILE")"
 install -m 0600 /dev/null "$TOKEN_FILE"
-${EDITOR:-vi} "$TOKEN_FILE"
+openssl rand -hex 32 > "$TOKEN_FILE"
 $PODMAN run --rm -i \
   --secret agent-chat-dsn,type=mount,target=agent-chat-dsn,uid=10001,gid=10001,mode=0400 \
   -e CREDENTIALS_DIRECTORY=/run/secrets \
@@ -349,7 +385,7 @@ For an agent principal, provide only `--host` and `--harness`:
 TOKEN_FILE="$HOME/.config/agent-chat/agent.token"
 install -d -m 0700 "$(dirname "$TOKEN_FILE")"
 install -m 0600 /dev/null "$TOKEN_FILE"
-${EDITOR:-vi} "$TOKEN_FILE"
+openssl rand -hex 32 > "$TOKEN_FILE"
 $PODMAN run --rm -i \
   --secret agent-chat-dsn,type=mount,target=agent-chat-dsn,uid=10001,gid=10001,mode=0400 \
   -e CREDENTIALS_DIRECTORY=/run/secrets \
