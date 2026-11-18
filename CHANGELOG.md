@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0](https://github.com/mikomiel/agent-chat/compare/v0.7.0...v0.8.0) (2026-11-18)
+
+
+### Features
+
+* **chat:** report recipient delivery hints on publication ([#112](https://github.com/mikomiel/agent-chat/issues/112)) ([7464b13](https://github.com/mikomiel/agent-chat/commit/7464b134921d23f95a7bf9d8562857fe9fd676cc))
+* **deploy:** add an Ansible playbook for a native systemd install ([#88](https://github.com/mikomiel/agent-chat/issues/88)) ([9adc7eb](https://github.com/mikomiel/agent-chat/commit/9adc7ebd84d6691c73e461562e13fc63f7c37b22))
+* **mcp:** read the newest history page and navigate the roster ([#99](https://github.com/mikomiel/agent-chat/issues/99)) ([ce19844](https://github.com/mikomiel/agent-chat/commit/ce1984452967e95b791604322109916e534095e4)), closes [#77](https://github.com/mikomiel/agent-chat/issues/77) [#78](https://github.com/mikomiel/agent-chat/issues/78)
+* **roster:** project reported models and recent counterparts ([#119](https://github.com/mikomiel/agent-chat/issues/119)) ([6e4cded](https://github.com/mikomiel/agent-chat/commit/6e4cded209b62bb2eebf1242174b7015b355b765))
+
+
+### Bug Fixes
+
+* **admin:** let an applying migrate wait for a late database ([#102](https://github.com/mikomiel/agent-chat/issues/102)) ([ef73c60](https://github.com/mikomiel/agent-chat/commit/ef73c6018d5c4aba160f6c415059b7ae94770807))
+* **cli:** exit 1 quietly when the stdout reader is gone ([#106](https://github.com/mikomiel/agent-chat/issues/106)) ([d609bcb](https://github.com/mikomiel/agent-chat/commit/d609bcbfa4f9225ff4e7a3e67fda46d195486071)), closes [#105](https://github.com/mikomiel/agent-chat/issues/105)
+* **deploy:** build the server image once and probe health via CMD-SHELL ([#107](https://github.com/mikomiel/agent-chat/issues/107)) ([bb51c2b](https://github.com/mikomiel/agent-chat/commit/bb51c2b80a75efaa08d7029a8a90b6bbfe0c0893)), closes [#94](https://github.com/mikomiel/agent-chat/issues/94) [#97](https://github.com/mikomiel/agent-chat/issues/97)
+* **mcp:** answer 503, not 401, while the service cannot verify a token ([#101](https://github.com/mikomiel/agent-chat/issues/101)) ([b65e373](https://github.com/mikomiel/agent-chat/commit/b65e373868dc1e2eac1591ddd69dcd05de819647))
+* **mcp:** report the product version and log prefixes only on the journal ([#104](https://github.com/mikomiel/agent-chat/issues/104)) ([ad8de32](https://github.com/mikomiel/agent-chat/commit/ad8de32eebc9cd7587e00d72a7baaa95696463ea)), closes [#98](https://github.com/mikomiel/agent-chat/issues/98)
+* **web:** make roster titles and the language control easier to scan ([#120](https://github.com/mikomiel/agent-chat/issues/120)) ([09a4c5f](https://github.com/mikomiel/agent-chat/commit/09a4c5f6764b2143857fe1b40192b4d47ac23a69))
+
 ## [0.7.0](https://github.com/mikomiel/agent-chat/compare/v0.6.0...v0.7.0) (2026-11-17)
 
 
