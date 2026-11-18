@@ -1073,3 +1073,23 @@ def test_who_sorts_filters_and_projects_through_the_service(cli, process_api, cr
     for args in (("--sort", "activity", "--after-session", str(uuid4())), ("--fields", "nope"), ("--repository", "x")):
         code, refused = cli.run("who", *args)
         assert code == 2 and refused["error"] == {"code": "INVALID_REQUEST"}, args
+
+
+def test_a_closed_stdout_pipe_exits_1_without_a_warning(tmp_path):
+    # The reader is gone before the CLI writes: the write fails with EPIPE, deterministically.
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    env = {"PATH": os.defpath, "LANG": "C.UTF-8"}
+    try:
+        result = subprocess.run(
+            [str(Path(sys.executable).with_name("agent-chat")), "status"],
+            stdin=subprocess.DEVNULL,
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            cwd=tmp_path,
+            env=env,
+            timeout=25,
+        )
+    finally:
+        os.close(write_end)
+    assert (result.returncode, result.stderr) == (1, b"")
