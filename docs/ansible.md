@@ -48,7 +48,7 @@ On the target host:
 
 - Linux with systemd 247 or newer, which is the first release with
   `LoadCredential=`.
-- `python3` 3.11 or newer with the `venv` module (Debian and Ubuntu:
+- `/usr/bin/python3` 3.11 or newer with the `venv` module (Debian and Ubuntu:
   `python3-venv`). The install needs no `git`.
 - Outbound HTTPS to the Python package index (`pypi.org` and
   `files.pythonhosted.org`) during the install.

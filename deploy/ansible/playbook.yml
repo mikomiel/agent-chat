@@ -147,7 +147,7 @@
 
     - name: Read the Python version of the target
       ansible.builtin.command:
-        argv: [python3, -c, "import sys; print('%d.%d' % sys.version_info[:2])"]
+        argv: [/usr/bin/python3, -I, -c, "import sys; print('%d.%d' % sys.version_info[:2])"]
       register: agent_chat_python
       changed_when: false
 
@@ -405,7 +405,7 @@
         cmd: |
           set -eu
           umask 022
-          python3 -m venv {{ agent_chat_venv | quote }}
+          /usr/bin/python3 -I -m venv {{ agent_chat_venv | quote }}
           {{ agent_chat_venv | quote }}/bin/pip install --disable-pip-version-check --no-cache-dir {{ agent_chat_requirement | quote }}
           touch {{ agent_chat_stamp | quote }}
         creates: "{{ agent_chat_stamp }}"
