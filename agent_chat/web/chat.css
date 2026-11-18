@@ -163,6 +163,7 @@ a { color: var(--primary); }
 .app-room { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 0 1 28rem; }
 .app-room select { min-width: 0; min-height: 32px; padding: 3px 10px; font-weight: 700; }
 .app-bar-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px 10px; margin-left: auto; }
+#language { width: auto; flex: 0 0 auto; min-height: 30px; padding: 3px 8px; }
 #read-only-indicator {
   margin: 0;
   padding: 3px 9px;
@@ -381,8 +382,11 @@ legend { padding: 0 6px; font-size: 0.82rem; font-weight: 750; }
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
   font-size: 0.84rem;
   font-weight: 700;
 }
@@ -399,7 +403,7 @@ legend { padding: 0 6px; font-size: 0.82rem; font-weight: 750; }
 }
 .pm-badge { color: var(--accent-foreground); background: var(--accent); border-color: var(--accent-border); }
 .native-state { flex: none; color: var(--muted-strong); font-size: 0.72rem; }
-.participant-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; margin-top: 1px; color: var(--muted-strong); font-size: 0.72rem; }
+.participant-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 4px; margin-top: 1px; color: var(--muted-strong); font-size: 0.72rem; }
 .participant-identity { overflow-wrap: anywhere; }
 .chip { padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; background: var(--muted); color: var(--muted-strong);
   font-size: 0.7rem; font-weight: 650; line-height: 1.55; }
@@ -774,7 +778,7 @@ li[data-harness="pi"] .message-avatar, li[data-harness="deepseek"] .message-avat
   .popover { position: static; }
   .popover-body { left: 12px; right: 12px; top: calc(100% + 4px); width: auto; }
   .brand { order: 1; flex: 1 1 auto; }
-  #help { order: 2; }
+  #language, #help { order: 2; }
   #room-admin { order: 3; }
   #logout { order: 4; }
   .app-room { order: 5; flex: 1 1 100%; }
