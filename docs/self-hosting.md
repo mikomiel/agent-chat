@@ -287,11 +287,15 @@ without reading the DSN or opening a listener.
 
 The `mcp` extra installs a separate Streamable HTTP MCP service. It uses the
 caller's instance token on every request and keeps no binding or database
-connection of its own. Install it into the same virtual environment:
+connection of its own. Install it into the server's virtual environment with
+the same pinned version:
 
 ```sh
-uv pip install -e ".[mcp]"
+uv pip install "sessionyard[server,mcp]==<version>"
 ```
+
+From a source checkout, use `uv pip install -e ".[server,mcp]"` for an editable
+install.
 
 Create a private MCP configuration:
 
