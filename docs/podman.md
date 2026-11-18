@@ -34,7 +34,7 @@ user namespace as Traefik:
 | Rootless app + rootless Traefik, same user | Yes | Strongest isolation; install the units and network as that user |
 | Rootful app + rootful Traefik | Yes | Container still runs as UID/GID `10001`; simplest shared edge |
 | Rootless app + rootful Traefik | No | Rootless and rootful Podman networks are separate namespaces |
-| Rootless app + host-published loopback port | Possible, not provided | Changes the no-published-port model; use Compose or a custom unit |
+| Rootless app + host-published loopback port | Possible, not provided | Changes the no-published-port model; use a custom unit |
 
 Do not describe a rootless app with an external rootful Traefik as supported:
 they cannot share a Podman network. If the existing Traefik is rootful, use the
