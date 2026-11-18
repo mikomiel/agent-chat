@@ -174,6 +174,7 @@ def test_one_step_reply_derives_room_and_key_and_publishes_once(cli, process_api
     reply = first[1]["result"]
     assert reply["room_id"] == room and reply["thread_id"] == incoming["thread_id"]
     assert reply["sender"]["session_id"] == own and reply["recipients"] == [target["session_id"]]
+    assert [hint["session_id"] for hint in reply["delivery_hints"]] == [target["session_id"]]
     # The retry identity is pinned: a changed namespace or input would let a retry publish twice.
     namespace = UUID("231e60c5-f032-4827-bd6f-848f18ac6ef7")
     assert first[1]["idempotency_key"] == str(uuid5(namespace, f"{own}:{incoming['id']}"))

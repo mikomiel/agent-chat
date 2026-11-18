@@ -5,6 +5,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import datetime
 from hashlib import sha256
 from http.client import HTTPConnection
 from threading import Thread
@@ -250,6 +251,55 @@ def test_http_publication_sender_scope_and_lost_response_retry(http_api, credent
     db.execute("INSERT INTO agent_chat.rooms VALUES (%s, 'foreign', 'Foreign')", (foreign,))
     assert http_api("POST", f"/v1/rooms/{foreign}/messages", payload, token, headers)[0] == 403
     assert db.execute("SELECT count(*) AS n FROM agent_chat.messages").fetchone()["n"] == 1
+
+
+def test_publication_returns_advisory_delivery_hints_for_current_recipients(http_api, credentials, db):
+    sender, token, _ = join(http_api, credentials, native="sender")
+    targets = {}
+    for state in ("live", "stopped", "no_instance"):
+        binding, target_token, _ = join(http_api, credentials, native=state)
+        status, _ = http_api(
+            "POST", "/v1/instance/heartbeat",
+            {"native_state": "idle", "stopped": False, "plan_mode": state == "stopped"}, target_token,
+        )
+        assert status == 200
+        targets[state] = binding["session_id"]
+
+    db.execute(
+        "UPDATE agent_chat.instances SET heartbeat_at = clock_timestamp() - interval '2 minutes' "
+        "WHERE session_id = %s",
+        (targets["no_instance"],),
+    )
+    room = credentials.room
+    path = f"/v1/rooms/{room}/messages"
+    payload = {"kind": "question", "body": "synthetic question", "recipients": list(targets.values())}
+    headers = {"Idempotency-Key": str(uuid4())}
+    code, stored = http_api("POST", path, payload, token, headers)
+    assert code == 200
+    seen = {
+        str(row["session_id"]): row["last_seen_at"] for row in db.execute(
+            "SELECT session_id, max(heartbeat_at) AS last_seen_at FROM agent_chat.instances GROUP BY session_id"
+        ).fetchall()
+    }
+    observed = {
+        row["session_id"]: (row["state"], datetime.fromisoformat(row["last_seen_at"]))
+        for row in stored["delivery_hints"]
+    }
+    assert observed == {session: (state, seen[session]) for state, session in targets.items()}
+
+    # A replay keeps the message and the original recipients. A departed session no longer exposes presence.
+    db.execute(
+        "DELETE FROM agent_chat.memberships WHERE room_id = %s AND session_id = %s", (room, targets["no_instance"]),
+    )
+    code, replayed = http_api("POST", path, payload, token, headers)
+    assert code == 200 and replayed["id"] == stored["id"]
+    assert replayed["recipients"] == stored["recipients"]
+    assert {hint["session_id"] for hint in replayed["delivery_hints"]} == {targets["live"], targets["stopped"]}
+    code, history = http_api("GET", f"/v1/rooms/{room}/history", None, token)
+    assert code == 200
+    assert len(history["messages"]) == 1
+    assert history["messages"][0]["sender"]["session_id"] == sender["session_id"]
+    assert "delivery_hints" not in history["messages"][0]
 
 
 @pytest.mark.parametrize("kind", ["missing", "malformed", "unknown", "host", "operator-register", "instance-register"])
