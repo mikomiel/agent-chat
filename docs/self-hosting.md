@@ -133,6 +133,20 @@ A systemd unit can use `LoadCredential=agent-chat-dsn:/path/to/dsn` instead;
 systemd then supplies `CREDENTIALS_DIRECTORY` to the process. The credential
 directory must remain private. Never commit the DSN or place it in the JSON.
 
+### TCP connections
+
+The credential file holds one libpq DSN line. For password authentication,
+substitute the role password in the private file.
+
+```text
+host=postgres.example.invalid port=5432 dbname=agent_chat user=agent_chat password='<role password>' sslmode=require
+```
+
+For `DATABASE_UNAVAILABLE`, check the destination, database, role and
+credential against the PostgreSQL log. With `sslmode=require`, confirm the
+server offers TLS. Peer authentication uses a local socket and requires a
+matching PostgreSQL rule.
+
 ## 4. Apply the schema explicitly
 
 The service never runs DDL at startup. Inspect the pending migration set first:
@@ -181,7 +195,11 @@ to it automatically.
 Each example below writes the token to a mode-0600 file with an editor, then
 redirects that file to the command. Only the file path appears in shell
 history. Create each file once, keep it in your secret store, and never commit
-it.
+it. If you generate a new token with `openssl rand -hex 32`, use a
+mode-0600 file and preserve any existing token until you intend to rotate it.
+Running `principal ensure` for the same name with a different token rotates
+that principal's credential. After provisioning succeeds, confirm the saved
+copy in your credential store before removing any staging file.
 
 ### Operator
 
@@ -344,6 +362,13 @@ Message bodies travel on stdin. A publication carries an idempotency key; a
 retry keeps the same key. A message is not proof that a recipient was woken or
 processed it.
 
+### Reverse-proxy requirements
+
+Use a TLS certificate the clients trust. The proxy must preserve
+`Authorization`, `Host` and `Origin` for MCP. The MCP endpoint authenticates
+the instance token itself. Keep Basic Auth, response buffering and short
+response-header timeouts off this route. Keep `/metrics` off public routes.
+
 ## 7. Operate
 
 ### Retention
@@ -390,31 +415,38 @@ outage to retry around blindly.
 
 ## Checks
 
-The declared product checks are:
+For a source checkout, run the [local product checks](../CONTRIBUTING.md#local-checks).
+
+The server and MCP `/healthz` routes report process liveness. The MCP
+`/readyz` route also checks the server's readiness and reports
+`UPSTREAM_UNAVAILABLE` with HTTP 503 when the server or database is
+unavailable. Scrape aggregate metrics on a private network. See the
+[Alloy observability example](../deploy/observability/README.md).
+
+Check the web origin from the client network. Substitute the hostname of the
+deployment.
 
 ```sh
-uv sync --frozen
-uv run ruff check .
-uv run ty check
-uv run python -m pytest -q
-python3 scripts/check_estate_identifiers.py
+curl -fsS "https://chat.example.invalid/healthz"
+curl -fsS "https://chat.example.invalid/readyz"
 ```
 
-The test suite needs PostgreSQL server binaries and the pinned Playwright
-Chromium. It fails rather than skipping when either is missing. The
-`public-content` CI job also runs the pinned secret scan and the commit-range
-identifier scan.
+If you deployed MCP, check its origin as well.
+
+```sh
+curl -fsS "https://mcp.example.invalid/healthz"
+curl -fsS "https://mcp.example.invalid/readyz"
+```
 
 ### Authenticated MCP smoke test
 
 Start an agent adapter and use the exact binding path it reports for the live
 instance. The bearer is valid only while that instance's lease is live. Use the
 MCP HTTPS endpoint configured for its deployment. From the source checkout,
-sync the dependencies and run this check with the binding path in
-`BINDING_FILE`:
+sync dependencies as shown in the [local checks](../CONTRIBUTING.md#local-checks).
+Set `BINDING_FILE` to the binding path before running the check.
 
 ```sh
-uv sync --frozen
 uv run python - "$BINDING_FILE" https://mcp.example.invalid/mcp <<'PYTEST'
 import asyncio
 import sys
