@@ -16,6 +16,7 @@ from psycopg import Connection
 from . import deliveries, events, receipts, roles
 from .auth import authorize_room, member, require_current
 from .models import (
+    LEASE_SECONDS,
     MAX_MESSAGES_PER_SESSION_HOUR,
     QUOTA_WINDOW_SECONDS,
     UNCOUNTED_KINDS,
@@ -131,13 +132,38 @@ def _message(db: Connection[dict[str, Any]], message_id: UUID) -> dict[str, Any]
     ).fetchone()
     if row is None:
         raise ChatError("MESSAGE_EXPIRED")
-    row["recipients"] = [
-        item["session_id"]
-        for item in db.execute(
-            "SELECT session_id FROM agent_chat.recipients WHERE message_id = %s ORDER BY session_id",
-            (message_id,),
-        ).fetchall()
-    ]
+    # Hints use the current room scope, including on a replay. Keep the stored recipient list
+    # intact even after a recipient leaves the room. These reads take no row locks.
+    recipients = db.execute(
+        """
+        SELECT r.session_id, hint.state, hint.last_seen_at
+        FROM agent_chat.recipients r
+        LEFT JOIN LATERAL (
+            SELECT CASE
+                WHEN i.id IS NULL THEN 'no_instance'
+                WHEN s.muted OR i.stopped OR i.plan_mode OR i.native_state = 'unknown' THEN 'stopped'
+                ELSE 'live'
+            END AS state,
+            GREATEST(
+                (SELECT max(b.heartbeat_at) FROM agent_chat.instances b WHERE b.session_id = s.id),
+                (SELECT max(m.created_at) FROM agent_chat.messages m
+                 WHERE m.sender_session_id = s.id AND m.room_id = %(room)s AND m.body IS NOT NULL)
+            ) AS last_seen_at
+            FROM agent_chat.memberships m
+            JOIN agent_chat.sessions s ON s.id = m.session_id
+            JOIN agent_chat.principals p ON p.id = s.principal_id AND NOT p.revoked
+            JOIN agent_chat.principal_rooms pr ON pr.principal_id = p.id AND pr.room_id = m.room_id
+            LEFT JOIN agent_chat.instances i ON i.session_id = s.id AND i.ended_at IS NULL
+                AND i.heartbeat_at > clock_timestamp() - make_interval(secs => %(lease)s)
+            WHERE m.session_id = r.session_id AND m.room_id = %(room)s
+        ) hint ON true
+        WHERE r.message_id = %(message)s
+        ORDER BY r.session_id
+        """,
+        {"room": row["room_id"], "lease": LEASE_SECONDS, "message": message_id},
+    ).fetchall()
+    row["recipients"] = [item["session_id"] for item in recipients]
+    row["delivery_hints"] = [item for item in recipients if item["state"] is not None]
     return row
 
 
