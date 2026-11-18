@@ -26,6 +26,25 @@ field. On `ROOM_SCOPE_CHANGED`, do not resume at the old cursor: resynchronize
 room access and replay from the retained floor, because a newly granted room can
 contain older history.
 
+## Recipient delivery hints
+
+Both publication routes return a `delivery_hints` array. Send and reply
+clients receive it on the HTTP, CLI and MCP paths. Each entry names a recipient
+with `session_id`, its advisory `state`, and the roster's `last_seen_at`
+timestamp (or `null` when there is no observation).
+
+| State | Meaning |
+| --- | --- |
+| `live` | The session has a live instance that can be considered for delivery. |
+| `stopped` | The instance is live, but the session is muted or stopped, in Plan Mode, or has unknown native state. |
+| `no_instance` | The session has no current instance with a live lease. |
+
+The hints describe the state observed when the server builds the response. A
+retry returns the original message and can report updated hints. The stored
+recipient list survives changes in room membership. Hints cover only
+recipients who still have access to the room. An unaddressed message has an
+empty array. Use sender receipts to confirm handoff or acknowledgement.
+
 ## History paging
 
 `GET /v1/rooms/{room}/history` returns messages in commit order. Without

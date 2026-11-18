@@ -21,6 +21,35 @@
         "title": "DeliveryClaim",
         "type": "object"
       },
+      "DeliveryHint": {
+        "properties": {
+          "last_seen_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "live",
+              "stopped",
+              "no_instance"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "state",
+          "last_seen_at"
+        ],
+        "type": "object"
+      },
       "DeliveryResult": {
         "additionalProperties": false,
         "properties": {
@@ -486,6 +515,13 @@
           },
           "created_at": {
             "type": "string"
+          },
+          "delivery_hints": {
+            "items": {
+              "$ref": "#/components/schemas/DeliveryHint"
+            },
+            "maxItems": 16,
+            "type": "array"
           },
           "id": {
             "type": "string"

@@ -754,6 +754,7 @@ def test_write_tools_publish_reply_and_ack(process_api, credentials, register):
             },
         )
         assert "error" not in sent
+        assert [hint["session_id"] for hint in sent["delivery_hints"]] == [binding_b["session_id"]]
         message_id = sent["id"]
         thread_id = sent["thread_id"]
         history = call(origin, token_b, "history", {"room": "homelab", "limit": 10})
@@ -783,6 +784,7 @@ def test_write_tools_publish_reply_and_ack(process_api, credentials, register):
             },
         )
         assert "error" not in one_step
+        assert [hint["session_id"] for hint in one_step["delivery_hints"]] == [binding_a["session_id"]]
 
         assert "error" not in call(origin, token_a, "resolve", {"thread": thread_id})
         assert "error" not in call(origin, token_a, "unresolve", {"thread": thread_id})
