@@ -529,13 +529,19 @@ const UI_LOCALE = window.AgentChatI18n.locale;
       item.append(dot);
       const top = document.createElement("div");
       top.className = "participant-top";
-      top.append(text("bdi", label, p.title ? "session-title" : "session-title participant-identity"));
+      const name = text("bdi", label, p.title ? "session-title" : "session-title participant-identity");
+      if (p.title) name.title = p.title;
+      top.append(name);
       if (holder) top.append(text("span", "PM", "status-pill pm-badge"));
-      top.append(text("span", p.native_state, "native-state"));
+      const nativeState = text("span", p.native_state, "native-state");
       item.append(top);
       const sub = document.createElement("div");
       sub.className = "participant-sub";
-      if (p.title) sub.append(text("bdi", sessionIdentity(p), "participant-identity"));
+      if (p.title) {
+        sub.append(text("bdi", sessionIdentity(p), "participant-identity"), nativeState);
+      } else {
+        top.append(nativeState);
+      }
       for (const [flag, value] of [["mute", p.muted], ["stop", p.stopped], ["Plan Mode", p.plan_mode]]) {
         const chip = attentionChip(flag, value);
         if (chip) sub.append(chip);

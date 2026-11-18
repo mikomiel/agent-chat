@@ -2310,6 +2310,21 @@ def test_a_roster_row_is_compact_and_its_controls_keep_the_exact_uuid_as_their_n
     expect(row.locator(".participant-flags")).to_contain_text("Plan Mode: false")
 
 
+@pytest.mark.parametrize("width", [900, 1440])
+def test_roster_keeps_distinguishing_title_text_visible(ui, db, actors, width):
+    _room, first, _second, _operator = actors
+    title = "Review package release metadata and dependency guard 26"
+    db.execute("UPDATE agent_chat.sessions SET title = %s WHERE id = %s", (title, first.session_id))
+    ui.page.set_viewport_size({"width": width, "height": 900})
+    ui.login()
+    name = _roster_row(ui.page, first.session_id).locator(".session-title")
+    expect(name).to_have_text(title)
+    assert name.evaluate("(node) => node.scrollHeight <= node.clientHeight + 1")
+    assert name.evaluate("(node) => node.scrollWidth <= node.clientWidth + 1")
+    assert ui.page.locator("#language").evaluate("(node) => node.offsetWidth < 160")
+    assert ui.page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+
+
 def test_roster_chips_flag_only_the_states_that_need_attention(ui, db, actors):
     _room, first, second, _operator = actors
     sessions.heartbeat(db, second, Heartbeat(native_state="idle", stopped=False, plan_mode=False))
