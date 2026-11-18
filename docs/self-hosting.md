@@ -373,6 +373,11 @@ Use a TLS certificate the clients trust. The proxy must preserve
 the instance token itself. Keep Basic Auth, response buffering and short
 response-header timeouts off this route. Keep `/metrics` off public routes.
 
+The container examples use the backend names `agent-chat` and
+`agent-chat-mcp` on their shared Traefik network. If you run multiple
+deployments on the same network, give each deployment distinct names for its
+services and configure Traefik to use the matching backends.
+
 ## 7. Operate
 
 ### Retention

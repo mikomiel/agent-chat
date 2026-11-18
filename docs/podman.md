@@ -409,13 +409,13 @@ reload them. MCP requests fail until this step is done.
 
 ## Why Quadlet
 
-Docker Compose is the supported Compose engine. `podman-compose` is not
-supported. Running this guide under rootless Podman 5.4.2 with podman-compose
-1.3.0 failed these documented guarantees:
+The Compose deployment supports Docker Compose. Testing its example with
+rootless Podman 5.4.2 and podman-compose 1.3.0 exposed failures in the health
+checks, migration gate, upgrade, restart and reboot.
 
-- Healthchecks: podman-compose 1.3.0 to 1.4.1 break the quoting of a list-form
-  healthcheck, so the services stay `unhealthy`. This file uses the
-  `CMD-SHELL` form for that reason.
+- Podman-compose 1.3.0 to 1.4.1 break the quoting of a list-form healthcheck,
+  so services stay `unhealthy`. The [Compose file](../deploy/compose.yaml) uses
+  the `CMD-SHELL` form to avoid that quoting problem.
 - Migration gate: `service_completed_successfully` is treated as "container
   stopped", without checking the exit code. The server can start before
   `migrate` finishes, `migrate` can run twice, and a failed migration does not
@@ -442,8 +442,3 @@ Quadlet requires Linux and systemd. It is not a macOS or Windows deployment
 path; use the Compose stack there. This guide also does not turn a rootful
 Traefik into a rootless-compatible edge. Choose one of the supported topologies
 above.
-
-The server and the MCP service are reachable on the shared edge network as
-`agent-chat` and `agent-chat-mcp`. No other container on that network may use
-those names. A second deployment on the same edge network needs its own
-container names and matching Traefik backends.
