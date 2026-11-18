@@ -32,7 +32,7 @@ classifiers = [
     "Topic :: Communications :: Chat",
 ]
 dependencies = [
-    "fastapi==0.162.2",
+    "fastapi==0.163.0",
     "pydantic==2.14.3",
     "uvicorn==0.54.0",
 ]
@@ -41,11 +41,11 @@ dependencies = [
 # The server and its migrations need PostgreSQL access; the client-only import
 # boundary (agent_chat.protocol, agent_chat.client) does not, so a client
 # install stays free of psycopg.
-server = ["psycopg[binary]==3.3.8"]
+server = ["psycopg[binary]==3.3.9"]
 # The optional one-shot viewer inspection drives a real browser.
-browser = ["playwright==1.64.1"]
+browser = ["playwright==1.65.2"]
 mcp = [
-    "fastmcp==4.1.6",
+    "fastmcp==4.2.0",
     "mcp==2.3.0",
 ]
 
@@ -61,15 +61,15 @@ Changelog = "https://github.com/mikomiel/agent-chat/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
-    "fastmcp==4.1.6",
+    "fastmcp==4.2.0",
     "mcp==2.3.0",
-    "playwright==1.64.1",
-    "psycopg[binary]==3.3.8",
+    "playwright==1.65.2",
+    "psycopg[binary]==3.3.9",
     "pytest==9.2.0",
     "pytest-xdist==3.8.0",
     "PyYAML==6.0.3",
-    "ruff==0.17.4",
-    "ty==0.0.100",
+    "ruff==0.17.5",
+    "ty==0.0.104",
 ]
 
 [tool.hatch.build.targets.wheel]
