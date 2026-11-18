@@ -18,6 +18,38 @@ need an issue first, so the decision is recorded before a pull request. Report
 security problems through private vulnerability reporting, never in a public
 issue.
 
+## Local checks
+
+From the repository root:
+
+```sh
+uv sync --frozen
+uv lock --check
+uv run ruff check .
+uv run ty check
+uv run python -m pytest -q
+python3 scripts/check_estate_identifiers.py
+```
+
+`ty` is pinned in the dev group and configured under `[tool.ty]` in
+`pyproject.toml`. It checks all of `agent_chat` with `redundant-cast`,
+`unused-ignore-comment` and `blanket-ignore-comment` as errors, and it
+ignores `# type: ignore` comments. Fix a diagnostic in the code; use a
+`# ty: ignore[rule]` with a one-line reason only for a genuine checker
+limitation.
+
+Install PostgreSQL server binaries and the pinned Playwright Chromium before
+running the suite. Set `PG_TEST_BIN_DIR` if PostgreSQL is outside the normal
+search path. The suite reports a failure when either prerequisite is missing.
+Run the pinned secret scan in the `public-content` job on the intended commit
+range before pushing.
+
+After syncing dependencies, you can run only the deployment contract tests.
+
+```sh
+uv run python -m pytest -q tests/test_deploy.py
+```
+
 ## Required checks
 
 `main` requires these contexts on the pull request's exact head, all strict:
@@ -42,23 +74,7 @@ signal. Making either a required context is a maintainer decision.
 1. Branch from the current `main`.
 2. Add or update the focused tests. The suite fails, never skips, without its
    PostgreSQL binaries and Playwright Chromium.
-3. Run the local checks:
-
-   ```sh
-   uv sync --frozen
-   uv lock --check
-   uv run ruff check .
-   uv run ty check
-   uv run python -m pytest -q
-   ```
-
-   `ty` is pinned in the dev group and configured under `[tool.ty]` in
-   `pyproject.toml`. It checks all of `agent_chat` with `redundant-cast`,
-   `unused-ignore-comment` and `blanket-ignore-comment` as errors, and it
-   ignores `# type: ignore` comments. Fix a diagnostic in the code; use a
-   `# ty: ignore[rule]` with a one-line reason only for a genuine checker
-   limitation.
-
+3. Run the [local checks](#local-checks).
 4. Push the branch and open one pull request against `main`. Expect the required
    checks (`checks`, `public-content`, `review`, `dependency-review`) and an
    independent review on the exact head.

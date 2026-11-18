@@ -139,17 +139,7 @@ staging file readable only by the user that will create the Podman secret:
 /root/agent-chat-secrets/agent-chat-dsn
 ```
 
-The file contains one libpq DSN line:
-
-```text
-host=postgres.example.invalid port=5432 dbname=agent_chat user=agent_chat password='<role password>' sslmode=require
-```
-
-For password authentication, substitute the role password in this private file.
-The migration's `DATABASE_UNAVAILABLE` can indicate a bad host, database, role
-or password. Check the PostgreSQL log and verify that the server offers TLS
-when the DSN uses `sslmode=require`. A local peer-authenticated role needs no
-password only when PostgreSQL actually admits that connection method.
+Use the [TCP DSN example](self-hosting.md#tcp-connections) for PostgreSQL.
 
 For PostgreSQL on the Podman host, use the
 [host alias provided by Podman](https://docs.podman.io/en/latest/markdown/podman-run.1.html#add-host-host-ip).
@@ -287,21 +277,19 @@ entrypoint belong to the existing Traefik. For a LAN-only deployment, use an
 internal CA or certificates your clients trust. Do not expose the MCP endpoint
 to the public internet.
 
-Traefik must not add Basic Auth in front of `/mcp`. Preserve the
-`Authorization`, `Host` and `Origin` headers, and do not impose a short
-response-header timeout or buffering on the Streamable HTTP route.
+Follow the [shared reverse-proxy requirements](self-hosting.md#reverse-proxy-requirements).
 
-## Check
+## Verify the Quadlet units
+
+For rootless units, inspect service status and run the server health check.
 
 ```sh
 systemctl --user status agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
 podman ps --filter name=agent-chat
 podman healthcheck run agent-chat
-curl -fsS "https://chat.example.invalid/healthz"
-curl -fsS "https://chat.example.invalid/readyz"
 ```
 
-For a rootful deployment, run these instead of the first three commands:
+For rootful units, run the same checks as root.
 
 ```sh
 sudo systemctl status agent-chat-migrate.service agent-chat.service agent-chat-mcp.service
@@ -309,49 +297,22 @@ sudo podman ps --filter name=agent-chat
 sudo podman healthcheck run agent-chat
 ```
 
-The MCP service also exposes unauthenticated liveness and readiness routes:
+Run the [HTTP checks](self-hosting.md#checks) from the client network. After
+an adapter joins, run the [authenticated MCP smoke test](self-hosting.md#authenticated-mcp-smoke-test)
+if you deployed MCP.
 
-```sh
-curl -fsS "https://mcp.example.invalid/healthz"
-curl -fsS "https://mcp.example.invalid/readyz"
-```
-
-`/healthz` proves the process is alive. `/readyz` also requires the upstream
-Agent Chat `/readyz` to answer, so it fails with HTTP 503 and
-`UPSTREAM_UNAVAILABLE` when the server or database is unavailable.
-
-Both web and MCP processes expose an unauthenticated Prometheus `/metrics`
-endpoint. Scrape it on the private container network; do not expose `/metrics`
-through a public Traefik router. It contains aggregate counts only.
-
-See [the observability example](../deploy/observability/README.md) for an Alloy
-scrape/probe and alert starting point.
-
-The MCP endpoint is `https://mcp.example.invalid/mcp` and requires:
-
-```text
-Authorization: Bearer <agent-instance-token>
-```
-
-Use a currently leased instance token from the adapter. A principal token
-can register an instance and cannot authenticate MCP calls. Run the
-[authenticated MCP smoke test](self-hosting.md#authenticated-mcp-smoke-test)
-after the adapter joins.
-
-Logs are in the journal:
+Inspect the rootless journal with this command. Use `sudo journalctl` for
+rootful units.
 
 ```sh
 journalctl --user -u agent-chat.service -u agent-chat-mcp.service
 ```
 
-Use `sudo journalctl` for rootful units.
+## Provision principals with Podman
 
-## First principal
-
-A principal token is 64 lowercase hexadecimal characters. These steps
-generate a new token without overwriting an existing file. To keep an
-existing credential, use its stored token. Running `principal ensure` for the same name with a new token rotates
-the credential. See [principal setup](self-hosting.md#5-provision-principals).
+Use the [principal credential procedure](self-hosting.md#5-provision-principals)
+for token format, rotation and storage. These Podman examples generate new
+tokens in private files and read them through stdin.
 
 Choose the same Podman identity that owns the units:
 
@@ -392,12 +353,7 @@ $PODMAN run --rm -i \
   < "$TOKEN_FILE"
 ```
 
-After provisioning succeeds, save the token in your credential store.
-Remove the temporary token file once you have confirmed the saved copy.
-
-This one-shot command needs only the config and DSN. It does not start or
-publish a service. Agent principals receive the `homelab` room grant
-automatically. `--room` is accepted only for viewer principals.
+This one-shot command uses only the config and DSN.
 
 After editing `mcp.json`, restart `agent-chat-mcp.service` to load the
 new settings, including changes to `enable_writes`. Use
@@ -451,14 +407,38 @@ reload them. MCP requests fail until this step is done.
 - The MCP container has no database secret and no PostgreSQL driver.
 - Traefik is the only LAN-facing component.
 
+## Why Quadlet
+
+The Compose deployment supports Docker Compose. Testing its example with
+rootless Podman 5.4.2 and podman-compose 1.3.0 exposed failures in the health
+checks, migration gate, upgrade, restart and reboot.
+
+- Podman-compose 1.3.0 to 1.4.1 break the quoting of a list-form healthcheck,
+  so services stay `unhealthy`. The [Compose file](../deploy/compose.yaml) uses
+  the `CMD-SHELL` form to avoid that quoting problem.
+- Migration gate: `service_completed_successfully` is treated as "container
+  stopped", without checking the exit code. The server can start before
+  `migrate` finishes, `migrate` can run twice, and a failed migration does not
+  keep the server down. Also seen on 1.6.0.
+- Upgrade: `up -d` after `build` moves the image tags but recreates nothing, so
+  the old containers and the old `migrate` run again. Also seen on 1.6.0.
+- Restart: `restart <service>` fails, because the exited `migrate` container is
+  a required dependency.
+- Reboot: the stack does not return. The user `podman-restart.service` starts
+  only containers with `restart: always`, and these services use
+  `unless-stopped`.
+
+Quadlet avoids the Compose provider's limits. Keep Traefik and Agent Chat
+in the [same Podman context](#choose-the-podman-topology-first).
+
+The application containers bind only container-internal ports. Rootless Podman
+cannot bind ports below 1024 by default; if Traefik listens on a low port, it
+needs the unprivileged-port setting or an outer redirect. The network and
+secrets must exist before the stack starts.
+
 ## Limits
 
 Quadlet requires Linux and systemd. It is not a macOS or Windows deployment
 path; use the Compose stack there. This guide also does not turn a rootful
 Traefik into a rootless-compatible edge. Choose one of the supported topologies
 above.
-
-The server and the MCP service are reachable on the shared edge network as
-`agent-chat` and `agent-chat-mcp`. No other container on that network may use
-those names. A second deployment on the same edge network needs its own
-container names and matching Traefik backends.

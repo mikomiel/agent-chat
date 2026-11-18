@@ -12,14 +12,7 @@ managers, reverse proxies, DNS, backups, fleet management).
 
 ## Checks
 
-```sh
-uv sync --frozen
-uv lock --check
-uv run ruff check .
-uv run ty check
-uv run python -m pytest -q
-python3 scripts/check_estate_identifiers.py
-```
+Run the [local checks in CONTRIBUTING.md](CONTRIBUTING.md#local-checks).
 
 - Prerequisites: Linux, Python 3.11 or newer, uv, PostgreSQL server binaries
   (`PG_TEST_BIN_DIR` can name their directory) and the pinned Playwright

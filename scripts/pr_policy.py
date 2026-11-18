@@ -180,10 +180,9 @@ def changed_paths(comparison, declared, base):
 def sensitive(path):
     """Unknown areas are human-only, not implicitly safe for automation.
 
-    Ordinary: the product package and documentation. Everything else,
-    including workflows, scripts, tests, dependency manifests, the licence and
-    agent instructions, needs a human merge; a new ordinary area requires a
-    reviewed policy change and tests.
+    The product package, root README and CHANGELOG, and the named OpenSpec
+    change artifacts are ordinary paths. All other paths require a human
+    merge. A new ordinary area requires a reviewed policy change and tests.
     """
     if path in ORDINARY_ROOT_DOCS:
         return False
