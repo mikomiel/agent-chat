@@ -2,6 +2,9 @@ name: agent-chat
 
 services:
   migrate:
+    # The only build of the server image; agent-chat runs the same tag. migrate is
+    # the root of the dependency chain, so `up` and `run --rm migrate` both build
+    # the image when it is missing, before they create any container.
     build:
       context: ..
       target: server
@@ -15,6 +18,9 @@ services:
       - ${AGENT_CHAT_CONFIG_DIR:-./config}/server.json:/etc/agent-chat/config.json:ro,z
     networks:
       - app
+    # A one-shot job: do not inherit the HEALTHCHECK of the server image.
+    healthcheck:
+      disable: true
     restart: "no"
     read_only: true
     tmpfs:
@@ -25,10 +31,10 @@ services:
       - no-new-privileges:true
 
   agent-chat:
-    build:
-      context: ..
-      target: server
+    # Runs the image that migrate builds. `never` stops Compose from trying to
+    # pull a tag that only exists locally.
     image: ${AGENT_CHAT_SERVER_IMAGE:-agent-chat-server:local}
+    pull_policy: never
     command: ["serve", "--config", "/etc/agent-chat/config.json"]
     depends_on:
       migrate:
@@ -45,11 +51,11 @@ services:
     expose:
       - "8443"
     healthcheck:
+      # The CMD-SHELL string form: podman-compose 1.3.0 to 1.4.1 break the quoting
+      # of the CMD list form. The probe itself is unchanged.
       test:
-        - CMD
-        - python
-        - -c
-        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8443/healthz', timeout=2)
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8443/healthz', timeout=2)"
       interval: 10s
       timeout: 3s
       start_period: 10s
@@ -80,11 +86,10 @@ services:
     expose:
       - "8951"
     healthcheck:
+      # The CMD-SHELL string form, as for agent-chat.
       test:
-        - CMD
-        - python
-        - -c
-        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8951/healthz', timeout=2)
+        - CMD-SHELL
+        - python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8951/healthz', timeout=2)"
       interval: 10s
       timeout: 3s
       start_period: 10s
