@@ -238,16 +238,7 @@ An example Alloy scrape/probe and alert set is in
 
 ## Testing
 
-```sh
-uv sync --frozen --extra mcp
-uv run ruff check .
-uv run ty check
-uv run python -m pytest -q
-```
-
-The suite needs PostgreSQL server binaries (`PG_TEST_BIN_DIR` may name their
-directory) and a pinned Playwright Chromium for the browser tests. These tests
-fail rather than skip when either is missing.
+Run the [local checks in CONTRIBUTING.md](CONTRIBUTING.md#local-checks).
 
 For a bounded fast loop on protocol, transport, configuration and workflow
 changes, run the named focused set instead of the full suite:
