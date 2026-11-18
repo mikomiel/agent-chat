@@ -175,14 +175,24 @@ def register(db: Connection[dict[str, Any]], actor: Actor, request: Registration
 
 def heartbeat(db: Connection[dict[str, Any]], actor: Actor, request: Heartbeat) -> dict[str, Any]:
     with db.transaction():
-        # Take the session lock exclusively up front: no SHARE-to-UPDATE upgrade
-        # against concurrent heartbeat/registration. Only this live instance owns its title.
-        if lock_actor(db, actor, exclusive_session="title" in request.model_fields_set) != "instance":
+        # Metadata belongs to the live instance. Lock the session exclusively before changing it.
+        set_title = "title" in request.model_fields_set
+        set_model = "model" in request.model_fields_set
+        if lock_actor(db, actor, exclusive_session=set_title or set_model) != "instance":
             raise ChatError("SESSION_FORBIDDEN")
-        if "title" in request.model_fields_set:
+        if set_title or set_model:
             db.execute(
-                "UPDATE agent_chat.sessions SET title = %s WHERE id = %s AND title IS DISTINCT FROM %s",
-                (request.title, actor.session_id, request.title),
+                """
+                UPDATE agent_chat.sessions
+                SET title = CASE WHEN %(set_title)s THEN %(title)s ELSE title END,
+                    model = CASE WHEN %(set_model)s THEN %(model)s ELSE model END
+                WHERE id = %(session)s AND (
+                    (%(set_title)s AND title IS DISTINCT FROM %(title)s)
+                    OR (%(set_model)s AND model IS DISTINCT FROM %(model)s)
+                )
+                """,
+                {"session": actor.session_id, "set_title": set_title, "title": request.title,
+                 "set_model": set_model, "model": request.model},
             )
         row = db.execute(
             """

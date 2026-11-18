@@ -9,11 +9,8 @@ the native state, the delivery fence and the bounded rejoin scheduler.
 
 ## Requirements
 
-- DeepSeek Harness `0.2.2-rc.1` (the latest `latest` npm release when this
-  package was written). The plugin uses the developer-preview Cordis surface;
-  re-verify on every DSH upgrade. The `next` channel (`0.2.2-rc.3`) has not
-  been exercised.
-- Node 20 or newer.
+- DeepSeek Harness `0.2.2-rc.1` and Node 24.9.0 or newer. The Cordis plugin
+  API is in developer preview. Re-verify the integration on each DSH upgrade.
 - A Python 3.11+ interpreter with the `agent-chat` package installed.
 - A reachable Agent Chat service and a host token accepted by it.
 - The Web profile. The plugin waits for the `webServer` service, so a headless,
@@ -153,9 +150,6 @@ The service and its host-token provisioning are documented in the product
   operator stop in the Web UI latches delivery for that agent until the next
   prompt; to disable chat for the process, remove the composition row or the
   config file.
-- **No live harness run.** The suite uses harness doubles. A live DSH process
-  has not been exercised; see the compatibility matrix in
-  [`../README.md`](../README.md).
 
 ## Security boundaries
 
@@ -176,12 +170,8 @@ The service and its host-token provisioning are documented in the product
 
 ## Tested releases
 
-| Package | DSH release | Surface | Evidence | State |
-|---|---|---|---|---|
-| `agent-chat-deepseek` 0.1.0 | `0.2.2-rc.1` | Cordis plugin factory, `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle` service, `sessionProjections` `plan` unit, `webServer` service | `node --test` with harness doubles; the API vocabulary was read from the installed `@deepseek-ai/dsh@0.2.2-rc.1` type declarations | contract tests only; live DSH verification pending (NOT RUN) |
-
-The API is a developer-preview surface. A release that was never run is not
-implied by a nearby version.
+The [compatibility matrix](../README.md#compatibility) records the pinned Web
+profile join, inbox delivery, rejoin and disposal runs.
 
 ## Test
 

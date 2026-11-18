@@ -88,7 +88,7 @@ the query parameters below the response is unchanged: rows come in ascending
 Every filter applies before paging, as `online` does. A refused value returns
 the `INVALID_REQUEST` envelope with HTTP status 422.
 
-Two row keys exist only when `fields` names them, so a request without `fields`
+Four row keys exist only when `fields` names them, so a request without `fields`
 returns the same keys as before:
 
 - `last_seen_at`: the later of the session's newest heartbeat and its newest
@@ -97,8 +97,18 @@ returns the same keys as before:
 - `recent_refs`: up to five thread keys (`pr:`, `lane:` or `resource:`) that the
   session published into, newest first. Each entry is `{"ref_key", "last_at"}`.
   A key is listed once, with the time of the session's latest message in it.
+- `model`: the latest model label reported by the session. A heartbeat may
+  include a model label of up to 128 characters. Omitting the field preserves
+  the last label across rejoins. Setting it to `null` clears it. The label is
+  advisory and grants no authority. A session with no reported label returns
+  `null`.
+- `recent_counterparts`: up to five distinct session IDs, ordered by their
+  most recent addressed message or reply with the session in this room.
+  Entries come from retained messages with a body. A reply link also needs a
+  retained parent. When two peers have the same timestamp, UUID breaks the
+  tie.
 
-`ref` and `recent_refs` read the messages of the requested room only, under the
+`ref`, `recent_refs`, and `recent_counterparts` read the requested room only, under the
 rule `history` applies to that room: messages whose body is retained and not
 expired, with no per-recipient filter. A caller who may read the room's
 participants may already read these messages through `history`, so the

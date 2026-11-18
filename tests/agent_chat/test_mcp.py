@@ -1004,8 +1004,21 @@ def test_who_sorts_filters_and_projects_through_the_tool(process_api, credential
         refs = call(origin, token, "who", published)
         assert [row["session_id"] for row in refs["participants"]] == [own["session_id"]]
         assert [entry["ref_key"] for entry in refs["participants"][0]["recent_refs"]] == ["pr:owner/repo#7"]
+        heartbeat = {"native_state": "idle", "stopped": False, "plan_mode": False}
+        fields = {"room": "homelab", "fields": "session_id,model"}
+        for update, expected in (
+            ({"model": "synthetic-model"}, "synthetic-model"),
+            ({}, "synthetic-model"),
+            ({"model": None}, None),
+        ):
+            status, _ = process_api.request("POST", "/v1/instance/heartbeat", heartbeat | update, token)
+            assert status == 200
+            participants = call(origin, token, "who", fields)["participants"]
+            assert {row["session_id"]: row["model"] for row in participants} == {
+                own["session_id"]: expected, peer["session_id"]: None,
+            }
         default = call(origin, token, "who", {"room": "homelab"})
-        assert {"last_seen_at", "recent_refs"}.isdisjoint(default["participants"][0])
+        assert {"last_seen_at", "recent_refs", "model", "recent_counterparts"}.isdisjoint(default["participants"][0])
         for refused in (
             {"sort": "newest"},
             {"sort": "activity", "after_session": peer["session_id"]},

@@ -21,7 +21,7 @@ DEFAULT_ROW = [
     "online", "native_state", "stopped", "plan_mode", "lane", "lane_since", "lane_age_seconds", "repositories",
     "last_published_at", "messages_24h", "announced_prs",
 ]
-NEW_ROW_KEYS = {"last_seen_at", "recent_refs"}
+NEW_ROW_KEYS = {"last_seen_at", "recent_refs", "model", "recent_counterparts"}
 PR = "pr:owner/project#7"
 
 
@@ -111,6 +111,41 @@ def test_new_row_keys_appear_only_when_named(db: Any, actors: Any) -> None:
     assert sorted(len(row["recent_refs"]) for row in refs) == [0, 1]
     both = rooms.participants(db, operator, room, fields="recent_refs,last_seen_at,label")["participants"]
     assert all(list(row) == ["recent_refs", "last_seen_at", "label"] for row in both)
+
+
+def test_recent_counterparts_use_retained_addresses_and_reply_links(db: Any, actors: Any, actor_factory: Any) -> None:
+    room, first, second, operator = actors
+    earlier, earlier_tie, newer, latest, reply_sender, expired, redacted, other_room_only, quiet = (
+        actor_factory(room) for _ in range(9)
+    )
+    other = _second_room(db, operator, first, other_room_only)
+    now = _clock(db)
+    _say(db, first, room, at=now - timedelta(seconds=10), recipients=[second.session_id])
+    _say(db, first, room, at=now - timedelta(seconds=9), recipients=[earlier.session_id, earlier_tie.session_id])
+    _say(db, newer, room, at=now - timedelta(seconds=8), recipients=[first.session_id])
+    _say(db, latest, room, at=now - timedelta(seconds=7), recipients=[first.session_id])
+    _say(db, first, room, at=now - timedelta(seconds=6), recipients=[newer.session_id])
+    _say(db, first, other, at=now - timedelta(seconds=5), recipients=[other_room_only.session_id])
+    gone = _say(db, expired, room, at=now - timedelta(seconds=4), recipients=[first.session_id])
+    db.execute("UPDATE agent_chat.messages SET expires_at = clock_timestamp() WHERE id = %s", (gone["id"],))
+    removed = _say(db, first, room, at=now - timedelta(seconds=3), recipients=[redacted.session_id])
+    # Keep a reply to the redacted parent. Its explicit recipient is the replier, so the parent link adds no peer.
+    publish(db, redacted, room, uuid4(), Publication(
+        kind="reply", body="synthetic", reply_to=removed["id"], recipients=[redacted.session_id],
+    ))
+    db.execute("UPDATE agent_chat.messages SET body = NULL WHERE id = %s", (removed["id"],))
+    parent = _say(db, first, room, at=now - timedelta(seconds=2))
+    publish(db, reply_sender, room, uuid4(), Publication(
+        kind="reply", body="synthetic", reply_to=parent["id"], recipients=[second.session_id],
+    ))
+    rows = rooms.participants(db, operator, room, fields="session_id,recent_counterparts")["participants"]
+    by_id = {row["session_id"]: row["recent_counterparts"] for row in rows}
+    assert by_id[first.session_id] == list(map(str, [
+        reply_sender.session_id, newer.session_id, latest.session_id,
+        *sorted((earlier.session_id, earlier_tie.session_id)),
+    ]))
+    assert set(by_id[reply_sender.session_id]) == {str(first.session_id), str(second.session_id)}
+    assert by_id[quiet.session_id] == []
 
 
 @pytest.mark.parametrize("name,values", [("harness", ("claude", "codex", "pi")), ("host", ("alpha", "beta", "gamma"))])
