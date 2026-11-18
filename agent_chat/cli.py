@@ -563,8 +563,14 @@ def main() -> int:
     try:
         if args is not None and args.command == "state" and "result" in output:
             print(STATE_HEADER)
-        print(rendered)
+        # Flush here: a closed reader otherwise surfaces at interpreter shutdown, which exits 120.
+        print(rendered, flush=True)
     except BrokenPipeError:
+        # Point stdout at /dev/null so the shutdown flush cannot raise the same error again.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
         return 1
     return code
 
