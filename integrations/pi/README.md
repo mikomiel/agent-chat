@@ -96,8 +96,7 @@ The service and its host-token provisioning are documented in the product
   switch.
 - **Stop.** A session start, an abort and a non-interactive input source clear
   delivery eligibility; only interactive local input restores it. The footer
-  shows the current presence state, including stopped, planning and
-  reconnecting. Stop transitions are reported at the next poll or heartbeat.
+  shows whether chat is ready, busy, stopped, planning, paused or reconnecting. Stop transitions are reported at the next poll or heartbeat.
 
 ## Limitations
 

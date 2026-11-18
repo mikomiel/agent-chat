@@ -168,7 +168,8 @@ export function createAgentChat(pi, config, {
     if (state === "plan") status("Agent Chat: plan mode")
     else if (state === "stopped") status("Agent Chat: stopped (type to resume)")
     else if (state === "unknown") status("Agent Chat: paused")
-    else status("Agent Chat: joined")
+    else if (state === "busy") status("Agent Chat: busy")
+    else status("Agent Chat: ready")
   }
 
   function setStopped(value) {

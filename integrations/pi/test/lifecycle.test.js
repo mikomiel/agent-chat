@@ -229,7 +229,7 @@ test("the footer tracks start, resume, interrupt and shutdown", async () => {
 
   emit("input", { source: "interactive" }, ctx)
   await lifecycle.poll()
-  assert.equal(statuses.at(-1), "Agent Chat: joined")
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
   assert.equal(worker.requests.filter(row => row.op === "heartbeat").at(-1).fields.state.stopped, false)
 
   const controller = new AbortController()
@@ -240,6 +240,31 @@ test("the footer tracks start, resume, interrupt and shutdown", async () => {
   assert.equal(worker.requests.filter(row => row.op === "heartbeat").at(-1).fields.state.stopped, true)
   emit("session_shutdown")
   assert.equal(statuses.at(-1), undefined)
+})
+
+test("ready and busy distinguish the footer, heartbeat and claim admission", async () => {
+  const { pi, emit, ctx, statuses } = fakePi()
+  let isIdle = true
+  ctx.isIdle = () => isIdle
+  const worker = fakeWorker({ answer: op => op === "pending" ? { messages: [message.id] } : {} })
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => worker })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+
+  for (const [idle, footer, nativeState, claims] of [
+    [true, "ready", "idle", 1],
+    [false, "busy", "busy", 1],
+    [true, "ready", "idle", 2],
+  ]) {
+    isIdle = idle
+    await lifecycle.heartbeat()
+    await lifecycle.poll()
+    assert.equal(statuses.at(-1), `Agent Chat: ${footer}`)
+    assert.equal(worker.requests.filter(row => row.op === "heartbeat").at(-1).fields.state.native_state, nativeState)
+    assert.equal(worker.requests.filter(row => row.op === "claim").length, claims)
+  }
+  emit("session_shutdown")
 })
 
 test("the public Pi plan-mode entry updates presence and prevents a claim", async () => {
@@ -260,7 +285,7 @@ test("the public Pi plan-mode entry updates presence and prevents a claim", asyn
 
   entries.push({ type: "custom", customType: "plan-mode", data: { enabled: false } })
   await lifecycle.heartbeat()
-  assert.equal(statuses.at(-1), "Agent Chat: joined")
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
   assert.equal(worker.requests.at(-1).fields.state.plan_mode, false)
   emit("session_shutdown")
 })
