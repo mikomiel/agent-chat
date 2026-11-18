@@ -248,35 +248,55 @@ not create a listening service.
 
 ## Upgrades and backups
 
-Before upgrading, save the working deployment configuration and back up
-PostgreSQL. Use versioned values for `AGENT_CHAT_SERVER_IMAGE` and
-`AGENT_CHAT_MCP_IMAGE` in `.env`. Keep the previous tags until the upgrade is
-verified. If the current stack uses the default `:local` tags, tag the image
+Before upgrading, save the working deployment configuration and take a
+PostgreSQL backup with your deployment's tested restore procedure. Record
+which backup belongs to this upgrade. Use versioned values for
+`AGENT_CHAT_SERVER_IMAGE` and `AGENT_CHAT_MCP_IMAGE` in `.env`. Keep the previous
+tags until the upgrade is verified. If the current stack uses the default `:local` tags, tag the image
 IDs of the running containers with unused rollback tags before rebuilding.
 Use `docker compose ps -q SERVICE` to get each container ID and
 `docker inspect --format '{{.Image}}' CONTAINER_ID` to find its image ID.
 
+Compose resolves these inputs from exported shell variables first, the
+file given to `--env-file` second and the defaults in `compose.yaml` last.
+Unset any unintended shell overrides for the image tags,
+`AGENT_CHAT_CONFIG_DIR`, `AGENT_CHAT_DSN_FILE` and `TRAEFIK_NETWORK`.
+Run `docker compose --env-file .env -f compose.yaml config` in your terminal
+and confirm the resolved image tags, configuration mounts, DSN file path
+and network before building or migrating. Check the DSN path without
+printing its contents.
+
 Build the candidate from the intended source version using new image tags.
 Run the same build and migration check as in [Start](#start). If the check
 fails, keep serving from the previous containers while you investigate.
-Running `up -d` too early can replace the serving containers before a failing
-migration leaves their replacements stopped.
+Keep the candidate images and Compose inputs fixed through the upgrade.
+Schedule a maintenance window if the schema change can interrupt the
+previous version.
 
-Apply the reviewed migrations in a one-shot container before replacing the
-serving containers. Schedule a maintenance window if the schema change can
-interrupt the previous version.
+If migrations are pending, review the listed files and pass the printed
+`reviewed=` value (the digest only) to the one-shot apply:
 
 ```sh
-docker compose --env-file .env -f compose.yaml run --rm --no-deps --pull never migrate && \
-  docker compose --env-file .env -f compose.yaml up -d --no-build --pull never
+docker compose --env-file .env -f compose.yaml run --rm --no-deps --pull never migrate \
+  migrate --config /etc/agent-chat/config.json --reviewed '<reviewed-sha256>'
+```
+
+After a successful apply, run the candidate's migration check again and
+confirm it prints `pending=0`. If the first check already prints `pending=0`,
+skip the apply. Once the check is clean, recreate the long-running services
+with `--no-deps` so Compose does not start another migration:
+
+```sh
+docker compose --env-file .env -f compose.yaml up -d --no-build --pull never \
+  --no-deps agent-chat agent-chat-mcp
 ```
 
 Check readiness on both origins before retiring the previous images. For a
-rollback, restore the previous Compose configuration and image tags. Check
-the database against that version before starting it. If a migration made the
-schema incompatible with the previous version, restore a compatible
-database using the backup procedure before bringing up the old stack.
-Software rollback alone cannot roll back the database.
+rollback, restore the previous Compose configuration and image tags.
+Check the resolved inputs again, then check database compatibility with
+the previous version. If a migration made the schema incompatible with
+that version, restore a compatible database using the tested restore
+procedure and verify it before bringing up the previous stack.
 
 When upgrading from a release that named the MCP service `mcp`, add
 `--remove-orphans` to the final `up` command. Change any Traefik and Alloy
@@ -302,6 +322,10 @@ docker compose --env-file .env -f compose.yaml up -d --no-deps --force-recreate 
 ```
 
 ## Restarts and logs
+
+Changes to Compose inputs take effect through `up` and container
+recreation. Use `restart` when you only need to restart a process with
+its existing container configuration.
 
 When Docker starts after reboot, it restarts the long-running services unless
 an operator stopped them. The completed migration container does not start
