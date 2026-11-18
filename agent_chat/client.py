@@ -151,6 +151,7 @@ class Client:
         key: str | None = None,
         *,
         invalid: str | None = None,
+        refused: str | None = None,
     ) -> Any:
         origin = urlsplit(self._origin)
         assert origin.hostname is not None
@@ -243,12 +244,18 @@ class Client:
             if not isinstance(result, dict):
                 raise ValueError("invalid response object")
             if response.status != 200:
+                # Any other complete 2xx is a protocol violation, for a caller that names one (`invalid`).
+                if invalid is not None and 200 <= response.status < 300:
+                    raise ChatError(invalid)
                 error = result.get("error", {})
                 code = error.get("code") if isinstance(error, dict) else None
                 if isinstance(code, str) and HTTP_ERROR_STATUS.get(code) == response.status:
                     raise ChatError(code)
                 if response.status >= 500:
                     raise ChatError("REQUEST_UNCERTAIN" if submitted else "SERVICE_UNAVAILABLE")
+                # A caller that tells refusals from outages (`refused`) reads an unnamed 408 or 429 as an outage.
+                if refused is not None and response.status in (408, 429) and not submitted:
+                    raise ChatError("SERVICE_UNAVAILABLE")
                 raise ChatError("REQUEST_UNCERTAIN" if submitted else "HTTP_REFUSED")
             return result
         except ChatError:
@@ -260,10 +267,25 @@ class Client:
                 raise ChatError("CLI_INTERRUPTED") from None
             if self._deadline is not None and time.monotonic() >= self._deadline:
                 raise ChatError("CLI_INTERRUPTED") from None
-            # A complete 200 whose body breaks the protocol is not an outage. A caller that tolerates
+            # A complete 2xx whose body breaks the protocol is not an outage. A caller that tolerates
             # outages names it `invalid`; every other caller keeps the classification below.
-            if invalid is not None and status == 200 and isinstance(error, (ValueError, RecursionError)):
+            if (
+                invalid is not None
+                and status is not None
+                and 200 <= status < 300
+                and isinstance(error, (ValueError, RecursionError))
+            ):
                 raise ChatError(invalid) from None
+            # Likewise a complete 4xx whose body is not this service's envelope, such as a proxy's HTML 403, is a
+            # refusal. A caller that must tell refusals from outages names it `refused`. 408 and 429 stay outages.
+            if (
+                refused is not None
+                and status is not None
+                and 400 <= status < 500
+                and status not in (408, 429)
+                and isinstance(error, (ValueError, RecursionError))
+            ):
+                raise ChatError(refused) from None
             raise ChatError("REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE") from None
         finally:
             if watchdog is not None:
