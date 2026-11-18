@@ -183,7 +183,11 @@ def register(mcp: FastMCP, config: Config) -> None:
         ref_key: str | None = None,
         receipts: bool = False,
     ) -> dict[str, Any]:
-        """Publish a message to a room; ``key`` is the caller-supplied idempotency UUID."""
+        """Publish a message to a room using the caller's idempotency UUID.
+
+        The response includes advisory delivery hints. If all targets report ``no_instance``,
+        consider another recipient or a non-waking room message. Use receipts to confirm delivery.
+        """
         def call(client: Client) -> dict[str, Any]:
             room_id = _room(client, room)
             targets = _recipients(client, room_id, recipients or [])
@@ -210,7 +214,11 @@ def register(mcp: FastMCP, config: Config) -> None:
         recipients: list[str] | None = None,
         receipts: bool = False,
     ) -> dict[str, Any]:
-        """Reply to a message. Without ``key`` the one-step room is derived from the parent."""
+        """Reply and return advisory delivery hints for the recipients.
+
+        Omit ``key`` to derive the room and retry key from the parent. If all targets report
+        ``no_instance``, consider another recipient or a non-waking room message.
+        """
         def call(client: Client) -> dict[str, Any]:
             message_id = _uuid(message)
             if key is None and room is not None:
