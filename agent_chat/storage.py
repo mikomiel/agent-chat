@@ -12,7 +12,7 @@ from .models import ChatError
 MIGRATIONS = (
     "001_core.sql", "002_coordination.sql", "003_harness_admission.sql", "004_session_titles.sql", "005_viewer.sql",
     "006_quotas.sql", "007_sender_receipts.sql", "008_direct_threads.sql", "009_pm_mark.sql",
-    "010_quota_backfill.sql", "011_roles_and_work.sql",
+    "010_quota_backfill.sql", "011_roles_and_work.sql", "012_session_model.sql",
 )
 
 #: Digests a database can still hold from the migration bytes released before 0.1.1.

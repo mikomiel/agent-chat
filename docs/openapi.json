@@ -122,6 +122,19 @@
       "Heartbeat": {
         "additionalProperties": false,
         "properties": {
+          "model": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
           "native_state": {
             "enum": [
               "idle",
@@ -335,6 +348,21 @@
               "string",
               "null"
             ]
+          },
+          "model": {
+            "maxLength": 128,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "recent_counterparts": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "maxItems": 5,
+            "type": "array"
           },
           "recent_refs": {
             "items": {
