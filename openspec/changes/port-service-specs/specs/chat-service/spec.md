@@ -377,19 +377,23 @@ The service MUST leave a recipient entry stored more than 24 hours ago, with no 
 - **AND** once the entry is settled, the message remains in history with the uncertainty reason `expired_undelivered`
 
 #### Scenario: Claim for an expired message
-- **WHEN** delivery is enabled and an adapter makes a first claim for a message stored more than 24 hours ago, from a session that is not blocked and has no attempt in flight
+- **WHEN** delivery is enabled and an adapter makes a first claim for a retained message with a body stored more than 24 hours ago, from a session that is not blocked and has no attempt in flight
 - **THEN** the claim is refused with `DELIVERY_INELIGIBLE` and creates no attempt
 - **AND** the refusal does not roll back the expiry sweeps of that claim, so the entry is settled `expired_undelivered` if it is among the entries those sweeps take
 - **AND** a blocked session, or one with an attempt in flight, receives `DELIVERY_BLOCKED` or `DELIVERY_IN_FLIGHT` instead
 - **AND** a message with earlier attempts is refused with `DELIVERY_INELIGIBLE` like a first claim unless a guard on those attempts refuses the claim before the eligibility check
 - **AND** an eligible entry without an open attempt is settled when a sweep reaches it
 
+#### Scenario: A recipient claims a message after retention expires
+- **WHEN** a live recipient claims a message whose retention has expired and whose row still exists
+- **THEN** the claim is refused with `MESSAGE_EXPIRED` and the expiry sweep skips the message
+
 ### Requirement: Expired questions, consultations and replies are settled
-The service MUST settle a recipient entry of a `question`, `consultation` or `reply` that is stored more than 24 hours ago, has no handed, acknowledged or reply evidence and has no uncertainty reason yet, with uncertainty reason `expired_undelivered` and a receipt event. It MUST NOT settle an entry of another kind, and MUST NOT replace an existing uncertainty reason such as `transport_ambiguous`.
+The service MUST settle an eligible recipient entry of a retained `question`, `consultation` or `reply` whose body is present and that was stored more than 24 hours ago, has no handed, acknowledged or reply evidence and has no uncertainty reason yet, with uncertainty reason `expired_undelivered` and a receipt event. It MUST NOT settle an entry of another kind, and MUST NOT replace an existing uncertainty reason such as `transport_ambiguous`.
 
 #### Scenario: Settlement is not clock-driven
 - **WHEN** a claim made while delivery is enabled, or a result call, runs for the session
-- **THEN** the oldest `question`, `consultation` and `reply` entries of that session past 24 hours that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep
+- **THEN** the oldest retained `question`, `consultation` and `reply` entries of that session with a body, past 24 hours, that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep
 - **AND** a call runs up to two sweeps. A refusal handled before the normal sweep runs only the refusal-path sweep. A refusal handled after the normal sweep runs both
 - **AND** later sweeps continue with the oldest remaining eligible entries
 - **AND** an entry covered by an open attempt is not settled
