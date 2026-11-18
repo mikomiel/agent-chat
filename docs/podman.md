@@ -348,10 +348,9 @@ Use `sudo journalctl` for rootful units.
 
 ## First principal
 
-A principal token is 64 lowercase hexadecimal characters. The commands below
-generate one into a private file. Save the token in your credential store
-before removing that file. To keep an existing credential, use its stored
-token. Running `principal ensure` for the same name with a new token rotates
+A principal token is 64 lowercase hexadecimal characters. These steps
+generate a new token without overwriting an existing file. To keep an
+existing credential, use its stored token. Running `principal ensure` for the same name with a new token rotates
 the credential. See [principal setup](self-hosting.md#5-provision-principals).
 
 Choose the same Podman identity that owns the units:
@@ -367,8 +366,7 @@ stdin and is never placed on the command line:
 ```sh
 TOKEN_FILE="$HOME/.config/agent-chat/operator.token"
 install -d -m 0700 "$(dirname "$TOKEN_FILE")"
-install -m 0600 /dev/null "$TOKEN_FILE"
-openssl rand -hex 32 > "$TOKEN_FILE"
+(umask 077; set -C; openssl rand -hex 32 > "$TOKEN_FILE") &&
 $PODMAN run --rm -i \
   --secret agent-chat-dsn,type=mount,target=agent-chat-dsn,uid=10001,gid=10001,mode=0400 \
   -e CREDENTIALS_DIRECTORY=/run/secrets \
@@ -376,7 +374,6 @@ $PODMAN run --rm -i \
   localhost/agent-chat-server:local \
   principal ensure --config /etc/agent-chat/config.json \
   --name operator --kind operator --json < "$TOKEN_FILE"
-rm -f "$TOKEN_FILE"
 ```
 
 For an agent principal, provide only `--host` and `--harness`:
@@ -384,8 +381,7 @@ For an agent principal, provide only `--host` and `--harness`:
 ```sh
 TOKEN_FILE="$HOME/.config/agent-chat/agent.token"
 install -d -m 0700 "$(dirname "$TOKEN_FILE")"
-install -m 0600 /dev/null "$TOKEN_FILE"
-openssl rand -hex 32 > "$TOKEN_FILE"
+(umask 077; set -C; openssl rand -hex 32 > "$TOKEN_FILE") &&
 $PODMAN run --rm -i \
   --secret agent-chat-dsn,type=mount,target=agent-chat-dsn,uid=10001,gid=10001,mode=0400 \
   -e CREDENTIALS_DIRECTORY=/run/secrets \
@@ -394,8 +390,10 @@ $PODMAN run --rm -i \
   principal ensure --config /etc/agent-chat/config.json \
   --name agent-a --kind agent --host workstation --harness pi --json \
   < "$TOKEN_FILE"
-rm -f "$TOKEN_FILE"
 ```
+
+After provisioning succeeds, save the token in your credential store.
+Remove the temporary token file once you have confirmed the saved copy.
 
 This one-shot command needs only the config and DSN. It does not start or
 publish a service. Agent principals receive the `homelab` room grant

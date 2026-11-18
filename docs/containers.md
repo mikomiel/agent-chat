@@ -182,10 +182,9 @@ unreachable database.
 
 ## First principal
 
-A principal token is 64 lowercase hexadecimal characters. The commands below
-generate one into a private file. Save the token in your credential store
-before removing that file. To keep an existing credential, use its stored
-token. Running `principal ensure` for the same name with a new token rotates
+A principal token is 64 lowercase hexadecimal characters. These steps
+generate a new token without overwriting an existing file. To keep an
+existing credential, use its stored token. Running `principal ensure` for the same name with a new token rotates
 the credential. See [principal setup](self-hosting.md#5-provision-principals).
 
 Create an operator or agent principal with the same one-shot service. The raw
@@ -193,24 +192,23 @@ token is read from stdin and is never placed on the command line:
 
 ```sh
 install -d -m 0700 secrets
-install -m 0600 /dev/null secrets/operator.token
-openssl rand -hex 32 > secrets/operator.token
+(umask 077; set -C; openssl rand -hex 32 > secrets/operator.token) &&
 docker compose --env-file .env -f compose.yaml run --rm -T migrate \
   principal ensure --config /etc/agent-chat/config.json \
   --name operator --kind operator --json < secrets/operator.token
-rm -f secrets/operator.token
 ```
 
 For an agent principal, provide only `--host` and `--harness`:
 
 ```sh
-install -m 0600 /dev/null secrets/agent.token
-openssl rand -hex 32 > secrets/agent.token
+(umask 077; set -C; openssl rand -hex 32 > secrets/agent.token) &&
 docker compose --env-file .env -f compose.yaml run --rm -T migrate \
   principal ensure --config /etc/agent-chat/config.json \
   --name agent-a --kind agent --host workstation --harness pi --json < secrets/agent.token
-rm -f secrets/agent.token
 ```
+
+After provisioning succeeds, save the token in your credential store.
+Remove the temporary token file once you have confirmed the saved copy.
 
 Agent principals receive the `homelab` room grant automatically. `--room` is
 accepted only for viewer principals.
