@@ -109,17 +109,29 @@ LOG_CONFIG: dict[str, Any] = {
     },
 }
 
+# `LOG_CONFIG` with the stock formatter, for stderr that is not the journal stream. `_serve` picks between the two.
+PLAIN_LOG_CONFIG: dict[str, Any] = {
+    **LOG_CONFIG,
+    "formatters": {
+        "plain": {key: value for key, value in LOG_CONFIG["formatters"]["plain"].items() if key != "()"},
+    },
+}
+
+
+def _on_journal_stream(stderr: TextIO, environ: Mapping[str, str]) -> bool:
+    # systemd names the journal stream it connected in JOURNAL_STREAM; matching it to stderr keeps the priority
+    # prefix out of a terminal, a pipe, a container log and a captured stream, where it would be noise.
+    try:
+        status = os.fstat(stderr.fileno())
+        return environ.get("JOURNAL_STREAM") == f"{status.st_dev}:{status.st_ino}"
+    except (OSError, ValueError):
+        return False
+
 
 def _diagnose(stderr: TextIO, environ: Mapping[str, str], text: str, priority: int = 3) -> None:
     # Uvicorn's formatter is installed only once it runs, so a failure before that (and every prune or migrate
-    # failure) prefixes its own line. systemd names the journal stream it connected in JOURNAL_STREAM; matching it
-    # to stderr keeps the prefix out of a terminal, a pipe and a captured stream, where it would be noise.
-    try:
-        status = os.fstat(stderr.fileno())
-        journal = environ.get("JOURNAL_STREAM") == f"{status.st_dev}:{status.st_ino}"
-    except (OSError, ValueError):
-        journal = False
-    print(f"<{priority}>{text}" if journal else text, file=stderr)
+    # failure) prefixes its own line.
+    print(f"<{priority}>{text}" if _on_journal_stream(stderr, environ) else text, file=stderr)
 
 
 class AdminError(Exception):
@@ -276,7 +288,7 @@ def _serve(config: Config, environ: Mapping[str, str], stderr: TextIO) -> int:
             access_log=False,
             proxy_headers=False,
             server_header=False,
-            log_config=LOG_CONFIG,
+            log_config=LOG_CONFIG if _on_journal_stream(stderr, environ) else PLAIN_LOG_CONFIG,
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
         )
     except (OSError, SystemExit) as error:
