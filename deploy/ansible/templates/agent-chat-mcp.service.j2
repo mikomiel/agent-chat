@@ -1,0 +1,49 @@
+# Managed by the Agent Chat example playbook (deploy/ansible/playbook.yml). Local edits are overwritten.
+[Unit]
+Description=Agent Chat Streamable HTTP MCP service (optional)
+After=network-online.target agent-chat.service
+Wants=network-online.target agent-chat.service
+
+[Service]
+Type=exec
+User=agent-chat-mcp
+Group=agent-chat-mcp
+ExecStart={{ agent_chat_root }}/current/bin/python -I -m agent_chat.mcp --config /etc/agent-chat/mcp.json
+Restart=on-failure
+RestartSec=5s
+# Exit status 2 is a configuration error: restarting cannot fix it.
+RestartPreventExitStatus=2
+TimeoutStopSec=30s
+SyslogIdentifier=agent-chat-mcp
+# This unit has no credential. The separate user is what keeps the DSN from it: a process of the
+# server's user could read the credential through /proc/<server pid>/root, but ProtectProc=invisible
+# hides the server from this user. Masking the credential directories is a second layer.
+InaccessiblePaths=-/run/credentials
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+UMask=0077
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

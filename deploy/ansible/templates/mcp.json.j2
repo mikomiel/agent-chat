@@ -1,0 +1,7 @@
+{
+  "bind_host": {{ agent_chat_bind_host | tojson }},
+  "port": {{ agent_chat_mcp_port | int }},
+  "agent_chat_origin": "http://127.0.0.1:{{ agent_chat_port | int }}",
+  "public_origin": {{ agent_chat_mcp_public_origin | tojson }},
+  "enable_writes": {{ agent_chat_mcp_enable_writes | tojson }}
+}

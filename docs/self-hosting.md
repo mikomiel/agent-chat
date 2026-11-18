@@ -1,9 +1,12 @@
 # Standalone first run
 
 This walkthrough starts the product source on one Linux host with a local
-PostgreSQL database. It uses synthetic paths, names and tokens. It does not
-describe a supported deployment: TLS termination, secret storage, network
-policy and backups belong to the deployer.
+PostgreSQL database. It uses synthetic paths, names and tokens. It is the manual
+first run, not a deployment. The supported native path is the systemd units and
+example playbook in [ansible.md](ansible.md). The supported container paths are
+[containers.md](containers.md) (Compose) and [podman.md](podman.md) (Quadlet).
+In every case TLS termination, secret storage, network policy and backups
+belong to the deployer.
 
 Read [AGENTS.md](../AGENTS.md) and [SECURITY.md](../SECURITY.md) first.
 

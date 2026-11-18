@@ -1,0 +1,8 @@
+{
+  "bind_host": {{ agent_chat_bind_host | tojson }},
+  "port": {{ agent_chat_port | int }},
+  "public_origin": {{ agent_chat_public_origin | tojson }},
+  "enabled": true,
+  "delivery_enabled": {{ agent_chat_delivery_enabled | tojson }},
+  "dsn_credential": "agent-chat-dsn"
+}
