@@ -1278,6 +1278,38 @@ def test_log_config_sends_agent_chat_api_to_stderr_with_the_priority_prefix():
     assert lines[2].startswith("<6>") and lines[2].endswith("INFO uvicorn.error Started")
 
 
+@pytest.mark.parametrize("journal", ["names-stderr", "names-another-stream", "absent"])
+def test_serve_log_lines_carry_the_priority_prefix_only_on_the_journal_stream(workdir, journal):
+    # The real `serve` in a child whose stderr is a real file. A taken port ends it at once: uvicorn has logged its
+    # start-up lines through the log config by then, and `_diagnose` prints the final code after them.
+    environ = {**os.environ, **write_dsn(workdir, SECRET_DSN)}
+    environ.pop("JOURNAL_STREAM", None)
+    with socket.socket() as occupied, open(workdir / "stderr.log", "w+", encoding="utf-8") as err:
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        config = write_config(workdir, enabled=True, port=occupied.getsockname()[1])
+        status = os.fstat(err.fileno())
+        if journal == "names-stderr":
+            environ["JOURNAL_STREAM"] = f"{status.st_dev}:{status.st_ino}"
+        elif journal == "names-another-stream":
+            environ["JOURNAL_STREAM"] = "1:1"
+        result = subprocess.run(
+            [sys.executable, "-I", "-m", "agent_chat.admin", "serve", "--config", config],
+            env=environ, stdout=subprocess.DEVNULL, stderr=err, timeout=60, check=False,
+        )
+        err.seek(0)
+        lines = err.read().splitlines()
+    assert result.returncode == 1, lines
+    started = [line for line in lines if " INFO uvicorn.error " in line]
+    assert started, lines
+    if journal == "names-stderr":
+        assert all(line.startswith("<6>") for line in started), lines
+        assert lines[-1] == "<3>agent-chat-admin: LISTENER_UNAVAILABLE", lines
+    else:
+        assert not any(line.startswith("<") for line in lines), lines
+        assert lines[-1] == "agent-chat-admin: LISTENER_UNAVAILABLE", lines
+
+
 def run_on_journal_stderr(argv, workdir, *, environ, journal=True):
     """`main` with a real file as stderr; `journal` makes JOURNAL_STREAM name that file, as systemd does."""
     out = io.StringIO()
