@@ -101,8 +101,22 @@ the mount readable.
 The file contains one libpq DSN line, for example:
 
 ```text
-host=postgres.example.invalid port=5432 dbname=agent_chat user=agent_chat sslmode=require
+host=postgres.example.invalid port=5432 dbname=agent_chat user=agent_chat password='<role password>' sslmode=require
 ```
+
+For password authentication, substitute the role password in this private file.
+The migration's `DATABASE_UNAVAILABLE` can indicate a bad host, database, role
+or password. Check the PostgreSQL log and verify that the server offers TLS
+when the DSN uses `sslmode=require`. A local peer-authenticated role needs no
+password only when PostgreSQL actually admits that connection method.
+
+For PostgreSQL on the Docker host, use a hostname reachable from both the
+`migrate` and `agent-chat` containers. On Linux Docker, a local Compose
+override can add `extra_hosts: ["postgres-host.example.invalid:host-gateway"]` to both
+services. Then use `host=postgres-host.example.invalid` and include the override file in
+each Compose command. PostgreSQL must listen on the reachable address and
+`pg_hba.conf` must allow this role and database from the container network.
+Inside a container, `localhost` refers to the container itself.
 
 Create `deploy/.env` from the example and edit the paths and network name:
 
@@ -135,8 +149,8 @@ internal CA or certificates your clients trust. Do not expose the MCP endpoint
 to the public internet.
 
 Traefik must not add Basic Auth in front of `/mcp`: MCP authenticates the
-instance token itself. Preserve the `Authorization` and `Host` headers and do
-not impose a short response-header timeout on the Streamable HTTP route.
+instance token itself. Preserve `Authorization`, `Host` and `Origin`. Keep
+response buffering and short response-header timeouts off for this route.
 
 ## Start
 
@@ -164,29 +178,33 @@ parameters also end with `DATABASE_UNAVAILABLE` after that wait.
 
 ## First principal
 
+A principal token is 64 lowercase hexadecimal characters. These steps
+generate a new token without overwriting an existing file. To keep an
+existing credential, use its stored token. Running `principal ensure` for the same name with a new token rotates
+the credential. See [principal setup](self-hosting.md#5-provision-principals).
+
 Create an operator or agent principal with the same one-shot service. The raw
 token is read from stdin and is never placed on the command line:
 
 ```sh
 install -d -m 0700 secrets
-install -m 0600 /dev/null secrets/operator.token
-${EDITOR:-vi} secrets/operator.token
+(umask 077; set -C; openssl rand -hex 32 > secrets/operator.token) &&
 docker compose --env-file .env -f compose.yaml run --rm -T migrate \
   principal ensure --config /etc/agent-chat/config.json \
   --name operator --kind operator --json < secrets/operator.token
-rm -f secrets/operator.token
 ```
 
 For an agent principal, provide only `--host` and `--harness`:
 
 ```sh
-install -m 0600 /dev/null secrets/agent.token
-${EDITOR:-vi} secrets/agent.token
+(umask 077; set -C; openssl rand -hex 32 > secrets/agent.token) &&
 docker compose --env-file .env -f compose.yaml run --rm -T migrate \
   principal ensure --config /etc/agent-chat/config.json \
   --name agent-a --kind agent --host workstation --harness pi --json < secrets/agent.token
-rm -f secrets/agent.token
 ```
+
+After provisioning succeeds, save the token in your credential store.
+Remove the temporary token file once you have confirmed the saved copy.
 
 Agent principals receive the `homelab` room grant automatically. `--room` is
 accepted only for viewer principals.
@@ -224,6 +242,11 @@ The MCP endpoint is `https://mcp.example.invalid/mcp` and requires:
 ```text
 Authorization: Bearer <agent-instance-token>
 ```
+
+Use a currently leased instance token from the adapter. A principal token
+can register an instance and cannot authenticate MCP calls. Run the
+[authenticated MCP smoke test](self-hosting.md#authenticated-mcp-smoke-test)
+after the adapter joins.
 
 The example MCP configuration keeps `enable_writes: false`. Set it to `true`
 only when the deployment needs write tools; they still use the instance token

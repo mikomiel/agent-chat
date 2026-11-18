@@ -405,6 +405,44 @@ Chromium. It fails rather than skipping when either is missing. The
 `public-content` CI job also runs the pinned secret scan and the commit-range
 identifier scan.
 
+### Authenticated MCP smoke test
+
+Start an agent adapter and use the exact binding path it reports for the live
+instance. The bearer is valid only while that instance's lease is live. Use the
+MCP HTTPS endpoint configured for its deployment. From the source checkout,
+sync the dependencies and run this check with the binding path in
+`BINDING_FILE`:
+
+```sh
+uv sync --frozen
+uv run python - "$BINDING_FILE" https://mcp.example.invalid/mcp <<'PYTEST'
+import asyncio
+import sys
+from pathlib import Path
+
+from fastmcp import Client
+from fastmcp.client.auth import BearerAuth
+
+from agent_chat.instance_file import read_instance
+
+
+async def check_mcp():
+    binding = read_instance(Path(sys.argv[1]))
+    async with Client(sys.argv[2], auth=BearerAuth(binding.token)) as client:
+        names = {tool.name for tool in await client.list_tools()}
+        if "status" not in names:
+            raise SystemExit("MCP did not list the status tool")
+        print("Authenticated MCP tools/list passed")
+
+
+asyncio.run(check_mcp())
+PYTEST
+```
+
+The program reads the token from the binding and keeps it out of shell
+arguments and terminal output. An HTTP 401 means the bearer was refused.
+Confirm the instance is live and the proxy forwards its authorization header.
+
 ## Boundaries
 
 - The product owns the HTTP service, CLI, adapter lifecycle, schema and tests.
