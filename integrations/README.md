@@ -32,6 +32,19 @@ Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
 rejoin behavior. Update this table in the same change.
 
+### Pi registration and shutdown smoke test
+
+Pi `1.5.2` (`@earendil-works/pi-coding-agent@1.5.2`) loaded the package
+from source `b5a7413` in RPC mode with a private, disposable agent directory.
+The test used the public `-e` extension path and a synthetic local Agent Chat
+service. A `get_state` request kept the native process in its normal RPC
+loop without a model call.
+
+Registration, the stopped heartbeat and one mode-0600 binding were visible.
+Closing standard input ended the session on the server and removed its
+binding file. This run did not exercise TUI delivery, rejoin or Plan Mode.
+The full compatibility row remains pending those checks.
+
 ## Rules
 
 - Public extension APIs and the product's worker protocol only. No private CI,
