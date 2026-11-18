@@ -35,7 +35,7 @@ user namespace as Traefik:
 | Rootless app + rootless Traefik, same user | Yes | Strongest isolation; install the units and network as that user |
 | Rootful app + rootful Traefik | Yes | Container still runs as UID/GID `10001`; simplest shared edge |
 | Rootless app + rootful Traefik | No | Rootless and rootful Podman networks are separate namespaces |
-| Rootless app + host-published loopback port | Possible, not provided | Changes the no-published-port model; use Compose or a custom unit |
+| Rootless app + host-published loopback port | Possible, not provided | Changes the no-published-port model; use a custom unit |
 
 Do not describe a rootless app with an external rootful Traefik as supported:
 they cannot share a Podman network. If the existing Traefik is rootful, use the
@@ -247,6 +247,13 @@ sudo systemctl start agent-chat-mcp.service
 
 The migration unit is a one-shot service with `RemainAfterExit=yes`. The server
 unit requires it, so a failed migration prevents the server from starting.
+
+If PostgreSQL does not answer yet, for example after a boot, the migration waits
+for it for up to 5 minutes and logs one `WAITING_FOR_DATABASE` line per retry,
+while the server units wait for the migration. After that it fails with
+`DATABASE_UNAVAILABLE` and the server units fail with it. A wrong host, user,
+password or database name is the same refusal, so a wrong DSN fails only after
+that wait.
 
 ## Traefik
 

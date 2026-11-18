@@ -24,6 +24,9 @@ StopTimeout=30
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+# `migrate` waits for a late database for up to MIGRATE_WAIT_SECONDS (agent_chat/admin.py). A one-shot unit has no
+# start limit unless it sets one; this limit stays above that wait. tests/test_deploy.py pins the relation.
+TimeoutStartSec=360
 
 [Install]
 WantedBy=default.target

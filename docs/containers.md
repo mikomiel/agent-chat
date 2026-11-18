@@ -27,8 +27,9 @@ private `app` network. Only Traefik is reachable from the LAN.
 
 ## Prerequisites
 
-- Docker with Compose, or Podman with a working Compose provider. For native
-  Podman Quadlet, see [podman.md](podman.md).
+- Docker with Docker Compose, the supported Compose engine. On Podman, use the
+  [Quadlet deployment](podman.md); `podman-compose` is not supported (see
+  [Podman notes](#podman-notes)).
 - An existing PostgreSQL database, role and DSN. The role must own the database.
 - An existing Traefik instance on a shared external network, with a TLS
   certificate covering the web and MCP hostnames.
@@ -71,10 +72,6 @@ runtime identity, not by every host user:
 # rootful Docker
 sudo chown 10001:10001 secrets/agent-chat-dsn
 sudo chmod 0400 secrets/agent-chat-dsn
-
-# rootless Podman: perform the same ownership change in the user namespace
-podman unshare chown 10001:10001 secrets/agent-chat-dsn
-podman unshare chmod 0400 secrets/agent-chat-dsn
 ```
 
 Do not leave the file world-readable. The migration command below is the
@@ -92,9 +89,6 @@ file as well:
 ```sh
 # rootful Docker
 sudo chcon -t container_file_t secrets/agent-chat-dsn
-
-# rootless Podman: apply the label in the user namespace
-podman unshare chcon -t container_file_t secrets/agent-chat-dsn
 ```
 
 Keep the ownership and mode restrictions above. Do not disable SELinux to make
@@ -124,7 +118,6 @@ have one:
 
 ```sh
 docker network create traefik
-# or: podman network create traefik
 ```
 
 Traefik must join that network. Add the routes from
@@ -150,24 +143,28 @@ docker compose --env-file .env -f compose.yaml up -d --build
 docker compose --env-file .env -f compose.yaml ps
 ```
 
-Podman:
+Podman: use the [Quadlet deployment](podman.md). `podman-compose` is not
+supported; see [Podman notes](#podman-notes).
 
-```sh
-podman compose --env-file .env -f compose.yaml up -d --build
-# or, depending on the installed provider:
-podman-compose --env-file .env -f compose.yaml up -d --build
-```
+The `migrate` service runs first. If migrations fail, Docker Compose does not
+start the server.
 
-The `migrate` service runs first. If migrations fail, the server is not started.
+If PostgreSQL does not answer yet, `migrate` waits for it for up to 5 minutes
+and then fails with `DATABASE_UNAVAILABLE`, so a late database delays the stack
+by up to that long. A wrong host, user, password or database name is the same
+refusal, so a wrong DSN fails only after that wait.
+
 To inspect an apply before bringing the full stack up:
 
 ```sh
+# run --rm migrate builds the server image first when it is missing
 docker compose --env-file .env -f compose.yaml run --rm migrate \
   migrate --config /etc/agent-chat/config.json --check
 ```
 
 Review the printed pending files and digest. The normal `migrate` service applies
-the pending set; the check does not.
+the pending set; the check does not, and unlike an apply it does not wait for an
+unreachable database.
 
 ## First principal
 
@@ -240,7 +237,9 @@ and the same HTTP authorization as the CLI.
 
 - No PostgreSQL or MCP host port is published.
 - The app and MCP containers run as UID/GID `10001:10001`.
-- Root filesystems are read-only; only `/tmp` is a bounded tmpfs.
+- Root filesystems are read-only. The Compose file declares one tmpfs, a 16 MiB
+  `noexec` mount on `/tmp`. It does not declare the mounts that the container
+  engine adds itself, such as `/dev/shm`.
 - All capabilities are dropped and `no-new-privileges` is set.
 - The DSN is a file-backed Compose secret, not an environment value or image
   layer.
@@ -274,8 +273,24 @@ database volume to back up.
 
 ## Podman notes
 
-`podman compose` is a wrapper around an external provider; it is not built into
-Podman. Install and test the provider before relying on this Compose file.
+Docker Compose is the supported Compose engine. `podman-compose` is not
+supported. Running this guide under rootless Podman 5.4.2 with podman-compose
+1.3.0 failed these documented guarantees:
+
+- Healthchecks: podman-compose 1.3.0 to 1.4.1 break the quoting of a list-form
+  healthcheck, so the services stay `unhealthy`. This file uses the
+  `CMD-SHELL` form for that reason.
+- Migration gate: `service_completed_successfully` is treated as "container
+  stopped", without checking the exit code. The server can start before
+  `migrate` finishes, `migrate` can run twice, and a failed migration does not
+  keep the server down. Also seen on 1.6.0.
+- Upgrade: `up -d` after `build` moves the image tags but recreates nothing, so
+  the old containers and the old `migrate` run again. Also seen on 1.6.0.
+- Restart: `restart <service>` fails, because the exited `migrate` container is
+  a required dependency.
+- Reboot: the stack does not return. The user `podman-restart.service` starts
+  only containers with `restart: always`, and these services use
+  `unless-stopped`.
 
 For native Podman with systemd, use [podman.md](podman.md). That path avoids the
 provider and documents the supported rootless/rootful Traefik topologies. In
