@@ -269,11 +269,15 @@ without reading the DSN or opening a listener.
 
 The `mcp` extra installs a separate Streamable HTTP MCP service. It uses the
 caller's instance token on every request and keeps no binding or database
-connection of its own. Install it into the same virtual environment:
+connection of its own. Install it into the server's virtual environment with
+the same pinned version:
 
 ```sh
-uv pip install -e ".[mcp]"
+uv pip install "sessionyard[server,mcp]==<version>"
 ```
+
+From a source checkout, use `uv pip install -e ".[server,mcp]"` for an editable
+install.
 
 Create a private MCP configuration:
 
@@ -404,6 +408,44 @@ The test suite needs PostgreSQL server binaries and the pinned Playwright
 Chromium. It fails rather than skipping when either is missing. The
 `public-content` CI job also runs the pinned secret scan and the commit-range
 identifier scan.
+
+### Authenticated MCP smoke test
+
+Start an agent adapter and use the exact binding path it reports for the live
+instance. The bearer is valid only while that instance's lease is live. Use the
+MCP HTTPS endpoint configured for its deployment. From the source checkout,
+sync the dependencies and run this check with the binding path in
+`BINDING_FILE`:
+
+```sh
+uv sync --frozen
+uv run python - "$BINDING_FILE" https://mcp.example.invalid/mcp <<'PYTEST'
+import asyncio
+import sys
+from pathlib import Path
+
+from fastmcp import Client
+from fastmcp.client.auth import BearerAuth
+
+from agent_chat.instance_file import read_instance
+
+
+async def check_mcp():
+    binding = read_instance(Path(sys.argv[1]))
+    async with Client(sys.argv[2], auth=BearerAuth(binding.token)) as client:
+        names = {tool.name for tool in await client.list_tools()}
+        if "status" not in names:
+            raise SystemExit("MCP did not list the status tool")
+        print("Authenticated MCP tools/list passed")
+
+
+asyncio.run(check_mcp())
+PYTEST
+```
+
+The program reads the token from the binding and keeps it out of shell
+arguments and terminal output. An HTTP 401 means the bearer was refused.
+Confirm the instance is live and the proxy forwards its authorization header.
 
 ## Boundaries
 

@@ -141,6 +141,20 @@ this repository, the file name `publish.yml` and the environment `pypi`;
 renaming any of them needs a matching change on PyPI. Tags up to `v0.6.0`
 predate the rename and carry the distribution name `agent-chat`.
 
+One-time setup belongs to the repository and PyPI maintainers.
+
+1. In the repository settings, create the [GitHub environment][pypi-env]
+   named `pypi` and configure its required reviewer before enabling the
+   publisher. The workflow's `environment` value selects the environment.
+   GitHub enforces the reviewer rule configured in repository settings.
+2. In the PyPI publishing settings, register a [trusted publisher][pypi-trust]
+   for the `sessionyard` project. Use owner `mikomiel`, repository
+   `agent-chat`, workflow `publish.yml` and environment `pypi`. Use a
+   pending publisher only when bootstrapping a project that does not exist yet.
+
+[pypi-env]: https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments
+[pypi-trust]: https://docs.pypi.org/trusted-publishers/adding-a-publisher/
+
 A tag or a release is not a deployment; image and deployment decisions remain
 separate operator decisions recorded outside this repository.
 
