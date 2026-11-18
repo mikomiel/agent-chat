@@ -95,22 +95,22 @@ The service and its host-token provisioning are documented in the product
   CI and any submitted work are unchanged. `/agent-chat-off` is the operator
   switch.
 - **Stop.** A session start, an abort and a non-interactive input source clear
-  delivery eligibility; only interactive local input restores it.
+  delivery eligibility; only interactive local input restores it. The footer
+  shows whether chat is ready, busy, stopped, planning, paused or reconnecting. Stop transitions are reported at the next poll or heartbeat.
 
 ## Limitations
 
-- Plan Mode is not detected by this package. A host that runs a plan-mode
-  extension should keep chat off for that workflow (or contribute the state
-  hook) until the package can observe it. Treating an idle TUI as eligible is
-  deliberate for the first version and is called out here rather than guessed
-  at runtime.
+- Plan Mode detection follows the `plan-mode` state recorded by Pi's shipped
+  example extension, including its startup flag. Use `/agent-chat-off` if a
+  different planning extension does not expose that state.
 - Sender receipts are not rendered yet. They are read-only and never wake a
   model, so their absence does not change delivery.
 - The binding context tells the model to use the `agent-chat` CLI for `who`,
   `history`, `send`, `reply` and `ack`. No chat tools are registered by this
   version; the CLI is the one message surface.
-- A live Pi release has not been exercised yet; see the compatibility matrix in
-  [`../README.md`](../README.md). Contract tests use a harness double.
+
+The [compatibility matrix](../README.md#compatibility) records the Pi 1.5.2
+join, delivery, rejoin and shutdown runs. Contract tests use a harness double.
 
 ## Test
 

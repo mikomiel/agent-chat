@@ -56,6 +56,9 @@ export function createAgentChat(pi, config, {
   let prompts = 0
   let stopped = true
   let closed = false
+  let displayedStatus
+  let reportedPlan = null
+  let planSnapshot = null
   const attempts = new Map()
   const policy = createRejoinPolicy({ now, random })
 
@@ -66,7 +69,11 @@ export function createAgentChat(pi, config, {
   }
 
   function status(text) {
-    try { if (context?.mode === "tui") context.ui?.setStatus("agent-chat", text) } catch { /* advisory */ }
+    if (displayedStatus === text || context?.mode !== "tui") return
+    try {
+      context.ui?.setStatus("agent-chat", text)
+      displayedStatus = text
+    } catch { /* advisory */ }
   }
 
   function clearTimers() {
@@ -132,15 +139,46 @@ export function createAgentChat(pi, config, {
     rejoinTimer = setTimeoutImpl(() => { void connect() }, delay)
   }
 
+  function planMode() {
+    // Pi's shipped plan-mode extension persists its state as a custom entry.
+    // Use the entry count when available to avoid copying an unchanged session.
+    const manager = context?.sessionManager
+    const count = manager?.getEntryCount?.()
+    if (Number.isInteger(count) && planSnapshot?.count === count) return planSnapshot.enabled
+    const entry = manager?.getEntries?.().findLast(row => row.type === "custom" && row.customType === "plan-mode")
+    const enabled = entry ? entry.data?.enabled : pi.getFlag?.("plan") === true
+    if (typeof enabled !== "boolean") throw new Error("Unrecognized Plan Mode state")
+    planSnapshot = { count, enabled }
+    return enabled
+  }
+
   function chatState() {
     if (disabled()) return "offline"
-    if (stopped) return "stopped"
     try {
+      if (planMode()) return "plan"
+      if (stopped) return "stopped"
       if (!context || context.mode !== "tui" || prompts || context.signal?.aborted) return "unknown"
       const idle = context.isIdle()
       if (typeof idle !== "boolean") return "unknown"
       return idle && !pendingNative ? null : "busy"
     } catch { return "unknown" }
+  }
+
+  function showPresence(state) {
+    if (state === "plan") status("Agent Chat: plan mode")
+    else if (state === "stopped") status("Agent Chat: stopped (type to resume)")
+    else if (state === "unknown") status("Agent Chat: paused")
+    else if (state === "busy") status("Agent Chat: busy")
+    else status("Agent Chat: ready")
+  }
+
+  function setStopped(value) {
+    if (stopped === value) return
+    stopped = value
+    if (joined) {
+      showPresence(chatState())
+      dirty = true
+    }
   }
 
   function heartbeatState() {
@@ -151,8 +189,8 @@ export function createAgentChat(pi, config, {
     return {
       ...(title === undefined ? {} : { title }),
       native_state: state === null ? "idle" : state === "busy" ? "busy" : "unknown",
-      stopped: ![null, "busy"].includes(state),
-      plan_mode: false,
+      stopped: state === "plan" ? stopped : ![null, "busy"].includes(state),
+      plan_mode: state === "plan",
     }
   }
 
@@ -192,7 +230,9 @@ export function createAgentChat(pi, config, {
 
   async function drive({ heartbeat = false, poll = false } = {}) {
     if (!live || !joined || disabled()) return
-    dirty ||= heartbeat
+    const state = chatState()
+    showPresence(state)
+    dirty ||= heartbeat || reportedPlan !== (state === "plan")
     pollDue ||= poll
     if (busy) return
     busy = true
@@ -200,7 +240,9 @@ export function createAgentChat(pi, config, {
       while ((dirty || pollDue) && live && !disabled()) {
         if (dirty) {
           dirty = false
-          const result = await request("heartbeat", { state: heartbeatState() })
+          const snapshot = heartbeatState()
+          reportedPlan = snapshot.plan_mode
+          const result = await request("heartbeat", { state: snapshot })
           if (refused(result)) {
             if (REJOIN_AFTER.has(result.refused)) throw Object.assign(new Error(result.refused), { code: result.refused, operation: "heartbeat" })
           }
@@ -313,7 +355,6 @@ export function createAgentChat(pi, config, {
       if (live !== record || closed || disabled()) { void worker.stop(); return }
       joined = result
       policy.succeeded()
-      status("Agent Chat: joined")
       notify(`Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.`)
       heartbeatTimer = setIntervalImpl(() => { void drive({ heartbeat: true }) }, HEARTBEAT_MS)
       pollTimer = setIntervalImpl(() => { void drive({ poll: true }) }, POLL_MS)
@@ -340,23 +381,23 @@ export function createAgentChat(pi, config, {
   pi.on("session_start", (_event, ctx) => {
     if (closed) return
     stopped = true
+    planSnapshot = null
     bind(ctx)
     if (nativeSessionId) void connect()
   })
 
   pi.on("input", (event, ctx) => {
     if (closed) return
-    if (event?.source !== "interactive") { stopped = true; return }
-    stopped = false
-    if (!context) bind(ctx)
+    if (event?.source === "interactive" && !context) bind(ctx)
+    setStopped(event?.source !== "interactive")
   })
   pi.on("agent_start", (_event, ctx) => {
     const signal = ctx?.signal
     if (!signal) return
-    if (signal.aborted) stopped = true
-    else signal.addEventListener("abort", () => { stopped = true }, { once: true })
+    if (signal.aborted) setStopped(true)
+    else signal.addEventListener("abort", () => setStopped(true), { once: true })
   })
-  pi.on("agent_settled", event => { if (event?.aborted === true) stopped = true })
+  pi.on("agent_settled", event => { if (event?.aborted === true) setStopped(true) })
   pi.on("ui_prompt_start", () => { prompts += 1 })
   pi.on("ui_prompt_end", () => { prompts = Math.max(0, prompts - 1) })
   pi.on("session_info_changed", () => { if (live) void drive({ heartbeat: true }) })
