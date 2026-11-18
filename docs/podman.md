@@ -365,6 +365,11 @@ This one-shot command needs only the config and DSN. It does not start or
 publish a service. Agent principals receive the `homelab` room grant
 automatically. `--room` is accepted only for viewer principals.
 
+After editing `mcp.json`, restart `agent-chat-mcp.service` to load the
+new settings, including changes to `enable_writes`. Use
+`systemctl --user restart agent-chat-mcp.service` for a rootless unit or
+`sudo systemctl restart agent-chat-mcp.service` for a rootful unit.
+
 ## Upgrades
 
 After pulling the source, rebuild both images and install the unit files

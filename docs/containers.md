@@ -57,6 +57,10 @@ Edit both JSON files:
 - `mcp.json`: set `public_origin` to the exact MCP HTTPS origin. Keep
   `agent_chat_origin` as `http://agent-chat:8443`.
 
+Make both JSON files readable by UID/GID `10001:10001`. Files containing only
+the settings in these examples can use mode 0644. Keep the DSN in its separate
+private file.
+
 Put the PostgreSQL DSN in a separate file, not in either JSON file:
 
 ```sh
@@ -136,35 +140,27 @@ not impose a short response-header timeout on the Streamable HTTP route.
 
 ## Start
 
-Docker:
+Build the images and inspect the pending migrations before creating the
+long-running containers:
 
 ```sh
-docker compose --env-file .env -f compose.yaml up -d --build
-docker compose --env-file .env -f compose.yaml ps
-```
-
-Podman: use the [Quadlet deployment](podman.md). `podman-compose` is not
-supported; see [Podman notes](#podman-notes).
-
-The `migrate` service runs first. If migrations fail, Docker Compose does not
-start the server.
-
-If PostgreSQL does not answer yet, `migrate` waits for it for up to 5 minutes
-and then fails with `DATABASE_UNAVAILABLE`, so a late database delays the stack
-by up to that long. A wrong host, user, password or database name is the same
-refusal, so a wrong DSN fails only after that wait.
-
-To inspect an apply before bringing the full stack up:
-
-```sh
-# run --rm migrate builds the server image first when it is missing
-docker compose --env-file .env -f compose.yaml run --rm migrate \
+docker compose --env-file .env -f compose.yaml build --pull migrate agent-chat-mcp
+docker compose --env-file .env -f compose.yaml run --rm --no-deps --pull never migrate \
   migrate --config /etc/agent-chat/config.json --check
 ```
 
-Review the printed pending files and digest. The normal `migrate` service applies
-the pending set; the check does not, and unlike an apply it does not wait for an
-unreachable database.
+Review the printed files and digest. The check reads the schema and exits
+immediately if PostgreSQL is unreachable. Once the result is acceptable, start
+the stack:
+
+```sh
+docker compose --env-file .env -f compose.yaml up -d --no-build --pull never
+docker compose --env-file .env -f compose.yaml ps
+```
+
+The one-shot `migrate` service applies the pending set before the server
+starts. An apply waits up to five minutes for PostgreSQL. Wrong connection
+parameters also end with `DATABASE_UNAVAILABLE` after that wait.
 
 ## First principal
 
@@ -252,24 +248,68 @@ not create a listening service.
 
 ## Upgrades and backups
 
-Upgrade by rebuilding the two images and recreating the services:
+Before upgrading, save the working deployment configuration and back up
+PostgreSQL. Use versioned values for `AGENT_CHAT_SERVER_IMAGE` and
+`AGENT_CHAT_MCP_IMAGE` in `.env`. Keep the previous tags until the upgrade is
+verified. If the current stack uses the default `:local` tags, tag the image
+IDs of the running containers with unused rollback tags before rebuilding.
+Use `docker compose ps -q SERVICE` to get each container ID and
+`docker inspect --format '{{.Image}}' CONTAINER_ID` to find its image ID.
+
+Build the candidate from the intended source version using new image tags.
+Run the same build and migration check as in [Start](#start). If the check
+fails, keep serving from the previous containers while you investigate.
+Running `up -d` too early can replace the serving containers before a failing
+migration leaves their replacements stopped.
+
+Apply the reviewed migrations in a one-shot container before replacing the
+serving containers. Schedule a maintenance window if the schema change can
+interrupt the previous version.
 
 ```sh
-docker compose --env-file .env -f compose.yaml build --pull
-docker compose --env-file .env -f compose.yaml up -d
+docker compose --env-file .env -f compose.yaml run --rm --no-deps --pull never migrate && \
+  docker compose --env-file .env -f compose.yaml up -d --no-build --pull never
 ```
 
-When upgrading from a release that named the MCP service `mcp`:
+Check readiness on both origins before retiring the previous images. For a
+rollback, restore the previous Compose configuration and image tags. Check
+the database against that version before starting it. If a migration made the
+schema incompatible with the previous version, restore a compatible
+database using the backup procedure before bringing up the old stack.
+Software rollback alone cannot roll back the database.
 
-1. Run `docker compose --env-file .env -f compose.yaml up -d --remove-orphans`
-   instead of the `up -d` above, so the old `mcp` container is removed.
-2. In the Traefik file-provider configuration, and in any Alloy scrape or probe
-   target, change the MCP backend from `mcp:8951` to `agent-chat-mcp:8951`,
-   then reload them. MCP requests fail until this step is done.
+When upgrading from a release that named the MCP service `mcp`, add
+`--remove-orphans` to the final `up` command. Change any Traefik and Alloy
+backends from `mcp:8951` to `agent-chat-mcp:8951` and reload them.
 
-The migration job runs before the new server. Back up PostgreSQL with the
-deployer's normal `pg_dump` or physical-backup process; this stack has no
-database volume to back up.
+## Rotate the database credential
+
+Update the PostgreSQL role credential and the DSN file, then recreate only
+the server so it reloads the credential. Verify web and MCP readiness.
+
+```sh
+docker compose --env-file .env -f compose.yaml up -d --no-deps --force-recreate \
+  --no-build --pull never agent-chat
+```
+
+The MCP process uses the server API. A DSN rotation requires only the server
+recreation. After editing `mcp.json`, recreate the MCP container to load the
+new settings, including any change to `enable_writes`:
+
+```sh
+docker compose --env-file .env -f compose.yaml up -d --no-deps --force-recreate \
+  --no-build --pull never agent-chat-mcp
+```
+
+## Restarts and logs
+
+When Docker starts after reboot, it restarts the long-running services unless
+an operator stopped them. The completed migration container does not start
+with them. Adapters can rejoin after an outage that outlasts their lease.
+
+```sh
+docker compose --env-file .env -f compose.yaml logs --tail 100 migrate agent-chat agent-chat-mcp
+```
 
 ## Podman notes
 
@@ -315,3 +355,10 @@ The repository test suite validates the Compose structure, example
 configurations, Dockerfile targets and Traefik header settings without requiring
 a container runtime. A live smoke test still requires the external PostgreSQL
 and Traefik instances above.
+
+From the repository root, run the deployment contract tests:
+
+```sh
+uv sync --frozen
+uv run python -m pytest -q tests/test_deploy.py
+```
