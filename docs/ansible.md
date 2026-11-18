@@ -76,9 +76,10 @@ the server. `require` encrypts but does not check the server. To check it, use
 `sslmode=verify-full` and `sslrootcert=/etc/agent-chat/db-ca.crt` (owner root,
 group `agent-chat`, mode 0640). Always name the CA file: the service user has
 no home directory, so libpq finds no `~/.postgresql/root.crt`, and the 0700
-credentials directory is closed to that user. The playbook only checks that the
-file is a regular file owned by `root:root` with mode 0600, and stops when it is
-not. systemd reads the file as root and hands each unit a private copy through
+credentials directory is closed to that user. The playbook checks the metadata
+of the file and never its content: the file must be a regular file owned by
+`root:root` with mode 0600, and the play stops when it is not. systemd reads the
+file as root and hands each unit a private copy through
 `LoadCredential=agent-chat-dsn:<path>`. The DSN never appears in an argument, an
 environment variable, a configuration file, a template or a log.
 
@@ -90,6 +91,19 @@ into one, before it changes anything. The path has no segment `.` or `..`. The
 play compares path names and does not resolve its own directories: if one of
 them is a symlink on your host, keep the file out of its target too. The default
 path is fine.
+
+Keep every directory on the way to the file out of reach of other users. systemd
+opens the path as root every time it starts a unit, so anyone who can write to
+one of those directories could replace the file, or a link on the way, after the
+check, and the service would receive whatever the path then names. The play
+checks every directory on the path from `/` down, both as you wrote it and after
+it resolves links: each must be a real directory owned by root that neither its
+group nor others can write to. A sticky bit does not make a writable directory
+acceptable, and a link in place of a directory is refused, so write the real
+path. The default path passes on a normal host after the commands above. The play
+stops before it changes anything, with a message that names
+`agent_chat_dsn_file` and the directory, and it never changes these directories.
+A final link must point directly at the canonical file. A chain of links fails this check.
 
 The server, the prune run and the admin commands connect to PostgreSQL as the
 OS user `agent-chat`. Its home directory is `/nonexistent` and the units set no
@@ -302,6 +316,13 @@ A link in place of one of them is refused too, because the play cannot see who
 can write to its target. The play does not change the owner or mode of an
 install directory, and it does not repair a release environment that it
 refuses: change the directory, or remove the environment, by hand and rerun.
+
+The play also checks every entry inside an existing release. Files and directories
+must be root-owned and closed to other writers. It accepts the standard Python
+interpreter aliases under `bin` pointing to a sibling interpreter or the system
+interpreter under `/usr/bin`, and the `lib64` link to `lib`. After the migration
+gate it sets the release directory itself to mode 0755 so the separate MCP user
+can enter an environment previously restricted to the server group.
 
 The play is not transactional after the gate. If a task fails between
 installing the configuration and switching `current`, the forced handlers can

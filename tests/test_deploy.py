@@ -5,10 +5,13 @@ from __future__ import annotations
 import ast
 import configparser
 import json
+import os
 import re
+import runpy
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from agent_chat.admin import MIGRATE_WAIT_SECONDS
@@ -375,7 +378,7 @@ def _flat(text: str) -> str:
 
 
 def test_ansible_example_is_one_play_with_a_handful_of_templates():
-    assert {path.name for path in ANSIBLE.iterdir()} == {"playbook.yml", "inventory.example.yml", "templates"}
+    assert {path.name for path in ANSIBLE.iterdir()} == {"playbook.yml", "inventory.example.yml", "templates", "files"}
     assert {path.name for path in TEMPLATES.iterdir()} == {
         "agent-chat.service.j2",
         "agent-chat-mcp.service.j2",
@@ -735,7 +738,7 @@ def test_ansible_playbook_leaves_an_existing_install_directory_alone_until_the_g
     reconcile = _task("Reconcile the install directories")
     assert gate < names.index(reconcile["name"]) < names.index("Install the server configuration")
     assert "when" not in reconcile
-    assert reconcile["loop"] == directories
+    assert reconcile["loop"] == [*directories, "{{ agent_chat_venv }}"]
     assert reconcile["ansible.builtin.file"] == {
         "path": "{{ item }}",
         "state": "directory",
@@ -954,7 +957,8 @@ def test_ansible_playbook_refuses_an_install_tree_that_another_user_can_write_be
     # environment, all before the gate. That first task is found from the variables that name the environment, not
     # from a task name, so a task that starts to use them ahead of the checks fails here. The stamp, the staged
     # directory and the admin command all sit inside the environment or run from it.
-    checks = (look, traversal, owned, environment_look, environment)
+    contents = _task("Check ownership, modes and links throughout the existing release")
+    checks = (look, traversal, owned, environment_look, environment, contents)
     uses_environment = re.compile(r"agent_chat_(venv|stamp|staged|admin)\b")
     users = [
         index
@@ -1024,12 +1028,13 @@ def test_ansible_playbook_never_reads_the_dsn_and_passes_it_as_a_credential():
     # Allowlists: a step that can read a file, run a process or copy one is named here on purpose, so adding
     # one fails this test until a reviewer has decided that it never touches the DSN.
     assert all(sum(key.startswith("ansible.builtin.") for key in step) == 1 for step in steps)
-    modules = "assert command copy debug file group meta set_fact shell stat systemd template uri user".split()
+    modules = "assert command copy debug file group meta set_fact script shell stat systemd template uri user".split()
     assert {key for step in steps for key in step if key.startswith("ansible.builtin.")} == {
         f"ansible.builtin.{module}" for module in modules
     }
-    spawning = ("ansible.builtin.command", "ansible.builtin.shell")
+    spawning = ("ansible.builtin.command", "ansible.builtin.shell", "ansible.builtin.script")
     assert {(key, step["name"]) for step in steps for key in step if key in spawning} == {
+        ("ansible.builtin.script", "Check ownership, modes and links throughout the existing release"),
         ("ansible.builtin.command", "Read the Python version of the target"),
         ("ansible.builtin.command", "Resolve the DSN path without reading the file"),
         ("ansible.builtin.shell", "Install Agent Chat into its versioned virtual environment"),
@@ -1045,6 +1050,10 @@ def test_ansible_playbook_never_reads_the_dsn_and_passes_it_as_a_credential():
         "Check the DSN file without reading it",
         "Require the deployer's DSN file",
         "Resolve the DSN path without reading the file",
+        "Inspect the credential pathname itself",
+        "Require a direct credential path or a single link to the canonical file",
+        "Look at the directories on the way to the DSN file",
+        "Require the directories on the way to the DSN file to be owned by root and closed to other writers",
         "Require the DSN file outside the paths the play writes",
     }
     text = (ANSIBLE / "playbook.yml").read_text()
@@ -1514,3 +1523,37 @@ def test_security_policy_and_readme_name_the_install_paths_that_the_guides_suppo
     assert "does not operate a hosted service" in security
     assert "green CI run" in security
     assert "no deployment is supported" not in security
+
+
+def test_existing_release_checks_nested_permissions_and_links(tmp_path):
+    task = _task("Check ownership, modes and links throughout the existing release")
+    script, argument = task["ansible.builtin.script"]["cmd"].split(" ", 1)
+    assert argument == "{{ agent_chat_venv | quote }}"
+    check = runpy.run_path(str(ANSIBLE / script))["check_release"]
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    (binary / "python3").symlink_to("/usr/bin/python3")
+    (binary / "python").symlink_to("python3")
+    check(tmp_path, os.getuid())
+    binary.chmod(0o775)
+    with pytest.raises(ValueError, match="unexpected mode"):
+        check(tmp_path, os.getuid())
+    binary.chmod(0o755)
+    (binary / "tool").symlink_to(tmp_path.parent)
+    with pytest.raises(ValueError, match="unexpected link"):
+        check(tmp_path, os.getuid())
+
+
+def test_credential_parent_permissions_checked_before_any_write():
+    names = [task["name"] for task in _playbook()["tasks"]]
+    look = _task("Look at the directories on the way to the DSN file")
+    guard = _task("Require the directories on the way to the DSN file to be owned by root and closed to other writers")
+    assert names.index(look["name"]) < names.index(guard["name"]) < names.index("Create the service group")
+    assert not look["ansible.builtin.stat"]["follow"]
+    assert not look["ansible.builtin.stat"]["get_checksum"]
+    assert guard["loop"] == "{{ " + look["register"] + ".results }}"
+    condition = guard["ansible.builtin.assert"]["that"]
+    good = dict(exists=True, isdir=True, uid=0, wgrp=False, woth=False)
+    assert _truth(condition, item=SimpleNamespace(stat=SimpleNamespace(**good)))
+    for change in ({"uid": 1000}, {"wgrp": True}, {"woth": True}, {"isdir": False}):
+        assert not _truth(condition, item=SimpleNamespace(stat=SimpleNamespace(**{**good, **change})))
