@@ -35,6 +35,12 @@ def test_client_modules_import_with_psycopg_blocked(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_mcp_service_imports_with_psycopg_blocked(tmp_path: Path) -> None:
+    # The MCP image carries no PostgreSQL driver, so nothing the service imports may need one.
+    result = _import_without_psycopg(tmp_path, "agent_chat.mcp.app")
+    assert result.returncode == 0, result.stderr
+
+
 def test_blocking_psycopg_is_observable_on_server_modules(tmp_path: Path) -> None:
     # Negative control: the client probe can only be meaningful if the block
     # really stops a module that imports the driver.

@@ -201,8 +201,10 @@ The MCP endpoint is `POST /mcp`. The default surface is read-only:
 to register `send`, `reply`, `ack`, `mute`, `unmute`, `resolve`, `unresolve`,
 `lane` and `work`; they use the same instance token and HTTP authorization as
 the CLI. Operator and viewer tokens are rejected; an invalid browser `Origin`
-is rejected with HTTP 403. Bind to loopback unless a deployer adds TLS and an
-authenticated proxy.
+is rejected with HTTP 403. While the Agent Chat service or its database is
+unavailable, a request with a bearer token answers HTTP 503 with `Retry-After`
+and `UPSTREAM_UNAVAILABLE`, not 401: keep the token and retry. Bind to loopback
+unless a deployer adds TLS and an authenticated proxy.
 
 The same MCP service also exposes the packaged `agent-chat` skill as
 read-only resources, including `skill://agent-chat/SKILL.md`. The skill

@@ -17,7 +17,7 @@ from fastmcp.server.providers.skills import SkillsDirectoryProvider
 from starlette.responses import JSONResponse, Response
 
 from ..metrics import Metrics
-from .auth import AgentChatTokenVerifier
+from .auth import UPSTREAM_UNAVAILABLE_BODY, AgentChatTokenVerifier
 from .config import Config
 from .tools import register, registered_tool_names
 
@@ -124,10 +124,7 @@ class HealthEndpoints:
                 if ready:
                     await JSONResponse({"status": "ready"})(scope, receive, send)
                 else:
-                    await JSONResponse(
-                        {"status": "not_ready", "code": "UPSTREAM_UNAVAILABLE"},
-                        status_code=503,
-                    )(scope, receive, send)
+                    await JSONResponse(UPSTREAM_UNAVAILABLE_BODY, status_code=503)(scope, receive, send)
                 return
         await self.app(scope, receive, send)
 

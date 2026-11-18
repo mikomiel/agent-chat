@@ -192,6 +192,53 @@ def test_compose_wires_migration_health_and_mcp_scope():
     assert "/healthz" in " ".join(services["agent-chat-mcp"]["healthcheck"]["test"])
 
 
+def test_compose_health_commands_are_shell_strings_that_run_the_original_probe():
+    # podman-compose 1.3.0 to 1.4.1 turn the CMD list form into a `/bin/sh -c` string with unbalanced quotes, so
+    # both services stay unhealthy. The CMD-SHELL string form is standard Compose. Split as the shell splits it,
+    # the string is the argv the list form had, so the URL, the timeout and the exit code do not change.
+    import shlex
+
+    services = _compose()["services"]
+    for name, port in (("agent-chat", 8443), ("agent-chat-mcp", 8951)):
+        test = services[name]["healthcheck"]["test"]
+        assert test[0] == "CMD-SHELL"
+        assert len(test) == 2
+        assert shlex.split(test[1]) == [
+            "python",
+            "-c",
+            f"import urllib.request; urllib.request.urlopen('http://127.0.0.1:{port}/healthz', timeout=2)",
+        ]
+
+
+def test_compose_builds_each_image_once_and_agent_chat_only_runs_the_server_image():
+    # One image tag, one build. `migrate` and `agent-chat` run the same tag. With a build section on both, each
+    # `build` or `up --build` built it twice and kept whichever finished last, so a later `up -d` could recreate the
+    # live server with no source change. `migrate` owns the build because `agent-chat` depends on it (pinned in
+    # test_compose_wires_migration_health_and_mcp_scope), so `up`, `up agent-chat` and `run --rm migrate` each build
+    # a missing image before they create a container. A build kept on `agent-chat` would leave `run --rm migrate`
+    # with no image on a fresh host. `never` keeps Compose from trying to pull a tag that exists only locally.
+    services = _compose()["services"]
+    builders: dict[str, list[str]] = {}
+    for name, service in services.items():
+        if "build" in service:
+            builders.setdefault(service["image"], []).append(name)
+    assert all(len(names) == 1 for names in builders.values()), builders
+
+    migrate = services["migrate"]
+    assert migrate["build"]["target"] == "server"
+    server = services["agent-chat"]
+    assert "build" not in server
+    assert server["image"] == migrate["image"]
+    assert server["pull_policy"] == "never"
+
+
+def test_compose_migrate_does_not_inherit_the_server_healthcheck():
+    # The server image carries a HEALTHCHECK that probes a port the migrate container never serves. Without this,
+    # the exited one-shot container reports unhealthy, and a migration that runs for about a minute would report
+    # unhealthy while it runs.
+    assert _compose()["services"]["migrate"]["healthcheck"] == {"disable": True}
+
+
 def test_example_configs_validate_with_the_product_models():
     server = json.loads((DEPLOY / "config" / "server.example.json").read_text())
     mcp = json.loads((DEPLOY / "config" / "mcp.example.json").read_text())
