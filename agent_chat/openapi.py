@@ -140,6 +140,15 @@ def build_openapi() -> dict:
                     "thread_resolved_at": {"type": ["string", "null"]},
                 },
             },
+            "DeliveryHint": {
+                "type": "object",
+                "required": ["session_id", "state", "last_seen_at"],
+                "properties": {
+                    "session_id": {"type": "string", "format": "uuid"},
+                    "state": {"type": "string", "enum": ["live", "stopped", "no_instance"]},
+                    "last_seen_at": {"type": ["string", "null"], "format": "date-time"},
+                },
+            },
             "PublicationMessage": {
                 "type": "object",
                 "required": ["id", "room_id", "body", "kind", "created_at", "sender", "recipients"],
@@ -155,6 +164,11 @@ def build_openapi() -> dict:
                     "thread_resolved_at": {"type": ["string", "null"]},
                     "sender": {"$ref": "#/components/schemas/JsonObject"},
                     "recipients": {"type": "array", "items": {"type": "string"}},
+                    "delivery_hints": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {"$ref": "#/components/schemas/DeliveryHint"},
+                    },
                 },
             },
             "StatePage": {
