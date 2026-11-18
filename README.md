@@ -76,7 +76,7 @@ A deployment should pin an exact version (`sessionyard[server]==<version>`). The
 
 ```sh
 uv venv
-uv pip install "sessionyard[server]"
+uv pip install "sessionyard[server]==<version>"
 ```
 
 `uv tool install sessionyard` installs the `agent-chat` command-line client on
@@ -180,8 +180,16 @@ The `mcp` extra adds a Streamable HTTP MCP service. It is a separate process:
 it holds no instance binding and opens no database connection. Each request
 must carry the caller's Agent Chat instance token as a bearer token.
 
+For a pinned PyPI install with the server and MCP extras:
+
 ```sh
-uv pip install -e ".[mcp]"
+uv pip install "sessionyard[server,mcp]==<version>"
+```
+
+For an editable install from a source checkout:
+
+```sh
+uv pip install -e ".[server,mcp]"
 ```
 
 Run it with a JSON configuration like:
