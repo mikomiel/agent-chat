@@ -340,7 +340,7 @@ def test_an_ended_session_keeps_a_last_seen_at(db: Any, actors: Any) -> None:
 
 def test_recent_refs_lists_up_to_five_distinct_keys_newest_first(db: Any, actors: Any) -> None:
     room, first, second, operator = actors
-    now = _clock(db)
+    now = _clock(db).replace(microsecond=123000)
     lane = "lane:project::0123456789ab-0123"
     keys = [f"pr:owner/project#{number}" for number in range(1, 8)]
     for number, key in enumerate(keys, start=1):
@@ -360,8 +360,8 @@ def test_recent_refs_lists_up_to_five_distinct_keys_newest_first(db: Any, actors
     db.execute("UPDATE agent_chat.messages SET body = NULL WHERE id = %s", (redacted["id"],))
     page = rooms.participants(db, operator, room, fields="session_id,recent_refs")
     rows = {row["session_id"]: row["recent_refs"] for row in page["participants"]}
-    assert [(entry["ref_key"], entry["last_at"]) for entry in rows[first.session_id]] == [
-        (key, (now - timedelta(seconds=age)).isoformat())
+    assert [(entry["ref_key"], datetime.fromisoformat(entry["last_at"])) for entry in rows[first.session_id]] == [
+        (key, now - timedelta(seconds=age))
         for key, age in (
             (keys[1], 50), (lane, 60), (keys[6], 100), (keys[5], 200), (keys[4], 300),
         )
