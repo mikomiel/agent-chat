@@ -524,7 +524,7 @@ def test_011_carries_009_and_leaves_existing_messages_without_a_role(
         migrate(client)
         versions = [row["version"] for row in client.execute("SELECT version FROM agent_chat.schema_migrations")]
         assert versions == list(range(1, len(storage.MIGRATIONS) + 1)) and storage.MIGRATIONS[8] == "009_pm_mark.sql"
-        assert storage.MIGRATIONS[-1] == "011_roles_and_work.sql"
+        assert storage.MIGRATIONS[10] == "011_roles_and_work.sql"
         assert _one(client, "SELECT to_regclass('agent_chat.room_pm') AS name")["name"] is None
         assert _one(client, "SELECT to_regclass('agent_chat.room_roles') AS name")["name"] is not None
         assert client.execute("SELECT sender_role FROM agent_chat.messages").fetchall() == [{"sender_role": None}]

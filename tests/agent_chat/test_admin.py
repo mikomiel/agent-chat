@@ -335,13 +335,13 @@ def test_migrate_is_idempotent_on_a_fresh_database(workdir, database):
     environ = write_dsn(workdir, database)
     config = write_config(workdir)
     assert run(["migrate", "--config", config], environ=environ) == (
-        0, "applied=1,2,3,4,5,6,7,8,9,10,11 current=11\n", ""
+        0, "applied=1,2,3,4,5,6,7,8,9,10,11,12 current=12\n", ""
     )
-    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=none current=11\n", "")
+    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=none current=12\n", "")
     with connect(database) as db:
         assert [row["version"] for row in db.execute(
             "SELECT version FROM agent_chat.schema_migrations ORDER BY version"
-        )] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        )] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
 
 def test_migrate_reports_a_schema_mismatch_by_code(workdir, database):
@@ -367,7 +367,7 @@ def test_a_reviewed_legacy_digest_is_accepted_and_left_in_place(workdir, databas
     config = write_config(workdir)
     assert run(["migrate", "--config", config], environ=environ)[0] == 0
     _record_legacy_digests(database)
-    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=none current=11\n", "")
+    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=none current=12\n", "")
     with connect(database) as db:
         recorded = {
             row["version"]: row["digest"]
@@ -422,13 +422,14 @@ def test_a_legacy_prefix_still_applies_the_pending_migrations(workdir, database,
             "UPDATE agent_chat.schema_migrations SET digest = %s WHERE version = 9",
             (_REVIEWED_LEGACY_DIGESTS[9],),
         )
-    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=10,11 current=11\n", "")
+    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=10,11,12 current=12\n", "")
     with connect(database) as db:
         recorded = {row["version"]: row["digest"]
                     for row in db.execute("SELECT version, digest FROM agent_chat.schema_migrations")}
     assert recorded[9] == _REVIEWED_LEGACY_DIGESTS[9]
     assert recorded[10] == _digest("010_quota_backfill.sql")
     assert recorded[11] == _digest("011_roles_and_work.sql")
+    assert recorded[12] == _digest("012_session_model.sql")
 
 
 def test_an_interior_gap_in_the_ledger_is_refused(workdir, database):
@@ -466,7 +467,7 @@ def test_migrate_check_lists_every_pending_file_with_its_digest_and_creates_noth
     assert (code, err) == (0, "")
     lines = [f"{version} {name} sha256={_digest(name)}" for version, name in enumerate(storage.MIGRATIONS, 1)]
     # The reviewed digest is the sha256 of the exact pending lines, each followed by a newline.
-    assert out.splitlines() == ["pending=11", *lines, _reviewed(*lines)]
+    assert out.splitlines() == ["pending=12", *lines, _reviewed(*lines)]
     with connect(database) as db:
         assert db.execute("SELECT 1 FROM pg_namespace WHERE nspname = 'agent_chat'").fetchone() is None
 
@@ -482,7 +483,9 @@ def test_migrate_check_lists_only_the_pending_files_and_applies_none_of_them(wor
     line9 = f"9 009_pm_mark.sql sha256={_digest('009_pm_mark.sql')}"
     line10 = f"10 010_quota_backfill.sql sha256={_digest('010_quota_backfill.sql')}"
     line11 = f"11 011_roles_and_work.sql sha256={_digest('011_roles_and_work.sql')}"
-    assert out == f"pending=3\n{line9}\n{line10}\n{line11}\n{_reviewed(line9, line10, line11)}\n"
+    line12 = f"12 012_session_model.sql sha256={_digest('012_session_model.sql')}"
+    lines = (line9, line10, line11, line12)
+    assert out.splitlines() == ["pending=4", *lines, _reviewed(*lines)]
     with connect(database) as db:
         assert [row["version"] for row in db.execute("SELECT version FROM agent_chat.schema_migrations")] == [
             1, 2, 3, 4, 5, 6, 7, 8,
@@ -490,7 +493,7 @@ def test_migrate_check_lists_only_the_pending_files_and_applies_none_of_them(wor
         table = db.execute("SELECT to_regclass('agent_chat.room_pm') AS name").fetchone()
         assert table is not None and table["name"] is None
     # What the check listed is what the apply then runs.
-    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=9,10,11 current=11\n", "")
+    assert run(["migrate", "--config", config], environ=environ) == (0, "applied=9,10,11,12 current=12\n", "")
 
 
 def _reviewed_digest(environ, config):
@@ -554,8 +557,8 @@ def test_migrate_applies_when_the_reviewed_digest_matches_the_pending_set(workdi
         storage.migrate(db)
     (digest,) = _reviewed_digest(environ, config)
     code, out, err = _apply_reviewed(environ, config, digest)
-    assert (code, out, err) == (0, "applied=9,10,11 current=11\n", "")
-    assert _schema_state(database) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert (code, out, err) == (0, "applied=9,10,11,12 current=12\n", "")
+    assert _schema_state(database) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
 
 def test_migrate_refuses_a_mismatching_reviewed_digest_without_running_any_ddl(workdir, database):
@@ -599,7 +602,7 @@ def test_migrate_refuses_a_reviewed_digest_once_the_pending_set_was_applied_else
     assert run(["migrate", "--config", config], environ=environ)[0] == 0
     code, out, err = _apply_reviewed(environ, config, digest)
     assert (code, out, err) == (1, "", "agent-chat-admin: REVIEW_MISMATCH\n")
-    assert _schema_state(database) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert _schema_state(database) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
 
 @pytest.mark.parametrize("value", ["", "abc", "A" * 64, "g" * 64, "0" * 63, "0" * 65])
@@ -1408,7 +1411,7 @@ def refuse_connections(monkeypatch, times=None):
     return attempts
 
 
-APPLIED_ALL = "applied=1,2,3,4,5,6,7,8,9,10,11 current=11\n"
+APPLIED_ALL = "applied=1,2,3,4,5,6,7,8,9,10,11,12 current=12\n"
 
 
 def test_migrate_waits_for_a_database_that_becomes_reachable(workdir, database, clock, monkeypatch):
@@ -1418,7 +1421,7 @@ def test_migrate_waits_for_a_database_that_becomes_reachable(workdir, database, 
     assert (code, out) == (0, APPLIED_ALL)
     assert err == "".join(f"agent-chat-admin: WAITING_FOR_DATABASE (attempt {n})\n" for n in (1, 2, 3))
     assert (len(attempts), clock.slept) == (4, [1, 2, 4])
-    assert _schema_state(database) == list(range(1, 12))
+    assert _schema_state(database) == list(range(1, len(storage.MIGRATIONS) + 1))
 
 
 def test_a_reviewed_apply_waits_for_the_database_too(workdir, database, clock, monkeypatch):

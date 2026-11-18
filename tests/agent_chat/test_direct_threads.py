@@ -206,7 +206,8 @@ def test_008_upgrades_a_database_at_007_and_charges_earlier_admissions_to_other(
         )
         migrate(client)
         migrate(client)
-        assert client.execute("SELECT max(version) AS v FROM agent_chat.schema_migrations").fetchone() == {"v": 11}
+        ledger = client.execute("SELECT max(version) AS v FROM agent_chat.schema_migrations").fetchone()
+        assert ledger == {"v": len(storage.MIGRATIONS)}
         assert client.execute("SELECT allowance FROM agent_chat.delivery_attempts").fetchall() == [
             {"allowance": "other"}
         ]
