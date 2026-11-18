@@ -25,6 +25,7 @@ function fakePi({ throwOnSend = false } = {}) {
   const handlers = new Map()
   const sent = []
   const notices = []
+  const statuses = []
   const commands = []
   const pi = {
     on(name, fn) { handlers.set(name, [...(handlers.get(name) ?? []), fn]) },
@@ -39,9 +40,9 @@ function fakePi({ throwOnSend = false } = {}) {
   const ctx = {
     mode: "tui", signal: undefined, isIdle: () => true,
     sessionManager: { getSessionId: () => "native-1", getSessionName: () => "synthetic" },
-    ui: { notify: text => notices.push(text), setStatus: () => {} },
+    ui: { notify: text => notices.push(text), setStatus: (_name, text) => statuses.push(text) },
   }
-  return { pi, emit, ctx, sent, notices, commands }
+  return { pi, emit, ctx, sent, notices, statuses, commands }
 }
 
 function fakeWorker({ ready = Promise.resolve(joined), answer = () => ({}) } = {}) {
@@ -215,6 +216,53 @@ test("non-interactive input latches the stop until local input", async () => {
   assert.equal(lifecycle.state(), "stopped")
   emit("input", { source: "interactive" }, ctx)
   assert.equal(lifecycle.state(), null)
+})
+
+test("the footer tracks start, resume, interrupt and shutdown", async () => {
+  const { pi, emit, ctx, statuses } = fakePi()
+  const worker = fakeWorker()
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => worker })
+  emit("session_start", {}, ctx)
+  await flush()
+  assert.equal(statuses.at(-1), "Agent Chat: stopped (type to resume)")
+  assert.equal(worker.requests.find(row => row.op === "heartbeat").fields.state.stopped, true)
+
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: joined")
+  assert.equal(worker.requests.filter(row => row.op === "heartbeat").at(-1).fields.state.stopped, false)
+
+  const controller = new AbortController()
+  emit("agent_start", {}, { ...ctx, signal: controller.signal })
+  controller.abort()
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: stopped (type to resume)")
+  assert.equal(worker.requests.filter(row => row.op === "heartbeat").at(-1).fields.state.stopped, true)
+  emit("session_shutdown")
+  assert.equal(statuses.at(-1), undefined)
+})
+
+test("the public Pi plan-mode entry updates presence and prevents a claim", async () => {
+  const { pi, emit, ctx, statuses } = fakePi()
+  const entries = [{ type: "custom", customType: "plan-mode", data: { enabled: true } }]
+  ctx.sessionManager.getEntryCount = () => entries.length
+  ctx.sessionManager.getEntries = () => entries
+  const worker = fakeWorker({ answer: op => op === "pending" ? { messages: [message.id] } : {} })
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => worker })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  await flush()
+  assert.equal(statuses.at(-1), "Agent Chat: plan mode")
+  assert.equal(worker.requests.filter(row => row.op === "heartbeat").at(-1).fields.state.plan_mode, true)
+  assert.equal(worker.requests.some(row => row.op === "claim"), false)
+
+  entries.push({ type: "custom", customType: "plan-mode", data: { enabled: false } })
+  await lifecycle.heartbeat()
+  assert.equal(statuses.at(-1), "Agent Chat: joined")
+  assert.equal(worker.requests.at(-1).fields.state.plan_mode, false)
+  emit("session_shutdown")
 })
 
 test("an unusable title never invalidates the heartbeat", async () => {
