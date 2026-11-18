@@ -1,0 +1,39 @@
+# Managed by the Agent Chat example playbook (deploy/ansible/playbook.yml). Local edits are overwritten.
+# Started by agent-chat-prune.timer; one bounded retention run per start.
+[Unit]
+Description=Agent Chat bounded retention pruning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=agent-chat
+Group=agent-chat
+LoadCredential=agent-chat-dsn:{{ agent_chat_dsn_file }}
+ExecStart={{ agent_chat_root }}/current/bin/python -I -m agent_chat.admin prune --config /etc/agent-chat/server.json --limit {{ agent_chat_prune_limit }} --max-batches {{ agent_chat_prune_max_batches }}
+SyslogIdentifier=agent-chat-prune
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+UMask=0077
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM

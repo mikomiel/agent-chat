@@ -1,0 +1,675 @@
+---
+# Example native deployment of Agent Chat: systemd units on one Linux host.
+# Guide: docs/ansible.md. Run it from a checkout of the release that agent_chat_version
+# names, so that the templates and the product match.
+#
+# The play never reads the DSN. The deployer provides the DSN file; systemd passes it to
+# the services as a credential (LoadCredential=), so it never appears in an argument, an
+# environment variable, a configuration file or a log. The DSN file must sit outside every path that the
+# play writes. The play refuses such a path, and a link that leads into one, before it changes anything. It
+# also refuses a path with a directory on the way, as written or after its links are resolved, that anyone but
+# root owns or that another user could write to, because that user could replace the file after the check.
+#
+# The migration review is a gate, and the gate comes first. Up to the task "Require the reviewed
+# digest before the schema changes" the play only installs the new release next to the old one,
+# stages the new configuration inside it, and runs `migrate --check` from there against the staged
+# configuration. It creates an install directory only when that directory is missing, refuses an existing one
+# that the service user cannot enter or that anyone but root can write, refuses an existing release environment
+# that is not a root-owned directory closed to every other writer or that holds an entry which root does not own
+# or which another user could write to, writes no live configuration or unit, does not
+# move `current`, restarts nothing and queues no handler, so a refusal leaves the running version exactly as it
+# was. Every change to the live host comes after the gate. The first tasks after it record an activation marker
+# and the last task removes it, so that a run which stops in between is finished by the next run.
+- name: Deploy Agent Chat under systemd
+  hosts: agent_chat
+  become: true
+  gather_facts: false
+  # A task that fails after the gate has installed a file must still restart the services. A run that is
+  # killed before its handlers run is finished by the activation marker below. No task before the gate
+  # notifies a handler.
+  force_handlers: true
+
+  vars:
+    # Derived values. They are not inputs and an inventory cannot override them.
+    agent_chat_root: /usr/local/lib/agent-chat
+    # One virtual environment per release and per set of extras. Its packages are installed once, when the stamp
+    # is written, so turning MCP on or off builds a new environment next to the running one.
+    agent_chat_venv: "{{ agent_chat_root }}/venvs/{{ agent_chat_version }}-{{ agent_chat_extras | replace(',', '-') }}"
+    # The new configuration is rendered and checked here, inside the release that is being installed.
+    agent_chat_staged: "{{ agent_chat_venv }}/staged"
+    agent_chat_extras: "{{ 'server,mcp' if agent_chat_mcp_enabled else 'server' }}"
+    agent_chat_requirement: >-
+      sessionyard[{{ agent_chat_extras }}]=={{ agent_chat_version[1:] }}
+    agent_chat_stamp: "{{ agent_chat_venv }}/.installed"
+    # Written right after the review gate and removed after the readiness checks; see the tasks that use it.
+    agent_chat_marker: "{{ agent_chat_root }}/activation-pending"
+    # The paths that the play writes, as one pattern: the install tree, the systemd configuration and the two live
+    # configuration files. The DSN file matches none of them, as written and after its links are resolved.
+    agent_chat_written_paths: '^({{ agent_chat_root }}|/etc/systemd)(/|$)|^/etc/agent-chat/(server|mcp)\.json$'
+    agent_chat_unit_files: >-
+      {{ ['agent-chat.service', 'agent-chat-prune.service', 'agent-chat-prune.timer']
+         + (['agent-chat-mcp.service'] if agent_chat_mcp_enabled else []) }}
+    agent_chat_runtime_units: >-
+      {{ ['agent-chat.service', 'agent-chat-prune.timer']
+         + (['agent-chat-mcp.service'] if agent_chat_mcp_enabled else []) }}
+    # One admin command as the service user, with the DSN passed as a credential.
+    agent_chat_admin:
+      - systemd-run
+      - --wait
+      - --pipe
+      - --collect
+      - --quiet
+      - -p
+      - User=agent-chat
+      - -p
+      - "LoadCredential=agent-chat-dsn:{{ agent_chat_dsn_file }}"
+      - "{{ agent_chat_venv }}/bin/python"
+      - -I
+      - -m
+      - agent_chat.admin
+    # Read from `migrate --check`: "pending=<n>", one line per file, then "reviewed=<sha256>" when n > 0.
+    agent_chat_pending: "{{ agent_chat_check.stdout_lines | first | regex_replace('^pending=', '') | int }}"
+    agent_chat_digest: >-
+      {{ agent_chat_check.stdout_lines | select('match', '^reviewed=') | map('regex_replace', '^reviewed=', '')
+         | first | default('') }}
+
+  tasks:
+    # The play installs, migrates and probes for real; a dry run would only fail halfway.
+    - name: Refuse check mode
+      ansible.builtin.assert:
+        that: not ansible_check_mode
+        fail_msg: Check mode is not supported by this playbook; run it without --check.
+        quiet: true
+
+    # A default in the play vars would override the inventory, so the defaults are facts: they fill
+    # only what the inventory and -e leave unset. A fact holds a number as a string and -e passes a
+    # string unless it is JSON, so the checks below accept a number in either form.
+    - name: Apply the defaults of the optional variables
+      ansible.builtin.set_fact:
+        agent_chat_bind_host: "{{ agent_chat_bind_host | default('127.0.0.1') }}"
+        agent_chat_port: "{{ agent_chat_port | default(8443) }}"
+        agent_chat_delivery_enabled: "{{ agent_chat_delivery_enabled | default(false) }}"
+        agent_chat_dsn_file: "{{ agent_chat_dsn_file | default('/etc/agent-chat/credentials/agent-chat-dsn') }}"
+        agent_chat_prune_limit: "{{ agent_chat_prune_limit | default(100) }}"
+        agent_chat_prune_max_batches: "{{ agent_chat_prune_max_batches | default(50) }}"
+        agent_chat_mcp_enabled: "{{ agent_chat_mcp_enabled | default(false) }}"
+        agent_chat_mcp_port: "{{ agent_chat_mcp_port | default(8951) }}"
+        agent_chat_mcp_enable_writes: "{{ agent_chat_mcp_enable_writes | default(false) }}"
+
+    # An origin is also checked against the product's own loader, which refuses an explicit :443 and a port
+    # above 65535. The split lines rely on the pattern above them: assert stops at the first failing item. The two
+    # lines behind the DSN pattern refuse a segment `.` or `..` and a path that the play writes. A link into
+    # such a path is caught by the two tasks behind the DSN checks.
+    - name: Check the variables
+      ansible.builtin.assert:
+        that:
+          - agent_chat_version is defined
+          - agent_chat_version is string
+          - agent_chat_version is match('^v[0-9]+\.[0-9]+\.[0-9]+$')
+          - agent_chat_version[1:] is version('0.7.0', '>=')
+          - agent_chat_public_origin is defined
+          - agent_chat_public_origin is match('^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$')
+          - not agent_chat_public_origin is search(':443$')
+          - (agent_chat_public_origin.split(':')[2] | default('1')) | int <= 65535
+          - agent_chat_bind_host in ['127.0.0.1', '0.0.0.0']
+          - agent_chat_port | string is match('^[0-9]+$')
+          - agent_chat_port | int >= 1024
+          - agent_chat_port | int <= 65535
+          - agent_chat_delivery_enabled is boolean
+          - agent_chat_dsn_file is match('^/[A-Za-z0-9._/-]+$')
+          - not agent_chat_dsn_file is search('/\.{1,2}(/|$)')
+          - not agent_chat_dsn_file is search(agent_chat_written_paths)
+          - agent_chat_prune_limit | string is match('^[0-9]+$')
+          - agent_chat_prune_limit | int >= 1
+          - agent_chat_prune_limit | int <= 1000
+          - agent_chat_prune_max_batches | string is match('^[0-9]+$')
+          - agent_chat_prune_max_batches | int >= 1
+          - agent_chat_mcp_enabled is boolean
+          - agent_chat_mcp_port | string is match('^[0-9]+$')
+          - agent_chat_mcp_port | int >= 1024
+          - agent_chat_mcp_port | int <= 65535
+          - not agent_chat_mcp_enabled or agent_chat_mcp_port | int != agent_chat_port | int
+          - agent_chat_mcp_enable_writes is boolean
+          - not agent_chat_mcp_enabled or agent_chat_mcp_public_origin is defined
+          - not agent_chat_mcp_enabled or agent_chat_mcp_public_origin is match('^https://[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[1-9][0-9]{0,4})?$')
+          - not agent_chat_mcp_enabled or not agent_chat_mcp_public_origin is search(':443$')
+          - not agent_chat_mcp_enabled or (agent_chat_mcp_public_origin.split(':')[2] | default('1')) | int <= 65535
+          - agent_chat_migrate_reviewed | default('') is match('^([0-9a-f]{64})?$')
+        fail_msg: >-
+          A variable is missing or invalid. The failed assertion is named in this output, and the
+          variable table in docs/ansible.md lists the valid values. A true/false flag must be a real
+          boolean: set it in the inventory, or pass it with -e as JSON, for example
+          -e '{"agent_chat_mcp_enabled": true}'. An origin has no :443 and a port of at most 65535;
+          the MCP port differs from the server port. Releases before 0.7.0 are not on PyPI as sessionyard.
+          The path in agent_chat_dsn_file is absolute, has no segment . or .., and sits outside the paths
+          that the play writes: the install tree, the live configuration files and the systemd configuration.
+        quiet: true
+
+    - name: Read the Python version of the target
+      ansible.builtin.command:
+        argv: [/usr/bin/python3, -I, -c, "import sys; print('%d.%d' % sys.version_info[:2])"]
+      register: agent_chat_python
+      changed_when: false
+
+    - name: Require Python 3.11 or newer
+      ansible.builtin.assert:
+        that: agent_chat_python.stdout is version('3.11', '>=')
+        fail_msg: "Agent Chat needs python3 3.11 or newer on the target; python3 is {{ agent_chat_python.stdout }}."
+        quiet: true
+
+    # The stat module reads metadata only; the checksum, MIME and attribute probes would open the file.
+    # It follows a link, as systemd does when it loads the credential.
+    - name: Check the DSN file without reading it
+      ansible.builtin.stat:
+        path: "{{ agent_chat_dsn_file }}"
+        follow: true
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: agent_chat_dsn
+      no_log: true
+
+    - name: Require the deployer's DSN file
+      ansible.builtin.assert:
+        that:
+          - agent_chat_dsn.stat.exists
+          - agent_chat_dsn.stat.isreg
+          - agent_chat_dsn.stat.mode == '0600'
+          - agent_chat_dsn.stat.uid == 0
+          - agent_chat_dsn.stat.gid == 0
+        fail_msg: >-
+          {{ agent_chat_dsn_file }} must exist as a regular file owned by root:root with mode 0600.
+          The deployer provides it from the secret manager; this playbook never creates, reads or prints it.
+        quiet: true
+
+    # The variable check compares the path as written. A link leads elsewhere than its name says, and the stat
+    # above and systemd both follow links, so the path is resolved here and held to the same rule before the first
+    # task that writes anything. realpath looks at the links on the way and never opens the file. These two tasks
+    # write nothing and queue no handler.
+    - name: Resolve the DSN path without reading the file
+      ansible.builtin.command:
+        argv: [realpath, -e, --, "{{ agent_chat_dsn_file }}"]
+      register: agent_chat_dsn_real
+      changed_when: false
+      no_log: true
+
+    - name: Require the DSN file outside the paths the play writes
+      ansible.builtin.assert:
+        that: not agent_chat_dsn_real.stdout is search(agent_chat_written_paths)
+        fail_msg: >-
+          agent_chat_dsn_file resolves to {{ agent_chat_dsn_real.stdout }}, which the play writes. The DSN file must
+          sit outside the paths that the play writes: the install tree {{ agent_chat_root }}, the live
+          configuration files and the systemd configuration. The same holds for every link on the way to it.
+          The variable table in docs/ansible.md lists the paths.
+        quiet: true
+
+    # The checks above judge the file as it is now. A path is only as safe as the directories on the way to it:
+    # systemd opens it as root every time it starts a unit, so a user who can write to one of those directories can
+    # replace the file, or a link on the way, after this play has checked it, and the service would then receive
+    # whatever the path names. So every directory on the path as written and on the resolved path, from `/` down,
+    # must be a real directory owned by root that neither its group nor others can write to. A sticky bit does not
+    # change that, so a directory such as /tmp is refused. Without `follow` a link reports as a link, not as a
+    # directory, so a link in a directory position is refused too: write the real path. The deployer creates every
+    # directory on the way, because the stat above requires the file to exist, so each one exists here. Both tasks
+    # read metadata only, write nothing and queue no handler. A name that another user chose could carry control
+    # characters, so the messages print each one with to_json. The play resolves the path once. A link that leads
+    # through another link is judged at its two ends only, so a link must name the file itself.
+    - name: Inspect the credential pathname itself
+      ansible.builtin.stat:
+        path: "{{ agent_chat_dsn_file }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: agent_chat_dsn_entry
+      no_log: true
+
+    - name: Require a direct credential path or a single link to the canonical file
+      ansible.builtin.assert:
+        that: >-
+          not agent_chat_dsn_entry.stat.islnk or
+          ([agent_chat_dsn_file | dirname, agent_chat_dsn_entry.stat.lnk_target] | path_join)
+          == agent_chat_dsn_real.stdout
+        fail_msg: Use the canonical credential path or point its final link directly at that path.
+        quiet: true
+
+    - name: Look at the directories on the way to the DSN file
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      loop: >-
+        {%- set found = ['/'] -%}
+        {%- for path in [agent_chat_dsn_file, agent_chat_dsn_real.stdout] -%}
+        {%- set parts = path.split('/')[1:-1] -%}
+        {%- for count in range(1, parts | length + 1) -%}
+        {%- set _ = found.append('/' ~ parts[:count] | join('/')) -%}
+        {%- endfor -%}
+        {%- endfor -%}
+        {{- found | unique | list -}}
+      register: agent_chat_dsn_dirs
+      no_log: true
+
+    - name: Require the directories on the way to the DSN file to be owned by root and closed to other writers
+      ansible.builtin.assert:
+        that: >-
+          item.stat.exists and item.stat.isdir and item.stat.uid == 0 and not item.stat.wgrp and not item.stat.woth
+        fail_msg: >-
+          {{ item.item | to_json }} is on the path of agent_chat_dsn_file, as written or after its links are resolved,
+          and it is not a real directory owned by root that neither its group nor others can write to. A user who can
+          write there could replace the DSN file, or a link on the way, after this check, and systemd reads the path as
+          root every time it starts a unit. Put the DSN file in directories that only root can write to; the default
+          path is fine. The play does not change them, and it has changed nothing yet.
+        quiet: true
+      loop: "{{ agent_chat_dsn_dirs.results }}"
+      loop_control:
+        label: "{{ item.item | to_json }}"
+
+    # Before the gate. The migration check runs as this user, so it must exist; creating it changes no
+    # running service.
+    - name: Create the service group
+      ansible.builtin.group:
+        name: agent-chat
+        system: true
+
+    - name: Create the service user
+      ansible.builtin.user:
+        name: agent-chat
+        group: agent-chat
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+        comment: Agent Chat service
+
+    # Before the gate the play creates an install directory only when it does not exist. It never changes the
+    # owner or mode of one that does, which a deployer may have hardened, so a refused upgrade leaves it as it
+    # was. "Reconcile the install directories" sets root:root 0755 on both once the gate has passed.
+    - name: Look for the install directories
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ agent_chat_root }}"
+        - "{{ agent_chat_root }}/venvs"
+      register: agent_chat_dirs
+
+    # The migration check below runs as the service user, from a virtual environment inside these directories,
+    # so that user must be able to enter both. If a deployer hardened one of them (0700 root:root, say), the
+    # check would fail with a permission error (exit 203, EXEC) before the gate, no digest could clear it, and
+    # the task that sets 0755 only comes after the gate. So the play refuses such a directory here and changes
+    # nothing. It reads the mode bits that the look-up recorded. The kernel applies one class of them to the
+    # user: the owner's if the user owns the directory, else the group's if the directory has the group
+    # agent-chat, else the others'. That is the whole model: it does not know ACLs, supplementary groups or
+    # symlinked roots, and the guide calls such a layout unsupported. A missing directory passes, because the
+    # task that creates the missing directories follows these checks and makes it 0755.
+    - name: Require the install directories to be traversable by the service user
+      ansible.builtin.assert:
+        that: >-
+          not item.stat.exists
+          or (item.stat.xusr if item.stat.pw_name | default('') == 'agent-chat'
+          else item.stat.xgrp if item.stat.gr_name | default('') == 'agent-chat'
+          else item.stat.xoth)
+        fail_msg: >-
+          {{ item.item }} must stay traversable by the agent-chat user (for example mode 0755, or mode 0750 with
+          group agent-chat), because that user runs the migration check from the new virtual environment. The play
+          does not change an existing install directory before the review gate. Change this one by hand and rerun.
+        quiet: true
+      loop: "{{ agent_chat_dirs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # The play runs Python from the new virtual environment as root before the review gate: the install step skips on
+    # the stamp inside the environment, and the `validate:` of each staged configuration file runs the environment's
+    # `bin/python`. A user who can write to the install root or to `venvs` can plant an environment there with a
+    # forged stamp and a `bin/python` of its own, and the play would run it as root. So an existing install
+    # directory must be a real directory owned by root that neither its group nor others can write to. That holds
+    # for anyone, not only the service user. `stat` without `follow` reports a link as a link, with mode 0777 and no
+    # word about its target, so a link is refused too. This reads the mode bits that the look-up recorded and
+    # changes nothing. A POSIX ACL entry that lets another user write raises the group bits, which hold the ACL
+    # mask, so it is refused as well. A missing directory passes: the play creates it as root, 0755, after these checks.
+    - name: Require the install directories to be owned by root and closed to other writers
+      ansible.builtin.assert:
+        that: >-
+          not item.stat.exists
+          or (item.stat.isdir and item.stat.uid == 0 and not item.stat.wgrp and not item.stat.woth)
+        fail_msg: >-
+          {{ item.item }} must be a real directory owned by root that neither its group nor others can write to (for
+          example mode 0755 owned by root:root). The play runs code from the new virtual environment as root before
+          the review gate, and whoever can write here could plant that code. The play does not change an existing
+          install directory before the review gate. Change this one by hand and rerun.
+        quiet: true
+      loop: "{{ agent_chat_dirs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # The release environment is the other half of the same trust. If it exists, the install step skips on its stamp
+    # and the staged files are validated with its `bin/python` as root, so everything that root runs or imports from
+    # it must be beyond the reach of every other user. Two read-only checks decide that, and the play does not read
+    # the stamp or follow the `bin/python` link for either. The first judges the directory itself: a real directory
+    # owned by root that neither its group nor others can write to. `follow: false` makes a link report as a link.
+    # Like the DSN stat, it turns the checksum, MIME and attribute probes off, so it reads metadata only. The second
+    # (below) judges what is inside it. A closed top directory says nothing about a directory below it: an entry that
+    # the service user owns or can write, such as `bin/` or `site-packages`, would let that user replace the Python
+    # that root runs. The play does not repair an environment that fails either check, because it cannot know what
+    # ran from it. A missing environment passes both: the install step creates it as root.
+    - name: Look for the release virtual environment
+      ansible.builtin.stat:
+        path: "{{ agent_chat_venv }}"
+        follow: false
+        get_checksum: false
+        get_mime: false
+        get_attributes: false
+      register: agent_chat_venv_dir
+
+    - name: Require the release virtual environment to be owned by root and closed to other writers
+      ansible.builtin.assert:
+        that: >-
+          not agent_chat_venv_dir.stat.exists
+          or (agent_chat_venv_dir.stat.isdir and agent_chat_venv_dir.stat.uid == 0
+          and not agent_chat_venv_dir.stat.wgrp and not agent_chat_venv_dir.stat.woth)
+        fail_msg: >-
+          {{ agent_chat_venv }} must be a real directory owned by root that neither its group nor others can write to.
+          The play does not trust or repair an existing release environment that is not, because it runs code from it
+          as root before the review gate. Remove it by hand and rerun.
+        quiet: true
+
+    # Inspect metadata with the system interpreter before executing any code from this release.
+    - name: Check ownership, modes and links throughout the existing release
+      ansible.builtin.script:
+        cmd: files/check_release_tree.py {{ agent_chat_venv | quote }}
+      changed_when: false
+      when: agent_chat_venv_dir.stat.exists
+
+    - name: Create the missing install directories
+      ansible.builtin.file:
+        path: "{{ item.item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ agent_chat_dirs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: not item.stat.exists
+
+    # One virtual environment per release and per set of extras, kept after an upgrade so that a rollback only
+    # repoints `current`. The stamp is one file inside that environment and is written last, so an interrupted
+    # install runs again and a second run with the same variables changes nothing. Once it is stamped, pip never
+    # runs in the environment again: turning MCP on or off installs a new environment instead of running pip in
+    # the one that `current` points at. The PyPI install needs outbound HTTPS to pypi.org and
+    # files.pythonhosted.org, and no git. The old release keeps serving: nothing points at this directory yet.
+    - name: Install Agent Chat into its versioned virtual environment
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          umask 022
+          /usr/bin/python3 -I -m venv {{ agent_chat_venv | quote }}
+          {{ agent_chat_venv | quote }}/bin/pip install --disable-pip-version-check --no-cache-dir {{ agent_chat_requirement | quote }}
+          touch {{ agent_chat_stamp | quote }}
+        creates: "{{ agent_chat_stamp }}"
+
+    # The new configuration is rendered inside the new release and checked with that release's own loader,
+    # so a configuration that the product would refuse stops the play here. `migrate --check` reads the
+    # staged server file. After the gate the live files are copies of these same files, so the gate
+    # judged the bytes that go live.
+    - name: Create the directory for the staged configuration
+      ansible.builtin.file:
+        path: "{{ agent_chat_staged }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Stage the server configuration
+      ansible.builtin.template:
+        src: server.json.j2
+        dest: "{{ agent_chat_staged }}/server.json"
+        owner: root
+        group: agent-chat
+        mode: "0640"
+        validate: "{{ agent_chat_venv }}/bin/python -I -c 'import sys; from agent_chat.admin import load_config; load_config(sys.argv[1])' %s"
+
+    - name: Stage the MCP configuration
+      ansible.builtin.template:
+        src: mcp.json.j2
+        dest: "{{ agent_chat_staged }}/mcp.json"
+        owner: root
+        group: root
+        mode: "0640"
+        validate: "{{ agent_chat_venv }}/bin/python -I -c 'import sys; from agent_chat.mcp.config import load_config; load_config(sys.argv[1])' %s"
+      when: agent_chat_mcp_enabled
+
+    # The schema never changes at startup. `migrate --check` takes the migration lock, prints what
+    # an apply would run and rolls back. It runs from the new virtual environment against the staged
+    # configuration, so a refusal leaves the running version, its files and its units untouched.
+    - name: List the pending migrations
+      ansible.builtin.command:
+        argv: "{{ agent_chat_admin + ['migrate', '--config', agent_chat_staged + '/server.json', '--check'] }}"
+      register: agent_chat_check
+      changed_when: false
+
+    - name: Check the format of the migration listing
+      ansible.builtin.assert:
+        that:
+          - agent_chat_check.stdout_lines | first | default('') is match('^pending=[0-9]+$')
+          - agent_chat_pending | int == 0 or agent_chat_digest is match('^[0-9a-f]{64}$')
+        fail_msg: "Unexpected output from migrate --check; run it by hand and see docs/ansible.md."
+        quiet: true
+
+    # The listing is a separate task so that each file is printed on its own line.
+    - name: Show the pending migrations
+      ansible.builtin.debug:
+        msg: "{{ agent_chat_check.stdout_lines }}"
+      when:
+        - agent_chat_pending | int > 0
+        - agent_chat_migrate_reviewed | default('') != agent_chat_digest
+
+    - name: Require the reviewed digest before the schema changes
+      ansible.builtin.assert:
+        that: agent_chat_pending | int == 0 or agent_chat_migrate_reviewed | default('') == agent_chat_digest
+        fail_msg: >-
+          {{ agent_chat_pending }} migration(s) are pending and have not been reviewed. Read the files
+          listed above in the release you are installing, then rerun with
+          -e agent_chat_migrate_reviewed={{ agent_chat_digest }}
+        quiet: true
+
+    # The gate has passed. From here on the play changes the live host.
+    #
+    # The activation marker is recorded first, before any other live write, and removed by the last task once the
+    # readiness checks pass. A run that stops in between (a failed task, or a controller that dies before its
+    # handlers run) leaves it, and the next run restarts the services even when every file already matches and
+    # nothing queues a handler. A run that the gate refuses never reaches these tasks.
+    - name: Look for an unfinished activation
+      ansible.builtin.stat:
+        path: "{{ agent_chat_marker }}"
+      register: agent_chat_unfinished
+
+    # The reload comes with the restart, as for a changed unit: the earlier run may have written a unit file and
+    # stopped before systemd read it.
+    - name: Resume an unfinished activation
+      ansible.builtin.debug:
+        msg: An earlier run passed the review gate and did not finish its activation; the services restart.
+      when: agent_chat_unfinished.stat.exists
+      changed_when: true
+      notify:
+        - Reload systemd
+        - Restart Agent Chat
+
+    # Bookkeeping, not a change of the host, so a clean rerun still reports changed=0. The content is the
+    # environment that this run activates; it holds no secret.
+    - name: Mark the activation as pending
+      ansible.builtin.copy:
+        content: "{{ agent_chat_venv }}\n"
+        dest: "{{ agent_chat_marker }}"
+        owner: root
+        group: root
+        mode: "0600"
+      changed_when: false
+
+    - name: Apply the reviewed migrations
+      ansible.builtin.command:
+        argv: >-
+          {{ agent_chat_admin + ['migrate', '--config', agent_chat_staged + '/server.json',
+                                 '--reviewed', agent_chat_migrate_reviewed] }}
+      when: agent_chat_pending | int > 0
+      notify: Restart Agent Chat
+
+    # The play declares root:root 0755 for the install tree and for the release environment that it activates. It
+    # applies that only now, after the review: before the gate it left an existing directory as the deployer made it.
+    # The checks before the gate accept a `root:agent-chat` directory with mode 0750, because they judge who can write.
+    # The MCP service runs as `agent-chat-mcp`, which is neither the owner nor in that group, so it could not enter the
+    # release environment, and systemd would fail to start Python (203/EXEC) on every run. Only the mode, the owner and
+    # the group of the directory itself are set; nothing below it changes.
+    - name: Reconcile the install directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ agent_chat_root }}"
+        - "{{ agent_chat_root }}/venvs"
+        - "{{ agent_chat_venv }}"
+
+    # Any user may enter this directory, so that the MCP user can reach its own file. server.json is
+    # readable by group agent-chat only, and the DSN file is readable by root only.
+    - name: Create the configuration directory
+      ansible.builtin.file:
+        path: /etc/agent-chat
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # The MCP service runs as its own user. A process that shares the server's user can read the DSN
+    # through /proc/<server pid>/root whatever it masks in its own view: ProtectProc=invisible hides
+    # only the processes of other users.
+    - name: Create the MCP service group
+      ansible.builtin.group:
+        name: agent-chat-mcp
+        system: true
+      when: agent_chat_mcp_enabled
+
+    - name: Create the MCP service user
+      ansible.builtin.user:
+        name: agent-chat-mcp
+        group: agent-chat-mcp
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+        comment: Agent Chat MCP service
+      when: agent_chat_mcp_enabled
+
+    # copy compares checksums, so a run with the same variables changes nothing.
+    - name: Install the server configuration
+      ansible.builtin.copy:
+        src: "{{ agent_chat_staged }}/server.json"
+        dest: /etc/agent-chat/server.json
+        remote_src: true
+        owner: root
+        group: agent-chat
+        mode: "0640"
+      notify: Restart Agent Chat
+
+    - name: Install the MCP configuration
+      ansible.builtin.copy:
+        src: "{{ agent_chat_staged }}/mcp.json"
+        dest: /etc/agent-chat/mcp.json
+        remote_src: true
+        owner: root
+        group: agent-chat-mcp
+        mode: "0640"
+      when: agent_chat_mcp_enabled
+      notify: Restart Agent Chat
+
+    - name: Install the systemd units
+      ansible.builtin.template:
+        src: "{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ agent_chat_unit_files }}"
+      notify:
+        - Reload systemd
+        - Restart Agent Chat
+
+    # Turning MCP off stops and disables an installed unit, or it would keep serving the code of an earlier
+    # release. The unit file and mcp.json stay on disk. The stat guard keeps a host that never had the unit
+    # away from the systemd module, which fails on an unknown unit.
+    - name: Look for an MCP unit from an earlier run
+      ansible.builtin.stat:
+        path: /etc/systemd/system/agent-chat-mcp.service
+      register: agent_chat_mcp_unit
+
+    - name: Stop and disable the MCP service while it is turned off
+      ansible.builtin.systemd:
+        name: agent-chat-mcp.service
+        state: stopped
+        enabled: false
+      when:
+        - not agent_chat_mcp_enabled
+        - agent_chat_mcp_unit.stat.exists
+
+    - name: Point current at this release
+      ansible.builtin.file:
+        src: "{{ agent_chat_venv }}"
+        dest: "{{ agent_chat_root }}/current"
+        state: link
+      notify: Restart Agent Chat
+
+    # Restart onto the new code before the readiness checks, or they would probe the old process.
+    - name: Run the queued restarts
+      ansible.builtin.meta: flush_handlers
+
+    # The reload also runs here, so that a run interrupted after it wrote a unit cannot leave the unit unknown.
+    - name: Enable and start the services and the prune timer
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        daemon_reload: true
+        enabled: true
+        state: started
+      loop: "{{ agent_chat_runtime_units }}"
+
+    - name: Wait for the server to be ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ agent_chat_port }}/readyz"
+        use_proxy: false
+      register: agent_chat_ready
+      until: agent_chat_ready.status == 200
+      retries: 20
+      delay: 3
+      changed_when: false
+
+    - name: Wait for the MCP service to be ready
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ agent_chat_mcp_port }}/readyz"
+        use_proxy: false
+      register: agent_chat_mcp_ready
+      until: agent_chat_mcp_ready.status == 200
+      retries: 20
+      delay: 3
+      changed_when: false
+      when: agent_chat_mcp_enabled
+
+    # The last task: the services run the new code and have answered their readiness checks.
+    - name: Clear the activation marker
+      ansible.builtin.file:
+        path: "{{ agent_chat_marker }}"
+        state: absent
+      changed_when: false
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    # try-restart leaves a stopped unit stopped. The start task above owns the first start, after
+    # `current` exists.
+    - name: Restart Agent Chat
+      ansible.builtin.command:
+        argv: "{{ ['systemctl', 'try-restart'] + agent_chat_runtime_units }}"

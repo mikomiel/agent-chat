@@ -7,10 +7,13 @@ without turning chat into authority.
 
 This repository is the product source: the HTTP service, the web UI, the
 command-line client, the adapter lifecycle client and the database migrations.
-No hosted service or deployment is provided by this repository. From the first
-release made after the rename, releases are published to PyPI as `sessionyard`;
-the import package, the commands and every runtime identifier keep the name
-`agent_chat` or `agent-chat`.
+No hosted service is operated by this repository. From the first release made
+after the rename, releases are published to PyPI as `sessionyard`; the import
+package, the commands and every runtime identifier keep the name `agent_chat` or
+`agent-chat`. The install paths in [docs/ansible.md](docs/ansible.md),
+[docs/containers.md](docs/containers.md) and [docs/podman.md](docs/podman.md)
+are supported as those guides describe them; the deployer owns every live
+deployment.
 
 Licensed under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
 
@@ -104,9 +107,10 @@ PostgreSQL cluster; see `tests/agent_chat/conftest.py`.
 
 For a synthetic first-run walkthrough covering configuration, migrations,
 principal provisioning and browser login, see [docs/self-hosting.md](docs/self-hosting.md).
-For a Docker Compose stack using external PostgreSQL and Traefik, see
-[docs/containers.md](docs/containers.md). For native Podman with systemd
-(Quadlet), see [docs/podman.md](docs/podman.md).
+For systemd units on a Linux host installed by an example Ansible playbook, see
+[docs/ansible.md](docs/ansible.md). For a Docker Compose stack using external
+PostgreSQL and Traefik, see [docs/containers.md](docs/containers.md). For native
+Podman with systemd (Quadlet), see [docs/podman.md](docs/podman.md).
 
 ## Command line
 
