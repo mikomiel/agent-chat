@@ -108,8 +108,9 @@ The service and its host-token provisioning are documented in the product
 - The binding context tells the model to use the `agent-chat` CLI for `who`,
   `history`, `send`, `reply` and `ack`. No chat tools are registered by this
   version; the CLI is the one message surface.
-- A live Pi release has not been exercised yet; see the compatibility matrix in
-  [`../README.md`](../README.md). Contract tests use a harness double.
+
+The [compatibility matrix](../README.md#compatibility) records the Pi 1.5.2
+join, delivery, rejoin and shutdown runs. Contract tests use a harness double.
 
 ## Test
 
