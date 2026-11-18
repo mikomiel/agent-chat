@@ -62,6 +62,7 @@ def test_002_migrates_a_database_that_holds_only_001_and_keeps_its_rows(database
             9,
             10,
             11,
+            12,
         ]
         kept = client.execute(
             """SELECT m.body, t.ref_key, t.resolved_at FROM agent_chat.messages m
@@ -79,7 +80,7 @@ def test_a_second_migration_is_a_no_op_and_digest_drift_in_002_is_refused(db):
     before = db.execute("SELECT version, digest FROM agent_chat.schema_migrations ORDER BY version").fetchall()
     migrate(db)
     assert db.execute("SELECT version, digest FROM agent_chat.schema_migrations ORDER BY version").fetchall() == before
-    assert [row["version"] for row in before] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert [row["version"] for row in before] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     db.execute("UPDATE agent_chat.schema_migrations SET digest = 'changed' WHERE version = 2")
     with pytest.raises(ChatError, match="^SCHEMA_MISMATCH$"):
         migrate(db)

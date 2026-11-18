@@ -69,7 +69,7 @@ def test_003_migrates_a_database_at_002_keeps_its_rows_and_reapplies_as_a_no_op(
         digests = client.execute(
             "SELECT version, digest FROM agent_chat.schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row["version"] for row in digests] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        assert [row["version"] for row in digests] == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         migrate(client)
         assert (
             client.execute("SELECT version, digest FROM agent_chat.schema_migrations ORDER BY version").fetchall()

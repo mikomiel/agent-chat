@@ -89,13 +89,15 @@ def join(db: Connection[dict[str, Any]], actor: Actor, room: UUID, session: UUID
         return {"room_id": room, "session_id": session}
 
 
-# The row keys `fields` may name: the default row, plus two keys that exist only on request.
+# The row keys `fields` may name: the default row, plus keys that exist only on request.
 ROSTER_FIELDS = (
     "session_id", "label", "title", "host", "harness", "native_session_id", "muted", "instance_id", "heartbeat_at",
     "online", "native_state", "stopped", "plan_mode", "lane", "lane_since", "lane_age_seconds", "repositories",
     "last_published_at", "messages_24h", "announced_prs", "last_seen_at", "recent_refs",
+    "model", "recent_counterparts",
 )
 RECENT_REFS = 5
+RECENT_COUNTERPARTS = 5
 
 
 def participants(
@@ -118,7 +120,7 @@ def participants(
     sessions first, then newest `last_seen_at`, then newest `last_published_at`, then session id. `online`,
     `harness`, `host`, `repository` (a live session's declared work), `ref` (published into that thread key) and `q`
     (case-insensitive substring of label or title) all filter before paging. `fields` projects the row keys;
-    `last_seen_at` and `recent_refs` are computed and returned only when it names them."""
+    `last_seen_at`, `recent_refs`, `model` and `recent_counterparts` are projected on request."""
     names = None if fields is None else fields.split(",")
     if (
         not 1 <= limit <= 100
@@ -140,7 +142,7 @@ def participants(
         # not already show. Each subquery scopes the room once, through the table it reaches first.
         rows = db.execute(
             """
-            SELECT s.id AS session_id, s.label, s.title, p.host, p.harness, s.native_session_id,
+            SELECT s.id AS session_id, s.label, s.title, s.model, p.host, p.harness, s.native_session_id,
                    s.muted, i.id AS instance_id, i.heartbeat_at, liveness.online,
                    i.native_state, i.stopped, i.plan_mode,
                    i.lane, i.lane_since,
@@ -168,7 +170,38 @@ def participants(
                              AND x.body IS NOT NULL AND x.expires_at > clock_timestamp()
                            GROUP BY t.ref_key ORDER BY last_at DESC, t.ref_key LIMIT %(recent)s
                        ) r
-                   ) END AS recent_refs
+                   ) END AS recent_refs,
+                   CASE WHEN %(counterparts)s::boolean THEN (
+                       SELECT COALESCE(jsonb_agg(peer ORDER BY newest DESC, peer), '[]'::jsonb)
+                       FROM (
+                           SELECT peer, max(x.created_at) AS newest
+                           FROM (
+                               SELECT r.session_id AS peer, m.id
+                               FROM agent_chat.messages m JOIN agent_chat.recipients r ON r.message_id = m.id
+                               WHERE m.sender_session_id = s.id
+                               UNION ALL
+                               SELECT m.sender_session_id, r.message_id
+                               FROM agent_chat.recipients r JOIN agent_chat.messages m ON m.id = r.message_id
+                               WHERE r.session_id = s.id
+                               UNION ALL
+                               SELECT parent.sender_session_id, reply.id
+                               FROM agent_chat.messages reply
+                               JOIN agent_chat.messages parent ON parent.id = reply.reply_to
+                               WHERE reply.sender_session_id = s.id AND parent.body IS NOT NULL
+                                 AND parent.expires_at > clock_timestamp()
+                               UNION ALL
+                               SELECT reply.sender_session_id, reply.id
+                               FROM agent_chat.messages parent
+                               JOIN agent_chat.messages reply ON reply.reply_to = parent.id
+                               WHERE parent.sender_session_id = s.id AND parent.body IS NOT NULL
+                                 AND parent.expires_at > clock_timestamp()
+                           ) links
+                           JOIN agent_chat.messages x ON x.id = links.id
+                           WHERE x.room_id = %(room)s AND x.body IS NOT NULL AND x.expires_at > clock_timestamp()
+                             AND peer IS NOT NULL AND peer <> s.id
+                           GROUP BY peer ORDER BY newest DESC, peer LIMIT %(recent_counterparts)s
+                       ) counterpart
+                   ) END AS recent_counterparts
             FROM agent_chat.memberships m JOIN agent_chat.sessions s ON s.id = m.session_id
             JOIN agent_chat.principals p ON p.id = s.principal_id
             JOIN agent_chat.principal_rooms pr ON pr.principal_id = p.id AND pr.room_id = m.room_id
@@ -218,6 +251,8 @@ def participants(
                 "seen": activity or (names is not None and "last_seen_at" in names),
                 "refs": names is not None and "recent_refs" in names,
                 "recent": RECENT_REFS,
+                "counterparts": names is not None and "recent_counterparts" in names,
+                "recent_counterparts": RECENT_COUNTERPARTS,
                 "limit": limit + 1,
             },
         ).fetchall()
@@ -248,7 +283,7 @@ def participants(
         # Project last: the continuation above and the offline blanking read keys the caller may not name.
         if names is None:
             for row in page:
-                del row["last_seen_at"], row["recent_refs"]
+                del row["last_seen_at"], row["recent_refs"], row["model"], row["recent_counterparts"]
         else:
             page = [{name: row[name] for name in names} for row in page]
         # The mark is a room fact: it does not depend on the page, the `online` filter or the holder's lease.

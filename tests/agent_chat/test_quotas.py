@@ -103,7 +103,8 @@ def test_006_upgrades_a_database_at_005_and_indexes_both_count_queries(database,
         assert client.execute("SELECT created_at IS NOT NULL AS ok FROM agent_chat.instances").fetchone() == {
             "ok": True
         }
-        assert client.execute("SELECT max(version) AS v FROM agent_chat.schema_migrations").fetchone() == {"v": 11}
+        ledger = client.execute("SELECT max(version) AS v FROM agent_chat.schema_migrations").fetchone()
+        assert ledger == {"v": len(storage.MIGRATIONS)}
         # The upgrade leaves the principal its hourly headroom instead of
         # refusing it with REGISTRATION_LIMIT for an hour.
         registered = register(client, actor)

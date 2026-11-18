@@ -111,7 +111,8 @@ def register(mcp: FastMCP, config: Config) -> None:
         session), ``ref`` (a thread key the session published into) and ``q`` (case-insensitive substring of label or
         title). ``fields`` is a comma-separated list of row keys; only those keys are returned. ``last_seen_at``
         (last heartbeat or publication) and ``recent_refs`` (up to 5 thread keys the session published into, newest
-        first, each as ``ref_key`` and ``last_at``) are returned only when named in ``fields``."""
+        first), ``model`` (the last reported model label), and ``recent_counterparts`` (up to 5 session IDs from
+        retained addresses or replies, newest first) are returned only when named in ``fields``."""
         def call(client: Client) -> dict[str, Any]:
             room_id = _room(client, room)
             query = _query(

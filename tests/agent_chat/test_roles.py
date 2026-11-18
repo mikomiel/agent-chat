@@ -362,7 +362,7 @@ def test_migration_011_copies_the_pm_mark_and_widens_the_stamp(
             )
         migrate(client)
         versions = [row["version"] for row in client.execute("SELECT version FROM agent_chat.schema_migrations")]
-        assert versions == list(range(1, len(storage.MIGRATIONS) + 1)) and storage.MIGRATIONS[-1].startswith("011")
+        assert versions == list(range(1, len(storage.MIGRATIONS) + 1)) and storage.MIGRATIONS[10].startswith("011")
         assert _one(client, "SELECT to_regclass('agent_chat.room_pm') AS name")["name"] is None
         roles = client.execute("SELECT role, session_id FROM agent_chat.room_roles").fetchall()
         assert roles == [{"role": "pm", "session_id": holder.session_id}]

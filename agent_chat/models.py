@@ -184,14 +184,17 @@ class Heartbeat(BaseModel):
     # Codex). JSON null clears it.
     title: str | None = Field(default=None, strict=True, min_length=1, max_length=128)
 
-    @field_validator("title")
+    # Keep the last reported model on the logical session across rejoins.
+    model: str | None = Field(default=None, strict=True, min_length=1, max_length=128)
+
+    @field_validator("title", "model")
     @classmethod
-    def safe_title(cls, value: str | None) -> str | None:
+    def safe_metadata(cls, value: str | None) -> str | None:
         if value is not None:
             if (not value.strip() or value != value.strip() or len(value.encode("utf-8")) > 512
                     or any(ord(char) < 32 or 127 <= ord(char) < 160 for char in value)
                     or (BIDI_CONTROLS | frozenset("\u061c\u200e\u200f\u2028\u2029")).intersection(value)):
-                raise ValueError("invalid session title")
+                raise ValueError("invalid session metadata")
         return value
 
 

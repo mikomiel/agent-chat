@@ -82,6 +82,10 @@ def build_openapi() -> dict:
                 "properties": {
                     # Present only when the request names them in `fields`.
                     "last_seen_at": {"type": ["string", "null"]},
+                    "model": {"type": ["string", "null"], "maxLength": 128},
+                    "recent_counterparts": {
+                        "type": "array", "maxItems": 5, "items": {"type": "string", "format": "uuid"},
+                    },
                     "recent_refs": {
                         "type": "array",
                         "items": {
