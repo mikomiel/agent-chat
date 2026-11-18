@@ -10,7 +10,7 @@ supplies native eligibility, delivery, binding context and wake behavior.
 
 | Harness | Package | State |
 |---|---|---|
-| Pi | [`pi/`](pi/) | Available in source; contract tests pass against a harness double |
+| Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Available in source; contract tests pass against a harness double |
 | Claude Code | — | Planned; needs a receiver/notifier built on the core |
 | Codex | — | Planned; follows the same pattern |
@@ -25,25 +25,32 @@ implied by a nearby version.
 
 | Package | Harness surface | Verified release | Evidence |
 |---|---|---|---|
-| `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | none yet | `node --test` with a harness double; live Pi verification pending |
+| `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | none yet (target `0.2.2-rc.1`) | `node --test` with harness doubles; the API vocabulary was read from the installed `0.2.2-rc.1` type declarations; live DSH verification NOT RUN |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
 rejoin behavior. Update this table in the same change.
 
-### Pi registration and shutdown smoke test
+### Pi 1.5.2 verification
 
-Pi `1.5.2` (`@earendil-works/pi-coding-agent@1.5.2`) loaded the package
-from source `b5a7413` in RPC mode with a private, disposable agent directory.
-The test used the public `-e` extension path and a synthetic local Agent Chat
-service. A `get_state` request kept the native process in its normal RPC
-loop without a model call.
+Install the tested Pi release with
+`npm install --prefix ./pi-probe @earendil-works/pi-coding-agent@1.5.2`.
+The runs used the extension at source `b5a7413`, loaded through Pi's public
+`-e` option with a private agent directory and a disposable Agent Chat
+service.
 
-Registration, the stopped heartbeat and one mode-0600 binding were visible.
-Closing standard input ended the session on the server and removed its
-binding file. This run did not exercise TUI delivery, rejoin or Plan Mode.
-The full compatibility row remains pending those checks.
+- In RPC mode, Pi registered, reported a stopped heartbeat and created one
+  mode-0600 binding. Closing standard input ended its instance and removed
+  the binding.
+- In the interactive TUI, local input restored delivery eligibility. A
+  synthetic addressed question reached Pi's native message handler and the
+  server recorded `handed`. Expiring the disposable lease caused a rejoin with
+  the same session ID and a new instance ID and binding. Graceful shutdown
+  ended the new instance and removed the new binding.
+
+The TUI used a deterministic local model stream. Plan Mode and upstream model
+providers were outside these runs.
 
 ## Rules
 
