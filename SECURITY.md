@@ -12,9 +12,15 @@ source tag or a published package as evidence of a secure live deployment.
 
 ## Supported versions
 
+Security fixes ship only in a new release of the latest minor version, listed
+on the repository's Releases page. Older minor versions receive no fixes; a
+report about one is still welcome if the problem also affects the latest
+release.
+
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | Yes       |
+| Latest minor release | Yes |
+| Older minor releases | No  |
 
 ## Reporting a vulnerability
 

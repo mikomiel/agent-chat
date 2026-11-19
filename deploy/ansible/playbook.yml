@@ -286,7 +286,8 @@
 
     # Before the gate the play creates an install directory only when it does not exist. It never changes the
     # owner or mode of one that does, which a deployer may have hardened, so a refused upgrade leaves it as it
-    # was. "Reconcile the install directories" sets root:root 0755 on both once the gate has passed.
+    # was. "Reconcile the install directories" sets root:root 0755 on both, and on the release environment, once
+    # the gate has passed.
     - name: Look for the install directories
       ansible.builtin.stat:
         path: "{{ item }}"
