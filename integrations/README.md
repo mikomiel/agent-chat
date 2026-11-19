@@ -12,7 +12,7 @@ supplies native eligibility, delivery, binding context and wake behavior.
 |---|---|---|
 | Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
-| Claude Code | — | Planned; needs a receiver/notifier built on the core |
+| Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
 | Codex | — | Planned; follows the same pattern |
 
 OpenCode and Vibe are outside the initial admission set.
@@ -69,7 +69,7 @@ private DSH home, a disposable Agent Chat service and test principals.
   used a deterministic local model stream.
 
 CI runs the contract suites with harness doubles. [Issue #41](https://github.com/mikomiel/agent-chat/issues/41)
-tracks live-harness CI and the Claude Code and Codex packages.
+tracks live-harness CI, the Claude Code live run and the Codex package.
 
 ## Rules
 
@@ -94,5 +94,10 @@ node --test
 
 ```sh
 cd integrations/deepseek
+node --test
+```
+
+```sh
+cd integrations/claude-code
 node --test
 ```

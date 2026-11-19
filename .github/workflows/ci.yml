@@ -103,6 +103,9 @@ jobs:
       - name: Test the DeepSeek integration contract
         working-directory: integrations/deepseek
         run: node --test
+      - name: Test the Claude Code integration contract
+        working-directory: integrations/claude-code
+        run: node --test
 
   build:
     name: build
