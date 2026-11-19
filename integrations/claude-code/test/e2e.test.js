@@ -176,3 +176,86 @@ test("a session joins, receives in a turn and by wake, ignores a delegate and en
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "acc-"))
+  const state = join(root, "s")
+  mkdirSync(state, { mode: 0o700 })
+  chmodSync(state, 0o700)
+  const python = join(root, "worker")
+  writeFileSync(python, workerSource)
+  chmodSync(python, 0o755)
+  const file = join(root, "chat.json")
+  writeFileSync(file, JSON.stringify({
+    chatEnabled: true, directory: state, serverOrigin: "https://chat.example", hostToken: "synthetic-host-token", python,
+  }))
+  chmodSync(file, 0o600)
+  const logFile = join(state, "worker.log")
+  const entries = () => (existsSync(logFile) ? readFileSync(logFile, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [])
+  return {
+    root,
+    env: { AGENT_CHAT_CLAUDE_CONFIG: file },
+    ops: name => entries().filter(entry => entry.op === name),
+    queue: (...ids) => writeFileSync(join(state, "queue.json"), JSON.stringify(ids.map(row))),
+    async until(done, what) {
+      for (let waited = 0; waited < 15_000; waited += 25) {
+        if (done()) return
+        await sleep(25)
+      }
+      assert.fail(`timed out waiting for ${what}`)
+    },
+  }
+}
+
+// Claude Code can close a hook's output pipe before the hook writes to it. The
+// write callback then reports EPIPE and Node also emits it as an 'error' event;
+// a hook that leaves that event unhandled exits 1 before it sends its receipt.
+// The pipe left open collects whatever else the hook prints, a trace included.
+// The payload is sent only after the closed pipe is gone, so the order is fixed.
+function hookWithClosedOutput(env, name, payload, closed) {
+  return new Promise(resolve => {
+    const child = spawn(process.execPath, [HOOK, name], { env, stdio: ["pipe", "pipe", "pipe"] })
+    let seen = ""
+    child[closed === "stdout" ? "stderr" : "stdout"].on("data", chunk => { seen += chunk })
+    child.stdin.on("error", () => {})
+    child.on("close", code => resolve({ code, seen }))
+    child[closed].destroy()
+    child[closed].once("close", () => child.stdin.end(JSON.stringify(payload)))
+  })
+}
+
+test("a hook whose output pipe was closed exits 0, and the delivery it could not write settles uncertain", { timeout: 90_000 }, async t => {
+  if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
+  const f = fixture()
+  const common = { session_id: "e2e-closed-pipe", permission_mode: "default" }
+  try {
+    const started = await hook(f.env, "session-start", { ...common, hook_event_name: "SessionStart", source: "startup" })
+    assert.equal(started.code, 0)
+
+    // A prompt hook delivers to a standard output nobody reads.
+    f.queue("msg-1")
+    const prompt = await hookWithClosedOutput(f.env, "prompt", { ...common, hook_event_name: "UserPromptSubmit", prompt: "go" }, "stdout")
+    assert.equal(prompt.code, 0, prompt.seen)
+    assert.equal(prompt.seen, "", "no trace on the pipe that stayed open")
+    await f.until(() => f.ops("settle").length === 1, "the settle after the unwritten delivery")
+    assert.deepEqual(f.ops("settle")[0].result, { outcome: "uncertain", reason: "transport_ambiguous" })
+
+    // The idle-wake waiter writes its notice to a standard error nobody reads: it must not exit 2.
+    await hook(f.env, "stop", { ...common, hook_event_name: "Stop" })
+    await f.until(() => f.ops("heartbeat").some(entry => entry.state.native_state === "idle"), "an idle heartbeat")
+    const wake = await hookWithClosedOutput(f.env, "wait", { ...common, hook_event_name: "Stop" }, "stderr")
+    assert.equal(wake.code, 0, wake.seen)
+    assert.equal(wake.seen, "")
+    await f.until(() => f.ops("settle").length === 2, "the settle after the unwritten wake")
+    assert.deepEqual(f.ops("settle")[1].result, { outcome: "uncertain", reason: "transport_ambiguous" })
+    assert.equal(f.ops("settle").some(entry => entry.result.outcome === "handed"), false, "nothing unwritten is ever handed")
+  } finally {
+    await hook(f.env, "session-end", { ...common, hook_event_name: "SessionEnd", reason: "other" })
+    // A failed test must not leave processes behind: stop exactly the two this test started.
+    const [first] = f.ops("join")
+    for (const pid of [first?.pid, first?.ppid]) {
+      if (Number.isInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL")
+    }
+    rmSync(f.root, { recursive: true, force: true })
+  }
+})

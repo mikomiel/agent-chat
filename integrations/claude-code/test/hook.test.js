@@ -94,7 +94,7 @@ test("session start prints the binding as additionalContext and acknowledges onl
     hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: "Agent Chat is available to this session." },
   })
   assert.equal(result.stdout.length, 1, "one JSON object, written once")
-  assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000 }])
+  assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000, owner_pid: 100 }])
   assert.deepEqual(result.sent, [{ op: "done", outcome: "written" }])
   assert.deepEqual(result.log, ["call:start", "write:stdout:start", "write:stdout:end", "send:done", "close"])
 })
@@ -108,8 +108,15 @@ test("a prompt and a tool event deliver through their own hookEventName", async 
     assert.deepEqual(json(result.stdout), {
       hookSpecificOutput: { hookEventName: event, additionalContext: "Agent Chat message(s) delivered by the native adapter.\n{}" },
     })
-    assert.deepEqual(result.calls, [{ op: "turn", permission_mode: "acceptEdits", patience_ms: 6000 }])
+    assert.deepEqual(result.calls, [{ op: "turn", permission_mode: "acceptEdits", patience_ms: 6000, owner_pid: 100 }])
     assert.deepEqual(result.sent, [{ op: "done", outcome: "written" }])
+  }
+})
+
+test("a start and a turn name the hook's parent process, so a resumed session moves the owner watch", async () => {
+  for (const name of ["session-start", "prompt", "tool"]) {
+    const result = await run(name, base, { ppid: () => 777 })
+    assert.equal(result.calls[0].owner_pid, 777, name)
   }
 })
 

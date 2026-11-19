@@ -123,7 +123,7 @@ async function rig({ handlers, gate, joinErrors, alive = () => true, config = {}
     clearTimeoutImpl: clock.clearTimeoutImpl,
     setIntervalImpl: clock.setIntervalImpl,
     clearIntervalImpl: clock.clearIntervalImpl,
-    alive: () => alive(),
+    alive: pid => alive(pid),
     release: () => events.push("release"),
     exit: code => { exitCode = code; events.push(`exit:${code}`) },
   })
@@ -508,6 +508,36 @@ test("a worker refusal that proves the lease gone starts the bounded rejoin and 
   assert.doesNotMatch(after.sent[0].context, new RegExp(r.worker.bootIds[0]))
 })
 
+test("a binding retired while the first turn runs is never announced, and the rejoin announces the new one", async () => {
+  let refuse = true
+  const r = await rig({ handlers: { pending: () => (refuse ? { refused: "STALE_INSTANCE" } : { messages: [] }) } })
+  // No start event ran, so the first binding is still unannounced when the turn begins.
+  const failed = await r.op(turn())
+  assert.deepEqual(failed.sent, [{ context: null }], "the lease the turn found gone is not announced")
+  assert.equal(r.worker.state.stops, 1)
+  refuse = false
+  await r.clock.advance(3750)
+  assert.equal(r.worker.bootIds.length, 2)
+  const next = await r.op(turn())
+  assert.match(next.sent[0].context, new RegExp(r.worker.bootIds[1]), "the new binding is announced")
+  assert.doesNotMatch(next.sent[0].context, new RegExp(r.worker.bootIds[0]))
+})
+
+// The two awaits in a turn, the state report and the delivery, can each end the
+// binding the turn started with; neither may leave its announcement behind.
+const fatal = Object.assign(new Error("x"), { code: "CHAT_PROTOCOL_INVALID", operation: "pending" })
+for (const [label, answers] of [
+  ["its state report finds the lease gone", () => { let beats = 0; return { heartbeat: () => (++beats > 1 ? { refused: "STALE_INSTANCE" } : {}) } }],
+  ["its delivery fails chat closed", () => ({ pending: () => { throw fatal } })],
+]) {
+  test(`a turn announces nothing when ${label}`, async () => {
+    const r = await rig({ handlers: answers() })
+    const hook = await r.op(turn())
+    assert.deepEqual(hook.sent, [{ context: null }])
+    assert.equal(r.worker.state.stops, 1)
+  })
+}
+
 const joinRefusal = workerCode => Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", workerCode, operation: "join" })
 
 test("a join conflict is the previous lease and rejoins; any other conflict fails closed", async () => {
@@ -624,6 +654,31 @@ test("a registered waiter counts as contact", async () => {
   await settle()
   await r.clock.advance(240_000)
   assert.equal(r.exitCode, 0)
+})
+
+test("a session resumed by a new Claude Code process hands the owner watch to it", async () => {
+  const running = new Set([4242, 5151]) // the first owner, and the process that resumes the session
+  const r = await rig({ alive: pid => running.has(pid) })
+  await r.begin()
+  running.delete(4242) // the first process exits without a SessionEnd
+  await r.op({ op: "start", wait_ms: 0, owner_pid: 5151 }) // the resume reattaches before any cleanup
+  await r.clock.advance(1_200_000) // one long tool call: twenty minutes with no hook contact
+  assert.equal(r.exitCode, undefined, "the live new owner keeps the receiver and its instance up")
+  const later = await r.op(turn({ owner_pid: 5151 }))
+  assert.deepEqual(later.sent, [{ context: null }], "later hooks still reach the receiver")
+  running.delete(5151)
+  await r.op({ op: "stop", permission_mode: "default" })
+  await r.clock.advance(210_000)
+  assert.equal(r.exitCode, 0, "once the new owner is gone and quiet, the receiver still ends itself")
+})
+
+test("an owner hint that is not a live process never displaces the owner being watched", async () => {
+  const r = await rig({ alive: pid => pid === 4242 })
+  await r.begin()
+  await r.op(turn({ owner_pid: 6000 }))
+  await r.op({ op: "start", wait_ms: 0, owner_pid: 6000 })
+  await r.clock.advance(1_200_000)
+  assert.equal(r.exitCode, undefined, "the running owner is still the one watched")
 })
 
 test("an unknown operation is refused without touching the worker", async () => {

@@ -68,6 +68,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let delivering = false
   let inflight = 0
   let contact = now()
+  let owner = ownerPid // the Claude Code process the owner check follows; a resume replaces it
   let heartbeatTimer = null
   let pollTimer = null
   let rejoinTimer = null
@@ -344,17 +345,19 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     cancelWaiter({ cancelled: true })
     setNative(request, "busy")
     if (failure) return link.send(disabledReply())
-    const announce = announcement()
     let replied = false
     if (inflight) void report() // a slow request never stacks up behind every tool call
     else {
       await report()
       replied = (await guard(deliver({
-        link, wake: false, announce, deadline: now() + clamp(request.patience_ms, 30_000),
+        link, wake: false, announce: announcement(), deadline: now() + clamp(request.patience_ms, 30_000),
       }))) === true
     }
     if (replied) return undefined
-    return announce ? announceOnly(link, announce) : link.send({ context: null })
+    // The state report and the delivery can each end the binding this turn began with,
+    // so announce the binding that is current now, never one read before them.
+    const current = announcement()
+    return current ? announceOnly(link, current) : link.send({ context: null })
   }
 
   async function onStop(request, link) {
@@ -397,9 +400,18 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     exit(0)
   }
 
+  // A session resumed in a new Claude Code process reattaches here before any cleanup,
+  // and its start and turn requests name that process. Following the dead one would
+  // end the live session's instance after the quiet window. A hint that is not a
+  // running process id never displaces the owner already followed.
+  function adoptOwner(pid) {
+    if (Number.isInteger(pid) && pid > 1 && alive(pid)) owner = pid
+  }
+
   function handle(first, link) {
     contact = now()
     if (closed) return link.send({ disabled: true })
+    adoptOwner(first.owner_pid)
     switch (first.op) {
       case "start": return onStart(first, link)
       case "turn": return onTurn(first, link)
@@ -411,11 +423,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // A crashed Claude Code process sends no SessionEnd. The owner check ends a
-  // receiver whose parent hint is dead and that no hook has contacted for a while.
+  // receiver whose owner process is dead and that no hook has contacted for a while.
   function start() {
     watchTimer = setIntervalImpl(() => {
       if (waiter) contact = now()
-      if (!alive(ownerPid) && now() - contact > QUIET_MS) void shutdown()
+      if (!alive(owner) && now() - contact > QUIET_MS) void shutdown()
     }, OWNER_CHECK_MS)
     return connect().catch(error => disable(describeFailure(error)))
   }

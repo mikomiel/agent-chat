@@ -97,12 +97,14 @@ async function dispatch(name, { payload, config, where, io }) {
       start: () => io.startReceiver(config, payload.session_id), connectImpl: io.connect, startMs,
     })
     : io.connect(where.socket))
-  const turn = { op: "turn", permission_mode: mode, patience_ms: PATIENCE_MS }
+  // A start and a turn name this hook's parent, Claude Code. A session resumed in a
+  // new process reattaches to the old receiver, which must then watch the new one.
+  const turn = () => ({ op: "turn", permission_mode: mode, patience_ms: PATIENCE_MS, owner_pid: io.ppid() })
   switch (name) {
     case "session-start":
-      return converse(await open(4_000), "SessionStart", { op: "start", wait_ms: 5_000 }, 8_000, io)
-    case "prompt": return converse(await open(2_500), "UserPromptSubmit", turn, 7_500, io)
-    case "tool": return converse(await open(0), "PostToolUse", turn, 7_500, io)
+      return converse(await open(4_000), "SessionStart", { op: "start", wait_ms: 5_000, owner_pid: io.ppid() }, 8_000, io)
+    case "prompt": return converse(await open(2_500), "UserPromptSubmit", turn(), 7_500, io)
+    case "tool": return converse(await open(0), "PostToolUse", turn(), 7_500, io)
     case "stop": return quiet(await open(0), { op: "stop", permission_mode: mode }, 3_500)
     case "wait": return waitForWake(await open(0), io)
     default: return quiet(await open(0), { op: "end" }, 800)
@@ -128,6 +130,10 @@ export async function runHook(name, io) {
 
 export function nodeIo() {
   const raw = process.env[CLAUDE_CHAT_CONFIG_ENV]
+  // A reader that closed the pipe gets EPIPE twice: through the write callback, which
+  // reports the write as failed, and then as an 'error' event. Left unhandled, that
+  // event ends the hook with a trace before it can send its receipt.
+  for (const stream of [process.stdout, process.stderr]) stream.on("error", () => {})
   return {
     stdin: process.stdin,
     env: process.env,
