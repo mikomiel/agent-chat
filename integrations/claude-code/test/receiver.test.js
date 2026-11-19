@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createReceiver } from "../lib/receiver.js"
+import { existsSync } from "node:fs"
+import { createReceiver, processStartTime } from "../lib/receiver.js"
 import { CHAT_PREFIX, MAX_OUTPUT_BYTES } from "../lib/notice.js"
 
 const ROOM = "33333333-3333-4333-8333-333333333333"
@@ -110,7 +111,7 @@ function hookDouble({ events, receipt = "written", answer = true, sendOk = true 
   }
 }
 
-async function rig({ handlers, gate, joinErrors, alive = () => true, config = {} } = {}) {
+async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {} } = {}) {
   const clock = scheduler()
   const events = []
   const worker = workerDouble({ events, handlers, gate, joinErrors })
@@ -124,6 +125,7 @@ async function rig({ handlers, gate, joinErrors, alive = () => true, config = {}
     setIntervalImpl: clock.setIntervalImpl,
     clearIntervalImpl: clock.clearIntervalImpl,
     alive: pid => alive(pid),
+    startTime: pid => startTime(pid),
     release: () => events.push("release"),
     exit: code => { exitCode = code; events.push(`exit:${code}`) },
   })
@@ -679,6 +681,68 @@ test("an owner hint that is not a live process never displaces the owner being w
   await r.op({ op: "start", wait_ms: 0, owner_pid: 6000 })
   await r.clock.advance(1_200_000)
   assert.equal(r.exitCode, undefined, "the running owner is still the one watched")
+})
+
+// `kill(pid, 0)` says only that some process holds the id. The owner is the process
+// recorded with its start time, so an id that another process reuses is not the owner.
+test("an owner whose pid another process now holds is gone, and the receiver ends after the quiet window", async () => {
+  const started = new Map([[4242, "1000"]]) // the start time each running process reports
+  const r = await rig({ startTime: pid => started.get(pid) ?? null })
+  await r.begin()
+  started.set(4242, "2000") // the owner exited without a SessionEnd; another process took its pid
+  await r.clock.advance(150_000)
+  assert.equal(r.exitCode, undefined, "inside the quiet window")
+  await r.clock.advance(60_000)
+  assert.equal(r.exitCode, 0, "the pid still answers, but the process that holds it is not the owner")
+  assert.ok(r.events.includes("release") && r.events.includes("stop"))
+})
+
+test("an adopted owner is followed by its start time as well as its pid", async () => {
+  const running = new Set([4242, 5151])
+  const started = new Map([[4242, "1000"], [5151, "3000"]])
+  const r = await rig({ alive: pid => running.has(pid), startTime: pid => started.get(pid) ?? null })
+  await r.begin()
+  running.delete(4242)
+  await r.op({ op: "start", wait_ms: 0, owner_pid: 5151 }) // the resume names its own process
+  await r.clock.advance(1_200_000)
+  assert.equal(r.exitCode, undefined, "the new owner is compared with its own start time, not the first owner's")
+  started.set(5151, "3500") // that process exited without a SessionEnd and another took its pid
+  await r.op({ op: "stop", permission_mode: "default" })
+  await r.clock.advance(210_000)
+  assert.equal(r.exitCode, 0)
+})
+
+test("a live owner is never mistaken for a reused pid, even when its start time cannot be read", async () => {
+  let reading = "1000"
+  const r = await rig({ startTime: () => reading })
+  await r.begin()
+  await r.clock.advance(1_200_000)
+  assert.equal(r.exitCode, undefined, "the same process keeps the receiver up however long it is quiet")
+  reading = null // the pid still answers but /proc does not
+  await r.clock.advance(1_200_000)
+  assert.equal(r.exitCode, undefined, "an unreadable start time falls back to the pid check")
+})
+
+test("the start time is field 22 of /proc stat, counted after the last parenthesis", () => {
+  const rest = "S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654321 1000 100 18446744073709551615"
+  for (const comm of ["node", "two words", "odd) name (x", "))", "("]) {
+    assert.equal(processStartTime(4242, () => `4242 (${comm}) ${rest}\n`), "987654321", comm)
+  }
+  for (const stat of ["", "garbage", "4242 (node) S 1 2", `4242 (node) ${rest.replace("987654321", "later")}`]) {
+    assert.equal(processStartTime(4242, () => stat), null, JSON.stringify(stat))
+  }
+  assert.equal(processStartTime(4242, () => { throw Object.assign(new Error("gone"), { code: "ENOENT" }) }), null)
+  for (const pid of [0, 1, -5, 1.5, Number.NaN, "4242", null, undefined]) {
+    assert.equal(processStartTime(pid, () => `1 (a) ${rest}`), null, String(pid))
+  }
+})
+
+test("the real reader returns this process's start time on Linux, and nothing for a pid nobody holds", t => {
+  if (!existsSync("/proc/self/stat")) return t.skip("no /proc on this system")
+  const mine = processStartTime(process.pid)
+  assert.match(mine, /^\d+$/)
+  assert.equal(processStartTime(process.pid), mine, "stable for the life of the process")
+  assert.equal(processStartTime(2_147_483_647), null)
 })
 
 test("an unknown operation is refused without touching the worker", async () => {

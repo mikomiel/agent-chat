@@ -9,6 +9,7 @@
 // it never starts a model turn itself and never treats a peer message as
 // authorization.
 import { randomUUID } from "node:crypto"
+import { readFileSync } from "node:fs"
 import { loadConfig } from "./config.js"
 import { assertPrivateDirectory, paths, serve } from "./ipc.js"
 import { CHAT_PREFIX, MAX_OUTPUT_BYTES, renderNotice } from "./notice.js"
@@ -41,6 +42,20 @@ function ownerAlive(pid) {
   try { process.kill(pid, 0); return true } catch (error) { return error?.code === "EPERM" }
 }
 
+// The start time of a process, in clock ticks since boot: field 22 of /proc/<pid>/stat.
+// A pid says only which process holds the id now; the start time tells that process from
+// an earlier one that held it. `comm`, field 2, can hold spaces and parentheses, so the
+// fields are counted from the last ")". Null where /proc cannot be read (it does not
+// exist off Linux); the owner check then goes by pid alone.
+export function processStartTime(pid, read = path => readFileSync(path, "utf8")) {
+  if (!Number.isInteger(pid) || pid <= 1) return null
+  try {
+    const stat = read(`/proc/${pid}/stat`)
+    const field = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] // index 0 is field 3, so field 22 is 19
+    return /^\d+$/.test(field) ? field : null
+  } catch { return null }
+}
+
 export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
   now = Date.now,
@@ -50,6 +65,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   setIntervalImpl = setInterval,
   clearIntervalImpl = clearInterval,
   alive = ownerAlive,
+  startTime = processStartTime,
   release = () => {},
   exit = () => {},
 } = {}) {
@@ -69,6 +85,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let inflight = 0
   let contact = now()
   let owner = ownerPid // the Claude Code process the owner check follows; a resume replaces it
+  let ownerStart = startTime(owner) // its start time, so a later process that reuses the pid is not it
   let heartbeatTimer = null
   let pollTimer = null
   let rejoinTimer = null
@@ -405,7 +422,18 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // end the live session's instance after the quiet window. A hint that is not a
   // running process id never displaces the owner already followed.
   function adoptOwner(pid) {
-    if (Number.isInteger(pid) && pid > 1 && alive(pid)) owner = pid
+    if (!Number.isInteger(pid) || pid <= 1 || !alive(pid)) return
+    owner = pid
+    ownerStart = startTime(pid)
+  }
+
+  // The owner is the process that was recorded, not whichever process now holds its pid.
+  // Only a start time that was read and now differs proves another process; an unreadable
+  // one falls back to the pid alone, so a live owner is never ended by a failed read.
+  function ownerRunning() {
+    if (!alive(owner)) return false
+    const current = ownerStart === null ? null : startTime(owner)
+    return current === null || current === ownerStart
   }
 
   function handle(first, link) {
@@ -427,7 +455,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   function start() {
     watchTimer = setIntervalImpl(() => {
       if (waiter) contact = now()
-      if (!alive(owner) && now() - contact > QUIET_MS) void shutdown()
+      if (!ownerRunning() && now() - contact > QUIET_MS) void shutdown()
     }, OWNER_CHECK_MS)
     return connect().catch(error => disable(describeFailure(error)))
   }

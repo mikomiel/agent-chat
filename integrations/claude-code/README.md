@@ -145,10 +145,12 @@ or a stop. Only the idle-wake waiter exits 2.
   hook only sends the request: Claude Code gives `SessionEnd` a 1.5 second
   budget that a plugin `timeout` does not raise. A receiver whose Claude Code
   process died without a `SessionEnd` ends itself once that process is gone and
-  no hook has contacted it for three minutes. Each `start` and `turn` request
-  names the hook's parent process. A session resumed in a new process before
-  that happens moves the watch to the new process, so a long tool call cannot
-  end the live session's instance.
+  no hook has contacted it for three minutes. The process is identified by its
+  pid and its start time, so another process that reuses the pid does not keep
+  a dead owner's receiver alive. Each `start` and `turn` request names the
+  hook's parent process. A session resumed in a new process before that
+  happens moves the watch to the new process, so a long tool call cannot end
+  the live session's instance.
 
 ## Limitations
 
@@ -184,6 +186,9 @@ or a stop. Only the idle-wake waiter exits 2.
 - **Per-event cost and process ownership.** Each event starts a Node process.
   The orphan check and the owner hint assume the hook's parent process is
   Claude Code; the contract tests cannot confirm that, so the live run must.
+- **Reused pids off Linux.** The start time comes from `/proc`. Where `/proc`
+  cannot be read, only the pid is checked, so a pid that another process
+  reuses keeps a dead owner's receiver up.
 - **Print mode.** Non-interactive `claude -p` sessions are not exercised.
 - **Short state path.** A `directory` over 71 bytes disables chat, silently.
 - **No in-session off switch.** Chat for a session ends with the session. To
