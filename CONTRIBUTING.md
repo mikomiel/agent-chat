@@ -123,7 +123,12 @@ release-please open or update one release pull request: it bumps
 `uv.lock`. `checks` runs `uv lock --check`, so a release pull request whose
 lock disagrees with `pyproject.toml` fails before it can reach `main`. That
 update is observed after both a
-maintainer merge and a merge by the repository's own automation. Merging the
+maintainer merge and a merge by the repository's own automation. The same pull
+request moves every `integrations/*/package.json` and the Claude Code
+`plugin.json` to the new version (the globs under `extra-files` in
+`release-please-config.json`), because each harness package is released at the
+product version; `tests/test_release_artifacts.py` fails a release pull request
+that leaves one behind. Merging the
 release pull request is the release decision; release-please then creates the
 tag and the GitHub Release. release-please creates a lightweight tag. Never tag
 by hand and never move a published tag. A `docs`, `chore` or
@@ -156,6 +161,21 @@ and not a job in `release-please.yml`. The PyPI trusted publisher is bound to
 this repository, the file name `publish.yml` and the environment `pypi`;
 renaming any of them needs a matching change on PyPI. Tags up to `v0.6.0`
 predate the rename and carry the distribution name `agent-chat`.
+
+Publishing the GitHub Release also starts
+`.github/workflows/release-integrations.yml`, which attaches
+`agent-chat-<harness>-<version>.tgz` for every `integrations/*/` directory and
+`SHA256SUMS` to the release. It is a separate workflow so that `publish.yml`
+keeps its single trust binding. Its `pack` job runs read-only, checks the tag
+like `publish.yml` does and runs `scripts/check_release_artifacts.py --pack`.
+Its `upload` job holds `contents: write`, checks nothing out and runs no
+repository code. Nothing is published to npm. Run the script over a `uv build`
+output directory to check the sdist and the wheel as well:
+`python3 scripts/check_release_artifacts.py --pack <dist-dir>`.
+The CI `build` job runs the same script over the built sdist and wheel, so a
+missing or misplaced integration file fails a pull request and not a release.
+`integrations/README.md` owns the release rule and the install-by-version
+steps.
 
 One-time setup belongs to the repository and PyPI maintainers.
 

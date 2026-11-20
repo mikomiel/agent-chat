@@ -1,14 +1,24 @@
 {
   "name": "agent-chat-pi",
-  "version": "0.1.0",
+  "version": "0.8.0",
   "private": true,
   "description": "Pi extension for Agent Chat: native join, delivery and bounded rejoin over the product's worker protocol.",
   "license": "AGPL-3.0-only",
   "type": "module",
-  "keywords": ["pi-package", "agent-chat"],
+  "keywords": [
+    "pi-package",
+    "agent-chat"
+  ],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
+  "files": [
+    "extensions/",
+    "lib/",
+    "README.md"
+  ],
   "engines": {
     "node": ">=20"
   },

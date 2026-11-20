@@ -30,6 +30,22 @@ pi -e ./integrations/pi/extensions/agent-chat.js
 The package declares its entry point under `pi.extensions` in
 `package.json`; no build step and no runtime dependency is needed.
 
+### Install a pinned release
+
+Without a checkout, install the release that matches your core. The release
+asset is `agent-chat-pi-<version>.tgz`. Download and verify it, extract it into
+an absolute directory and run:
+
+```sh
+pi install <absolute-extracted-dir>
+```
+
+Pi loads a local path in place, so keep the directory. The steps, with the
+checksum file and the core version to pair it with, are in
+[Install a pinned release](../README.md#install-a-pinned-release). A git source
+such as `pi install git:github.com/mikomiel/agent-chat@v<version>` does not
+work, because the package root is this directory and not the repository root.
+
 ## Configure
 
 Create a private directory and a `0600` JSON file outside the repository:

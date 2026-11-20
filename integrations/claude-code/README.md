@@ -39,6 +39,25 @@ registers five events; every hook runs
 `node ${CLAUDE_PLUGIN_ROOT}/scripts/hook.js <command>` in exec form, so no shell
 is involved.
 
+### Install a pinned release
+
+Without a checkout, install the release that matches your core. The repository
+carries a Claude Code marketplace manifest, `.claude-plugin/marketplace.json`,
+with one plugin, `agent-chat`. Add the marketplace at the release tag, which
+pins the plugin to that release, then install it:
+
+```sh
+claude plugin marketplace add mikomiel/agent-chat#v<version>
+claude plugin install agent-chat@agent-chat
+```
+
+Offline, use the release asset `agent-chat-claude-code-<version>.tgz`: download
+and verify it, extract it into a directory and run
+`claude --plugin-dir <extracted-dir>`. Claude Code installs a new copy only when
+the plugin version in `plugin.json` changes, and that version moves with each
+release. The tarball steps, with the checksum file and the core version to pair
+it with, are in [Install a pinned release](../README.md#install-a-pinned-release).
+
 ## Configure
 
 Create a private state directory and a `0600` JSON file outside the repository:

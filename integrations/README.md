@@ -23,6 +23,13 @@ A package records the harness releases it was exercised against. The matrix is
 evidence, not a promise: a release that was never run is `NOT RUN`, never
 implied by a nearby version.
 
+An integration release is tested only with the core of the same version: both
+ship at the product version, and a package at one release with a core at
+another is an untested combination. A row therefore names the package version
+and the core version it was run with. The rows below were recorded before
+the packages shared the product version. They name the package at `0.1.0`, and
+the core they ran with is not recorded.
+
 | Package | Harness surface | Verified release | Evidence |
 |---|---|---|---|
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
@@ -31,7 +38,9 @@ implied by a nearby version.
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
-rejoin behavior. Update this table in the same change. A `NOT RUN` row records
+rejoin behavior. Update this table in the same change. Name the package
+version and the core version, and install both from the same release (see
+[Install a pinned release](#install-a-pinned-release)). A `NOT RUN` row records
 a release that was read but never run: it is not verification. `0.2.2-rc.2` to
 `0.2.2-rc.4` are `NOT RUN` too.
 
@@ -87,6 +96,104 @@ tracks live-harness CI, the Claude Code live run and the Codex package.
 - The Python core stays the owner of lifecycle policy. Where a package must
   mirror a core constant for a non-Python process, a test pins the copy to
   `agent_chat/models.py`.
+
+## Release rule
+
+`integrations/<harness>/` is a self-contained package directory with
+`package.json` at its root, and every such directory is released at the product
+version. The release lists no harness: it enumerates the directories, so a new
+package is covered when its directory appears.
+
+- **Version.** `version` in `package.json`, and in `.claude-plugin/plugin.json`
+  where a package has one, equals `version` in the root `pyproject.toml`.
+  release-please bumps them with the project version (`extra-files` globs in
+  `release-please-config.json`).
+- **Name.** `agent-chat-<harness>`. `npm pack` names the release asset after
+  it: `agent-chat-<harness>-<version>.tgz`.
+- **Contents.** A `files` allowlist lists the entry points, `lib/`, `scripts/`,
+  `hooks/`, `.claude-plugin/` and `README.md` that the package needs, so
+  `test/` stays out of the tarball. Every other top-level path of the
+  directory belongs in `files`.
+- **Configuration.** `lib/config.js` reads the shared `AGENT_CHAT_DELEGATED_CHILD`
+  opt-out and exactly one `AGENT_CHAT_<HARNESS>_CONFIG` variable, and the
+  package README documents it. See the table below.
+- **Not on npm.** Each `package.json` stays `private`. The release tarball is
+  the install source.
+
+| Harness | Config file variable | Shared |
+|---|---|---|
+| Pi | `AGENT_CHAT_PI_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
+| DeepSeek Harness | `AGENT_CHAT_DEEPSEEK_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
+| Claude Code | `AGENT_CHAT_CLAUDE_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
+
+The variable names the private `0600` config file. `AGENT_CHAT_DELEGATED_CHILD=1`
+keeps a harness process that a session starts on purpose from joining chat.
+
+`tests/test_release_artifacts.py` pins this rule for every directory under
+`integrations/`. `scripts/check_release_artifacts.py` packs the directories and
+checks the built artifacts: the sdist holds every tracked integration file, the
+wheel holds none, and there is one tarball per directory with its entry points
+and without `test/`. The release workflow `release-integrations.yml` runs it
+before it attaches the tarballs to the release.
+
+## Install a pinned release
+
+A GitHub Release `v<version>` carries one tarball per integration,
+`agent-chat-<harness>-<version>.tgz`, and `SHA256SUMS` over them. Install the
+core and the integration from the same release: an integration is tested only
+with the core of its own version. Releases up to and including `v0.8.0` carry
+no integration assets and no Claude Code marketplace manifest, so use a later
+release.
+
+1. **Core.** Install `sessionyard[server]==<version>`, as the product
+   [README](../README.md#install-and-run) describes. The integrations run the
+   core's `agent_chat.instance_worker` through the `python` field of their
+   config file.
+2. **Download and verify the tarball** of the harness (`pi`, `deepseek` or
+   `claude-code`).
+
+   ```sh
+   version=<version>
+   harness=pi
+   base="https://github.com/mikomiel/agent-chat/releases/download/v${version}"
+   curl --fail --location --remote-name "${base}/agent-chat-${harness}-${version}.tgz" --remote-name "${base}/SHA256SUMS"
+   sha256sum --check --ignore-missing SHA256SUMS
+   ```
+
+3. **Extract it** into an absolute directory that you keep for as long as the
+   harness uses it. The tarball unpacks into a `package/` directory; strip it.
+   The layout must stay intact, because the entry points import `../lib/`.
+
+   ```sh
+   dir="<absolute-directory>/agent-chat-${harness}-${version}"
+   mkdir -p "$dir"
+   tar -xzf "agent-chat-${harness}-${version}.tgz" -C "$dir" --strip-components=1
+   ```
+
+4. **Point the harness at the extracted directory.**
+
+| Harness | Asset | Step |
+|---|---|---|
+| Claude Code | tag `v<version>`, or `agent-chat-claude-code-<version>.tgz` | `claude plugin marketplace add mikomiel/agent-chat#v<version>`, then `claude plugin install agent-chat@agent-chat`. Offline: extract the tarball and run `claude --plugin-dir <extracted-dir>`. |
+| Pi | `agent-chat-pi-<version>.tgz` | `pi install <absolute-extracted-dir>`. Pi loads a local path in place, without copying it. |
+| DeepSeek Harness | `agent-chat-deepseek-<version>.tgz` | Set the `name` of the Cordis `insert` row to `<absolute-extracted-dir>/extensions/agent-chat.js`. See the [package README](deepseek/README.md#install). |
+
+Claude Code installs by tag through the repository's `.claude-plugin/marketplace.json`.
+`claude plugin marketplace add owner/repo#<ref>` pins the catalog to a ref, so
+a tag pins the plugin. Claude Code installs a new copy only when the plugin
+version in `plugin.json` changes, so each release moves it to the new product
+version.
+
+Do not use `pi install git:github.com/mikomiel/agent-chat@v<version>`. The Pi
+package root is `integrations/pi/`, and the Pi documentation describes no
+subdirectory selector for a git source (not checked against the Pi source). Pi
+installs from the extracted tarball.
+
+A harness package that lands later follows the same rule: its tarball is
+`agent-chat-<harness>-<version>.tgz`, and its README names the install step for
+that tarball.
+
+Then configure the integration as its README describes.
 
 ## Test
 

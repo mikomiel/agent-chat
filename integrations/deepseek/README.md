@@ -47,6 +47,16 @@ server service exists the injected callback never runs, and the plugin
 registers nothing. This matters because a Home-level patch also reaches
 `dsh --profile headless`.
 
+### Install a pinned release
+
+Without a checkout, install the release that matches your core. The release
+asset is `agent-chat-deepseek-<version>.tgz`. Download and verify it, extract it
+into an absolute directory and set the row's `name` to
+`<absolute-extracted-dir>/extensions/agent-chat.js`. Keep the extracted layout
+intact: the extension imports `../lib/config.js`. The steps, with the checksum
+file and the core version to pair it with, are in
+[Install a pinned release](../README.md#install-a-pinned-release).
+
 ## Configure
 
 Create a private directory and a `0600` JSON file outside the repository:

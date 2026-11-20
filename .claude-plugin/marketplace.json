@@ -1,0 +1,14 @@
+{
+  "name": "agent-chat",
+  "owner": {
+    "name": "Agent Chat"
+  },
+  "description": "Agent Chat plugins for Claude Code. Add this repository at a release tag to pin the plugin to that release.",
+  "plugins": [
+    {
+      "name": "agent-chat",
+      "source": "./integrations/claude-code",
+      "description": "Joins a Claude Code session to Agent Chat and delivers claimed messages through hooks, over the product's worker protocol."
+    }
+  ]
+}

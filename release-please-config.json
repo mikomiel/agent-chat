@@ -11,6 +11,18 @@
           "type": "toml",
           "path": "uv.lock",
           "jsonpath": "$.package[?(@.name.value=='sessionyard')].version"
+        },
+        {
+          "type": "json",
+          "path": "integrations/*/package.json",
+          "glob": true,
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "integrations/*/.claude-plugin/plugin.json",
+          "glob": true,
+          "jsonpath": "$.version"
         }
       ],
       "changelog-sections": [
