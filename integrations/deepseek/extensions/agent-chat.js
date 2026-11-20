@@ -20,7 +20,7 @@
  * ELIGIBILITY BY FEATURE DETECTION. 0.2.2-rc.1 exposes `ctx.agents.roots()` and
  * `isOwnedBy()`; 0.2.2-rc.2 and later keep `get()` and `list()` only. The plugin
  * reads which surface it found and names it in the `registered` line. Every
- * skipped agent has a fixed reason code, logged once per process: a registry or
+ * skipped agent has a fixed reason code, logged once per plugin instance: a registry or
  * header the plugin cannot read never joins, and never fails silently.
  *
  * Event vocabulary, read from @deepseek-ai 0.2.2-rc.1: agent/created,
@@ -36,13 +36,18 @@ import { loadConfig } from "../lib/config.js"
 const HARNESS = "deepseek"
 
 // Which registry surface the host exposes: `registry-roots` (0.2.2-rc.1, with
-// `roots()` and `isOwnedBy()`), `header-origin` (0.2.2-rc.2 and later, `get()` and
-// `list()` only) or `unreadable` (no `get()`). Total: it never throws, so the
-// plugin can read it before it attaches a listener.
+// both `roots()` and `isOwnedBy()`), `header-origin` (0.2.2-rc.2 and later, with
+// neither) or `unreadable` (no `get()`, or only one of `roots()` and
+// `isOwnedBy()`: a partial registry fails closed). Total: it never throws, so
+// the plugin can read it before it attaches a listener.
 function eligibilityMode(ctx) {
   try {
-    if (typeof ctx.agents.get !== "function") return "unreadable"
-    return typeof ctx.agents.roots === "function" ? "registry-roots" : "header-origin"
+    const { agents } = ctx
+    if (typeof agents.get !== "function") return "unreadable"
+    const roots = typeof agents.roots === "function"
+    const owned = typeof agents.isOwnedBy === "function"
+    if (roots && owned) return "registry-roots"
+    return roots || owned ? "unreadable" : "header-origin"
   } catch { return "unreadable" }
 }
 
@@ -63,7 +68,8 @@ export function isSubagentChild(ctx, agent) {
 // Total: it returns `{ eligible, reason }` and never throws. A registry or header
 // it cannot read is a refusal, never a join. Reasons reach the log, so they are
 // codes only: no session id, no path, no error text.
-//   registry_unreadable  no `ctx.agents.get`, or `roots()` is not a list
+//   registry_unreadable  no `ctx.agents.get`, a partial rc.1 surface, or `roots()`
+//                        is not a list
 //   agent_not_live       `ctx.agents.get(agent.id)` is not this agent
 //   header_unreadable    `agent.session.header` is missing or not an object
 //   subagent_child       `origin === 'subagent'`, or owned by its `parentSession`
@@ -121,7 +127,8 @@ const CONTEXT_SOURCE_KIND = "plugin:agent-chat-context"
  * lifecycle parts. Cordis calls the default export with (ctx).
  */
 export function createAgentChat({ env = process.env, loadParts = defaultLoadParts } = {}) {
-  // Skip reasons already logged: one entry per fixed code, kept for the process.
+  // Skip reasons already logged: one entry per fixed code, kept for this plugin
+  // instance (the default export is one instance per process).
   const reported = new Set()
   function agentChat(ctx) {
     const log = (level, message) => {
@@ -140,7 +147,7 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
       try { parts = Promise.resolve(loadParts()).catch(() => null) } catch { parts = Promise.resolve(null) }
 
       // The classifier never throws. A skipped agent leaves its reason code in the
-      // log once per process; only `subagent_child` is the expected skip.
+      // log once per plugin instance; only `subagent_child` is the expected skip.
       function eligible(agent) {
         const { eligible: joins, reason } = classifyChatEligibility(webCtx, agent)
         if (!joins && !reported.has(reason)) {

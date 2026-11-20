@@ -366,9 +366,12 @@ test("a parentSession never makes a fork root a child where the registry has no 
   const get = id => ({ parent, fork })[id]
   assert.equal(isSubagentChild({ agents: { get } }, fork), false)
   assert.equal(isSubagentChild({ agents: { get } }, agentOf("sub", { origin: "subagent" })), true)
-  // The rc.1 surface without isOwnedBy: roots() alone decides, so the fork root joins.
+  // A partial rc.1 surface (roots() without isOwnedBy) cannot tell a child from a
+  // fork root, so it fails closed for every agent.
   const rootsOnly = { agents: { get, roots: () => [fork] } }
-  assert.deepEqual(classifyChatEligibility(rootsOnly, fork), { eligible: true, reason: null })
+  assert.deepEqual(classifyChatEligibility(rootsOnly, fork), { eligible: false, reason: "registry_unreadable" })
+  const ownedOnly = { agents: { get, isOwnedBy: () => false } }
+  assert.deepEqual(classifyChatEligibility(ownedOnly, fork), { eligible: false, reason: "registry_unreadable" })
 })
 
 test("the rc.1 registry keeps its roots and ownership rules", () => {
@@ -418,7 +421,7 @@ test("an unreadable registry logs one warning, however many agents are created",
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-test("each skip reason is logged once per process, a subagent child only at info", async () => {
+test("each skip reason is logged once per plugin instance, a subagent child only at info", async () => {
   const { dir, file } = configFile()
   try {
     const loaded = parts()

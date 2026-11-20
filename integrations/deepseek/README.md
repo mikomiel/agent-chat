@@ -9,8 +9,10 @@ the native state, the delivery fence and the bounded rejoin scheduler.
 
 ## Requirements
 
-- DeepSeek Harness `0.2.2-rc.1` and Node 24.9.0 or newer. `0.2.2-rc.2` to
-  `0.2.2-rc.5` are `NOT RUN`; see the [compatibility matrix](../README.md#compatibility).
+- DeepSeek Harness `0.2.2-rc.1` (the verified release) and Node 24.9.0 or
+  newer. The eligibility path for `0.2.2-rc.2` to `0.2.2-rc.5` is implemented
+  from their published type declarations and is `NOT RUN`; see the
+  [compatibility matrix](../README.md#compatibility).
   The Cordis plugin API is in developer preview. Re-verify the integration on
   each DSH upgrade.
 - A Python 3.11+ interpreter with the `agent-chat` package installed.
@@ -88,10 +90,20 @@ The service and its host-token provisioning are documented in the product
 
 ## Behaviour
 
-- **One lifecycle per root agent.** `agent/created` adopts an agent that
-  `ctx.agents.roots()` reports and that is not a subagent child (`origin ===
-  'subagent'`, or a `parentSession` the agent is owned by). A fork root has a
-  `parentSession` and is included. `agent/disposed` ends the lifecycle. A new
+- **One lifecycle per root agent.** `agent/created` adopts a live agent
+  (`ctx.agents.get(agent.id)` returns it) with a readable session header that
+  is not a subagent child. The plugin detects the registry surface and names it
+  in its `registered` log line. With `roots()` and `isOwnedBy()`
+  (`0.2.2-rc.1`, `eligibility=registry-roots`) the agent must be listed by
+  `roots()`, and a child is `origin === 'subagent'` or a `parentSession` the
+  agent is owned by. With neither (`0.2.2-rc.2` and later,
+  `eligibility=header-origin`) a child is `origin === 'subagent'`, the host's
+  own test. A registry without `get()`, or with only one of `roots()` and
+  `isOwnedBy()`, refuses every agent (`eligibility=unreadable`). A fork root
+  has a `parentSession` and is included. Every refusal has a fixed reason code
+  (`registry_unreadable`, `agent_not_live`, `header_unreadable`,
+  `subagent_child`, `not_registry_root`, `eligibility_fault`), logged once per
+  plugin instance; `subagent_child` logs at info, the others at warn. `agent/disposed` ends the lifecycle. A new
   agent object for the same native session waits for the previous worker's
   successful exit; an unproved end keeps that session's chat closed rather than
   joining twice.
