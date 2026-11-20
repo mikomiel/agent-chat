@@ -1,0 +1,15 @@
+{
+  "name": "agent-chat-claude-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code plugin for Agent Chat: a per-session receiver and hook commands over the product's worker protocol.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "keywords": ["claude-code-plugin", "agent-chat"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
