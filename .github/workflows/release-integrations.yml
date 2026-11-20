@@ -73,8 +73,10 @@ jobs:
         with:
           name: integration-assets
           path: assets/
-      # --clobber makes a re-run after a partial upload finish the set. The
-      # packing is reproducible, and the digests come from the same run.
+      # --clobber makes a re-run after a partial upload finish the set. A re-run
+      # packs again and uploads a SHA256SUMS that matches its own tarballs. The
+      # install steps verify each download against SHA256SUMS, so a tarball that
+      # does not match it is refused.
       - name: Attach the assets to the release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -19,7 +19,10 @@ releases](#tested-releases).
   that supports `asyncRewake` is not documented (see [Limitations](#limitations)).
 - Node 20 or newer on the `PATH` of the Claude Code process: the hooks run
   `node`.
-- A Python 3.11+ interpreter with the `agent-chat` package installed.
+- A Python 3.11+ interpreter with the same version of the core installed: the PyPI
+  distribution `sessionyard`, which provides the `agent_chat` import. Do not install
+  `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
+  field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token accepted by it.
 - A POSIX host. The receiver and the hooks talk over a Unix socket; the
   contract tests run on Linux.
@@ -51,12 +54,13 @@ claude plugin marketplace add mikomiel/agent-chat#v<version>
 claude plugin install agent-chat@agent-chat
 ```
 
-Offline, use the release asset `agent-chat-claude-code-<version>.tgz`: download
-and verify it, extract it into a directory and run
+Offline, use the release asset `agent-chat-claude-code-<version>.tgz`: download,
+verify and extract it with the checked block in
+[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release)
+(it extracts only after the `SHA256SUMS` check passes), then run
 `claude --plugin-dir <extracted-dir>`. Claude Code installs a new copy only when
 the plugin version in `plugin.json` changes, and that version moves with each
-release. The tarball steps, with the checksum file and the core version to pair
-it with, are in [Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release).
+release. Install the core at the same version first.
 
 ## Configure
 

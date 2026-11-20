@@ -178,6 +178,9 @@ def test_the_overview_documents_the_install_by_version_steps_and_the_compatibili
     overview = (INTEGRATIONS / "README.md").read_text(encoding="utf-8")
     assert INSTALL_SECTION in overview
     assert "SHA256SUMS" in overview
+    # The guide checks one named line and extracts only after that passes.
+    assert "--ignore-missing" not in overview
+    assert "sha256sum --check --strict asset.sha256" in overview
     assert "tested only with the core of the same version" in overview
 
 
@@ -414,6 +417,73 @@ def test_a_tarball_that_drops_a_tracked_file_fails(release: tuple[Path, Path, li
     errors = problems(release)
     assert any("missing lib/config.js" in error for error in errors)
     assert any("declared entry point lib/config.js is not in the tarball" in error for error in errors)
+
+
+Entry = tuple[tarfile.TarInfo, bytes]
+
+
+def regular(name: str, text: str) -> Entry:
+    return tarfile.TarInfo(name), text.encode("utf-8")
+
+
+def special(name: str, kind: bytes, linkname: str = "") -> Entry:
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.linkname = linkname
+    return info, b""
+
+
+def write_alpha(release: tuple[Path, Path, list[str]], entries: list[Entry]) -> None:
+    """Replace the alpha tarball with exactly these members; the tarfile module builds the bad ones."""
+    _, dist, _ = release
+    with tarfile.open(dist / script.tarball_name("alpha", VERSION), "w:gz") as archive:
+        for info, data in entries:
+            info.size = len(data) if info.isreg() else 0
+            archive.addfile(info, io.BytesIO(data) if info.isreg() else None)
+    write_sums(dist)
+
+
+def alpha_entries() -> list[Entry]:
+    return [regular(name, text) for name, text in tarball_members("alpha").items()]
+
+
+@pytest.mark.parametrize(
+    ("kind", "linkname"),
+    [
+        pytest.param(tarfile.SYMTYPE, "/etc/passwd", id="symlink"),
+        pytest.param(tarfile.LNKTYPE, "package/package.json", id="hardlink"),
+        pytest.param(tarfile.CHRTYPE, "", id="character-device"),
+        pytest.param(tarfile.BLKTYPE, "", id="block-device"),
+        pytest.param(tarfile.FIFOTYPE, "", id="fifo"),
+    ],
+)
+def test_a_tarball_member_that_is_not_a_file_or_a_directory_fails(
+    release: tuple[Path, Path, list[str]], kind: bytes, linkname: str
+) -> None:
+    write_alpha(release, [*alpha_entries(), special("package/lib/extra.js", kind, linkname)])
+    assert any(
+        "member package/lib/extra.js is not a regular file or directory" in error for error in problems(release)
+    )
+
+
+def test_a_link_cannot_stand_in_for_a_tracked_file(release: tuple[Path, Path, list[str]]) -> None:
+    entries = [entry for entry in alpha_entries() if entry[0].name != "package/lib/config.js"]
+    write_alpha(release, [*entries, special("package/lib/config.js", tarfile.SYMTYPE, "/etc/passwd")])
+    errors = problems(release)
+    assert any("member package/lib/config.js is not a regular file or directory" in error for error in errors)
+    assert any("missing lib/config.js" in error for error in errors)
+
+
+def test_a_tarball_with_a_duplicate_member_fails(release: tuple[Path, Path, list[str]]) -> None:
+    write_alpha(release, [*alpha_entries(), regular("package/lib/config.js", "export const changed = 1")])
+    assert any("duplicate member package/lib/config.js" in error for error in problems(release))
+
+
+def test_a_directory_member_is_allowed(release: tuple[Path, Path, list[str]]) -> None:
+    directory = tarfile.TarInfo("package/lib")
+    directory.type = tarfile.DIRTYPE
+    write_alpha(release, [(directory, b""), *alpha_entries()])
+    assert problems(release) == []
 
 
 def test_the_sums_must_match_the_tarballs(release: tuple[Path, Path, list[str]]) -> None:

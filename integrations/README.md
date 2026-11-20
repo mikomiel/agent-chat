@@ -145,32 +145,49 @@ with the core of its own version. Releases up to and including `v0.8.0` carry
 no integration assets and no Claude Code marketplace manifest, so use a later
 release.
 
-1. **Core.** Install `sessionyard[server]==<version>`, as the product
-   [README](../README.md#install-and-run) describes. The integrations run the
-   core's `agent_chat.instance_worker` through the `python` field of their
-   config file.
-2. **Download and verify the tarball** of the harness (`pi`, `deepseek` or
-   `claude-code`).
+1. **Core.** Install the PyPI distribution `sessionyard` at the same version,
+   as the product [README](../README.md#install-and-run) describes. The
+   import is `agent_chat`. Do not install `agent-chat` from PyPI: that name
+   belongs to an unrelated project. A client install,
+   `sessionyard==<version>`, is enough for an integration, because
+   `agent_chat.instance_worker` imports without psycopg. The service host adds
+   the `server` extra. Each integration runs the worker with the interpreter
+   that its config file names in `python`, so point `python` at an interpreter
+   that has this version installed.
+2. **Download, verify and extract the tarball** of the harness (`pi`,
+   `deepseek` or `claude-code`) in one block. The block works in a fresh
+   temporary directory and stops at the first failure: it extracts only after
+   both downloads succeed and `SHA256SUMS` has exactly one line for the
+   chosen file name and that line matches. The target directory is absolute,
+   must not exist yet, and stays in place for as long as the harness uses it.
+   The tarball unpacks into a `package/` directory, which the block strips.
+   The layout must stay intact, because the entry points import `../lib/`.
 
    ```sh
    version=<version>
    harness=pi
-   base="https://github.com/mikomiel/agent-chat/releases/download/v${version}"
-   curl --fail --location --remote-name "${base}/agent-chat-${harness}-${version}.tgz" --remote-name "${base}/SHA256SUMS"
-   sha256sum --check --ignore-missing SHA256SUMS
-   ```
-
-3. **Extract it** into an absolute directory that you keep for as long as the
-   harness uses it. The tarball unpacks into a `package/` directory; strip it.
-   The layout must stay intact, because the entry points import `../lib/`.
-
-   ```sh
    dir="<absolute-directory>/agent-chat-${harness}-${version}"
-   mkdir -p "$dir"
-   tar -xzf "agent-chat-${harness}-${version}.tgz" -C "$dir" --strip-components=1
+   (
+     set -euo pipefail
+     asset="agent-chat-${harness}-${version}.tgz"
+     base="https://github.com/mikomiel/agent-chat/releases/download/v${version}"
+     work=$(mktemp -d)
+     trap 'rm -rf "$work"' EXIT
+     cd "$work"
+     curl --fail --location --remote-name "${base}/${asset}" --remote-name "${base}/SHA256SUMS"
+     awk -v name="$asset" 'NF == 2 && $2 == name' SHA256SUMS > asset.sha256
+     test "$(wc -l < asset.sha256)" -eq 1 || { echo "SHA256SUMS needs exactly one line for ${asset}" >&2; exit 1; }
+     sha256sum --check --strict asset.sha256
+     test ! -e "$dir" || { echo "${dir} exists already" >&2; exit 1; }
+     mkdir -p "$dir"
+     tar -xzf "$asset" -C "$dir" --strip-components=1
+   )
    ```
 
-4. **Point the harness at the extracted directory.**
+   A failed download or check extracts nothing. Do not extract a tarball by
+   hand after a failed check.
+
+3. **Point the harness at the extracted directory.**
 
 | Harness | Asset | Step |
 |---|---|---|

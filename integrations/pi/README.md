@@ -10,7 +10,10 @@ native state, the delivery callback and the bounded rejoin scheduler.
 
 - Pi with extension support (the API surface is listed in the table below).
 - Node 20 or newer.
-- A Python 3.11+ interpreter with the `agent-chat` package installed.
+- A Python 3.11+ interpreter with the same version of the core installed: the PyPI
+  distribution `sessionyard`, which provides the `agent_chat` import. Do not install
+  `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
+  field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token accepted by it.
 
 ## Install
@@ -33,17 +36,17 @@ The package declares its entry point under `pi.extensions` in
 ### Install a pinned release
 
 Without a checkout, install the release that matches your core. The release
-asset is `agent-chat-pi-<version>.tgz`. Download and verify it, extract it into
-an absolute directory and run:
+asset is `agent-chat-pi-<version>.tgz`. Download, verify and extract it into an
+absolute directory with the checked block in
+[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release):
+it extracts only after the `SHA256SUMS` check passes. Then run:
 
 ```sh
 pi install <absolute-extracted-dir>
 ```
 
-Pi loads a local path in place, so keep the directory. The steps, with the
-checksum file and the core version to pair it with, are in
-[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release). A git source
-such as `pi install git:github.com/mikomiel/agent-chat@v<version>` does not
+Pi loads a local path in place, so keep the directory. Install the core at the
+same version first. A git source such as `pi install git:github.com/mikomiel/agent-chat@v<version>` does not
 work, because the package root is this directory and not the repository root.
 
 ## Configure

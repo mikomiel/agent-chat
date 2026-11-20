@@ -22,7 +22,8 @@ The checks:
   and ``SHA256SUMS`` matches those tarballs;
 * each tarball carries ``package.json`` at the product version, every declared
   entry point, every tracked file of its directory except ``test/``, and
-  nothing else.
+  nothing else, with no duplicate member and no member that is not a regular
+  file or a directory (a link, device or fifo).
 
 ``--integrations-only`` skips the sdist and wheel checks, for a directory that
 holds only tarballs. The script reads archive member names and one JSON member.
@@ -49,6 +50,8 @@ SUMS = "SHA256SUMS"
 TARBALL_PREFIX = "package/"
 # What reading a damaged or truncated archive, or a bad package.json inside one, raises.
 UNREADABLE = (tarfile.TarError, zipfile.BadZipFile, EOFError, OSError, ValueError)
+# The only member types a tarball may hold: a regular file or a directory.
+REGULAR_OR_DIRECTORY = (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
 # A directory of a package that its tarball leaves out, by the release rule.
 UNSHIPPED_DIRECTORY = "test/"
 
@@ -171,9 +174,16 @@ def entry_points(package: dict) -> Iterator[str]:
 def read_tarball(path: Path, errors: list[str]) -> tuple[set[str], dict]:
     """The file names under ``package/`` and the parsed ``package.json`` of one tarball."""
     files: set[str] = set()
+    seen: set[str] = set()
     with tarfile.open(path, "r:gz") as archive:
         for member in archive.getmembers():
-            if not member.name.startswith(TARBALL_PREFIX):
+            if member.name in seen:
+                errors.append(f"{path.name}: duplicate member {member.name}")
+            seen.add(member.name)
+            # A link, device or fifo never belongs in a package that a user extracts.
+            if member.type not in REGULAR_OR_DIRECTORY:
+                errors.append(f"{path.name}: member {member.name} is not a regular file or directory")
+            elif not member.name.startswith(TARBALL_PREFIX):
                 errors.append(f"{path.name}: member {member.name} is outside {TARBALL_PREFIX}")
             elif member.isfile():
                 files.add(member.name[len(TARBALL_PREFIX) :])
