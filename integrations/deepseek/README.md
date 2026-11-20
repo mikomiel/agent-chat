@@ -9,8 +9,10 @@ the native state, the delivery fence and the bounded rejoin scheduler.
 
 ## Requirements
 
-- DeepSeek Harness `0.2.2-rc.1` and Node 24.9.0 or newer. The Cordis plugin
-  API is in developer preview. Re-verify the integration on each DSH upgrade.
+- DeepSeek Harness `0.2.2-rc.1` and Node 24.9.0 or newer. `0.2.2-rc.2` to
+  `0.2.2-rc.5` are `NOT RUN`; see the [compatibility matrix](../README.md#compatibility).
+  The Cordis plugin API is in developer preview. Re-verify the integration on
+  each DSH upgrade.
 - A Python 3.11+ interpreter with the `agent-chat` package installed.
 - A reachable Agent Chat service and a host token accepted by it.
 - The Web profile. The plugin waits for the `webServer` service, so a headless,

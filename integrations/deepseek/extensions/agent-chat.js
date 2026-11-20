@@ -17,6 +17,12 @@
  * serial event whose listener throw or rejection FAILS AGENT CREATION, and
  * emit is stop-on-throw. A fault disables chat for that one agent only.
  *
+ * ELIGIBILITY BY FEATURE DETECTION. 0.2.2-rc.1 exposes `ctx.agents.roots()` and
+ * `isOwnedBy()`; 0.2.2-rc.2 and later keep `get()` and `list()` only. The plugin
+ * reads which surface it found and names it in the `registered` line. Every
+ * skipped agent has a fixed reason code, logged once per process: a registry or
+ * header the plugin cannot read never joins, and never fails silently.
+ *
  * Event vocabulary, read from @deepseek-ai 0.2.2-rc.1: agent/created,
  * agent/disposed, agent/status, agent/inbox/inserted, agent/inbox/claimed,
  * agent/inbox/discarded, agent/pre-step (waterfall), session/event `turn/end`
@@ -29,21 +35,67 @@ import { loadConfig } from "../lib/config.js"
 
 const HARNESS = "deepseek"
 
+// Which registry surface the host exposes: `registry-roots` (0.2.2-rc.1, with
+// `roots()` and `isOwnedBy()`), `header-origin` (0.2.2-rc.2 and later, `get()` and
+// `list()` only) or `unreadable` (no `get()`). Total: it never throws, so the
+// plugin can read it before it attaches a listener.
+function eligibilityMode(ctx) {
+  try {
+    if (typeof ctx.agents.get !== "function") return "unreadable"
+    return typeof ctx.agents.roots === "function" ? "registry-roots" : "header-origin"
+  } catch { return "unreadable" }
+}
+
 // Mirror of the host's own ownership rule: `origin === 'subagent'`, or a
 // `parentSession` the agent is actually owned by. `parentSession` alone is NOT a
-// child test: a fork root carries one. A root listener sees child events.
+// child test: a fork root carries one, so a registry without `isOwnedBy` cannot
+// turn it into a child. A root listener sees child events.
 export function isSubagentChild(ctx, agent) {
   const header = agent.session.header
   if (header?.origin === "subagent") return true
   const parentId = header?.parentSession
-  if (parentId === undefined) return false
+  if (parentId === undefined || typeof ctx.agents.isOwnedBy !== "function") return false
   const parent = ctx.agents.get(parentId)
   return parent !== undefined && ctx.agents.isOwnedBy(agent.id, parent)
 }
 
-// Top-level agent that is not a subagent child. A throw means "not eligible".
+// Whether one agent may join chat, and the fixed reason code when it may not.
+// Total: it returns `{ eligible, reason }` and never throws. A registry or header
+// it cannot read is a refusal, never a join. Reasons reach the log, so they are
+// codes only: no session id, no path, no error text.
+//   registry_unreadable  no `ctx.agents.get`, or `roots()` is not a list
+//   agent_not_live       `ctx.agents.get(agent.id)` is not this agent
+//   header_unreadable    `agent.session.header` is missing or not an object
+//   subagent_child       `origin === 'subagent'`, or owned by its `parentSession`
+//   not_registry_root    `roots()` does not list the agent (0.2.2-rc.1 only)
+//   eligibility_fault    a registry call threw
+export function classifyChatEligibility(ctx, agent) {
+  const refuse = reason => ({ eligible: false, reason })
+  try {
+    const mode = eligibilityMode(ctx)
+    if (mode === "unreadable") return refuse("registry_unreadable")
+    const { agents } = ctx
+    if (agent === null || typeof agent !== "object" || agents.get(agent.id) !== agent) return refuse("agent_not_live")
+    const header = agent.session?.header
+    if (header === null || typeof header !== "object" || Array.isArray(header)) return refuse("header_unreadable")
+    if (header.origin === "subagent") return refuse("subagent_child")
+    if (mode === "registry-roots") {
+      // The child test runs first, so a real child is the expected skip and not
+      // an unexplained "not a root".
+      if (isSubagentChild(ctx, agent)) return refuse("subagent_child")
+      const roots = agents.roots()
+      if (!Array.isArray(roots)) return refuse("registry_unreadable")
+      if (!roots.includes(agent)) return refuse("not_registry_root")
+    }
+    return { eligible: true, reason: null }
+  } catch {
+    return refuse("eligibility_fault")
+  }
+}
+
+// Boolean wrapper for a caller that needs no reason.
 export function isChatEligibleAgent(ctx, agent) {
-  return ctx.agents.roots().includes(agent) && !isSubagentChild(ctx, agent)
+  return classifyChatEligibility(ctx, agent).eligible
 }
 
 // The lifecycle and the native half are loaded lazily: when chat is off, or a
@@ -69,6 +121,8 @@ const CONTEXT_SOURCE_KIND = "plugin:agent-chat-context"
  * lifecycle parts. Cordis calls the default export with (ctx).
  */
 export function createAgentChat({ env = process.env, loadParts = defaultLoadParts } = {}) {
+  // Skip reasons already logged: one entry per fixed code, kept for the process.
+  const reported = new Set()
   function agentChat(ctx) {
     const log = (level, message) => {
       try { ctx.logger?.[level]?.(`agent-chat: ${message}`) } catch { /* a logger that throws must not take the session with it */ }
@@ -85,8 +139,15 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
       let parts = null
       try { parts = Promise.resolve(loadParts()).catch(() => null) } catch { parts = Promise.resolve(null) }
 
+      // The classifier never throws. A skipped agent leaves its reason code in the
+      // log once per process; only `subagent_child` is the expected skip.
       function eligible(agent) {
-        try { return isChatEligibleAgent(webCtx, agent) } catch { return false }
+        const { eligible: joins, reason } = classifyChatEligibility(webCtx, agent)
+        if (!joins && !reported.has(reason)) {
+          reported.add(reason)
+          log(reason === "subagent_child" ? "info" : "warn", `chat not joined for one agent (${reason})`)
+        }
+        return joins
       }
 
       // One agent's fault ends that agent's chat, nothing else.
@@ -187,6 +248,9 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
         }
       }
 
+      // Read before any listener attaches. It is total, so nothing can throw
+      // between the first listener and the returned disposer.
+      const mode = eligibilityMode(webCtx)
       const disposers = [
         webCtx.on("agent/created", ({ agent }) => {
           // Old-worker I/O must neither fail nor delay native agent creation.
@@ -265,7 +329,7 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
           } catch { /* a listener must not throw into cordis */ }
         }),
       ]
-      log("info", "registered (Web profile, opt-in)")
+      log("info", `registered (Web profile, opt-in, eligibility=${mode})`)
       return () => {
         active = false
         for (const off of disposers) { try { off?.() } catch { /* already gone */ } }
