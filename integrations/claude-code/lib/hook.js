@@ -12,7 +12,7 @@ import { spawn } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { CLAUDE_CHAT_CONFIG_ENV, loadConfig } from "./config.js"
 import { assertPrivateDirectory, connect, connectOrStart, paths } from "./ipc.js"
-import { MAX_OUTPUT_BYTES } from "./notice.js"
+import { MAX_OUTPUT_BYTES } from "./channel.js"
 
 // hooks/hooks.json sets the matching `timeout` values in seconds. The waiter
 // holds for less than its timeout, because Claude Code kills an asyncRewake hook

@@ -69,7 +69,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
-| `noticeBodies` | Optional. `true` includes message bodies in the notice; default metadata only. |
+| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 
 Every key is fixed: the loader accepts exactly these six and refuses an unknown
 key, including the `harness` selector a different integration may use. Point
@@ -121,7 +121,9 @@ The service and its host-token provisioning are documented in the product
   only while the agent is idle, not stopped, outside Plan Mode, not already
   busy, and not in an unknown state. A claimed batch becomes one framed notice
   (metadata by default; bodies only when configured) and is handed over with
-  `agent.steer` using source `plugin:agent-chat`. `handed` is reported only
+  `agent.steer` using source `plugin:agent-chat`. With `noticeBodies`, the
+  plugin reads each candidate's size from `pending` and claims only the prefix
+  that one 8 KiB notice can carry; a retry batch is claimed whole. `handed` is reported only
   from the `agent/inbox/claimed` event for that message id.
 - **The fence.** Before steering, the plugin checks the refused states, `status
   === 'idle'` and an empty `nextStep`/`nextTurn` inbox. After steering it checks
@@ -164,6 +166,11 @@ The service and its host-token provisioning are documented in the product
   operator stop in the Web UI latches delivery for that agent until the next
   prompt; to disable chat for the process, remove the composition row or the
   config file.
+- **Shared renderer.** `lib/notice.js` is a byte-identical copy of
+  [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
+  over; `test/notice.test.js` fails on any difference. The
+  [notice contract](../README.md#notice-contract) lists what framing and
+  packing do not cover.
 
 ## Security boundaries
 
@@ -196,7 +203,8 @@ node --test
 
 The suite covers config refusal, the worker join frame and frame validation,
 the rejoin policy pinned to `agent_chat/models.py`, lifecycle delivery and
-settlement with doubles, whole-notice budget fallback, and the delivery fence
+settlement with doubles, the shared notice vectors, the claim packing for bodies
+mode, and the delivery fence
 (claim, steer throw, retraction, discard, Plan Mode, unreadable projections,
 mute, expired reservation, throwing native call and disposal). It needs no
 DSH install, no PostgreSQL, no service and no credential.
