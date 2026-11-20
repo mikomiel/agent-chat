@@ -56,7 +56,7 @@ and verify it, extract it into a directory and run
 `claude --plugin-dir <extracted-dir>`. Claude Code installs a new copy only when
 the plugin version in `plugin.json` changes, and that version moves with each
 release. The tarball steps, with the checksum file and the core version to pair
-it with, are in [Install a pinned release](../README.md#install-a-pinned-release).
+it with, are in [Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release).
 
 ## Configure
 

@@ -55,7 +55,7 @@ into an absolute directory and set the row's `name` to
 `<absolute-extracted-dir>/extensions/agent-chat.js`. Keep the extracted layout
 intact: the extension imports `../lib/config.js`. The steps, with the checksum
 file and the core version to pair it with, are in
-[Install a pinned release](../README.md#install-a-pinned-release).
+[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release).
 
 ## Configure
 

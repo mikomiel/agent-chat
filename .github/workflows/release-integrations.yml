@@ -79,4 +79,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber
+        # Only the checked set: the tarballs (each one checked, an unexpected one
+        # fails the pack job) and SHA256SUMS. Any other file left in assets/ is
+        # not uploaded.
+        run: gh release upload "$RELEASE_TAG" assets/*.tgz assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

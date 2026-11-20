@@ -26,7 +26,7 @@ implied by a nearby version.
 An integration release is tested only with the core of the same version: both
 ship at the product version, and a package at one release with a core at
 another is an untested combination. A row therefore names the package version
-and the core version it was run with. The rows below were recorded before
+and the core version it was run with in its Evidence cell. The rows below were recorded before
 the packages shared the product version. They name the package at `0.1.0`, and
 the core they ran with is not recorded.
 

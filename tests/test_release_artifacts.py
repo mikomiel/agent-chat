@@ -170,7 +170,8 @@ def test_each_package_reads_the_shared_opt_out_and_one_documented_config_variabl
 def test_each_package_readme_names_its_release_asset_and_points_at_the_install_steps(package: Path) -> None:
     readme = package_readme(package)
     assert f"agent-chat-{package.name}-<version>.tgz" in readme
-    assert "../README.md#install-a-pinned-release" in readme
+    # An absolute link: the tarball ships only the package README.
+    assert "https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release" in readme
 
 
 def test_the_overview_documents_the_install_by_version_steps_and_the_compatibility_rule() -> None:
@@ -248,7 +249,10 @@ def test_the_job_that_may_write_runs_no_repository_code() -> None:
         "RELEASE_TAG": "${{ github.event.release.tag_name }}",
     }
     assert "${{" not in release["run"]
-    assert release["run"] == 'gh release upload "$RELEASE_TAG" assets/* --repo "$GITHUB_REPOSITORY" --clobber'
+    # Only the checked set is uploaded: the tarballs and SHA256SUMS, never assets/*.
+    assert release["run"] == (
+        'gh release upload "$RELEASE_TAG" assets/*.tgz assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber'
+    )
     assert "if" not in release and "continue-on-error" not in release
 
 
