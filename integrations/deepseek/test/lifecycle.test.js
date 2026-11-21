@@ -1,6 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
+import { PassThrough } from "node:stream"
 import { createLifecycle } from "../lib/lifecycle.js"
+import { startWorker } from "../lib/worker.js"
 import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
 import { renderNotice } from "../lib/notice.js"
 
@@ -543,4 +546,75 @@ test("a throwing worker shutdown is not converted into a proved end", async () =
   bus.fire("session_start", { nativeSessionId: "native-1" })
   await flush()
   assert.deepEqual(await lifecycle.stop(), { code: 1, signal: null })
+})
+
+// A request that outlives the parent-side deadline has an unknown outcome. The real worker reports the core's
+// own code for it, so the lifecycle rejoins instead of latching chat off.
+const stdioChild = () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.kill = () => {}
+  return child
+}
+
+// The node:test timer mock needs Node 20.11, and the package supports 20.0. This stub records each timer, fires one on demand
+// and restores the originals when the test ends, so a failing test cannot leak it.
+function stubTimeouts(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  return {
+    fire(ms) {
+      for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() }
+    },
+  }
+}
+
+test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
+  const clock = stubTimeouts(t)
+  const children = []
+  const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
+  const retries = []
+  const notices = []
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  const lifecycle = createLifecycle(bus, delivery, config, {
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    now: () => 0,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    clearTimeoutImpl: () => {},
+    setIntervalImpl: () => 0,
+    clearIntervalImpl: () => {},
+    notice: text => notices.push(text),
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  children[0].stdout.write(`${JSON.stringify({ id: 0, result: joined })}\n`)
+  await flush() // joined and bound; the first heartbeat is written and never answered
+  clock.fire(22_000)
+  await flush()
+  assert.doesNotMatch(notices.join("\n"), /stopped/, "not a permanent disable")
+  assert.match(notices.join("\n"), /reconnecting/)
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.equal(delivery.calls.disable, 0)
+  assert.equal(retries.length, 1)
+  assert.equal(retries[0].ms, 2500)
+  retries[0].fn()
+  await flush()
+  assert.equal(children.length, 2, "a fresh worker joins after the back-off")
+  const rejoined = {
+    ...joined, session_id: "99999999-9999-4999-8999-999999999999", instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instance_file: "/tmp/agent-chat-state/boot-2.json",
+  }
+  children[1].stdout.write(`${JSON.stringify({ id: 0, result: rejoined })}\n`)
+  await flush()
+  assert.match(notices.join("\n"), new RegExp(`joined as ${rejoined.session_id}`))
+  assert.match(delivery.calls.context.at(-1), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/, "the new binding is published")
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.equal(delivery.calls.disable, 0)
 })

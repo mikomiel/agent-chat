@@ -1,7 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
 import { existsSync } from "node:fs"
+import { PassThrough } from "node:stream"
 import { createReceiver, processStartTime } from "../lib/receiver.js"
+import { startWorker } from "../lib/worker.js"
 import { CHAT_PREFIX, MAX_OUTPUT_BYTES } from "../lib/channel.js"
 import { renderNotice } from "../lib/notice.js"
 
@@ -879,4 +882,81 @@ test("an unknown operation is refused without touching the worker", async () => 
   const hook = await r.op({ op: "nope" })
   assert.deepEqual(hook.sent, [{ error: "bad_op" }])
   assert.deepEqual(r.worker.log, [])
+})
+
+// A request that outlives the parent-side deadline has an unknown outcome. The real worker reports the core's
+// own code for it, so the receiver rejoins instead of latching chat off. This one drives the real worker with a
+// child that never answers; the shared rig substitutes a worker double and cannot reach the deadline.
+const stdioChild = () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.kill = () => {}
+  return child
+}
+
+// The node:test timer mock needs Node 20.11, and the package supports 20.0. This stub records each timer, fires one on demand
+// and restores the originals when the test ends, so a failing test cannot leak it.
+function stubTimeouts(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  return {
+    fire(ms) {
+      for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() }
+    },
+  }
+}
+
+test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
+  const timeouts = stubTimeouts(t)
+  const clock = scheduler()
+  const children = []
+  const bootIds = []
+  const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
+  const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
+    startProcess: (workerConfig, identity) => {
+      bootIds.push(identity.bootId)
+      return startWorker(workerConfig, identity, { spawnImpl })
+    },
+    now: clock.now,
+    random: () => 0,
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    setIntervalImpl: clock.setIntervalImpl,
+    clearIntervalImpl: clock.clearIntervalImpl,
+    alive: () => true,
+    startTime: () => null,
+  })
+  void receiver.start()
+  await settle()
+  const record = {
+    session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+    room_id: ROOM, host: "synthetic-host", harness: "claude", instance_file: "/tmp/agent-chat-state/boot-1.json",
+  }
+  children[0].stdout.write(`${JSON.stringify({ id: 0, result: record })}\n`)
+  await settle() // joined; the first heartbeat is written and never answered
+  timeouts.fire(22_000)
+  await settle()
+  assert.notEqual(receiver.state(), "offline", "not a permanent disable")
+  assert.equal(children.length, 1, "the rejoin waits out its back-off")
+  await clock.advance(2499)
+  assert.equal(children.length, 1, "5 s base, jitter 0.5: this run waits 2.5 s")
+  await clock.advance(1)
+  assert.equal(children.length, 2, "a fresh worker joins after the back-off")
+  assert.notEqual(bootIds[0], bootIds[1])
+  const rejoined = {
+    ...record, session_id: "99999999-9999-4999-8999-999999999999", instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instance_file: "/tmp/agent-chat-state/boot-2.json",
+  }
+  children[1].stdout.write(`${JSON.stringify({ id: 0, result: rejoined })}\n`)
+  await settle()
+  const hook = hookDouble()
+  await receiver.handle({ op: "start", wait_ms: 5000 }, hook) // the session start announces the binding that is current
+  assert.match(hook.sent[0].message, new RegExp(`joined as ${rejoined.session_id}`))
+  assert.match(hook.sent[0].context, /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/, "the new binding is published")
+  assert.notEqual(receiver.state(), "offline")
 })
