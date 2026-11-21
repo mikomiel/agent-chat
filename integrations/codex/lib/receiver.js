@@ -178,6 +178,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   })
   const bindingFits = text => text !== null && bytes(text) <= MAX_BINDING_BYTES
 
+  // Whether a metadata notice of `count` rows fits `bound` with every row at its widest (UUIDs, the longest kind, a 19-digit
+  // cursor): the renderer itself answers, so the estimate is exact there and an upper bound for any other rows.
+  const WIDEST_METADATA_ROW = { id: ID, kind: "consultation", room_id: ID, history_after: "9".repeat(19) }
+  const metadataFits = (count, bound) => renderNotice(joined, config.python, Array(count).fill(WIDEST_METADATA_ROW), { bound }) !== null
+
   const announcement = ({ always = false } = {}) => {
     const text = joined ? renderBinding(joined) : null
     return text === null || (!always && announced === bootId) ? null : { text, boot: bootId }
@@ -356,10 +361,15 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // whose worker is gone drops what it learned and sends nothing; the replacement binds and reads for itself.
   async function tick(record) {
     if (thread && !threadBound) {
-      const check = await bindThread(() => live === record)
+      // As with a read, a bind that a hook event overtook (a session start, say) commits nothing and is dropped: it never
+      // disables, and the next tick binds again. Binds and reads never overlap, so the read sequence does not apply.
+      const before = epoch
+      const check = await bindThread(() => live === record && epoch === before)
       if (live !== record) return
-      if (check.refusal) return disable(check.refusal)
-      setBound(check.bound)
+      if (epoch === before) {
+        if (check.refusal) return disable(check.refusal)
+        setBound(check.bound)
+      }
     }
     if (thread && threadBound && !stopped && native !== "busy") {
       const result = await refine(record)
@@ -409,9 +419,13 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link.closed || !eligible() || deadline - now() < CLAIM_MARGIN_MS) return false
         // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
+        // Metadata mode gets no retry marker, so it claims the candidates whole, and only when their widest rendering fits
+        // beside an announcement still to be shown; otherwise nothing is claimed and the binding goes alone (see onTurn),
+        // and the next hook, with more room, is offered the batch whole, no attempt spent.
         const claimIds = bodies
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound })
-          : ids
+          : metadataFits(ids.length, bound) ? ids : []
+        if (!claimIds.length) return false
         const started = now()
         const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
         if (!live || check(grant, "claim")) return false

@@ -727,16 +727,23 @@ for (const [label, data, reason, status] of NEWEST) {
   })
 }
 
-// A lookup of the newest turn that fails, or answers in a way that is not the documented one, leaves the thread unread.
-test("a lookup of the newest turn that fails or is malformed leaves the thread unread: offline", async () => {
+// The newest turn is asked for only once the resume confirmed the mode. A lookup that fails, or answers in a way that is not
+// the documented one, keeps that mode: the running state is unknown, and the read is not offline.
+test("a lookup of the newest turn that fails or is malformed keeps the confirmed mode, and the running state is unknown", async () => {
   for (const [label, answer] of [
     ["an error reply", () => ({ error: { code: -32000, message: "no" } })],
     ["data that is not a list", () => ok({ data: "none", nextCursor: null })],
     ["no data", () => ok({})],
     ["a connection that drops", (message, connection) => { connection.socket.destroy(); return undefined }],
   ]) {
-    const { result } = await observeWith({ "thread/turns/list": answer })
-    assert.equal(result.reason, "offline", label)
+    for (const plan of [false, true]) {
+      const { result, methods } = await observeWith({
+        ...resumeWith({ thread: thread() }, { mode: plan ? "plan" : "default", settings: {} }),
+        "thread/turns/list": answer,
+      })
+      assert.deepEqual(result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan } }, `${label}, plan ${plan}`)
+      assert.equal(methods.at(-1), "thread/turns/list", label)
+    }
   }
 })
 

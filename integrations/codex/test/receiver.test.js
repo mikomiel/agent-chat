@@ -239,6 +239,67 @@ test("a join whose own binding does not fit, or lacks a field, is ended at once 
   }
 })
 
+// Metadata mode has no retry marker, so it claims the candidates whole. When their widest rendering does not fit beside a
+// binding still to be announced, nothing is claimed: the binding goes alone, and the next hook, with the room the binding
+// left, is offered the same batch whole. No attempt is spent on a notice that could not be shown.
+test("metadata rows that do not fit beside a long unannounced binding are not claimed; the binding goes alone, and the next hook delivers them", async () => {
+  const sized = await rig()
+  const shown = bytes((await sized.begin()).sent[0].context)
+  const fits = baseConfig.python.length + (MAX_BINDING_BYTES - shown) - (63 - "synthetic-host".length)
+  const ids = Array.from({ length: 16 }, (_, index) => uid(index + 1))
+  const r = await rig({
+    config: { python: `/usr/bin/${"p".repeat(fits - "/usr/bin/".length)}` },
+    handlers: deliverable({ pending: () => ({ messages: ids }) }),
+  })
+  r.worker.log.length = 0
+  const first = await r.op(turn())
+  assert.ok(bytes(first.sent[0].context) > MAX_BINDING_BYTES - 100, "the binding is near the cap")
+  assert.equal(r.worker.ops("pending").length, 1)
+  assert.deepEqual(r.worker.ops("claim"), [], "nothing is claimed")
+  assert.deepEqual(r.worker.ops("settle"), [], "no attempt is spent")
+  assert.deepEqual(first.sent.map(frame => frame.context), [first.sent[0].context])
+  assert.match(first.sent[0].context, /^Agent Chat is available/)
+  assert.equal(first.sent[0].context.includes(uid(1)), false, "the binding goes alone")
+  const next = await r.op(turn())
+  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids], "the batch is claimed whole")
+  for (const id of ids) assert.ok(next.sent[0].context.includes(id), id)
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+})
+
+// The estimate holds every metadata row at its widest. The longest interpreter path whose hook, beside an unannounced
+// binding, still claims is found by bisection: there the claimed rows at their widest are handed, and one byte longer the
+// binding goes alone with nothing claimed. A claim is never spent on rows at their widest that cannot be shown.
+test("beside an unannounced binding, widest metadata rows are claimed exactly when their notice fits", async () => {
+  const ids = Array.from({ length: 16 }, (_, index) => uid(index + 1))
+  const widestRow = id => validRow(id, { kind: "consultation", history_after: "9".repeat(19) })
+  const hook = async length => {
+    const r = await rig({
+      config: { python: `/usr/bin/${"p".repeat(length - "/usr/bin/".length)}` },
+      handlers: deliverable({
+        pending: () => ({ messages: ids }),
+        claim: fields => ({ dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(widestRow) }),
+      }),
+    })
+    const sent = await r.op(turn())
+    return { claimed: r.worker.ops("claim").length > 0, settled: r.worker.ops("settle").map(entry => entry.result), sent: sent.sent }
+  }
+  let lo = baseConfig.python.length
+  let hi = 1500
+  assert.equal((await hook(lo)).claimed, true)
+  assert.equal((await hook(hi)).claimed, false)
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2)
+    if ((await hook(mid)).claimed) lo = mid
+    else hi = mid
+  }
+  const last = await hook(lo)
+  assert.deepEqual(last.settled, [{ outcome: "handed", reason: null }], `the longest path that claims (${lo} bytes) hands its notice`)
+  assert.ok(bytes(last.sent[0].context) <= MAX_OUTPUT_BYTES)
+  const over = await hook(hi)
+  assert.deepEqual(over.settled, [], "one byte longer spends no attempt")
+  assert.match(over.sent[0].context, /^Agent Chat is available/)
+})
+
 test("the binding is announced once, then re-announced by every later start event", async () => {
   const r = await rig()
   await r.begin()
@@ -1073,6 +1134,74 @@ test("a child answer that lands after a session start does not disable chat, and
   assert.equal(reads, 3)
   assert.equal(r.receiver.state(), "offline")
   assert.equal(r.worker.state.stops, 1)
+})
+
+// A heartbeat rebind is an answer like a read: one that a hook event (a session start) overtook commits nothing and never
+// disables. The next tick binds again, and a current child answer still ends chat.
+test("a rebind that a session start overtook does not disable chat on a child answer, and a current one still does", async () => {
+  let release
+  let held
+  let binds = 0
+  let answer = { status: "stale_binding" }
+  const thread = threadDouble({ bind: options => {
+    binds += 1
+    if (binds !== 2) return answer
+    held = options
+    return new Promise(resolve => { release = () => resolve({ status: "child" }) })
+  } })
+  const r = await rig({ thread })
+  assert.equal(r.worker.bootIds.length, 1, "a changed provider joins, unbound")
+  await r.begin()
+  await r.clock.advance(30_000) // the tick's rebind is out
+  assert.equal(binds, 2)
+  await r.op({ op: "start", wait_ms: 5000 })
+  assert.equal(held.owns(), false, "the overtaken bind owns nothing it could commit")
+  release()
+  await settle()
+  assert.notEqual(r.receiver.state(), "offline", "the stale child answer did not disable chat")
+  assert.equal(r.worker.state.stops, 0)
+  answer = { status: "child" }
+  await r.clock.advance(30_000) // a current child answer still ends chat
+  assert.equal(binds, 3)
+  assert.equal(r.receiver.state(), "offline")
+  assert.equal(r.worker.state.stops, 1)
+})
+
+// The real thread against a fake app-server: the resume confirms Plan Mode and the newest-turn lookup then fails. The mode
+// is kept over the Stop hook's default hint, and the running state is unknown, so the session is reported stopped.
+test("a Stop hook with a default hint, then a resume that confirms Plan Mode and a failed newest-turn lookup, reports Plan Mode and unknown", async () => {
+  const waitFor = async (check, what) => {
+    for (let waited = 0; !check() && waited < 3000; waited += 5) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(check(), `${what} never happened`)
+  }
+  const dir = mkdtempSync(join(tmpdir(), "acr-"))
+  const record = {
+    id: "session-1", parentThreadId: null, agentRole: null, ephemeral: false, source: "cli", modelProvider: "openai", status: { type: "idle" },
+  }
+  const answers = {
+    "thread/loaded/list": () => ({ result: { data: ["session-1"], nextCursor: null } }),
+    "thread/read": () => ({ result: { thread: record } }),
+    "thread/resume": () => ({ result: { thread: record, collaborationMode: { mode: "plan", settings: {} } } }),
+    "thread/turns/list": () => ({ error: { code: -32000, message: "no" } }),
+  }
+  const server = await fakeAppServer(join(dir, "s.sock"), message => answers[message.method]?.() ?? { error: { code: -32601, message: "no" } })
+  try {
+    const thread = Object.assign(createThread({ path: join(dir, "s.sock"), threadId: "session-1" }), { opened: [] })
+    const r = await rig({ thread })
+    await waitFor(() => r.worker.bootIds.length === 1, "the join")
+    await r.begin()
+    await r.op(turn())
+    await r.op({ op: "stop", permission_mode: "default" })
+    assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "idle", stopped: false, plan_mode: false })
+    await r.clock.advance(30_000) // the tick reads the thread
+    await waitFor(() => server.methods().includes("thread/turns/list"), "the newest-turn lookup")
+    await waitFor(() => r.worker.ops("heartbeat").at(-1).state.plan_mode === true, "the tick's report")
+    assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: true, plan_mode: true })
+    assert.notEqual(r.receiver.state(), "offline")
+  } finally {
+    await server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test("a changed provider leaves the thread unbound: the worker joins and hook delivery continues", async () => {

@@ -180,11 +180,13 @@ sends its request: it does not wait for the worker to end its instance.
   to the hook's `permission_mode` hint, and the session is then not idle but
   unknown. The mode and the running state are two answers of the read: a
   mode it confirmed decides Plan Mode even when its running state is unknown
-  (the newest turn failed, or there is none), and the state then stays unknown,
+  (the newest turn failed, there is none, or its lookup failed), and the state
+  then stays unknown,
   not idle. A read that answered is kept even when its answer is unknown (a
   status the plugin does not know, such as `systemError`, no usable newest
   turn, a mode it does not know): it is newer than the hooks' idle, so the
-  running state stays unknown. Only a read that failed or found the thread
+  running state stays unknown. Only a read that failed before the mode was
+  known (at the connect, the list, the read or the resume) or found the thread
   offline is dropped, and then the state follows the hooks. Any later hook
   event discards the read. Reads can overlap when one is slow; only the newest
   read that started is kept, so an older one that lands after it, whatever it
@@ -238,7 +240,12 @@ sends its request: it does not wait for the worker to end its instance.
   subtracts the bytes of the first two from it before the claim and passes the
   rest to the renderer as its bound. In bodies mode the renderer cuts bodies to
   fit and never falls back to metadata; a batch whose headers, markers and
-  pointers alone do not fit is deferred, never partly delivered. The hook
+  pointers alone do not fit is deferred, never partly delivered. In metadata
+  mode the pending answer carries no retry marker, so the candidates are
+  claimed whole, and only when their notice fits with every row at its widest;
+  otherwise nothing is claimed, the binding is sent alone, and the next hook,
+  with no announcement in front, is offered the batch whole, no attempt spent.
+  The hook
   refuses any text over the budget as a second check.
 - **Notice.** `lib/notice.js` is a byte-identical copy of the shared notice
   renderer, [`../shared/notice.js`](../shared/notice.js). A body sits between
@@ -428,7 +435,10 @@ rule has already excluded.
    provider is recorded when the bind completes; a read that later shows another
    provider is a `stale_binding`: the thread still joins, but it is unbound, so no
    read is taken and the state follows the hooks. Each later heartbeat binds again
-   until a bind finds the thread with the provider that was recorded.
+   until a bind finds the thread with the provider that was recorded. A
+   heartbeat bind that a hook event (a session start, say) overtook is dropped,
+   as a read is: it records nothing, a child it found does not end chat, and the
+   next heartbeat binds again.
 2. **Read.** While nothing is known to run, each heartbeat reads the thread:
    `thread/loaded/list`, `thread/read`, then `thread/resume` with
    `excludeTurns`, and last the newest turn from `thread/turns/list`. The
@@ -443,8 +453,9 @@ rule has already excluded.
    refused `thread/resume` has no record and ends the read as unknown. A thread with no turn yet may refuse both
    `thread/resume` and `thread/turns/list`: the read is unknown at the resume
    and never reaches the turns list, and chat stays on. A
-   `thread/turns/list` that fails after a resume answered leaves the thread
-   unread, as an unreachable app-server does. The thread must be idle and its newest turn must be
+   `thread/turns/list` that fails after a resume answered (an error reply, a
+   dropped connection, or an answer in another shape) keeps the mode that the
+   resume confirmed, and the running state is unknown. The thread must be idle and its newest turn must be
    `completed`, the one status that shows a finished turn. A turn that is
    `inProgress` reads as `busy`, an `interrupted` one as `stopped`, and every
    other answer as `unknown`: no turn at all, a turn without a status, a status
@@ -539,7 +550,7 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   subagents, and a stop that happens while the receiver is down is not seen
   until the next turn event. With `appServer`, an interrupted newest turn is also
   read.
-- **Large retry batches.** A retry batch is claimed whole, up to 16 messages;
+- **Large retry batches (bodies mode).** A retry batch is claimed whole, up to 16 messages;
   only a first claim is packed to fit. With short synthetic values in the
   binding line (interpreter, state file and host), 16 frames at body cap 0 and
   the adapter's own lines take 7,688 bytes when every header field is at its

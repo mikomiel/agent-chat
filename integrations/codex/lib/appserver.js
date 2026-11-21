@@ -341,11 +341,13 @@ export function createThread({ path, threadId, open = openAppServer }) {
     const unclear = () => (observed.plan === true ? "plan" : observed.plan === null ? "unknown" : null)
     observed.status = statusOf(record)
     if (observed.status !== "idle") return { reason: observed.status, observed }
-    const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" })
-    if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
+    // The mode is known from here on. A newest-turn lookup that fails (an error reply, a dropped connection) or answers in
+    // a shape that is not the documented one keeps it: the running state is unknown, and the read is not offline.
+    let turns = null
+    try { turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }) } catch { /* unknown */ }
     // Only a newest turn that is known to be finished clears the thread. A turn that is running is busy; an interrupted one is
     // stopped; no turn, a turn without a status and a status that is not known say nothing, and an unknown state is not idle.
-    const newest = turns.data[0]?.status
+    const newest = Array.isArray(turns?.data) ? turns.data[0]?.status : undefined
     if (newest === "interrupted") { observed.stopped = true; return { reason: "stopped", observed } }
     if (newest === "inProgress") { observed.status = "busy"; return { reason: "busy", observed } }
     if (newest !== "completed") { observed.status = "unknown"; return { reason: "unknown", observed } }
