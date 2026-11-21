@@ -630,6 +630,68 @@ test("an owed read-back queued behind an earlier operation does not read or disa
   assert.equal(delivery.state(), null)
 })
 
+// Review 6003597565, finding 2: a check superseded by a newer gap does no I/O, and its failure does not turn chat off.
+test("a read-back queued before a newer gap does not disable chat, and the newest gap schedules its own", async () => {
+  const entries = new Map()
+  let lists = 0
+  let heldCall = 0
+  let releaseList = null
+  let failFrom = Infinity
+  const ctx = {
+    session: {
+      async get({ sessionID }) { return root(sessionID) },
+      synthetic() { return Promise.resolve({ id: "msg_1" }) },
+      instructions: {
+        entry: {
+          async put({ key, value }) { entries.set(key, value) },
+          async list() {
+            const call = ++lists
+            if (call === heldCall) await new Promise(resolve => { releaseList = resolve })
+            if (call >= failFrom) throw new Error("unavailable")
+            return [...entries].map(([key, value]) => ({ key, value }))
+          },
+          async remove({ key }) { entries.delete(key) },
+        },
+      },
+    },
+  }
+  let delivery = null
+  const parts = stubParts()
+  parts.createDelivery = (hostCtx, id) => {
+    delivery = Object.assign(createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }), { id })
+    return delivery
+  }
+  const manager = createManager(ctx, config, parts)
+  const send = (type, data = {}) => manager.feed(event(type, "ses_a", data))
+  send("session.execution.started")
+  await flush()
+  await delivery.context("binding text")
+  heldCall = lists + 1
+  const earlier = delivery.context("binding text") // its own check is held, so later context operations queue behind it
+  await flush()
+  manager.reset()
+  await flush()
+  send("session.agent.selected", { agent: "build" }) // the first event after the first gap: a check is queued
+  await flush()
+  manager.reset() // a newer gap supersedes that check
+  await flush()
+  const before = lists
+  failFrom = lists + 1 // a read from here on would be rejected
+  releaseList()
+  await earlier
+  await flush()
+  assert.equal(lists, before) // the superseded check read nothing
+  assert.deepEqual(parts.lifecycles.get("ses_a").disables, []) // and chat is still on
+  failFrom = Infinity
+  send("session.agent.selected", { agent: "build" }) // the first event after the newest gap schedules its own check
+  send("session.inbox.enqueued", { item: { type: "user" } })
+  send("session.execution.started")
+  await flush()
+  assert.equal(lists, before + 1)
+  assert.deepEqual(parts.lifecycles.get("ses_a").disables, [])
+  assert.equal(delivery.state(), null)
+})
+
 test("a compaction whose end is lost in a gap cannot reach synthetic before the binding is read back", async () => {
   const entries = new Map()
   const synthetic = []

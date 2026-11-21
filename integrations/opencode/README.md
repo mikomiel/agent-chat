@@ -150,7 +150,9 @@ The service and its host-token provisioning are documented in the product
   Events of one session run in order on that session's own chain. A fault
   there ends that session's chat and no other. A faulted session stays out
   while its refusal is in the bounded lookup cache, which holds 1,024 entries
-  and drops the oldest first.
+  and drops the oldest first. After an eviction a new lookup can succeed and
+  the session can rejoin while the cleanup of its old worker and entry is
+  still pending.
 - **State comes from durable events only.** `session.execution.started`
   means busy. `succeeded`, `failed` and `interrupted` mean idle. A fact no
   event has shown is `unknown`, and `unknown` never reads as idle. A lost or
@@ -186,9 +188,15 @@ The service and its host-token provisioning are documented in the product
   proof. A compaction that was running when the gap came is not ended by the
   gap, and no check runs while it is running: the session stays `busy`, and the
   check runs only after that compaction's own `ended` or `failed` event. That
-  is decided where the read would start, not when it is asked for: a check
-  queued behind an earlier context operation reads nothing if a compaction began
-  while it waited, and it stays owed.
+  is decided before every host call the check makes, not when it is asked for:
+  a check queued behind an earlier context operation reads nothing if a
+  compaction began, or a newer gap came, while it waited. The same holds
+  between its list, its put and its confirming list. A check that stops this
+  way ends without error and stays owed, and a failure it meets after it was
+  overtaken is ignored. A compaction that started while a check was running
+  counts as an overlap even if it has already ended or failed: the check does
+  not clear the obligation, and a failure it met is ignored. Only a failure of
+  a current check that no compaction overlapped turns that session's chat off.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input

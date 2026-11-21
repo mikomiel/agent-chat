@@ -650,6 +650,155 @@ test("a read-back is asked for once per obligation, and again after a newer one"
   assert.equal(delivery.needsReadBack(), false) // a read that failed is not asked for again in the same epoch
 })
 
+// Review 6003597565, findings 1 and 2: every host call of a read-back is made only while the read-back may still touch the host.
+// Wraps one host call so that its first invocation waits until the test settles it.
+function holdFirst(target, name) {
+  const original = target[name]
+  const held = { entered: false, settle: null }
+  target[name] = async (...args) => {
+    if (held.entered) return original(...args)
+    held.entered = true
+    await new Promise((resolve, reject) => { held.settle = { resolve, reject } })
+    return original(...args)
+  }
+  return held
+}
+
+// A session that has just had a gap: the entry is gone, a read-back is owed, and fresh events show a running session.
+async function gapped() {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  ctx.entries.clear() // a compaction dropped the entry
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  return { ctx, delivery, calls: { lists: ctx.calls.list, puts: ctx.calls.put.length } }
+}
+
+test("a compaction that begins while the first list is pending stops the repair before any put", async () => {
+  const { ctx, delivery, calls } = await gapped()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const read = delivery.verifyContext()
+  await flush()
+  assert.equal(held.entered, true)
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  held.settle.resolve() // the list answers: no binding
+  await read // resolves: nothing failed
+  assert.equal(ctx.calls.put.length, calls.puts) // no put
+  assert.equal(ctx.calls.list, calls.lists + 1) // and no second list
+  assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), false) // still owed, but not while it compacts
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  assert.equal(delivery.needsReadBack(), true)
+  await delivery.verifyContext()
+  assert.equal(ctx.entries.get(BINDING_KEY), "binding") // the repair runs after the end
+  assert.equal(delivery.state(), null)
+})
+
+test("a compaction that begins while the repair put is pending stops the read-back before the confirming list", async () => {
+  const { ctx, delivery, calls } = await gapped()
+  const held = holdFirst(ctx.session.instructions.entry, "put")
+  const read = delivery.verifyContext()
+  await flush()
+  assert.equal(held.entered, true)
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  held.settle.resolve()
+  await read
+  assert.equal(ctx.calls.list, calls.lists + 1) // only the first list: the confirming one was not made
+  assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), false)
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  await delivery.verifyContext()
+  assert.equal(ctx.calls.list, calls.lists + 2) // the read-back runs again after the end
+  assert.equal(delivery.state(), null)
+})
+
+test("a read that fails while a compaction began during it is ignored, and the check stays owed", async () => {
+  const { ctx, delivery } = await gapped()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const read = delivery.verifyContext()
+  await flush()
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  held.settle.reject(new Error("unavailable"))
+  await read // not a context failure: the check overlapped a compaction
+  assert.equal(delivery.state(), "busy")
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  assert.equal(delivery.needsReadBack(), true)
+  await delivery.verifyContext()
+  assert.equal(delivery.state(), null)
+})
+
+test("a read that overlapped a compaction that began and failed inside one host call is ignored too", async () => {
+  const { ctx, delivery } = await gapped()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const read = delivery.verifyContext()
+  await flush()
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.observe(event("session.compaction.failed", { reason: "auto" })) // nothing is compacting again when the call fails
+  held.settle.reject(new Error("unavailable"))
+  await read // not a context failure: the compaction overlapped the call
+  assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), true) // still owed, and may start again now
+  await delivery.verifyContext()
+  assert.equal(delivery.state(), null)
+})
+
+test("a read that succeeds across a compaction that began and failed does not clear the obligation", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const read = delivery.verifyContext()
+  await flush()
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.observe(event("session.compaction.failed", { reason: "auto" }))
+  held.settle.resolve() // the entry is there, but the read overlapped a compaction
+  await read
+  assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), true)
+  await delivery.verifyContext()
+  assert.equal(delivery.state(), null)
+})
+
+test("a read that fails with no compaction and no newer gap is a context failure", async () => {
+  const { ctx, delivery } = await gapped()
+  ctx.session.instructions.entry.list = async () => { throw new Error("unavailable") }
+  await assert.rejects(delivery.verifyContext(), { code: "CHAT_CONTEXT_UNAVAILABLE" })
+})
+
+test("a read-back queued behind an earlier operation does no I/O after a newer gap, and its failure is ignored", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  const entry = ctx.session.instructions.entry
+  const base = entry.list
+  let attempts = 0
+  entry.list = async (...args) => { attempts += 1; if (attempts > 1) throw new Error("unavailable"); return base(...args) }
+  const held = holdFirst(entry, "list")
+  const earlier = delivery.context("binding") // its own check is held, so later context operations queue behind it
+  await flush()
+  assert.equal(held.entered, true)
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  const stale = delivery.verifyContext() // queued behind the earlier operation
+  delivery.reset() // a newer gap supersedes it
+  held.settle.resolve()
+  await earlier
+  await stale // resolves: a superseded check neither reads nor fails
+  assert.equal(attempts, 1) // only the earlier operation's own list
+  assert.equal(delivery.needsReadBack(), true) // the newest gap still owes its own check
+  entry.list = base
+  await delivery.verifyContext()
+  assert.equal(delivery.needsReadBack(), false)
+})
+
 // Finding 4 (non-blocking): reservation arithmetic and receipt checks share one monotonic clock.
 test("the default clock is monotonic: a wall-clock step cannot decide whether a reservation is over", async t => {
   const realNow = Date.now
