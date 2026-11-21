@@ -22,7 +22,8 @@
 // A DELETION IS FENCED WHEN IT IS RECEIVED, as a fork is: it is not queued behind a lookup that is still running. The
 // record is ended at once, so a lookup that answers afterwards finds its record dead and starts no worker and sends
 // no join. The deletion is also a tombstone in its own set, like fork evidence: no cache evicts it, and the next owner
-// receives it, so a late event for that session is never looked up again.
+// receives it, so a late event for that session is never looked up again. A lookup that answers also asks both shared
+// sets once more, because the old owner can record a tombstone, or the registry a fork, while it runs.
 //
 // A DELETION CAN BE MISSED, AND THE TICK FINDS IT. The host has no replay and no cursor, so a `session.deleted` event
 // can be lost with no gap marker, and nothing else would end that session's worker and binding. The heartbeat tick
@@ -153,6 +154,13 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (!active || record.dead) return
+    // Both sets are shared with the other owners. Evidence that another owner recorded while this lookup ran, such as a
+    // tombstone from the old owner's last call as it ended, reaches this record only here: it is not fed to this manager.
+    if (deleted.has(record.id) || forked.has(record.id)) {
+      records.delete(record.id)
+      record.dead = true
+      return
+    }
     if (!isRootSession(info, record.id)) {
       refuse(record.id, Infinity)
       records.delete(record.id)

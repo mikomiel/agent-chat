@@ -606,6 +606,7 @@ test("a heartbeat tick that finds its session gone ends that session's chat, and
             if (answer === "wrong-session") return Promise.reject(missing("ses_other")) // another session's answer
             if (answer === "error") return Promise.reject(new Error("unavailable"))
             if (answer === "silent") return new Promise(() => {})
+            if (answer === "held") return new Promise((resolve, reject) => { rig.answerList = { resolve, reject } })
             return Promise.resolve([...entries].filter(([name]) => name.startsWith(`${sessionID}/`))
               .map(([name, value]) => ({ key: name.slice(sessionID.length + 1), value })))
           },
@@ -686,9 +687,10 @@ test("a heartbeat tick that finds its session gone ends that session's chat, and
 async function backoffRig() {
   const entries = new Map()
   const deleted = new Set()
+  const forked = new Set()
   const callTimers = []
   const workers = []
-  const rig = { entries, deleted, workers, gone: false, next: null, retry: null, tick: null }
+  const rig = { entries, deleted, forked, workers, gone: false, next: null, retry: null, tick: null, answerList: null }
   const missing = Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID: "ses_a" })
   const stale = Object.assign(new Error("STALE_INSTANCE"), { code: "STALE_INSTANCE" })
   const gone = () => (rig.gone ? Promise.reject(missing) : null)
@@ -705,6 +707,7 @@ async function backoffRig() {
             if (rig.gone) return Promise.reject(missing)
             if (answer === "error") return Promise.reject(new Error("unavailable"))
             if (answer === "silent") return new Promise(() => {})
+            if (answer === "held") return new Promise((resolve, reject) => { rig.answerList = { resolve, reject } })
             return Promise.resolve([...entries].map(([key, value]) => ({ key, value })))
           },
         },
@@ -744,7 +747,7 @@ async function backoffRig() {
     workers.push(worker)
     return worker
   }
-  rig.manager = createManager(ctx, config, parts, { deleted })
+  rig.manager = createManager(ctx, config, parts, { deleted, forked })
   rig.armed = () => callTimers.filter(timer => !timer.cleared && timer.ms === CALL_TIMEOUT_MS)
   rig.manager.feed(event("session.execution.started", "ses_a"))
   await flush()
@@ -801,6 +804,55 @@ test("a retry whose session still exists starts the replacement", async () => {
   assert.equal(rig.workers.length, 2)
   assert.deepEqual([...rig.deleted], [])
 })
+
+// Review 6005906094, finding 1: the sets are shared by every owner. Evidence that another owner records while a lookup runs
+// is not fed to this manager, so the lookup checks both sets again when it answers.
+test("a tombstone that the old owner records during a handoff stops the successor's lookup before a worker starts", async () => {
+  const rig = await backoffRig()
+  rig.next = "held"
+  rig.retry() // the old owner's retry asks the host, and the answer is pending
+  await flush()
+  assert.equal(typeof rig.answerList?.reject, "function")
+  const ending = rig.manager.stop() // the old owner is torn down
+  let release
+  const lookups = []
+  const parts = stubParts()
+  const ctx = { session: { get: ({ sessionID }) => { lookups.push(sessionID); return new Promise(resolve => { release = resolve }) } } }
+  const successor = createManager(ctx, config, parts, { deleted: rig.deleted, forked: rig.forked })
+  successor.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(lookups, ["ses_a"]) // the successor's lookup is pending
+  rig.answerList.reject(Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID: "ses_a" }))
+  await flush()
+  assert.deepEqual([...rig.deleted], ["ses_a"]) // the old owner's last call recorded the tombstone
+  release(root("ses_a")) // the successor's lookup then answers root-shaped
+  await flush()
+  await ending
+  assert.equal(parts.lifecycles.size, 0) // no worker starts, and no join is sent
+  assert.equal(parts.contexts.size, 0)
+  assert.deepEqual(successor.sessions(), [])
+  assert.equal(rig.workers.length, 1) // and the old owner started none either
+  successor.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(lookups, ["ses_a"]) // it is refused from now on
+})
+
+for (const [kind, shared] of [["a tombstone", "deleted"], ["fork evidence", "forked"]]) {
+  test(`${kind} in the shared set when the lookup answers, with no event fed to this manager, starts no worker`, async () => {
+    let release
+    const sets = { deleted: new Set(), forked: new Set() }
+    const parts = stubParts()
+    const ctx = { session: { get: () => new Promise(resolve => { release = resolve }) } }
+    const manager = createManager(ctx, config, parts, sets)
+    manager.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    sets[shared].add("ses_a") // recorded by the registry or another owner, not fed here
+    release(root("ses_a"))
+    await flush()
+    assert.equal(parts.lifecycles.size, 0)
+    assert.deepEqual(manager.sessions(), [])
+  })
+}
 
 // Review 6003407206, finding 2: a deletion is fenced when it is received, not queued behind the lookup.
 test("a deletion that arrives during the lookup stops it before a worker starts or a join is sent", async () => {

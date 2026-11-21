@@ -359,6 +359,29 @@ test("a native half with no probe keeps the retry as it was", async () => {
   assert.equal(starts, 2) // started in the same turn: nothing was awaited
 })
 
+// Review 6005906094, finding 2: a worker that never started fails closed like any other worker-start failure.
+test("a spawn that makes no pipes fails that session's chat closed, and its end settles", async () => {
+  const bus = fakeBus()
+  const notices = []
+  const child = new EventEmitter()
+  child.stdin = null
+  child.stdout = null
+  child.kill = () => {}
+  const spawnImpl = () => { process.nextTick(() => child.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" }))); return child }
+  const native = fakeNative()
+  const lifecycle = createLifecycle(bus, native, config, {
+    ...timers,
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    notice: text => notices.push(text),
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  assert.match(notices.at(-1), /Agent Chat stopped \(join:CHAT_WORKER_UNAVAILABLE\)/)
+  assert.equal(native.calls.disable, 1)
+  assert.deepEqual(native.calls.context.filter(text => text !== null), []) // no binding for a worker that never joined
+  await lifecycle.stop() // settles
+})
+
 test("a wall-clock step does not end a rejoin episode: the default clock is monotonic", async t => {
   const realNow = Date.now
   t.after(() => { Date.now = realNow })

@@ -162,8 +162,9 @@ The service and its host-token provisioning are documented in the product
   dropped. The deletion is also a tombstone in a set of its own, kept the same
   way: no cache evicts it, and the next owner receives it, including a deletion
   that arrived between two owners. A later event for a deleted session is never
-  looked up, and a `session.forked` event that arrives after the deletion adds
-  no fork record. A deleted fork drops its fork record, because the tombstone
+  looked up, and a lookup that answers asks both shared sets once more, because
+  the old owner can record a tombstone while a successor's lookup runs. A
+  `session.forked` event that arrives after the deletion adds no fork record. A deleted fork drops its fork record, because the tombstone
   covers it. The tombstone set is never trimmed, so it grows with the deleted
   sessions of one process. A deletion event can be lost, because the host has no
   replay and no cursor, and no later event would end that session's chat. The
@@ -257,13 +258,15 @@ The service and its host-token provisioning are documented in the product
   worker that dies or breaks the protocol still turns that session's chat off.
   That holds from the moment the worker is ready, so a worker that exits while
   its binding waits behind a slow removal withdraws that binding, and the
-  queued publish makes no put. Before a retry starts a replacement worker, it
-  asks the host once for the session's entry list, with the same 10-second
-  limit, because the session can be deleted during the backoff with no event
-  seen. The session's own `Session.NotFoundError` ends the chat through the
-  deletion path above and starts no worker. A timeout, any other error and a
-  session that is found leave the retry as it was. The first join asks nothing,
-  because the eligibility lookup came first. A heartbeat that the worker
+  queued publish makes no put. A spawn that fails after it returned, such as
+  `EMFILE`, leaves no pipes and also turns that session's chat off. Before a
+  retry starts a replacement worker, it asks the host once for the session's
+  entry list, with the same 10-second limit, because the session can be deleted
+  during the backoff with no event seen. The session's own
+  `Session.NotFoundError` ends the chat through the deletion path above and
+  starts no worker. A timeout, any other error and a session that is found
+  leave the retry as it was. The first join asks nothing, because the
+  eligibility lookup came first. A heartbeat that the worker
   answers with `refused` is a brief outage, not a failure. The worker and the
   binding stay, no rejoin budget is spent and the next heartbeat is the retry.
   The worker ends itself with an error once an outage lasts as long as the
@@ -364,15 +367,15 @@ unverified, inferred, or a deliberate choice.
   during a join can land after the removal that follows the failed join, and
   leaves a stale entry with chat off. The plugin does not remove it again: a
   cleanup outside the serial queue would race the next owner's publish. The
-  next join replaces the entry. The entry names an instance file. Once the core
-  change from #149 is in the installed core, the worker discards that file
+  next join replaces the entry. The entry names an instance file. With the core
+  change from #149 in the installed core, the worker discards that file
   before it sends its end request. The removal is best effort: when it
-  succeeds, a new open of its path finds nothing. Until then the worker
-  discards it only after a successful end. The plugin ends a worker by closing
-  its stdin, and then sends `SIGTERM` after 3 seconds and `SIGKILL` after 5.
-  Once #149 is in the installed core, a kill during that shutdown leaves the
-  session online only until its lease expires, with the instance file already
-  discarded if that best-effort removal succeeded. A late put that lands while a
+  succeeds, a new open of its path finds nothing. An installed core without
+  #149 discards it only after a successful end. The plugin ends a worker by
+  closing its stdin, and then sends `SIGTERM` after 3 seconds and `SIGKILL`
+  after 5. With #149 in the installed core, a kill during that shutdown leaves
+  the session online only until its lease expires, with the instance file
+  already discarded if that best-effort removal succeeded. A late put that lands while a
   successor confirms its own binding is put over once more by the successor's
   publish.
 - **The binding text asks, the plugin does not check.** The binding tells the
@@ -435,7 +438,7 @@ The suites use doubles of the plugin context and of the worker. They cover the
 config refusals, the delegated-child refusal, root, child and fork eligibility,
 the fork and deletion records and their tombstones, a child's `session.created`
 event, the deletion check at the heartbeat tick and before a rejoin, owner
-failover and handoff,
+failover and handoff, a spawn that makes no pipes,
 per-session fault isolation, the binding publish, replace and fail-closed
 context, the repair after a compaction signal or a gap with its currency rule
 and call time limit, the read-back at each heartbeat tick, the
