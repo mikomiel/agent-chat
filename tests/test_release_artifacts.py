@@ -35,7 +35,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATIONS = ROOT / "integrations"
 WORKFLOWS = ROOT / ".github" / "workflows"
-PACKAGES = sorted(path for path in INTEGRATIONS.iterdir() if path.is_dir())
 PROJECT_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 DEFAULT_RUNNER = "ubuntu-24.04"
 TAG_CHECK_STEP = "Release tag matches the project version"
@@ -52,6 +51,7 @@ def load_script():
 
 
 script = load_script()
+PACKAGES = script.package_directories(ROOT)
 
 
 def read_json(path: Path) -> dict:
@@ -383,6 +383,20 @@ def problems(release: tuple[Path, Path, list[str]]) -> list[str]:
 
 def test_a_complete_set_of_tarballs_passes(release: tuple[Path, Path, list[str]]) -> None:
     assert problems(release) == []
+
+
+def test_a_source_only_directory_is_not_a_package(release: tuple[Path, Path, list[str]]) -> None:
+    root, _, _ = release
+    (root / "integrations" / "shared").mkdir()
+    assert problems(release) == []
+    (root / "integrations" / "gamma").mkdir()
+    assert any("integrations/gamma: no package.json" in error for error in problems(release))
+
+
+@pytest.mark.parametrize("name", sorted(script.SOURCE_ONLY))
+def test_the_source_only_directory_holds_no_package(name: str) -> None:
+    assert (INTEGRATIONS / name).is_dir(), "drop the exception once the directory is gone"
+    assert not (INTEGRATIONS / name / "package.json").exists()
 
 
 def test_a_directory_without_a_tarball_fails(release: tuple[Path, Path, list[str]]) -> None:

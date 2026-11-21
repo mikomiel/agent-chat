@@ -202,7 +202,8 @@ The variable names the private `0600` config file. `AGENT_CHAT_DELEGATED_CHILD=1
 keeps a harness process that a session starts on purpose from joining chat.
 
 `tests/test_release_artifacts.py` pins this rule for every directory under
-`integrations/`. `scripts/check_release_artifacts.py` packs the directories and
+`integrations/` except `shared/`, which holds the notice source each package
+copies into its own `lib/` and is never packed alone. `scripts/check_release_artifacts.py` packs the directories and
 checks the built artifacts. The pack step refuses a link or special file in a
 package directory, and the output directory must hold no link. The checks:
 
