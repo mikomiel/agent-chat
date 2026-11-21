@@ -1,7 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
 import { existsSync } from "node:fs"
+import { PassThrough } from "node:stream"
 import { createReceiver, processStartTime } from "../lib/receiver.js"
+import { startWorker } from "../lib/worker.js"
 import { CHAT_PREFIX, MAX_OUTPUT_BYTES } from "../lib/channel.js"
 import { renderNotice } from "../lib/notice.js"
 
@@ -730,6 +733,66 @@ test("an exhausted rejoin budget fails closed instead of retrying forever", asyn
   assert.equal(r.worker.bootIds.length, 4)
 })
 
+// #146: during a brief outage the core's worker answers a heartbeat or a pending read with the non-terminal
+// `{ refused: code }` and keeps the binding; the next heartbeat or poll is the retry. Claude Code shows no
+// reconnecting notice, so a rejoin shows as a second boot id, a stopped worker, a rejoin timer or a disable.
+test("brief heartbeat and pending refusals keep the worker and the binding and spend no rejoin budget", async () => {
+  const answered = []
+  const refusing = { heartbeat: null, pending: null } // the code the worker answers with, or null for a normal answer
+  const r = await rig({
+    handlers: {
+      heartbeat: () => {
+        if (refusing.heartbeat) { answered.push(["heartbeat", refusing.heartbeat]); return { refused: refusing.heartbeat } }
+        return {}
+      },
+      pending: () => {
+        if (refusing.pending) { answered.push(["pending", refusing.pending]); return { refused: refusing.pending } }
+        return { messages: [] }
+      },
+    },
+  })
+  await r.begin()
+  const timersBefore = r.clock.count()
+  // Four brief outages, one more than the hourly rejoin budget allows.
+  const outages = [
+    ["heartbeat", "SERVICE_UNAVAILABLE"], ["pending", "TRANSPORT_UNAVAILABLE"],
+    ["heartbeat", "REQUEST_UNCERTAIN"], ["pending", "SERVICE_UNAVAILABLE"],
+  ]
+  for (const [operation, code] of outages) {
+    refusing[operation] = code
+    if (operation === "heartbeat") await r.clock.advance(30_000)
+    else assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "no disable reply and no new announcement")
+    refusing[operation] = null
+  }
+  assert.deepEqual(answered, outages, "each refusal reached the receiver")
+  assert.equal(r.worker.bootIds.length, 1, "the same worker keeps serving")
+  assert.equal(r.worker.state.stops, 0, "the worker is not stopped")
+  assert.equal(r.clock.count(), timersBefore, "no rejoin timer is scheduled")
+  assert.notEqual(r.receiver.state(), "offline")
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the binding is still the announced one")
+  const before = r.worker.ops("heartbeat").length // the next tick is the retry
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.ops("heartbeat").length, before + 1)
+  assert.equal(r.worker.bootIds.length, 1)
+})
+
+test("a thrown worker error on a heartbeat still rejoins, even with a code that a refused reply would not rejoin on", async () => {
+  const terminal = Object.assign(new Error("CHAT_WORKER_REFUSED"), {
+    code: "CHAT_WORKER_REFUSED", workerCode: "SERVICE_UNAVAILABLE", operation: "heartbeat",
+  })
+  let failing = false
+  const r = await rig({ handlers: { heartbeat: () => { if (failing) throw terminal; return {} } } })
+  await r.begin()
+  failing = true
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.state.stops, 1, "the old worker is stopped")
+  assert.notEqual(r.receiver.state(), "offline")
+  failing = false
+  await r.clock.advance(3750)
+  assert.equal(r.worker.bootIds.length, 2, "a fresh worker joins after the back-off")
+  assert.notEqual(r.receiver.state(), "offline")
+})
+
 test("the heartbeat repeats on the core cadence", async () => {
   const r = await rig()
   await r.begin()
@@ -879,4 +942,81 @@ test("an unknown operation is refused without touching the worker", async () => 
   const hook = await r.op({ op: "nope" })
   assert.deepEqual(hook.sent, [{ error: "bad_op" }])
   assert.deepEqual(r.worker.log, [])
+})
+
+// A request that outlives the parent-side deadline has an unknown outcome. The real worker reports the core's
+// own code for it, so the receiver rejoins instead of latching chat off. This one drives the real worker with a
+// child that never answers; the shared rig substitutes a worker double and cannot reach the deadline.
+const stdioChild = () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.kill = () => {}
+  return child
+}
+
+// The node:test timer mock needs Node 20.11, and the package supports 20.0. This stub records each timer, fires one on demand
+// and restores the originals when the test ends, so a failing test cannot leak it.
+function stubTimeouts(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  return {
+    fire(ms) {
+      for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() }
+    },
+  }
+}
+
+test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
+  const timeouts = stubTimeouts(t)
+  const clock = scheduler()
+  const children = []
+  const bootIds = []
+  const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
+  const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
+    startProcess: (workerConfig, identity) => {
+      bootIds.push(identity.bootId)
+      return startWorker(workerConfig, identity, { spawnImpl })
+    },
+    now: clock.now,
+    random: () => 0,
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    setIntervalImpl: clock.setIntervalImpl,
+    clearIntervalImpl: clock.clearIntervalImpl,
+    alive: () => true,
+    startTime: () => null,
+  })
+  void receiver.start()
+  await settle()
+  const record = {
+    session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+    room_id: ROOM, host: "synthetic-host", harness: "claude", instance_file: "/tmp/agent-chat-state/boot-1.json",
+  }
+  children[0].stdout.write(`${JSON.stringify({ id: 0, result: record })}\n`)
+  await settle() // joined; the first heartbeat is written and never answered
+  timeouts.fire(22_000)
+  await settle()
+  assert.notEqual(receiver.state(), "offline", "not a permanent disable")
+  assert.equal(children.length, 1, "the rejoin waits out its back-off")
+  await clock.advance(2499)
+  assert.equal(children.length, 1, "5 s base, jitter 0.5: this run waits 2.5 s")
+  await clock.advance(1)
+  assert.equal(children.length, 2, "a fresh worker joins after the back-off")
+  assert.notEqual(bootIds[0], bootIds[1])
+  const rejoined = {
+    ...record, session_id: "99999999-9999-4999-8999-999999999999", instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instance_file: "/tmp/agent-chat-state/boot-2.json",
+  }
+  children[1].stdout.write(`${JSON.stringify({ id: 0, result: rejoined })}\n`)
+  await settle()
+  const hook = hookDouble()
+  await receiver.handle({ op: "start", wait_ms: 5000 }, hook) // the session start announces the binding that is current
+  assert.match(hook.sent[0].message, new RegExp(`joined as ${rejoined.session_id}`))
+  assert.match(hook.sent[0].context, /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/, "the new binding is published")
+  assert.notEqual(receiver.state(), "offline")
 })
