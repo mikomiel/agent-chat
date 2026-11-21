@@ -4,14 +4,17 @@
 //
 // EVENTS. Every member reads its own event stream and forwards each event to the registry. Nothing here assumes that
 // one stream covers every location, or that each stream is a separate one. The published plugin and client types
-// (2.3.2) document no order for event ids or for `durable.seq`, so a bounded memory of seen ids cannot promise to
-// recognise a delayed duplicate: once an id is evicted, a late `execution.started` from a second stream could mark an
-// idle session running. A session's events are therefore accepted from one stream only, the member that delivered it
-// first: a stream delivers in order. Another member's copy of them is dropped. A fork or a deletion is the exception,
-// because it is idempotent and final: it is recorded from any stream and passed on. The session is released when its
-// stream is reset or its member leaves, and the next stream that delivers it takes it over. The registry also drops an
-// event id it has already seen. The cost is a fail-open case: a holding stream that goes quiet for a session while
-// another stream still delivers it leaves the owner with the last state it saw, until the holder is reset or leaves.
+// (2.3.2) document no order for event ids or for `durable.seq`, so no memory of seen ids can promise to recognise a
+// delayed duplicate: once an id is evicted, a late `execution.started` from a second stream could mark an idle session
+// running. A session's events are therefore accepted from one stream only, the member that delivered it first: a
+// stream delivers in order. Another member's copy of them is dropped. A fork or a deletion is the exception, because it
+// is idempotent and final: it is recorded from any stream and passed on. The session is released when its stream is
+// reset or its member leaves, and the next stream that delivers it takes it over. The registry keeps no event-id
+// memory. Within one stream a repeat only follows a reconnect, which is a reset, and the next holder's replay is
+// applied in full and in order: an id cache that outlived the handoff would drop a replayed run end as already seen
+// and leave the session looking busy. The cost is a fail-open case: a holding stream that goes quiet for a session
+// while another stream still delivers it leaves the owner with the last state it saw, until the holder is reset or
+// leaves.
 //
 // FAILOVER. When the owner's instance is torn down, the registry waits until that owner's workers have ended and
 // only then promotes the next member. A session rejoins at its next event. Registry changes run one at a time.
@@ -22,13 +25,11 @@
 import { EVENT_TYPES, createManager, deletedSessionOf, forkedSessionOf, sessionOf } from "./manager.js"
 
 const REGISTRY_KEY = Symbol.for("agent-chat.opencode.registry.v1")
-const MAX_SEEN_EVENTS = 1024
 const RECONNECT_MIN_MS = 1_000
 const RECONNECT_MAX_MS = 30_000
 
 export function createRegistry() {
   const members = []
-  const seen = new Set() // event ids, newest last, bounded
   const forks = new Set() // sessions known to be forks: every owner gets this set, so a promotion forgets none
   const deletions = new Set() // deletion tombstones: handed to every owner the same way
   const pins = new Map() // session id -> the member whose stream delivered it first
@@ -51,19 +52,12 @@ export function createRegistry() {
     const gone = deletedSessionOf(event)
     if (gone !== null) { deletions.add(gone); forks.delete(gone); pins.delete(gone) }
     if (!owner) return
-    // Filtered before the id is remembered: a copy dropped here must not hide the same event from the stream that holds
-    // the session. A session with fork or deletion evidence is final, so the owner refuses it whatever stream it came from.
+    // A session with fork or deletion evidence is final, so the owner refuses it whatever stream it came from.
     const session = sessionOf(event)
     if (member !== undefined && session !== null && !forks.has(session) && !deletions.has(session)) {
       const holder = pins.get(session)
       if (holder === undefined) pins.set(session, member)
       else if (holder !== member) return
-    }
-    const id = event?.id
-    if (typeof id === "string" && id) {
-      if (seen.has(id)) return
-      seen.add(id)
-      while (seen.size > MAX_SEEN_EVENTS) seen.delete(seen.values().next().value)
     }
     try { owner.feed(event) } catch { /* one event must not stop the stream */ }
   }

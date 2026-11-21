@@ -122,15 +122,17 @@ The service and its host-token provisioning are documented in the product
   process-wide registry. The first instance owns the joins. Every instance
   reads its own event stream and forwards events to the owner. The registry
   accepts a session's events from one stream only, the instance that delivered
-  that session first, and drops another instance's copy of them. It does not
-  rely on an event-id memory for this, because the published plugin and client
-  types document no order for event ids and a bounded memory forgets an old id. A `session.forked` or
+  that session first, and drops another instance's copy of them. It keeps no
+  event-id memory: the published plugin and client types document no order for
+  event ids, so a bounded memory forgets an old id, and one that outlives a
+  handoff drops a replayed event as already seen. Within one stream a repeat
+  only follows a reconnect, which is a reset. A `session.forked` or
   `session.deleted` event is the exception: it is recorded and passed on from
   any stream. A session is released when its stream is reset or its instance
-  leaves, and the next stream that delivers it takes it over. The registry
-  keeps one entry per held session and removes it on deletion or release. It
-  still drops an event id it has already seen. When the owner's instance
-  is torn down, the next one takes over only after the old owner's workers
+  leaves, and the next stream that delivers it takes it over and applies what
+  it delivers in full and in order, a run end included. The registry keeps one
+  entry per held session and removes it on deletion or release. When the
+  owner's instance is torn down, the next one takes over only after the old owner's workers
   and the removal of its binding entries have ended. A session that is still in
   its `session.get` lookup has no worker and no entry, so it does not delay the
   takeover, and a lookup that answers late starts nothing. A session then
@@ -208,11 +210,26 @@ The service and its host-token provisioning are documented in the product
   A check that is no longer current ends without error: it puts nothing,
   proves nothing and ignores its failure. A compaction that started while a
   check was running counts the same way, even if it has already ended or
-  failed. The obligation then stays owed. Only a failure of a current check
-  turns that session's chat off, and the check does that itself, in that same
-  step, not after the answer has passed through a promise. The gate stays
-  closed until a check proves the binding, and a check that ended stale is
-  asked for again at the session's next event, not at the rejoin.
+  failed. The obligation then stays owed. A signal that moves the rule is
+  fenced when it is received, not when its turn comes: the manager applies a
+  session's events in order, so a lost stream and a compaction event
+  (`started`, `ended`, `failed`) are queued behind earlier events. On receipt
+  they only advance the check's epoch, so a check in flight stops being current
+  now and cannot put or turn chat off in the gap before the queued event runs.
+  They change nothing the session shows; the queued event does that, in order.
+  A session with nothing published has nothing to read, so the obligation stays
+  owed. Only a failure of a current check turns that session's chat off, and
+  the check does that itself, in that same step, not after the answer has
+  passed through a promise. The gate stays closed until the binding is proved.
+  A check proves it. So does a confirmed publish of the binding (a join or a
+  rejoin), if no gap or compaction came since that publish began and nothing
+  replaced the binding. A gap is over only once the stream has resumed for that
+  session, because a compaction can still end inside it and drop the entry
+  after the put. So a publish that began before the first event after a gap
+  does not discharge the gap's obligation, even if it is confirmed: that first
+  event still asks for the read-back. A check that ended stale is asked for
+  again at the session's next event, unless a confirmed publish has discharged
+  the obligation first.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input
@@ -320,7 +337,10 @@ unverified, inferred, or a deliberate choice.
   subscribe to). A reset of the holding stream or the departure of its instance
   releases the session, and a quiet stream does not. After a release the next
   stream that delivers the session takes it, including a lagging stream whose
-  first event is an old one.- **Instruction entries.** The entries surface is typed experimental. Whether
+  first event is an old one. The registry applies that stream's events in full
+  and in order and keeps no event-id memory, so a replay can move a session to
+  an older state until the stream catches up.
+- **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
   after each put, each compaction and each gap. After a crash an entry can remain with a
   stale binding. The next join replaces it. An owner change waits for the old
@@ -367,11 +387,13 @@ unverified, inferred, or a deliberate choice.
   emits those events during a compaction is not verified. The host read named in
   the previous item is the candidate that would close this, and the plugin does
   not rely on it.
-- **A join's own publish is not a read-back.** The put and the confirming list
-  of a join or a rejoin do not follow the currency rule above. If a compaction
-  ends between that put and that list, the confirmation fails and that
-  session's chat is turned off. A later `context()` call is serialised behind
-  it, so the order of puts and removals still holds.
+- **A join's own publish follows the currency rule only at its end.** The put
+  and the confirming list of a join or a rejoin do not follow the currency rule
+  above while they run. If a compaction ends between that put and that list,
+  the confirmation fails and that session's chat is turned off. The publish
+  discharges the read-back obligation only if the rule still holds when it is
+  confirmed and the stream had resumed when it began. A later `context()` call is serialised behind it, so the order of
+  puts and removals still holds.
 - **A user input is not an operator.** A `user` inbox item clears the stop
   latch whether an operator or an API client sent it.
 - **Persisted idle sessions** join at their first event after the server

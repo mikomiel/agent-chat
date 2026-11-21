@@ -55,7 +55,7 @@ test("the first member owns the joins and the others stand by", async () => {
   assert.equal(log.at(-1), "reset first")
 })
 
-test("an event without an id is passed on every time, and a seen id is dropped", async () => {
+test("an event without an id is passed on every time", async () => {
   const registry = createRegistry()
   const log = []
   const member = fakeMember("only", log)
@@ -66,16 +66,17 @@ test("an event without an id is passed on every time, and a seen id is dropped",
   assert.equal(log.filter(line => line.startsWith("feed")).length, 2)
 })
 
-test("the seen-id memory is bounded", async () => {
+// Review 6003960841, finding 1: the registry keeps no event-id memory. A session's events come from one stream, and a
+// repeat within one stream only follows a reconnect, which already resets the session.
+test("the registry keeps no event-id memory: a repeat from the holding stream is passed on each time", async () => {
   const registry = createRegistry()
   const log = []
   const member = fakeMember("only", log)
   registry.attach(member)
   await flush()
-  member.dispatch(event("first"))
-  for (let index = 0; index < 1100; index++) member.dispatch(event(`e${index}`))
-  member.dispatch(event("first")) // forgotten: passed on again
-  assert.equal(log.filter(line => line === "feed only first").length, 2)
+  member.dispatch(event("same"))
+  member.dispatch(event("same"))
+  assert.equal(log.filter(line => line === "feed only same").length, 2)
 })
 
 test("failover: the next owner starts only after the old owner's workers ended, and events in between are dropped", async () => {
@@ -233,7 +234,7 @@ test("activate builds a manager that takes events, and deactivate stops it and p
   const ctx = { ...streamCtx([]), session: { get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID } } } }
   const stops = []
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, invalidate() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
     createLifecycle: (bus) => { bus.on("session_start", () => {}); return { stop: () => { stops.push("stop"); return Promise.resolve({ code: 0 }) } } },
   }
   const member = createMember(ctx, {}, parts)
@@ -374,7 +375,7 @@ function realMember(lookups, started = [], { stuck = [] } = {}) {
     },
   }
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, invalidate() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
     createLifecycle: bus => {
       bus.on("session_start", payload => started.push(payload.nativeSessionId))
       return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) }
@@ -597,7 +598,7 @@ test("a copy that the wrong stream delivered first does not hide the pinned stre
   await flush()
   log.length = 0
   first.dispatch(event("e0"))
-  second.dispatch(event("e1")) // dropped by the pin, so its id must not be remembered as seen
+  second.dispatch(event("e1")) // dropped by the pin
   first.dispatch(event("e1"))
   assert.deepEqual(log, ["feed first e0", "feed first e1"])
 })
@@ -640,21 +641,19 @@ test("a fork or a deletion is passed on from any stream, not only from the one t
   assert.deepEqual(log, ["feed first e1", "feed first e2", "feed first e3", "feed first e4"])
 })
 
-// The session of the finding: started and finished on one stream, then a delayed duplicate of the start arrives from
-// another stream after the first stream's ids have long left the bounded memory.
-test("a delayed duplicate start from another stream does not mark an idle session running once its id was evicted", async () => {
+// Two real members whose streams the test drives by hand, and one real delivery for `ses_a` behind the owner.
+async function handDrivenStreams() {
   const registry = createRegistry()
   let delivery = null
   const ctx = { ...streamCtx([]), session: { get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }) } }
   const parts = {
     createDelivery: (hostCtx, id) => {
-      if (id !== "ses_a") return { seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve("proved"), dispose() {} }
+      if (id !== "ses_a") return { seed() {}, observe: () => false, reset() {}, invalidate() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve("proved"), dispose() {} }
       delivery = createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} })
       return delivery
     },
     createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) } },
   }
-  // Real members whose stream the test drives by hand.
   const streams = {}
   const attach = name => {
     const member = createMember(name === "a" ? ctx : streamCtx([]), {}, parts)
@@ -663,18 +662,49 @@ test("a delayed duplicate start from another stream does not mark an idle sessio
   registry.attach(attach("a"))
   registry.attach(attach("b"))
   await flush()
-  const send = (name, item) => streams[name].dispatch(item)
-  send("a", event("e0", "session.agent.selected"))
-  send("a", { id: "e0b", type: "session.inbox.enqueued", data: { sessionID: "ses_a", item: { type: "user" } } })
-  send("a", event("e1", "session.execution.started"))
-  send("a", event("e2", "session.execution.succeeded"))
+  return {
+    send: (name, item) => streams[name].dispatch(item),
+    lose: name => streams[name].reset(),
+    delivery: () => delivery,
+  }
+}
+const userItem = (id, sessionID = "ses_a") => ({ id, type: "session.inbox.enqueued", data: { sessionID, item: { type: "user" } } })
+
+// The session of the finding: started and finished on one stream, then a delayed duplicate of the start arrives from
+// another stream after the first stream's ids have long left the bounded memory.
+test("a delayed duplicate start from another stream does not mark an idle session running once its id was evicted", async () => {
+  const rig = await handDrivenStreams()
+  rig.send("a", event("e0", "session.agent.selected"))
+  rig.send("a", userItem("e0b"))
+  rig.send("a", event("e1", "session.execution.started"))
+  rig.send("a", event("e2", "session.execution.succeeded"))
   await flush()
+  const delivery = rig.delivery()
   assert.notEqual(delivery, null)
   assert.equal(delivery.heartbeatState().native_state, "idle") // started and finished
   assert.notEqual(delivery.state(), null)
-  for (let index = 0; index < 1100; index++) send("a", event(`filler-${index}`, "session.execution.started", `ses_other_${index}`))
-  send("b", event("e1", "session.execution.started")) // the delayed duplicate: its id was evicted long ago
+  for (let index = 0; index < 1100; index++) rig.send("a", event(`filler-${index}`, "session.execution.started", `ses_other_${index}`))
+  rig.send("b", event("e1", "session.execution.started")) // the delayed duplicate: its id was evicted long ago
   await flush()
   assert.equal(delivery.heartbeatState().native_state, "idle") // still idle
   assert.notEqual(delivery.state(), null) // so no notice can be handed over
+})
+
+// Review 6003960841, finding 1: a handoff replays a session's events from a lagging stream. The registry keeps no id
+// memory, so the whole replay is applied in order, and the run end is not dropped as already seen.
+test("after a handoff the new holder's replay is applied in full, so a session that had ended ends again", async () => {
+  const rig = await handDrivenStreams()
+  const replay = [event("sel", "session.agent.selected"), userItem("usr"), event("run", "session.execution.started")]
+  const end = event("end", "session.execution.succeeded")
+  for (const item of replay) rig.send("a", item)
+  // The first three ids leave any bounded memory of 1,024 ids; the end stays in it.
+  for (let index = 0; index < 1100; index++) rig.send("a", event(`filler-${index}`, "session.execution.started", `ses_other_${index}`))
+  rig.send("a", end)
+  await flush()
+  assert.equal(rig.delivery().heartbeatState().native_state, "idle")
+  rig.lose("a") // the first stream is lost: the session is released
+  for (const item of [...replay, end]) rig.send("b", item) // the lagging stream takes it and replays all four
+  await flush()
+  assert.equal(rig.delivery().heartbeatState().native_state, "idle") // the run end was applied, not dropped
+  assert.notEqual(rig.delivery().state(), null)
 })

@@ -11,6 +11,11 @@
 // over. The exception is a compaction already seen running: a read-back then proves only that the entry exists, so the
 // delivery holds it back until that compaction's own `ended` or `failed` event.
 //
+// A SIGNAL THAT MOVES THE READ-BACK IS FENCED WHEN IT IS RECEIVED. Events run on the session's chain, so a lost stream
+// (`reset()`) or a compaction event can be received before it is applied, and a check in flight would still put or turn
+// chat off in that gap. `feed()` and `reset()` therefore call `delivery.invalidate()` synchronously, which only advances
+// the check's epoch; the event itself is applied in order when its turn comes, and the next event asks again.
+//
 // FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
 // never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
 // answers later cannot undo it.
@@ -37,6 +42,10 @@ export const EVENT_TYPES = Object.freeze([
   "session.inbox.enqueued", "session.inbox.delivered", "session.inbox.cancelled",
   "session.compaction.started", "session.compaction.ended", "session.compaction.failed",
 ])
+
+// The events that move a delivery's read-back epoch when they are applied. Each also fences an in-flight check when it
+// is received, not when its turn on the session's chain comes.
+const FENCING_EVENTS = new Set(["session.compaction.started", "session.compaction.ended", "session.compaction.failed"])
 
 const RETRY_LOOKUP_MS = 60_000
 const MAX_REFUSED = 1024
@@ -184,6 +193,10 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (isRefused(id)) return
+    // Fenced on receipt: the event below is applied in order, behind whatever is queued, and a check that is in flight
+    // must stop being current now, not when its turn comes. Nothing the delivery observed changes here.
+    const known = records.get(id)
+    if (known?.delivery && FENCING_EVENTS.has(event.type)) known.delivery.invalidate()
     let record = records.get(id)
     if (!record) {
       record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
@@ -198,6 +211,7 @@ export function createManager(ctx, config, parts, {
   // The event stream broke or restarted: events may be missing, so every observation is stale.
   function reset() {
     for (const record of [...records.values()]) {
+      record.delivery?.invalidate() // fenced on receipt, like a compaction event: the reset itself lands in order below
       record.chain = record.chain.then(() => {
         if (record.dead || !record.delivery) return
         record.delivery.reset() // a read-back is owed now, and asked for at the next event, once the stream has resumed

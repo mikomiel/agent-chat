@@ -81,6 +81,7 @@ test("state: a new session is stopped, then unknown until an event shows the run
 
 test("state: the plan agent, an idle session, a compaction and a pending input block a claim", async () => {
   const { delivery } = running()
+  await delivery.context("binding") // a joined session has published its binding; nothing published would stay owed
   delivery.observe(event("session.agent.selected", { agent: "plan" }))
   assert.equal(delivery.state(), "plan")
   delivery.observe(event("session.agent.selected", { agent: "build" }))
@@ -89,7 +90,7 @@ test("state: the plan agent, an idle session, a compaction and a pending input b
   assert.equal(delivery.state(), "busy")
   delivery.observe(event("session.compaction.ended", { reason: "auto" }))
   assert.equal(delivery.state(), "busy") // ended is not enough: the binding entry is read back first
-  await delivery.verifyContext() // nothing is published here, so there is nothing to put back
+  await delivery.verifyContext() // the entry is intact, so the read-back proves the binding
   assert.equal(delivery.state(), null)
   delivery.observe(event("session.execution.succeeded"))
   // Idle is a known state, but this release never wakes an idle session; it must not be claimed for.
@@ -426,9 +427,10 @@ test("a read-back that finishes after a second compaction ended does not reopen 
 // Finding 5: after a gap both the agent and the stop latch are only what the events last showed.
 test("a stream gap makes the selected agent unknown again, so Plan Mode needs fresh evidence", async () => {
   const { delivery } = running()
+  await delivery.context("binding")
   assert.equal(delivery.state(), null)
   delivery.reset()
-  await delivery.verifyContext() // a gap also needs the binding read back; nothing is published here
+  await delivery.verifyContext() // a gap also needs the binding read back; the entry is intact
   delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
   delivery.observe(event("session.execution.started"))
   assert.equal(delivery.state(), "unknown") // the old `build` selection is not carried over
@@ -440,8 +442,9 @@ test("a stream gap makes the selected agent unknown again, so Plan Mode needs fr
 
 test("a stream gap latches stop again, so a missed operator interrupt cannot stay hidden", async () => {
   const { delivery } = running()
+  await delivery.context("binding")
   delivery.reset()
-  await delivery.verifyContext() // a gap also needs the binding read back; nothing is published here
+  await delivery.verifyContext() // a gap also needs the binding read back; the entry is intact
   delivery.observe(event("session.agent.selected", { agent: "build" }))
   delivery.observe(event("session.execution.started"))
   assert.equal(delivery.state(), "stopped") // the cleared latch is not carried over
@@ -840,13 +843,14 @@ test("a withdrawn binding is not put back: the binding is cleared while the firs
   assert.equal(ctx.calls.list, calls.lists + 1) // and nothing was read after it
   assert.deepEqual(failures, [])
   assert.equal(ctx.entries.has(BINDING_KEY), false)
-  // The rejoin publishes its new binding. The obligation is still owed: the next event asks again, and until that
-  // check proves the new binding the gate stays closed.
-  await delivery.context("binding two")
-  assert.equal(ctx.entries.get(BINDING_KEY), "binding two")
+  // The stale check changed nothing: the obligation is still owed, and the gate stays closed until a binding is proved.
   assert.equal(delivery.state(), "busy")
   assert.equal(delivery.needsReadBack(), true)
-  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] })
+  // The rejoin publishes its new binding. Its confirmed put is a read-back no gap or compaction overlapped, so it
+  // discharges the obligation, and the next event has nothing to ask.
+  await delivery.context("binding two")
+  assert.equal(ctx.entries.get(BINDING_KEY), "binding two")
+  assert.equal(delivery.needsReadBack(), false)
   assert.equal(delivery.state(), null)
 })
 
@@ -874,7 +878,7 @@ test("a replaced binding with the same text is still a different binding", async
   assert.equal(await read, "stale")
   await replaced
   assert.equal(ctx.calls.put.length, calls.puts + 1) // only the new call's own put
-  assert.equal(delivery.needsReadBack(), true)
+  assert.equal(delivery.needsReadBack(), false) // discharged by that put's own confirmation, not by the stale check
 })
 
 test("a confirming list that answers after the binding was withdrawn proves nothing", async () => {
@@ -903,6 +907,154 @@ test("a read-back that is closed or disabled while a host call is pending does n
     assert.equal(await read, "stale", end)
     assert.deepEqual(failures, [], end)
   }
+})
+
+// Review 6003960841, finding 2: `invalidate()` is the receipt-time fence. It moves the read-back epoch and changes
+// nothing the delivery observed, so the event it announces can still be applied in order when its turn comes.
+test("invalidate makes a pending check stale on receipt and leaves the observed state alone", async () => {
+  const { ctx, delivery, calls } = await gapped()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const failures = []
+  const read = delivery.verifyContext(error => failures.push(error.code))
+  await flush()
+  const before = delivery.heartbeatState()
+  delivery.invalidate()
+  assert.deepEqual(delivery.heartbeatState(), before) // nothing it observed changed
+  assert.equal(delivery.state(), "busy") // a running session, its binding still owed
+  held.settle.resolve() // the list answers: no entry
+  assert.equal(await read, "stale")
+  assert.equal(ctx.calls.put.length, calls.puts) // no put
+  assert.deepEqual(failures, [])
+  assert.equal(delivery.needsReadBack(), true) // the obligation is still owed, and asked for again
+  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] })
+  assert.equal(ctx.entries.get(BINDING_KEY), "binding")
+  assert.equal(delivery.state(), null)
+})
+
+test("invalidate also makes a failure of the pending check no failure", async () => {
+  const { ctx, delivery } = await gapped()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const failures = []
+  const read = delivery.verifyContext(error => failures.push(error.code))
+  await flush()
+  delivery.invalidate()
+  held.settle.reject(new Error("unavailable"))
+  assert.equal(await read, "stale")
+  assert.deepEqual(failures, [])
+  assert.equal(delivery.needsReadBack(), true)
+})
+
+// Review 6003960841, note: nothing published is not a proof. The obligation stays owed, and a confirmed `context()`
+// publish discharges it when no gap or compaction came since that publish began.
+async function gappedWithNoBinding() {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  return { ctx, delivery }
+}
+
+test("with no binding published the obligation stays owed, and a confirmed publish discharges it", async () => {
+  const { ctx, delivery } = await gappedWithNoBinding()
+  assert.equal(delivery.needsReadBack(), true)
+  assert.equal(await delivery.verifyContext(), "stale") // nothing to read, and nothing proved
+  assert.equal(ctx.calls.list, 0)
+  assert.equal(delivery.needsReadBack(), false) // asked once per epoch, not at every event
+  assert.equal(delivery.state(), "busy") // still owed
+  await delivery.context("binding") // the join's publish, confirmed
+  assert.equal(delivery.state(), null)
+})
+
+test("a confirmed publish that a gap overlapped does not discharge the obligation", async () => {
+  const { ctx, delivery } = await gappedWithNoBinding()
+  const held = holdFirst(ctx.session.instructions.entry, "list") // the publish's confirming list
+  const publish = delivery.context("binding")
+  await flush()
+  assert.equal(held.entered, true)
+  delivery.reset() // a newer gap while the confirming list is pending
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  held.settle.resolve()
+  await publish
+  assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), true)
+  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] }) // the next event's check discharges it
+  assert.equal(delivery.state(), null)
+})
+
+test("a confirmed publish that a compaction overlapped does not discharge the obligation", async () => {
+  const { ctx, delivery } = await gappedWithNoBinding()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const publish = delivery.context("binding")
+  await flush()
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.observe(event("session.compaction.failed", { reason: "auto" })) // nothing is compacting again when the list answers
+  held.settle.resolve()
+  await publish
+  assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), true)
+})
+
+test("a publish that a newer binding replaced does not discharge the obligation", async () => {
+  const { ctx, delivery } = await gappedWithNoBinding()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const first = delivery.context("binding one")
+  await flush()
+  const withdrawn = delivery.context(null) // the binding is withdrawn while its first publish is confirming
+  held.settle.resolve()
+  await first
+  await withdrawn
+  assert.equal(delivery.state(), "busy") // that publish was for a binding that is gone
+  await delivery.context("binding two")
+  assert.equal(delivery.state(), null) // the new binding's own confirmed publish discharges it
+})
+
+// Review 6003960841, note, and its follow-up: a gap is over only once the stream has resumed for the session, so a
+// publish confirmed before the first event after the gap cannot discharge the gap's obligation.
+test("a confirmed publish before the first event after a gap leaves the obligation owed, and that event asks for the read-back", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  delivery.reset()
+  assert.equal(delivery.needsReadBack(), true)
+  await delivery.context("binding two") // a rejoin's publish, confirmed while the gap may still be open
+  assert.equal(ctx.entries.get(BINDING_KEY), "binding two")
+  assert.equal(delivery.needsReadBack(), true) // still owed: a compaction may yet end in the rest of the gap
+  delivery.observe(event("session.agent.selected", { agent: "build" })) // the first event after the gap
+  assert.equal(delivery.needsReadBack(), true) // the caller asks for the read-back now
+  ctx.entries.clear() // a compaction that ended in the gap dropped the entry after the publish
+  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] })
+  assert.equal(ctx.entries.get(BINDING_KEY), "binding two") // the read-back found it gone and put it back
+  assert.equal(delivery.needsReadBack(), false)
+})
+
+test("a confirmed publish after the first event after a gap discharges the obligation", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" })) // the stream has resumed
+  assert.equal(delivery.needsReadBack(), true)
+  await delivery.context("binding two")
+  assert.equal(delivery.needsReadBack(), false)
+})
+
+test("a publish that began before the first event after a gap does not discharge it, though that event arrived while it ran", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  delivery.reset()
+  const held = holdFirst(ctx.session.instructions.entry, "put") // the publish began in the gap and its put is pending
+  const publish = delivery.context("binding two")
+  await flush()
+  assert.equal(held.entered, true)
+  delivery.observe(event("session.agent.selected", { agent: "build" })) // the stream resumes while the put is pending
+  held.settle.resolve()
+  await publish
+  assert.equal(delivery.needsReadBack(), true) // the put may have preceded the end of a compaction inside the gap
 })
 
 // Finding 4 (non-blocking): reservation arithmetic and receipt checks share one monotonic clock.

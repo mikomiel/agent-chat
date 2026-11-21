@@ -23,6 +23,16 @@
 // where it would act on a failure or prove the binding. A check that is not current does nothing more and reports
 // "stale": it neither puts, nor fails, nor proves, and the obligation stays owed for the next event. It reports
 // "proved" or "failed" only in the step in which it was still current, and it calls `onFailed` in that same step.
+// The same rule lets a confirmed `context()` publish discharge the obligation: nothing published proves nothing, so
+// with no binding the obligation stays owed until a publish that no gap or compaction overlapped has been confirmed.
+// A gap is over only when the stream has resumed for the session: a compaction can still end inside it and drop the
+// entry after the put. So a publish that began before the first event after a gap does not discharge it, and the read-back
+// at that first event runs as before.
+//
+// FENCED ON RECEIPT. The caller applies events in order, on a chain, so an event can be received before it is applied.
+// `invalidate()` is called at receipt for a signal that will move the epoch (a gap, a compaction start, end or
+// failure). It advances the epoch and changes nothing observed, so a check in flight stops being current now, and the
+// event itself still lands in order when its turn comes.
 //
 // State is read from events only. A fact the events have not shown is unknown, and unknown never reads as idle.
 import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES, monotonicNow } from "./channel.js"
@@ -46,7 +56,8 @@ export function createDelivery(ctx, sessionID, {
   let executing = null // true, false, or null when no event has shown it
   let compacting = false
   let unverified = false // a compaction ended, or the stream broke, and the binding entry has not been read back since
-  let compactions = 0 // compaction starts, endings and gaps so far: a read-back that began before the latest one proves nothing
+  let resuming = false // the stream broke and no event has arrived since: a compaction may still end inside the gap
+  let compactions = 0 // compaction starts, endings, gaps and receipts of them so far: a read-back that began before the latest one proves nothing
   let verifying = null // the `compactions` value a queued read-back was asked for: one read per obligation
   let generation = 0 // `context()` calls so far: a read-back made for an earlier call is for a binding that is gone
   let agent = null
@@ -105,6 +116,7 @@ export function createDelivery(ctx, sessionID, {
   // The reporting state changed when this returns true; the caller publishes a heartbeat now.
   function observe(event) {
     if (closed || disabled || !event || typeof event !== "object") return false
+    resuming = false // the first event after a gap: the stream has resumed, so whatever ended inside the gap is over
     const data = event.data ?? {}
     switch (event.type) {
       case "session.execution.started":
@@ -169,6 +181,7 @@ export function createDelivery(ctx, sessionID, {
     agent = null
     stopped = true
     unverified = true
+    resuming = true
     compactions += 1
     abandon()
   }
@@ -234,6 +247,11 @@ export function createDelivery(ctx, sessionID, {
     return Array.isArray(entries) && entries.some(entry => entry?.key === BINDING_KEY && entry.value === text)
   }
 
+  // The currency rule: is the work begun at epoch `mark` for binding `binding` still the work that is wanted? Everything
+  // that can change across an await is in it: a compaction or a gap, a withdrawn or replaced binding, and a chat that
+  // was closed or disabled.
+  const currentAt = (mark, binding) => () => !closed && !disabled && !compacting && compactions === mark && generation === binding
+
   // Put the entry and confirm it. `current` is asked after the put and before the confirming list: false stops there,
   // and the result is false. A put that left no entry means no binding context, which means chat off. A caller that
   // passes a `current` re-asks it for the failure this throws.
@@ -258,13 +276,24 @@ export function createDelivery(ctx, sessionID, {
     if (typeof text !== "string" || !text) return Promise.reject(contextFailure())
     published = text
     generation += 1
+    const binding = generation
     return queued(async () => {
+      const current = currentAt(compactions, binding) // from the start of this publish to its confirmation
+      const resumed = !resuming // a publish that began inside a gap is not a proof for it, whenever its put lands
       try { await publish(text) } catch { throw contextFailure() }
+      // A confirmed put is a read-back of this binding, when nothing has overlapped it and the stream has resumed.
+      if (current() && resumed) unverified = false
     })
   }
 
+  // A signal that moves the read-back epoch has been received and is queued behind earlier events. This moves the epoch
+  // now, so a check in flight is no longer current, and changes nothing observed: the queued event does that in order.
+  // `needsReadBack()` asks for a fresh check once that event has landed and `unverified` is set.
+  function invalidate() { compactions += 1 }
+
   // A read-back is owed after a compaction ended and after a gap, until one that began while nothing was compacting
-  // has succeeded. Whoever drives it asks here, so it is asked for once per obligation and never during a compaction.
+  // has succeeded, or a confirmed `context()` publish has discharged it. Whoever drives it asks here, so it is asked
+  // for once per obligation and never during a compaction.
   function needsReadBack() {
     return unverified && !compacting && !closed && !disabled && verifying !== compactions
   }
@@ -274,17 +303,16 @@ export function createDelivery(ctx, sessionID, {
   //   "proved"  the entry is there and the read-back was current throughout; the gate may reopen
   //   "failed"  a host call failed while the read-back was current; `onFailed(error)` was called in that step
   //   "stale"   it stopped, or its failure was ignored, because it was no longer current; the obligation stays owed
-  // Nothing published is trivially proved. `onFailed` may re-enter the delivery, so nothing is touched after it runs.
+  // With nothing published there is nothing to read, so it is "stale" and the obligation stays owed: a confirmed
+  // `context()` publish discharges it. `onFailed` may re-enter the delivery, so nothing is touched after it runs.
   function verifyContext(onFailed = () => {}) {
     const mark = compactions
     const binding = generation
-    // Asked after every host call, and again for the failure and the proof. Everything that can change across an
-    // await is here: a compaction or a gap, a withdrawn or replaced binding, and a chat that was closed or disabled.
-    const current = () => !closed && !disabled && !compacting && compactions === mark && generation === binding
+    const current = currentAt(mark, binding) // asked after every host call, and again for the failure and the proof
     if (closed) return Promise.resolve("stale")
-    if (published === null) { unverified = false; return Promise.resolve("proved") }
+    verifying = mark // one read per obligation, also when there is nothing to read
+    if (published === null) return Promise.resolve("stale")
     const text = published
-    verifying = mark
     const stale = () => { if (verifying === mark) verifying = null; return "stale" }
     return queued(async () => {
       try {
@@ -317,5 +345,5 @@ export function createDelivery(ctx, sessionID, {
     attempts.clear()
   }
 
-  return { state, heartbeatState, observe, seed, reset, deliver, sendChat, context, needsReadBack, verifyContext, disable, dispose }
+  return { state, heartbeatState, observe, seed, reset, invalidate, deliver, sendChat, context, needsReadBack, verifyContext, disable, dispose }
 }
