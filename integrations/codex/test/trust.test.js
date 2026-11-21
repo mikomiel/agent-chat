@@ -63,9 +63,11 @@ test("a socket that is not there is rethrown as absent, not refused, and a direc
   assert.throws(() => trustedSocket(SOCKET, { ...denied, lstat }), untrusted)
 })
 
+// The walk resolves a link on the way itself (readlink), so the table holds `/link` as a link, next to what lstat of the full
+// spelling `/link/app` answers (the directory behind it); realpath must agree with the walk.
 test("the caller connects to the path that was checked, with the links above the directory resolved", () => {
-  const entries = good({ "/real/app": { kind: "dir", uid: ME, mode: 0o700 }, "/real": { kind: "dir", uid: 0, mode: 0o755 }, "/real/app/s.sock": { kind: "socket", uid: ME, mode: 0o600 }, "/link/app": { kind: "dir", uid: ME, mode: 0o700 } })
-  const resolving = { ...entries, realpath: path => (path === "/link/app" ? "/real/app" : path) }
+  const entries = good({ "/real/app": { kind: "dir", uid: ME, mode: 0o700 }, "/real": { kind: "dir", uid: 0, mode: 0o755 }, "/real/app/s.sock": { kind: "socket", uid: ME, mode: 0o600 }, "/link": { kind: "link", uid: 0, mode: 0o777 }, "/link/app": { kind: "dir", uid: ME, mode: 0o700 } })
+  const resolving = { ...entries, readlink: path => (path === "/link" ? "/real" : undefined), realpath: path => (path === "/link/app" ? "/real/app" : path) }
   assert.equal(trustedSocket("/link/app/s.sock", resolving).path, "/real/app/s.sock")
 })
 
@@ -428,4 +430,60 @@ test("the 103-byte limit is on the socket at the end of the link", () => {
   const fits = socketOfBytes(103)
   assert.equal(trustedSocket(SOCKET, behind(fits)).path, fits.socket)
   assert.throws(() => trustedSocket(SOCKET, behind(socketOfBytes(104))), untrusted)
+})
+
+// ---- a link on the way to the directory ---------------------------------------------------------------------------------
+// The way is walked name by name from the root: a link on it is followed only when the directory that holds it has passed, so
+// nobody else can repoint it. An alias such as /work/team/profile -> /run/user, in a directory that its group can write, could
+// otherwise be repointed at another private directory of the user. A link that resolves first and is judged only by where it
+// ends up hides that.
+const ALIASED = "/work/team/profile/app/s.sock"
+const aliased = (over = {}) => {
+  const entries = {
+    "/": { kind: "dir", uid: 0, mode: 0o755 }, "/run": { kind: "dir", uid: 0, mode: 0o755 }, "/run/user": { kind: "dir", uid: 0, mode: 0o755 },
+    "/run/user/app": { kind: "dir", uid: ME, mode: 0o700 }, [SOCKET]: { kind: "socket", uid: ME, mode: 0o600, dev: 7, ino: 42 },
+    "/work": { kind: "dir", uid: 0, mode: 0o755 }, "/work/team": { kind: "dir", uid: 0, mode: 0o755 },
+    "/work/team/profile": { kind: "link", uid: ME, mode: 0o777, to: "/run/user" },
+    "/work/team/profile/app": { kind: "dir", uid: ME, mode: 0o700 }, // what lstat of the full spelling answers
+    ...over,
+  }
+  const targets = { "/work/team/profile/app": "/run/user/app", "/alias/app": "/run/user/app" }
+  return { ...table(entries), readlink: path => entries[path]?.to, realpath: path => targets[path] ?? path }
+}
+
+test("an alias on the way in a directory that nobody else can change is followed, and the socket behind it is trusted", () => {
+  assert.deepEqual(trustedSocket(ALIASED, aliased()), { path: SOCKET, dev: 7, ino: 42 })
+  assert.equal(trustedDirectory("/work/team/profile/app", aliased()), "/run/user/app")
+})
+
+for (const [label, team] of [
+  ["its group can write", { kind: "dir", uid: 0, mode: 0o775 }],
+  ["others can write, with no sticky bit", { kind: "dir", uid: 0, mode: 0o777 }],
+  ["another user owns", { kind: "dir", uid: OTHER, mode: 0o755 }],
+]) {
+  test(`an alias on the way in a directory that ${label} is refused, though it points at a private directory`, () => {
+    assert.throws(() => trustedSocket(ALIASED, aliased({ "/work/team": team })), untrusted)
+    assert.throws(() => trustedDirectory("/work/team/profile/app", aliased({ "/work/team": team })), untrusted)
+  })
+}
+
+test("a root-owned link in a root-owned directory is followed, as /tmp -> /private/tmp is on macOS; another user's link is not", () => {
+  const rooted = { "/alias": { kind: "link", uid: 0, mode: 0o777, to: "run/user" }, "/alias/app": { kind: "dir", uid: ME, mode: 0o700 } }
+  assert.equal(trustedSocket("/alias/app/s.sock", aliased(rooted)).path, SOCKET, "a relative target is resolved from the link's directory")
+  const foreign = { ...rooted, "/alias": { kind: "link", uid: OTHER, mode: 0o777, to: "/run/user" } }
+  assert.throws(() => trustedSocket("/alias/app/s.sock", aliased(foreign)), untrusted)
+})
+
+test("a loop of links on the way, and more than 8 links in a row, are refused", () => {
+  assert.throws(() => trustedSocket(ALIASED, aliased({ "/work/team/profile": { kind: "link", uid: ME, mode: 0o777, to: "/work/team/profile" } })), untrusted, "a link to itself")
+  assert.throws(() => trustedSocket(ALIASED, aliased({
+    "/work/team/profile": { kind: "link", uid: ME, mode: 0o777, to: "/work/team/other" },
+    "/work/team/other": { kind: "link", uid: ME, mode: 0o777, to: "/work/team/profile" },
+  })), untrusted, "a loop of two")
+  const row = count => Object.fromEntries(Array.from({ length: count }, (_, index) => [
+    index === 0 ? "/work/team/profile" : `/work/team/l${index}`,
+    { kind: "link", uid: ME, mode: 0o777, to: index === count - 1 ? "/run/user" : `/work/team/l${index + 1}` },
+  ]))
+  assert.equal(trustedSocket(ALIASED, aliased(row(8))).path, SOCKET, "8 links in a row")
+  assert.throws(() => trustedSocket(ALIASED, aliased(row(9))), untrusted, "9 links in a row")
 })

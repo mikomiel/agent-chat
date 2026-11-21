@@ -114,7 +114,9 @@ first, by the rule for the socket directories (see
 is not a symlink, and every directory on the way is owned by the current user or
 root and is not writable by group or other unless it is sticky, so no entry on
 the way can be replaced to point the lookup at another private file. A link
-further up is resolved and the directories it reaches are judged. The loader then
+further up is followed only once the directory that holds it has passed, and
+only when the link is the current user's or root's; the directories it leads to
+are judged too. The loader then
 opens the checked file and refuses it when what it opened is not that file
 (device and inode), so a file swapped in between is not read. A hook also refuses a state
 directory that is not private. Chat stays off silently on every refusal; the
@@ -377,14 +379,21 @@ that a hook connects to.
   a `.` name makes the kernel look through a link, so `link/`, `link//` and
   `link/.` are refused as `link` is (the name is checked without those endings,
   so `link//control.sock` has the directory `link`);
-- the directory and every directory above it (links above it resolved first, the
-  way the kernel walks a path: a `..` after a link names the parent of the link's
-  target) is owned by the current user or by root and is not writable by group or
-  other. A directory that is writable by others but has the sticky bit set, such
-  as `/tmp`, passes: others cannot remove or rename what the current user owns in
-  it, and the socket's owner is checked on its own. The directories are judged
-  from the root down, each only once every directory above it has passed, for
-  the socket and for every link on the way to it;
+- the directory and every directory on the way to it is owned by the current
+  user or by root and is not writable by group or other. A directory that is
+  writable by others but has the sticky bit set, such as `/tmp`, passes: others
+  cannot remove or rename what the current user owns in it, and the socket's
+  owner is checked on its own. The way is walked as the kernel walks it, one
+  name at a time from the root down, and a name is trusted only once the
+  directory that holds it has passed. A link on the way (an alias such as
+  `/work/team/profile`) is followed only from a directory that has passed, and
+  only when the link is the current user's or root's (a root-owned
+  `/tmp -> /private/tmp` passes); its target goes on the same walk, an absolute
+  one from the root and a relative one from the link's directory, and a `..`
+  after a link names the parent of the link's target. More than 8 links on the
+  way, or a loop, is refused, and the walk must reach the directory that the
+  kernel resolves the spelling to. This holds for the socket and for every link
+  on the way to it;
 - after the socket or a link is looked at, its directory and every directory
   above it are looked at again: the spelling must still resolve to the same
   real path and each directory must still be the same one (device and inode),

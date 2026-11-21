@@ -236,3 +236,20 @@ test("a directory swapped between the check of the way and the look at the recor
     assert.equal(loadConfig({ [ENV]: file }).hostToken, "decoy-token", "control: the swapped-in record itself is a valid one")
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
+
+// An alias on the way to the record (team/profile -> real) is followed only when the directory that holds it is one that nobody
+// else can change: in one that its group can write, the alias could be repointed at another private record of the user.
+test("a record reached through an alias in a directory that its group can write is refused; in a private one it loads", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "agent-chat-config-")))
+  try {
+    for (const name of ["team", "real", "real/cfg"]) { mkdirSync(join(root, name)); chmodSync(join(root, name), 0o700) }
+    writeFileSync(join(root, "real", "cfg", "chat.json"), JSON.stringify(base))
+    chmodSync(join(root, "real", "cfg", "chat.json"), 0o600)
+    symlinkSync(join(root, "real"), join(root, "team", "profile"))
+    const aliased = join(root, "team", "profile", "cfg", "chat.json")
+    assert.deepEqual(loadConfig({ [ENV]: aliased }), base, "the alias in a private directory")
+    chmodSync(join(root, "team"), 0o770)
+    assert.equal(loadConfig({ [ENV]: aliased }), null, "the same alias in a directory that its group can write")
+    assert.deepEqual(loadConfig({ [ENV]: join(root, "real", "cfg", "chat.json") }), base, "control: the record by its own path")
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})

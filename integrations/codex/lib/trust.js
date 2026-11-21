@@ -59,33 +59,60 @@ function unfollowed(directory) {
   return names.join("/") || (directory.startsWith("/") ? "/" : "")
 }
 
-const settings = ({ refuse = "CHAT_UNTRUSTED", lstat = lstatSync, realpath = realpathSync.native, uid = process.geteuid() } = {}) =>
-  ({ refuse, lstat, realpath, uid })
+const settings = ({
+  refuse = "CHAT_UNTRUSTED", lstat = lstatSync, realpath = realpathSync.native, readlink = readlinkSync, uid = process.geteuid(),
+} = {}) => ({ refuse, lstat, realpath, readlink, uid })
 
-// A directory that nobody else can change: it is not a symlink, and it and every directory above it pass `guarded`. The
-// path is resolved by realpath(3), which walks it the way the kernel does: a `..` after a symlink names the parent of the
-// link's target. `realpathSync` collapses such a `..` against the link's own directory first, so it would name another
-// directory than the one `lstat` and `connect` reach for the same string, and the rule would judge that one. The real path
-// is judged from the root down, so a directory is looked at only once every directory above it has passed, and the
-// identity (device and inode) of each is kept: { spelled, real, chain: [{ path, dev, ino }, ...] }, root first.
-function checkedChain(directory, { refuse, lstat, realpath, uid }) {
+// The links in a row that a walk follows: on the way to a directory (each walk has its own count), and, for a caller that
+// follows a socket's name, from that name to the socket.
+export const MAX_LINK_HOPS = 8
+
+// A name that a link holds: a non-empty string that is valid UTF-8. A name that is not comes back with U+FFFD in it, which can
+// spell another name, and is refused.
+const heldName = (held, refuse) => {
+  if (typeof held !== "string" || !held || held.includes("\uFFFD")) throw refusal(refuse)
+  return held
+}
+
+// A directory that nobody else can change: it is not a symlink, and every directory on the way to it passes `guarded`. The
+// way is walked as the kernel walks it, one name at a time from the root down, and a name is trusted only once the directory
+// that holds it has passed: so a link on the way is followed only when nobody else can change the directory it is in, and
+// the link is the current user's or root's (a `/tmp` that is root's link to `/private/tmp` passes). Its target goes on the
+// same walk: an absolute one from the root, a relative one from the link's directory. A `..` names the parent of the
+// directory the walk has reached, so after a link it is the parent of the link's target, as for the kernel (a `..`
+// collapsed on the string would name another directory). More than MAX_LINK_HOPS links, a loop included, is refused. The
+// walk must reach the directory that realpath(3) gives for the spelling, which names one that is not valid UTF-8 with
+// U+FFFD. Every directory judged, those reached through a link included, is kept with its identity (device and inode):
+// { spelled, real, chain: [{ path, dev, ino }, ...] }, in the order judged, the root first.
+function checkedChain(directory, { refuse, lstat, realpath, readlink, uid }) {
   const spelled = unfollowed(directory)
   if (lstat(spelled).isSymbolicLink()) throw refusal(refuse)
-  const real = realpath(spelled)
-  // A name that is not valid UTF-8 comes back with U+FFFD in it, and that string can name another directory that is
-  // spelled with U+FFFD. Such a path is refused rather than guessed at.
-  if (real.includes("\uFFFD")) throw refusal(refuse)
-  const paths = []
-  for (let current = real; ; current = dirname(current)) {
-    paths.unshift(current)
-    if (dirname(current) === current) break
-  }
-  const chain = paths.map(path => {
-    const info = lstat(path)
+  const judged = new Map()
+  const judge = (path, info) => {
     if (!guarded(info, uid)) throw refusal(refuse)
-    return { path, dev: info.dev, ino: info.ino }
-  })
-  return { spelled, real, chain }
+    if (!judged.has(path)) judged.set(path, { path, dev: info.dev, ino: info.ino })
+  }
+  const names = (spelled.startsWith("/") ? spelled : `${process.cwd()}/${spelled}`).split("/")
+  let current = "/"
+  judge(current, lstat(current))
+  for (let hops = 0; names.length;) {
+    const name = names.shift()
+    if (name === "" || name === ".") continue
+    if (name === "..") { current = dirname(current); continue } // every directory above `current` has been judged
+    const next = join(current, name)
+    const info = lstat(next)
+    if (info.isSymbolicLink()) {
+      if (++hops > MAX_LINK_HOPS || (info.uid !== uid && info.uid !== 0)) throw refusal(refuse)
+      const held = heldName(readlink(next), refuse)
+      names.unshift(...held.split("/"))
+      if (held.startsWith("/")) current = "/"
+      continue
+    }
+    judge(next, info)
+    current = next
+  }
+  if (realpath(spelled) !== current) throw refusal(refuse)
+  return { spelled, real: current, chain: [...judged.values()] }
 }
 
 // The chain that `checkedChain` judged is still the one the name reaches: the spelling still resolves to the same real path,
@@ -121,17 +148,14 @@ export function trustedFile(path, options = {}) {
   } catch (error) { throw classify(error, rule.refuse) }
 }
 
-// The links in a row that a caller which follows a socket's name accepts.
-export const MAX_LINK_HOPS = 8
-
 // { path, dev, ino }: the checked real path of the socket and its identity. The real path is the one that is measured against
 // MAX_SOCKET_PATH_BYTES: a short spelling that resolves to a long path is refused like a long spelling. With `follow` above 0 the
 // last name may be a symlink: it is read, and the name it holds (relative to the link's directory, or absolute) goes through the
 // same check, so the returned path is the socket at the end and the identity is that socket's.
 export function trustedSocket(path, options = {}) {
-  const { readlink = readlinkSync, follow = 0 } = options
+  const { follow = 0 } = options
   const rule = settings(options)
-  const { refuse, lstat, uid } = rule
+  const { refuse, lstat, readlink, uid } = rule
   // A socket is a file: a spelling that ends in a separator names a directory, and lstat of it fails where the connect
   // to the resolved name would not.
   if (typeof path !== "string" || path.endsWith("/")) throw refusal(refuse)
