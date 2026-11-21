@@ -793,6 +793,30 @@ test("a child or a changed provider found by a later read is refused by name", a
   })
 })
 
+// Only a provider that a record names shows a change. After a bind that fixed the provider, a read record with no provider,
+// an empty one or one that is not a string is no stale binding: the read goes on, and the resume record decides as it does
+// for any record (here complete: the thread is clear; incomplete: unknown).
+test("a read record whose provider is missing or invalid is no provider change", async () => {
+  for (const modelProvider of [undefined, "", 7, null]) {
+    const weak = thread()
+    if (modelProvider === undefined) delete weak.modelProvider
+    else weak.modelProvider = modelProvider
+    let record = thread()
+    let resumed = thread()
+    await withServer(main({
+      "thread/read": () => ok({ thread: record }),
+      "thread/resume": () => ok({ thread: resumed, collaborationMode: { mode: "default", settings: {} } }),
+    }), async path => {
+      const bound = createThread({ path, threadId: THREAD })
+      assert.deepEqual(await bound.bind(), { status: "bound" })
+      record = weak
+      assert.deepEqual(await bound.observe(), { reason: null, observed: { status: "idle", stopped: false, plan: false } }, String(modelProvider))
+      resumed = weak
+      assert.equal((await bound.observe()).reason, "unknown", `an incomplete resume record too: ${String(modelProvider)}`)
+    })
+  }
+})
+
 test("a server that cannot be reached, or that sends a malformed answer, is offline", async () => {
   const gone = createThread({ path: join(dir, "absent.sock"), threadId: THREAD })
   assert.equal((await gone.observe()).reason, "offline")

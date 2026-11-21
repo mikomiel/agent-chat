@@ -83,8 +83,9 @@ async function dispatch(name, { payload, config, where, io, deadline, now }) {
     : io.connect(where.socket))
   // A start and a turn name the process that runs this hook's command, Codex. A
   // session resumed in a new process reattaches to the old receiver, which must
-  // then watch the new one. An end names it too, so a late end from the old process
-  // does not end the receiver that the new one adopted.
+  // then watch the new one. An end names it only when /proc proved it, so a late end
+  // from the old process does not end the receiver that the new one adopted, and an end
+  // whose owner is a guess falls under the receiver's rule for an end with no owner.
   const owner = io.owner()
   // The hook's one deadline for a turn: the time to wait for the reply is what is left of it, and the receiver is given that
   // less the margin, so a reply that it sends in its time is one this hook is still there to write.
@@ -100,7 +101,10 @@ async function dispatch(name, { payload, config, where, io, deadline, now }) {
     case "tool": return turn("tool", "PostToolUse", await open(0))
     case "stop": return quiet(await open(0), { op: "stop", permission_mode: mode }, 3_500)
     case "interrupt": return quiet(await open(0), { op: "interrupt" }, 1_500)
-    default: return quiet(await open(0), { op: "end", owner_pid: owner }, 800)
+    default: {
+      const proven = io.provenOwner?.() ?? null
+      return quiet(await open(0), { op: "end", ...(Number.isInteger(proven) ? { owner_pid: proven } : {}) }, 800)
+    }
   }
 }
 
@@ -127,7 +131,10 @@ export async function runHook(name, io) {
 // The process that runs Codex. A hook command is a string, so Codex may run it through
 // a shell, and then this process's parent is that shell, which exits with the hook.
 // Skip up to two shells by reading /proc; where /proc is absent the parent is the answer.
-export function ownerOf(pid, read = path => readFileSync(path, "utf8")) {
+// With `proven`, only a process that /proc shows is not a shell is the answer, and every
+// fallback (no /proc, a shell with no parent, a third shell) is null.
+export function ownerOf(pid, read = path => readFileSync(path, "utf8"), { proven = false } = {}) {
+  const fallback = value => (proven ? null : value)
   let current = pid
   for (let hop = 0; hop < 2; hop += 1) {
     try {
@@ -135,11 +142,11 @@ export function ownerOf(pid, read = path => readFileSync(path, "utf8")) {
       const name = stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")"))
       if (!SHELLS.has(name)) return current
       const parent = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]) // field 4: index 0 is field 3
-      if (!Number.isInteger(parent) || parent <= 1) return current
+      if (!Number.isInteger(parent) || parent <= 1) return fallback(current)
       current = parent
-    } catch { return current }
+    } catch { return fallback(current) }
   }
-  return current
+  return fallback(current)
 }
 
 export function nodeIo() {
@@ -153,6 +160,7 @@ export function nodeIo() {
     env: process.env,
     connect,
     owner: () => ownerOf(process.ppid),
+    provenOwner: () => ownerOf(process.ppid, undefined, { proven: true }),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     now: () => performance.now(),
     write: text => new Promise(resolve => {

@@ -38,7 +38,7 @@ function world({ parentMode } = {}) {
 // happened before what.
 async function run(name, payload, {
   env, reply = { context: null }, up = true, writeOk = true, writeDelay = 0,
-  hang = false, owner = () => 100, sleep = never, now, connected,
+  hang = false, owner = () => 100, provenOwner = owner, sleep = never, now, connected,
 } = {}) {
   const w = world()
   const out = { stdout: [], started: [], calls: [], waits: [], sent: [], log: [], connects: 0 }
@@ -70,7 +70,7 @@ async function run(name, payload, {
       out.stdout.push(text)
       return writeOk
     },
-    owner, sleep, ...(now ? { now } : {}),
+    owner, provenOwner, sleep, ...(now ? { now } : {}),
   }
   try {
     out.code = await runHook(name, io)
@@ -170,6 +170,30 @@ test("the owner skips the shell that runs a hook command, and stops at anything 
   assert.equal(ownerOf(40, read), 40, "a program that is not a shell is the owner")
   assert.equal(ownerOf(61, read), 61, "a name with parentheses is read from the last one")
   assert.equal(ownerOf(99, read), 99, "an unreadable /proc leaves the parent")
+})
+
+// An end names its owner only when /proc proved it: a guessed owner (no /proc, a shell with no parent, a third shell) is null
+// there, and the end then names none, so the receiver's rule for an end with no owner applies. Start and turn are unchanged.
+test("the proven owner is null wherever the owner is a fallback, and the end then names no owner", async () => {
+  const table = {
+    50: "50 (sh) S 40 0", 40: "40 (codex) S 30 0", 60: "60 (bash) S 50 0", 70: "70 (sh) S 1 0",
+    80: "80 (sh) S 81 0", 81: "81 (sh) S 82 0", 82: "82 (sh) S 40 0",
+  }
+  const read = path => {
+    const text = table[Number(path.split("/")[2])]
+    if (text === undefined) throw new Error("gone")
+    return text
+  }
+  assert.equal(ownerOf(50, read, { proven: true }), 40, "a shell under Codex: proven")
+  assert.equal(ownerOf(40, read, { proven: true }), 40)
+  assert.equal(ownerOf(99, read, { proven: true }), null, "no /proc")
+  assert.equal(ownerOf(70, read, { proven: true }), null, "a shell with no parent")
+  assert.equal(ownerOf(80, read, { proven: true }), null, "a third shell")
+  assert.equal(ownerOf(99, read), 99, "the start and turn owner keeps its fallback")
+  const guessed = await run("session-end", { ...base, hook_event_name: "SessionEnd", reason: "other" }, { reply: { ok: true }, provenOwner: () => null })
+  assert.deepEqual(guessed.calls, [{ op: "end" }])
+  const start = await run("session-start", base, { provenOwner: () => null })
+  assert.equal(start.calls[0].owner_pid, 100, "a start still names its owner")
 })
 
 test("a mode Codex did not report is left out of the request, never guessed", async () => {

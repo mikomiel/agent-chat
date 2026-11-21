@@ -919,6 +919,41 @@ test("a late session end from a replaced owner leaves the receiver to the owner 
   assert.equal(r.worker.state.stops, 1)
 })
 
+// A late end is rejected before it counts as contact: it does not keep a receiver whose owner is gone inside the quiet window.
+test("a late session end from a replaced owner does not extend the quiet window", async () => {
+  let ownerAlive = true
+  const r = await rig({ alive: pid => pid !== 5151 || ownerAlive })
+  await r.op({ op: "start", wait_ms: 5000, owner_pid: 4242, permission_mode: "default" })
+  await r.op({ op: "start", wait_ms: 0, owner_pid: 5151, permission_mode: "default" }) // adopted
+  ownerAlive = false // the adopting process dies without a SessionEnd
+  await r.clock.advance(150_000)
+  const late = await r.op({ op: "end", owner_pid: 4242 })
+  assert.deepEqual(late.sent, [{ ok: true }])
+  await r.clock.advance(60_000) // 210 s after the last real contact
+  assert.equal(r.exitCode, 0, "the quiet window ran from the last real contact")
+})
+
+// A receipt for an announcement sent before a start is not kept: the start dropped the receipts, and a write it confirms may
+// be of text that the start's compaction removed.
+test("a receipt that lands after a start reset does not mark the binding announced", async () => {
+  const r = await rig()
+  await r.op({ op: "start", wait_ms: 5000 }, hookDouble({ events: r.events, answer: false })) // nothing confirmed yet
+  let land
+  const held = {
+    sent: [], closed: false, onClose() {}, close() {},
+    async send(value) { held.sent.push(value); return true },
+    next: () => new Promise(resolve => { land = () => resolve({ op: "done", outcome: "written" }) }),
+  }
+  const tool = r.op(turn({ event: "tool" }), held) // its announcement is in flight
+  await settle()
+  assert.match(held.sent[0]?.context ?? "", /Agent Chat is available/)
+  await r.op({ op: "start", wait_ms: 0 }, hookDouble({ events: r.events, answer: false })) // a compaction, not confirmed
+  land() // the old receipt lands as written
+  await tool
+  const next = await r.op(turn({ event: "tool" }))
+  assert.match(next.sent[0].context ?? "", /Agent Chat is available/, "the binding is still announced")
+})
+
 test("a receiver whose owner is gone and that nothing has contacted ends itself", async () => {
   let owner = true
   const r = await rig({ alive: () => owner })
@@ -1269,6 +1304,46 @@ test("a provider answer from a read that a hook event overtook is dropped: the t
   await settle()
   await r.clock.advance(30_000)
   assert.deepEqual(thread.calls, ["observe", "observe"], "still bound: the next tick reads, it does not bind")
+})
+
+// The real thread against a fake app-server: once the bind fixed the provider, a heartbeat read whose record names none is no
+// provider change. The thread stays bound, so the next tick reads again (a resume) instead of binding.
+test("a heartbeat read whose record has no provider does not unbind the thread", async () => {
+  const waitFor = async (check, what) => {
+    for (let waited = 0; !check() && waited < 3000; waited += 5) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(check(), `${what} never happened`)
+  }
+  const dir = mkdtempSync(join(tmpdir(), "acr-"))
+  const full = {
+    id: "session-1", parentThreadId: null, agentRole: null, ephemeral: false, source: "cli", modelProvider: "openai", status: { type: "idle" },
+  }
+  const { modelProvider: _dropped, ...bare } = full
+  let record = full
+  const answers = {
+    "thread/loaded/list": () => ({ result: { data: ["session-1"], nextCursor: null } }),
+    "thread/read": () => ({ result: { thread: record } }),
+    "thread/resume": () => ({ result: { thread: full, collaborationMode: { mode: "default", settings: {} } } }),
+    "thread/turns/list": () => ({ result: { data: [{ id: "t1", status: "completed" }], nextCursor: null } }),
+  }
+  const server = await fakeAppServer(join(dir, "s.sock"), message => answers[message.method]?.() ?? { error: { code: -32601, message: "no" } })
+  const resumes = () => server.methods().filter(method => method === "thread/resume").length
+  try {
+    const thread = Object.assign(createThread({ path: join(dir, "s.sock"), threadId: "session-1" }), { opened: [] })
+    const r = await rig({ thread })
+    await waitFor(() => r.worker.bootIds.length === 1, "the join")
+    await r.begin()
+    await r.op({ op: "stop", permission_mode: "default" })
+    record = bare
+    await r.clock.advance(30_000)
+    await waitFor(() => resumes() === 1 && server.state.open === 0, "the first read")
+    await settle()
+    await r.clock.advance(30_000)
+    await waitFor(() => resumes() === 2, "a second read, not a bind")
+    assert.notEqual(r.receiver.state(), "offline")
+  } finally {
+    await server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test("a changed provider leaves the thread unbound: the worker joins and hook delivery continues", async () => {

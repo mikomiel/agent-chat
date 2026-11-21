@@ -299,10 +299,13 @@ export function createThread({ path, threadId, open = openAppServer }) {
     return thread
   }
 
-  // Why a thread record is no longer the one that was bound: a child, or a provider that is not the bound one.
+  // Why a thread record is no longer the one that was bound: a child, or a provider that is not the bound one. Only a
+  // provider that the record names (a non-empty string) can show a change; a missing or invalid one shows nothing, and the
+  // record is judged as an incomplete one is.
   const refusing = record => {
     if (isChildThread(record)) return "child"
-    return provider !== null && record.modelProvider !== provider ? "stale_binding" : null
+    const named = typeof record.modelProvider === "string" && record.modelProvider !== ""
+    return provider !== null && named && record.modelProvider !== provider ? "stale_binding" : null
   }
 
   // A record that can show what the thread is: the origin, the `ephemeral` flag and a model provider, next to the id and a status.

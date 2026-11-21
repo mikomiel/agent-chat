@@ -72,6 +72,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let joined = null
   let bootId = null
   let announced = null // the boot id whose binding the model has been shown
+  let shown = 0 // counts the starts that dropped the earlier receipt; a receipt for text sent before the newest one is not kept
   let native = "unknown" // idle | busy | unknown: the running state from the last hook event
   let planHint = false // the last hook payload said permission_mode "plan"
   let stopped = false // an Interrupt hook ran; only the next UserPromptSubmit clears it
@@ -185,8 +186,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   const announcement = ({ always = false } = {}) => {
     const text = joined ? renderBinding(joined) : null
-    return text === null || (!always && announced === bootId) ? null : { text, boot: bootId }
+    return text === null || (!always && announced === bootId) ? null : { text, boot: bootId, shown }
   }
+  // A confirmed write of `announce` counts only while no start has dropped the receipts since it was made.
+  const confirm = announce => { if (announce.shown === shown) announced = announce.boot }
 
   function ask(operation, fields) {
     if (!live) return Promise.reject(Object.assign(new Error("CHAT_WORKER_CLOSED"), { code: "CHAT_WORKER_CLOSED", operation }))
@@ -397,7 +400,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
     if (isDone(done, "written")) {
-      if (announce) announced = announce.boot
+      if (announce) confirm(announce)
       return { result: { outcome: "handed", reason: null }, replied: true }
     }
     if (isDone(done, "refused")) return { result: NOT_WRITTEN, replied: true }
@@ -466,7 +469,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   async function announceOnly(link, announce) {
     await link.send({ context: announce.text, ack: true })
-    if (isDone(await link.next(2_000), "written")) announced = announce.boot
+    if (isDone(await link.next(2_000), "written")) confirm(announce)
   }
 
   const disabledReply = () => {
@@ -484,14 +487,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     void report()
     await within(attempted, clamp(request.wait_ms, 10_000))
     if (failure) return link.send(disabledReply())
-    // A start event always announces: a compaction or resume may have dropped the earlier text.
-    const announce = announcement({ always: true })
-    // The earlier receipt is for text this start may have dropped: until this write is confirmed, the next hook announces again.
+    // A start event always announces: a compaction or resume may have dropped the earlier text. The earlier receipt is for
+    // text this start may have dropped, and so is one still on its way: until this write is confirmed, the next hook
+    // announces again.
     announced = null
+    shown += 1
+    const announce = announcement({ always: true })
     const message = announce ? `Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.` : undefined
     if (!announce) return link.send({ context: null })
     await link.send({ context: announce.text, ack: true, message })
-    if (isDone(await link.next(2_000), "written")) announced = announce.boot
+    if (isDone(await link.next(2_000), "written")) confirm(announce)
   }
 
   // A hook event is newer than any app-server read, so it discards the read. Only a prompt clears a local stop.
@@ -536,11 +541,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return link.send({ ok: true })
   }
 
-  // An end from a process that another one has replaced (a resume adopted the new one) is late: the session goes on in the new
-  // process, so it changes nothing. An end that names no owner (a hook from before owner_pid) ends the receiver, as it did.
-  async function onEnd(request, link) {
+  async function onEnd(_request, link) {
     await link.send({ ok: true })
-    if (Number.isInteger(request.owner_pid) && request.owner_pid !== owner) return
     void shutdown()
   }
 
@@ -576,7 +578,13 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return current === null || current === ownerStart
   }
 
+  // An end from a process that another one has replaced (a resume adopted the new one) is late: the session goes on in the new
+  // process, so it changes nothing, not even the time of the last contact. An end that names no owner (a hook from before
+  // owner_pid, or one that could not prove its owner) ends the receiver.
+  const lateEnd = request => request.op === "end" && Number.isInteger(request.owner_pid) && request.owner_pid !== owner
+
   function handle(first, link) {
+    if (lateEnd(first)) return link.send({ ok: true })
     contact = now()
     if (closed) return link.send({ disabled: true })
     if (first.op !== "end") adoptOwner(first.owner_pid) // an end never moves the owner watch
