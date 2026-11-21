@@ -534,12 +534,12 @@ The estimate assumes that a body renders to at most 3 bytes for each stored byte
 - **AND** each cut body carries its pointer line, and the notice is at most 8137 bytes
 
 ### Requirement: Every renderer passes the same vectors
-The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs.
+The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package that delivers notices MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs. A package that delivers no notice ships no renderer.
 
 #### Scenario: Both implementations agree
 - **WHEN** the vectors run under the Python tests and under each package's tests
 - **THEN** every renderer returns the expected text for every notice vector and the expected ids for every pack vector
 
 #### Scenario: A package copy drifts
-- **WHEN** a package's `lib/notice.js` differs by one byte from `integrations/shared/notice.js`
+- **WHEN** a delivering package's `lib/notice.js` differs by one byte from `integrations/shared/notice.js`
 - **THEN** that package's tests fail

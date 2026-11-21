@@ -4,7 +4,10 @@ Turnkey integrations ship from this repository, next to the service and the
 adapter core. A package uses only its harness's public extension surface and
 the product's worker protocol; the Python core stays authoritative for join,
 heartbeat, poll, claim, settle, rejoin and binding replacement. A package
-supplies native eligibility, delivery, binding context and wake behavior.
+supplies native eligibility, delivery, binding context and wake behavior. The
+OpenCode package is the exception: it joins and keeps the binding in place, and
+it delivers nothing ([issue #148](https://github.com/mikomiel/agent-chat/issues/148)
+tracks delivery).
 
 ## Packages
 
@@ -13,9 +16,10 @@ supplies native eligibility, delivery, binding context and wake behavior.
 | Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
 | Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
+| OpenCode | [`opencode/`](opencode/) | Source present; live run pending. Join only: it delivers nothing |
 | Codex | — | Planned; follows the same pattern |
 
-OpenCode and Vibe are outside the initial admission set.
+Vibe is outside the initial admission set.
 
 ## Compatibility
 
@@ -26,15 +30,17 @@ implied by a nearby version.
 An integration release is tested only with the core of the same version: both
 ship at the product version, and a package at one release with a core at
 another is an untested combination. A row therefore names the package version
-and the core version it was run with in its Evidence cell. The rows below were recorded before
-the packages shared the product version. They name the package at `0.1.0`, and
-the core they ran with is not recorded.
+and the core version it was run with in its Evidence cell. The Pi and DeepSeek
+rows below were recorded before the packages shared the product version. They
+name the package at `0.1.0`, and the core they ran with is not recorded. The
+OpenCode row records no run, so no core version applies.
 
 | Package | Harness surface | Verified release | Evidence |
 |---|---|---|---|
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | eligibility: `ctx.agents.get` and the session header `origin`, plus `roots()` and `isOwnedBy()` where the registry has them | `NOT RUN` on `0.2.2-rc.5` | No run. The published type declarations were compared; nothing was executed. `@deepseek-ai/dsh-agent` `0.2.2-rc.1` declares `AgentRegistry.roots()`, `AgentRegistry.isOwnedBy(id, owner)` and `CreateAgentOptions.parentAgent`. `0.2.2-rc.2` to `0.2.2-rc.5` declare none of them, and `enter(agent)` takes no owner; `get(id)` and `list()` remain. In `0.2.2-rc.5` the host's own subagent test is `session.header.origin === 'subagent'`, and the subagent child factory sets that value. The package reads which registry surface it finds and uses that header test where `roots()` and `isOwnedBy()` are both absent; a registry with only one of them refuses every agent. |
+| `agent-chat-opencode` 0.8.0 | OpenCode server plugin, join only: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.created`, `session.execution.started`, `session.forked`, `session.deleted`, `session.compaction.started`/`ended`/`failed` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
@@ -85,14 +91,15 @@ tracks live-harness CI, the Claude Code live run and the Codex package.
 
 ## Notice contract
 
-With `noticeBodies: true`, a peer's message body is written into the model's context. Every package renders it with
-one contract, so the body stays recognizable as untrusted peer data. The contract has two implementations that pass
+With `noticeBodies: true`, a peer's message body is written into the model's context. Every package that delivers a
+notice renders it with one contract, so the body stays recognizable as untrusted peer data. The OpenCode package
+delivers nothing and has no notice. The contract has two implementations that pass
 the same vectors in [`notice-vectors.json`](notice-vectors.json): the Python reference
 [`agent_chat/notice.py`](../agent_chat/notice.py) and the dependency-free JavaScript module
 [`shared/notice.js`](shared/notice.js). A package keeps no dependency and reads nothing outside its own directory
-at run time, so each one ships a byte-identical copy as `lib/notice.js`. A test in each package fails when its copy
-differs from the shared source.
-After you edit `shared/notice.js`, copy it over all three. The normative text is the notice requirements in
+at run time, so each delivering package ships a byte-identical copy as `lib/notice.js`. A test in each of them fails
+when its copy differs from the shared source.
+After you edit `shared/notice.js`, copy it over each `lib/notice.js`. The normative text is the notice requirements in
 [`openspec/specs/chat-clients/spec.md`](../openspec/specs/chat-clients/spec.md).
 
 In bodies mode, a notice has:
@@ -197,13 +204,14 @@ package is covered when its directory appears.
 | Pi | `AGENT_CHAT_PI_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 | DeepSeek Harness | `AGENT_CHAT_DEEPSEEK_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 | Claude Code | `AGENT_CHAT_CLAUDE_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
+| OpenCode | `AGENT_CHAT_OPENCODE_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 
 The variable names the private `0600` config file. `AGENT_CHAT_DELEGATED_CHILD=1`
 keeps a harness process that a session starts on purpose from joining chat.
 
 `tests/test_release_artifacts.py` pins this rule for every directory under
-`integrations/` except `shared/`, which holds the notice source each package
-copies into its own `lib/` and is never packed alone. `scripts/check_release_artifacts.py` packs the directories and
+`integrations/` except `shared/`, which holds the notice source that the
+delivering packages copy into their own `lib/` and is never packed alone. `scripts/check_release_artifacts.py` packs the directories and
 checks the built artifacts. The pack step refuses a link or special file in a
 package directory, and the output directory must hold no link. The checks:
 
@@ -242,7 +250,7 @@ release.
    that its config file names in `python`, so point `python` at an interpreter
    that has this version installed.
 2. **Download, verify and extract the tarball** of the harness (`pi`,
-   `deepseek` or `claude-code`) in one block. The block needs `bash`, `curl`,
+   `deepseek`, `claude-code` or `opencode`) in one block. The block needs `bash`, `curl`,
    `tar` and GNU coreutils `sha256sum`. macOS has no GNU `sha256sum`: install
    coreutils with Homebrew (`brew install coreutils`) and put its `gnubin`
    directory first on `PATH` in the shell that runs the block:
@@ -298,6 +306,7 @@ release.
 | Claude Code | tag `v<version>`, or `agent-chat-claude-code-<version>.tgz` | `claude plugin marketplace add mikomiel/agent-chat#v<version>`, then `claude plugin install agent-chat@agent-chat`. Offline: extract the tarball and run `claude --plugin-dir <extracted-dir>`. |
 | Pi | `agent-chat-pi-<version>.tgz` | `pi install <absolute-extracted-dir>`. Pi loads a local path in place, without copying it. |
 | DeepSeek Harness | `agent-chat-deepseek-<version>.tgz` | Set the `name` of the Cordis `insert` row to `<absolute-extracted-dir>/extensions/agent-chat.js`. See the [package README](deepseek/README.md#install). |
+| OpenCode | `agent-chat-opencode-<version>.tgz` | Put `<absolute-extracted-dir>` in `plugins` in a global `opencode.jsonc`. See the [package README](opencode/README.md#install). |
 
 Claude Code installs by tag through the repository's `.claude-plugin/marketplace.json`.
 `claude plugin marketplace add owner/repo#<ref>` pins the catalog to a ref, so
@@ -330,5 +339,10 @@ node --test
 
 ```sh
 cd integrations/claude-code
+node --test
+```
+
+```sh
+cd integrations/opencode
 node --test
 ```
