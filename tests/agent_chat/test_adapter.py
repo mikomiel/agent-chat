@@ -276,6 +276,7 @@ def test_stop_discards_the_record_even_when_the_end_fails(tmp_path, error):
 
     def failing_end(instance, *, deadline=None):
         operations.ends += 1
+        assert not path.exists()  # the record went before the end call, so a kill during it leaves nothing usable
         raise error
 
     operations.end = failing_end

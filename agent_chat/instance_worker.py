@@ -94,11 +94,13 @@ def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
 
 
 def _end(instance: instance_client.JoinedInstance, directory: Path) -> dict[str, Any]:
-    """End this binding and drop its record, even when the end fails: the server lease then ends the instance."""
-    try:
-        return instance_client.end(instance)
-    finally:
-        instance_file.discard_instance(directory, instance.binding.boot_id)
+    """Drop this binding's record, then end it.
+
+    The record goes first, so nothing local can use the binding while the end is in flight, or after an end that fails
+    or is cut short by a kill; the server lease then ends the instance. The end uses the credential held in memory.
+    """
+    instance_file.discard_instance(directory, instance.binding.boot_id)
+    return instance_client.end(instance)
 
 
 def _asks_bodies(request: dict[str, Any]) -> bool:

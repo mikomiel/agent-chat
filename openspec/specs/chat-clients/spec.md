@@ -352,7 +352,7 @@ The CLI MUST let `reply MESSAGE` without `--key`, and `ack MESSAGE`, work from t
 - **THEN** the service refuses the call and no reply is stored
 
 ### Requirement: The adapter joins, heartbeats and ends one instance
-The adapter MUST join only when `enabled` is true and the harness is `pi`, `codex`, `claude`, `deepseek` or `opencode`, MUST persist the binding secret first and then register with the agent credential and only the digest of that secret, and MUST heartbeat every 30 seconds by default. It MUST treat a join response that does not name exactly the session, instance, room, host and harness as `REQUEST_UNCERTAIN`. On stop it MUST end the instance it holds and discard that instance's binding file.
+The adapter MUST join only when `enabled` is true and the harness is `pi`, `codex`, `claude`, `deepseek` or `opencode`, MUST persist the binding secret first and then register with the agent credential and only the digest of that secret, and MUST heartbeat every 30 seconds by default. It MUST treat a join response that does not name exactly the session, instance, room, host and harness as `REQUEST_UNCERTAIN`. On stop it MUST discard the held instance's binding file, then end the instance.
 
 #### Scenario: Join and heartbeat
 - **WHEN** an enabled adapter starts for a native session
@@ -365,7 +365,8 @@ The adapter MUST join only when `enabled` is true and the harness is `pi`, `code
 
 #### Scenario: Stop with the end call failing
 - **WHEN** the adapter stops and the end call fails
-- **THEN** it keeps the binding file, and the server's 90-second lease ends the instance
+- **THEN** the binding file is already gone, because it was discarded before the end call, so no local caller can use the binding
+- **AND** the server's 90-second lease ends the instance
 
 #### Scenario: Stop without a joined instance
 - **WHEN** the adapter stops while it waits to rejoin, after it failed terminally or after a join that did not complete

@@ -182,11 +182,12 @@ class Adapter:
         self.delivery.context(None)
         if joined is None:
             return
+        # The record goes first, so nothing local can use the binding while the end is in flight or after it fails.
+        instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
         try:
             self.operations.end(joined, deadline=self._request_deadline())
         except (ChatError, OSError):
-            pass  # The server lease ends the instance; the record goes either way, so nothing local can use it.
-        instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
+            pass  # The server lease ends the instance.
 
     def tick(self, now: float | None = None) -> float | None:
         """Run one due heartbeat, poll or join attempt; return the next deadline."""
