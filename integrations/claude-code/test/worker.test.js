@@ -1,4 +1,4 @@
-import test, { mock } from "node:test"
+import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
@@ -117,15 +117,30 @@ test("closing the worker ends its stdin and settles the request in flight as unc
   assert.deepEqual(await stopping, { code: 0, signal: null })
 })
 
+// The node:test timer mock needs Node 20.11, and the package supports 20.0. This stub records each timer, fires one on demand
+// and restores the originals when the test ends, so a failing test cannot leak it.
+function stubTimeouts(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  return {
+    fire(ms) {
+      for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() }
+    },
+  }
+}
+
 test("a request that outlives the parent-side deadline rejects with the core's REQUEST_UNCERTAIN", async t => {
-  mock.timers.enable({ apis: ["setTimeout"] })
-  t.after(() => mock.timers.reset())
+  const clock = stubTimeouts(t)
   const { child } = harness()
   const worker = startWorker(config, identity, { spawnImpl: () => child })
   child.stdout.write(`${JSON.stringify({ id: 0, result: joinedRecord })}\n`)
   await worker.ready
   const heartbeat = worker.request("heartbeat", { state: { native_state: "idle", stopped: false, plan_mode: false } })
-  mock.timers.tick(22_000)
+  clock.fire(22_000)
   await assert.rejects(heartbeat, { code: "REQUEST_UNCERTAIN", operation: "heartbeat" })
 })
 

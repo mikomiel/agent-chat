@@ -1,4 +1,4 @@
-import test, { mock } from "node:test"
+import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
@@ -496,12 +496,25 @@ const stdioChild = () => {
   return child
 }
 
+// The node:test timer mock needs Node 20.11, and the package supports 20.0. This stub records each timer, fires one on demand
+// and restores the originals when the test ends, so a failing test cannot leak it.
+function stubTimeouts(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  return {
+    fire(ms) {
+      for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() }
+    },
+  }
+}
+
 test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
-  mock.timers.enable({ apis: ["setTimeout"] })
-  t.after(() => {
-    mock.timers.reset()
-    delete globalThis[Symbol.for("agent-chat.pi.disabled")] // a disable would otherwise leak into later tests
-  })
+  const clock = stubTimeouts(t)
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] }) // a disable would otherwise leak into later tests
   const children = []
   const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
   const retries = []
@@ -519,7 +532,7 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   await flush()
   children[0].stdout.write(`${JSON.stringify({ id: 0, result: joined })}\n`)
   await flush() // joined and bound; the first heartbeat is written and never answered
-  mock.timers.tick(22_000)
+  clock.fire(22_000)
   await flush()
   assert.doesNotMatch(notices.join("\n"), /stopped/, "not a permanent disable")
   assert.match(notices.join("\n"), /reconnecting/)
@@ -529,4 +542,14 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   retries[0].fn()
   await flush()
   assert.equal(children.length, 2, "a fresh worker joins after the back-off")
+  const rejoined = {
+    ...joined, session_id: "99999999-9999-4999-8999-999999999999", instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instance_file: "/tmp/agent-chat-state/boot-2.json",
+  }
+  children[1].stdout.write(`${JSON.stringify({ id: 0, result: rejoined })}\n`)
+  await flush()
+  assert.match(notices.join("\n"), new RegExp(`joined as ${rejoined.session_id}`))
+  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/, "the new binding is published")
+  assert.doesNotMatch(lifecycle.binding(), /boot-1\.json/)
+  assert.notEqual(lifecycle.state(), "offline")
 })
