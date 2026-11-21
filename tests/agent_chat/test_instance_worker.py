@@ -153,6 +153,20 @@ def test_end_drops_the_record_before_the_end_request(monkeypatch: pytest.MonkeyP
     assert calls == ["discard", "end"]
 
 
+def test_a_deadline_during_the_removal_propagates_and_sends_no_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    ends: list[object] = []
+
+    def discard(directory, boot_id):
+        raise TimeoutError("worker interrupted")
+
+    monkeypatch.setattr(instance_worker.instance_file, "discard_instance", discard)
+    monkeypatch.setattr(instance_worker.instance_client, "end", ends.append)
+    instance = type("Joined", (), {"binding": type("Binding", (), {"boot_id": uuid4()})()})()
+    with pytest.raises(TimeoutError):
+        instance_worker._end(instance, Path("/nonexistent"))
+    assert ends == []  # the caller's fallback end runs under a fresh deadline
+
+
 def test_worker_start_sweeps_only_long_untouched_records_and_never_uses_the_network(join_frame, db):
     directory = Path(join_frame["directory"])
     with socket.socket() as watched:

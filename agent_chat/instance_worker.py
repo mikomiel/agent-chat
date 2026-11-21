@@ -96,9 +96,11 @@ def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
 def _end(instance: instance_client.JoinedInstance, directory: Path) -> dict[str, Any]:
     """Drop this binding's record, then end it.
 
-    The record goes first, so a new open of its path finds nothing while the end is in flight, or after an end that
-    fails or is cut short by a kill; the server lease then ends the instance. A caller that already holds the file
-    open or has read the credential keeps it until that lease ends. The end uses the credential held in memory.
+    The record goes first. Once its removal succeeds, a new open of its path finds nothing while the end is in
+    flight, or after an end that fails or is cut short by a kill; the instance then ends when no heartbeat renews its
+    server lease. Removal is best effort. A caller that already holds the file open or has read the credential can
+    still use it, and its heartbeats renew the lease. A deadline that expires during the removal propagates, so the
+    caller's fallback end runs under a fresh deadline. The end uses the credential held in memory.
     """
     instance_file.discard_instance(directory, instance.binding.boot_id)
     return instance_client.end(instance)

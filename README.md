@@ -172,10 +172,12 @@ per hour. A join that meets `BINDING_CONFLICT` waits for the previous lease.
 Any other code fails closed. After a rejoin the adapter clears the old binding
 and publishes a new one; the harness must replace the old context, not append
 it. `stop()` removes the binding's record and then ends the binding, even when
-the harness's context callback fails. The record goes before the callback and
-the end request, so a new open of its path finds nothing. Removal is best
-effort, and a command that already opened or read the record keeps the
-credential; when the end fails, the server lease ends the instance. Sender receipts are not
+the removal or the harness's context callback fails. The record goes before
+the callback and the end request; once it is removed, a new open of its path
+finds nothing. Removal is best effort. A command that already opened or read
+the record can still use the credential, and its heartbeats renew the lease.
+When the end fails, the instance ends once no heartbeat renews its server
+lease. Sender receipts are not
 part of this core yet; `instance_client.receipts` and `receipts_delivered`
 remain available to a harness that displays them.
 

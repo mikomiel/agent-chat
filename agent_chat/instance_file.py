@@ -145,17 +145,21 @@ def prepare_instance(directory: Path, native_session_id: str, boot_id: UUID, *, 
 
 
 def discard_instance(directory: Path, boot_id: UUID) -> None:
-    """Best effort: drop one record whose instance is over. A failure leaves the file; never raises."""
+    """Best effort: drop one record whose instance is over. A failure leaves the file and is not raised.
+
+    A `TimeoutError` is raised: the worker's request deadline arrives as one, and swallowing it would leave the
+    next request without a deadline.
+    """
     try:
         directory_fd = _directory(directory)
+        try:
+            os.unlink(f"{boot_id}.json", dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+    except TimeoutError:
+        raise
     except (OSError, ChatError):
-        return
-    try:
-        os.unlink(f"{boot_id}.json", dir_fd=directory_fd)
-    except OSError:
         pass
-    finally:
-        os.close(directory_fd)
 
 
 def touch_instance(directory: Path, boot_id: UUID) -> None:

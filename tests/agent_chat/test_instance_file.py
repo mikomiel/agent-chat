@@ -179,6 +179,28 @@ def test_sweep_survives_a_failing_directory_listing_or_close(tmp_path, monkeypat
     assert instance_file.sweep_stale(tmp_path, uuid4()) == 1 and not stale.exists()
 
 
+def test_discard_raises_a_deadline_but_no_other_filesystem_error(tmp_path, monkeypatch):
+    boot_id = uuid4()
+    prepare_instance(tmp_path, "native", boot_id, server_origin="http://127.0.0.1:1")
+    real_close = os.close
+
+    def failing_close(fd):
+        real_close(fd)
+        raise OSError(errno.EBADF, "close failed")
+
+    monkeypatch.setattr(instance_file.os, "close", failing_close)
+    instance_file.discard_instance(tmp_path, boot_id)  # a close failure is not raised
+    assert not (tmp_path / f"{boot_id}.json").exists()
+    monkeypatch.setattr(instance_file.os, "close", real_close)
+
+    def interrupted(*args, **kwargs):
+        raise TimeoutError("worker interrupted")
+
+    monkeypatch.setattr(instance_file.os, "unlink", interrupted)
+    with pytest.raises(TimeoutError):
+        instance_file.discard_instance(tmp_path, uuid4())
+
+
 def test_touch_advances_only_the_own_record_and_never_follows_a_link(tmp_path):
     first = prepare_instance(tmp_path, "a", uuid4(), server_origin="https://chat.test")
     second = prepare_instance(tmp_path, "b", uuid4(), server_origin="https://chat.test")

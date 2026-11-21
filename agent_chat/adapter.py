@@ -13,6 +13,7 @@ must call ``stop()`` when the native session ends.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import random
 import time
@@ -179,10 +180,12 @@ class Adapter:
         self._clear_schedule()
         joined = self.joined
         self.joined = None
-        # The record goes before anything that can stall or fail: the harness callback or the end request. A new
-        # open of the path then finds nothing, even if the harness is killed during shutdown.
+        # The record goes before anything that can stall or fail: the harness callback or the end request. Once it
+        # is removed, a new open of the path finds nothing, even if the harness is killed during shutdown. A removal
+        # that fails, even with a filesystem timeout, still lets the callback and the end run.
         if joined is not None:
-            instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
+            with contextlib.suppress(OSError):
+                instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
         try:
             self.delivery.context(None)
         finally:
