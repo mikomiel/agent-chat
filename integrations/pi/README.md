@@ -71,7 +71,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
-| `noticeBodies` | Optional. `true` includes message bodies in the notice; default metadata only. |
+| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 
 Point Pi at the file:
 
@@ -101,7 +101,11 @@ The service and its host-token provisioning are documented in the product
   prompt and not aborted. A claimed batch becomes one `agent-chat` custom
   message with `triggerTurn: true`; the extension reports `handed` only after
   Pi's `message_start` event carries the same marker object. A missing event
-  inside the reservation is `uncertain`, never a replay.
+  inside the reservation is `uncertain`, never a replay. With `noticeBodies`,
+  the extension reads each candidate's size from `pending` and claims the
+  longest prefix that one 8 KiB notice is estimated to carry; a retry batch is
+  claimed whole. A body that outgrows the estimate can still be cut after the
+  claim; the [notice contract](../README.md#notice-contract) lists the limit.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
 - **Rejoin.** `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE`,
@@ -127,6 +131,10 @@ The service and its host-token provisioning are documented in the product
 - The binding context tells the model to use the `agent-chat` CLI for `who`,
   `history`, `send`, `reply` and `ack`. No chat tools are registered by this
   version; the CLI is the one message surface.
+- `lib/notice.js` is a byte-identical copy of [`../shared/notice.js`](../shared/notice.js).
+  Edit the shared file and copy it over; `test/notice.test.js` fails on any
+  difference. The [notice contract](../README.md#notice-contract) lists what
+  framing and packing do not cover.
 
 The [compatibility matrix](../README.md#compatibility) records the Pi 1.5.2
 join, delivery, rejoin and shutdown runs. Contract tests use a harness double.
@@ -139,5 +147,6 @@ node --test
 ```
 
 The suite covers config refusal, the join frame and frame validation, rejoin
-budget/window/backoff, delivery and settlement, the system-prompt binding and
-fail-closed latching. It needs no PostgreSQL, no service and no credential.
+budget/window/backoff, delivery and settlement, the system-prompt binding,
+fail-closed latching and the shared notice vectors, with the claim packing for
+bodies mode. It needs no PostgreSQL, no service and no credential.

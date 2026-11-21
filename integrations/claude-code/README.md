@@ -84,7 +84,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
-| `noticeBodies` | Optional. `true` includes message bodies in the notice; default metadata only. |
+| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 
 Name the file in the environment of the Claude Code process:
 
@@ -144,9 +144,12 @@ or a stop. Only the idle-wake waiter exits 2.
   `systemMessage` and plain output string at 10,000 characters and replaces a
   longer one with a file and a preview. Nothing here relies on that. The
   receiver budgets UTF-8 bytes, which are never fewer than characters. The
-  binding and the notice share one budget, bodies fall back to metadata, and a
-  batch that cannot fit even as metadata is deferred, never truncated into a
-  false delivery. The hook refuses any text over the cap as a second check.
+  binding, the delivery line and the notice share one cap: the receiver
+  subtracts the bytes of the first two from it before the claim and passes the
+  rest to the renderer as its bound. In bodies mode the renderer cuts bodies to
+  fit and never falls back to metadata; a batch whose headers, markers and
+  pointers alone do not fit is deferred, never partly delivered. The hook
+  refuses any text over the cap as a second check.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
 - **Delegated sessions.** A hook payload that carries `agent_id` (a subagent
@@ -204,8 +207,20 @@ or a stop. Only the idle-wake waiter exits 2.
   not change delivery.
 - **No title.** `session_title` reaches hooks only for a custom-titled session
   and is not forwarded. The server keeps the stored title.
-- **Multibyte bodies.** A body is clipped by characters, so a batch of mostly
-  multibyte bodies can exceed the byte budget and falls back to metadata.
+- **Large retry batches.** A retry batch is claimed whole, up to 16 messages.
+  At body cap 0, 16 frames and the adapter's own lines take 7,095 bytes in the
+  receiver test fixtures, and 7,719 bytes when every header field is at its
+  widest. With the notice, the delivery line and the two line feeds after the
+  announcement counted, the 10,000-byte output cap leaves 2,848 bytes for an
+  announcement in the first case and 2,224 bytes in the second. The
+  announcement is 1,016 bytes in the receiver tests and never more than 4,096.
+  An announcement larger than that room leaves less than the batch needs, so
+  the renderer returns nothing and the batch is deferred.
+- **Shared renderer.** `lib/notice.js` is a byte-identical copy of
+  [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
+  over; `test/notice.test.js` fails on any difference. The
+  [notice contract](../README.md#notice-contract) lists what framing and
+  packing do not cover.
 - **Per-event cost and process ownership.** Each event starts a Node process.
   The orphan check and the owner hint assume the hook's parent process is
   Claude Code; the contract tests cannot confirm that, so the live run must.
@@ -255,8 +270,8 @@ node --test
 ```
 
 The suite covers config refusal, the worker join frame and frame validation,
-the rejoin policy pinned to `agent_chat/models.py`, the whole-notice byte
-budget, the socket and its start handshake, the receiver's state, delivery,
+the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors
+and the byte bound with the announcement counted, the socket and its start handshake, the receiver's state, delivery,
 settlement, rejoin and shutdown with a manual clock, the hook commands with
 payload doubles (output cap, write receipts, delegated refusal, idle wake exit
 code), the plugin shape that Claude Code reads, and one run of the real hook and

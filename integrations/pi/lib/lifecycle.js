@@ -5,7 +5,8 @@
 // authorization.
 import { randomUUID } from "node:crypto"
 import { loadConfig, PI_CHAT_CONFIG_ENV } from "./config.js"
-import { renderNotice, CHAT_PREFIX, MAX_CONTEXT_BYTES } from "./notice.js"
+import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "./channel.js"
+import { packCandidates, renderNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
 import { describeFailure, startWorker } from "./worker.js"
 
@@ -258,7 +259,8 @@ export function createAgentChat(pi, config, {
   }
 
   async function pollOnce() {
-    const candidates = await request("pending", config.noticeBodies === true ? { bodies: true } : {})
+    const bodies = config.noticeBodies === true
+    const candidates = await request("pending", bodies ? { bodies: true } : {})
     if (!live) return
     const refusal = refused(candidates)
     if (refusal) {
@@ -268,11 +270,16 @@ export function createAgentChat(pi, config, {
     const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
     if (!ids.length) return
     if (chatState() !== null) return
+    // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply without
+    // sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
+    const claimIds = bodies
+      ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound: NOTICE_BOUND })
+      : ids
     const started = now()
     const grant = await request("claim", {
       key: randomUUID(),
-      messages: ids,
-      ...(config.noticeBodies === true ? { bodies: true } : {}),
+      messages: claimIds,
+      ...(bodies ? { bodies: true } : {}),
     })
     if (!live) return
     const claimRefusal = refused(grant)
@@ -297,7 +304,9 @@ export function createAgentChat(pi, config, {
         // reservation is uncertain, never a retryable native failure.
         result = { outcome: "uncertain", reason: "transport_ambiguous" }
       } else {
-        const content = renderNotice(joined, config.python, grant.messages ?? [], { bodies: config.noticeBodies === true })
+        const content = renderNotice(joined, config.python, grant.messages ?? [], {
+          bodies, bound: NOTICE_BOUND, admittedAt: grant.admitted_at,
+        })
         result = content === null
           ? { outcome: "deferred", reason: "offline" }
           : await sendNative(content, grant.attempt_id, started + Number(grant.reservation_ms))

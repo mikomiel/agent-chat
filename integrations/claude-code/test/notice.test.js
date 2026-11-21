@@ -1,6 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { CHAT_PREFIX, MAX_OUTPUT_BYTES, renderNotice } from "../lib/notice.js"
+import * as notice from "../lib/notice.js"
+import { CHAT_PREFIX, MAX_OUTPUT_BYTES } from "../lib/channel.js"
+import { runNoticeSuite } from "../../shared/notice-suite.mjs"
+
+const { renderNotice } = notice
+
+// The vectors, the property, budget and pack tests, and the copy check are shared by every package.
+runNoticeSuite("claude-code", notice, new URL("../lib/notice.js", import.meta.url))
 
 const joined = {
   session_id: "11111111-1111-4111-8111-111111111111",
@@ -19,55 +26,70 @@ const row = index => ({
   sender_session_id: "peer-1",
   created_at: "2026-01-01T00:00:00Z",
 })
-const size = notice => Buffer.byteLength(CHAT_PREFIX + notice, "utf8")
+// A message as `claim` returns it in bodies mode: the core's field set, a canonical id and a numeric cursor.
+const bodyRow = (index, body = "synthetic body") => ({
+  id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
+  kind: "question",
+  room_id: joined.room_id,
+  history_after: String(100 + index),
+  body,
+  body_truncated: false,
+  sender_session_id: "66666666-6666-4666-8666-666666666666",
+  sender_principal_id: "77777777-7777-4777-8777-777777777777",
+  created_at: "2026-01-01T00:00:00+00:00",
+  thread_id: "88888888-8888-4888-8888-888888888888",
+})
+const ADMITTED = "2026-01-01T00:00:42+00:00"
+const bytes = text => Buffer.byteLength(text, "utf8")
+const size = text => bytes(CHAT_PREFIX + text)
+// What the receiver passes with no announcement in front: the cap minus the delivery line.
+const BOUND = MAX_OUTPUT_BYTES - bytes(CHAT_PREFIX)
+const bodies = (rows, options = {}) =>
+  renderNotice(joined, "/usr/bin/python3", rows, { bodies: true, bound: BOUND, admittedAt: ADMITTED, ...options })
 
 test("the cap is the documented 10,000 characters", () => {
   assert.equal(MAX_OUTPUT_BYTES, 10_000)
 })
 
 test("metadata mode carries ids and cursors, never bodies or senders", () => {
-  const notice = renderNotice(joined, "/usr/bin/python3", [row(0)])
-  assert.ok(notice)
-  assert.match(notice, /Process every item/)
-  assert.match(notice, /"history_after":"history-cursor-0"/)
-  assert.match(notice, /"room_id":"33333333-3333-4333-8333-333333333333"/)
-  assert.doesNotMatch(notice, /synthetic body/)
-  assert.doesNotMatch(notice, /sender_session_id/)
+  const text = renderNotice(joined, "/usr/bin/python3", [row(0)], { bound: BOUND })
+  assert.ok(text)
+  assert.match(text, /Process every item/)
+  assert.match(text, /"history_after":"history-cursor-0"/)
+  assert.match(text, /"room_id":"33333333-3333-4333-8333-333333333333"/)
+  assert.doesNotMatch(text, /synthetic body/)
+  assert.doesNotMatch(text, /sender_session_id/)
 })
 
-test("bodies mode carries the body and the sender field", () => {
-  const notice = renderNotice(joined, "/usr/bin/python3", [row(0)], { bodies: true })
-  assert.match(notice, /synthetic body/)
-  assert.match(notice, /"sender_session_id":"peer-1"/)
+test("bodies mode frames the body and names the sender in the message header", () => {
+  const text = bodies([bodyRow(1)], { nonce: "0123456789abcdef" })
+  assert.match(text, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question room 33333333-3333-4333-8333-333333333333 from session 66666666-6666-4666-8666-666666666666 /m)
+  assert.match(text, /^<<<AGENT-CHAT-BODY 0123456789abcdef\n> synthetic body\nAGENT-CHAT-BODY 0123456789abcdef>>>$/m)
+  assert.doesNotMatch(text, /sender_session_id/)
 })
 
 test("an empty batch renders nothing", () => {
-  assert.equal(renderNotice(joined, "/usr/bin/python3", []), null)
+  assert.equal(renderNotice(joined, "/usr/bin/python3", [], { bound: BOUND }), null)
 })
 
-const wide = (index, cursor) => ({
-  ...row(index),
-  history_after: `cursor-${String(index).padStart(2, "0")}-${"c".repeat(cursor)}`,
-  body: "b".repeat(1200),
+test("a maximum batch has no metadata fallback: every message keeps its frame inside the same whole-notice cap", () => {
+  const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "b".repeat(1200)))
+  const text = bodies(rows)
+  assert.ok(text)
+  assert.ok(size(text) <= MAX_OUTPUT_BYTES)
+  for (const item of rows) assert.ok(text.includes(`message ${item.id} kind question`))
+  assert.doesNotMatch(text, /"history_after"/)
+  assert.match(text, /^Body cut\. Read all of it with: history --room /m)
 })
 
-test("a maximum batch falls back to metadata inside the same whole-notice budget", () => {
-  // Cursors this long leave the bodies no room to share the 10,000-byte budget,
-  // so the notice must fall back to metadata instead of deferring the batch.
-  const rows = Array.from({ length: 16 }, (_, index) => wide(index, 300))
-  const notice = renderNotice(joined, "/usr/bin/python3", rows, { bodies: true })
-  assert.ok(notice)
-  assert.ok(size(notice) <= MAX_OUTPUT_BYTES)
-  assert.match(notice, /"history_after":"cursor-15-/)
-  assert.doesNotMatch(notice, /bbbb/)
-})
-
-test("bodies share what is left of the budget before the metadata fallback", () => {
-  const rows = Array.from({ length: 16 }, (_, index) => wide(index, 220))
-  const notice = renderNotice(joined, "/usr/bin/python3", rows, { bodies: true })
-  assert.ok(size(notice) <= MAX_OUTPUT_BYTES)
-  assert.match(notice, /--- message-15 from peer-1 ---\nb+…/)
-  assert.doesNotMatch(notice, /b{200}/)
+test("bodies share what is left of the bound: one halved cap for every body", () => {
+  const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "b".repeat(1200)))
+  const text = bodies(rows)
+  assert.ok(size(text) <= MAX_OUTPUT_BYTES)
+  const runs = text.split("\n").filter(line => line.startsWith("> b")).map(line => line.length - 2)
+  assert.equal(runs.length, 16)
+  assert.equal(new Set(runs).size, 1, "every body is cut to the same length")
+  assert.ok([1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1].includes(runs[0]), `${runs[0]} is a halving of 4096`)
 })
 
 test("a batch whose metadata alone does not fit renders nothing", () => {
@@ -75,32 +97,31 @@ test("a batch whose metadata alone does not fit renders nothing", () => {
     ...row(index),
     history_after: `${index}-${"c".repeat(600)}`,
   }))
-  assert.equal(renderNotice(joined, "/usr/bin/python3", rows), null)
+  assert.equal(renderNotice(joined, "/usr/bin/python3", rows, { bound: BOUND }), null)
 })
 
 test("the budget is bytes, so multi-byte bodies never push the notice over the cap", () => {
   // Each body is 1200 characters but 3600 bytes; a character count would let 16 of them through.
-  const rows = Array.from({ length: 16 }, (_, index) => ({ ...row(index), body: "€".repeat(1200) }))
-  const notice = renderNotice(joined, "/usr/bin/python3", rows, { bodies: true })
-  assert.ok(notice)
-  assert.ok(size(notice) <= MAX_OUTPUT_BYTES)
+  const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "€".repeat(1200)))
+  const text = bodies(rows)
+  assert.ok(text)
+  assert.ok(size(text) <= MAX_OUTPUT_BYTES)
 })
 
-test("a smaller budget is honoured, and a budget the metadata cannot meet renders nothing", () => {
-  const rows = [row(0), row(1)]
-  for (const budget of [700, 1200, 2500, 5000, 9000]) {
-    const notice = renderNotice(joined, "/usr/bin/python3", rows, { bodies: true, budget })
-    if (notice !== null) assert.ok(size(notice) <= budget, `budget ${budget}`)
+test("a smaller bound is honoured, and a bound the notice cannot meet renders nothing", () => {
+  const rows = [bodyRow(0), bodyRow(1)]
+  for (const bound of [700, 1200, 2500, 5000, 9000]) {
+    const text = bodies(rows, { bound })
+    if (text !== null) assert.ok(bytes(text) <= bound, `bound ${bound}`)
   }
-  assert.equal(renderNotice(joined, "/usr/bin/python3", rows, { budget: 100 }), null)
-  assert.equal(renderNotice(joined, "/usr/bin/python3", rows, { budget: Number.NaN }), null)
-  assert.equal(renderNotice(joined, "/usr/bin/python3", rows, { budget: 10 ** 9 }) === null, false)
-  const huge = renderNotice(joined, "/usr/bin/python3", rows, { bodies: true, budget: 10 ** 9 })
-  assert.ok(size(huge) <= MAX_OUTPUT_BYTES, "a caller cannot raise the cap")
+  assert.equal(renderNotice(joined, "/usr/bin/python3", [row(0), row(1)], { bound: 100 }), null)
+  assert.equal(bodies(rows, { bound: 100 }), null)
+  assert.throws(() => bodies(rows, { bound: Number.NaN }), TypeError, "a bound that is not a whole number is a caller error")
 })
 
-test("a body is clipped, not truncated into a false full copy", () => {
-  const notice = renderNotice(joined, "/usr/bin/python3", [{ ...row(0), body: "x".repeat(5000) }], { bodies: true })
-  assert.match(notice, /x…/)
-  assert.doesNotMatch(notice, /x{1300}/)
+test("a body over the per-body cap is cut and pointed at, never passed on as a full copy", () => {
+  const text = bodies([bodyRow(0, "x".repeat(5000))])
+  assert.match(text, /^> x{4096}$/m)
+  assert.doesNotMatch(text, /x{4097}/)
+  assert.match(text, /^Body cut\. Read all of it with: history --room 33333333-3333-4333-8333-333333333333 --after 100 --limit 1$/m)
 })

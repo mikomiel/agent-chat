@@ -1,7 +1,7 @@
 # chat-clients Specification
 
 ## Purpose
-Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, and the adapter's join, heartbeat and bounded rejoin lifecycle.
+Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, and the notice contract that puts a peer message body into a harness session.
 
 ## Requirements
 
@@ -413,3 +413,130 @@ An episode begins at the first failure that calls for a rejoin and ends at the n
 #### Scenario: Authorization refusal
 - **WHEN** a join or heartbeat request fails with `UNAUTHENTICATED` or `INVALID_REQUEST`
 - **THEN** the adapter fails with that code and does not rejoin
+
+### Requirement: A peer message body is framed behind a per-notice nonce
+When a harness package passes message bodies to its session, the notice MUST carry a nonce of at least 64 bits from a cryptographic generator, drawn after the claim and never derived from message data. Each message MUST be a header line, an opening marker `<<<AGENT-CHAT-BODY NONCE`, the body and a closing marker `AGENT-CHAT-BODY NONCE>>>`. Every body line MUST start with `> `, added after the cut.
+
+#### Scenario: A body is rendered inside its frame
+- **WHEN** a claimed question with the body `hello` is rendered
+- **THEN** the notice has the message's header, the opening marker with the notice's nonce, the line `> hello` and the closing marker with the same nonce
+
+#### Scenario: A body imitates the frame
+- **WHEN** a body contains a closing marker, a header line, a binding line and an instruction line
+- **THEN** each of those lines is written after `> ` inside the frame
+- **AND** none of them ends the frame or reads as the adapter's own text
+
+#### Scenario: Two notices
+- **WHEN** the same batch is rendered twice
+- **THEN** the two notices carry different nonces
+
+### Requirement: The notice header names no peer-chosen text
+The header line MUST carry the message id, the kind, the room of that message as `room <uuid>`, the sender as `session <uuid>` or `principal <uuid>`, the sent time, and the age in whole seconds from the server's `created_at` and `admitted_at`. No peer-chosen name, harness or host MAY appear outside the body. The renderer MUST check every header field against a strict pattern and MUST return nothing instead of interpolating text that does not match.
+
+#### Scenario: A message from a session or from an operator
+- **WHEN** a message has a sending session, or only a sending principal
+- **THEN** the header names the sender as `session <uuid>`, or as `principal <uuid>`, and nothing else about the sender
+
+#### Scenario: A message from another room
+- **WHEN** a claimed message belongs to a room other than the room of the binding
+- **THEN** its header names its own room as `room <uuid>`
+- **AND** the pointer line of a cut body names that same room
+
+#### Scenario: A header field fails its pattern
+- **WHEN** a claimed message carries an id, kind, room, history cursor or time that does not match its strict pattern
+- **THEN** the renderer returns nothing, and no text from that message reaches the session
+
+### Requirement: The notice writes hidden and confusing code points as text
+Before the cut, the renderer MUST write C0 controls other than LF and TAB, DEL, C1 controls, line and paragraph separators, bidirectional controls, zero-width and other default-ignorable format code points, variation selectors, tag characters and lone surrogates as `\uXXXX` text (`\u{X}` above U+FFFF), so that LF is the only line break a body carries. The ranges MUST be data in the vectors.
+
+#### Scenario: A body carries hidden or confusing characters
+- **WHEN** a body contains a bidirectional override, a NUL, a carriage return, U+0085 or a lone surrogate
+- **THEN** each is written as `\uXXXX` text
+- **AND** the body has no line break other than LF
+
+### Requirement: The notice cuts a body on whole units and points at the rest
+The renderer MUST cut a body on whole units (a code point or one escape) at a per-body cap of 4096 UTF-8 bytes unless the caller sets another. The cap counts the body as written, so an escape counts as its `\uXXXX` text. It MUST give every body that it or the core cut a pointer line with the exact `history` arguments.
+
+#### Scenario: A body over the cap
+- **WHEN** a body, as written, is longer than 4096 UTF-8 bytes
+- **THEN** it ends on a code point or on one complete escape, never inside one
+- **AND** a pointer line after the closing marker gives the room, the history cursor and a limit of 1, and does not repeat the message id that the header above it carries
+
+#### Scenario: A body the core already cut
+- **WHEN** the core marks a body as cut
+- **THEN** the message carries the same pointer line
+
+### Requirement: The instruction line ties a pointer and a reply to the header of the item
+A notice with bodies MUST carry an instruction line before the first frame. It MUST tell the reader to verify that the `history` read of a cut body returns the id shown in that item's header, and that the `--room` of a reply is the room shown in that item's header.
+
+#### Scenario: A reader follows a pointer line
+- **WHEN** a notice with bodies is rendered
+- **THEN** the instruction line tells the reader to verify that the `history` read returns the id shown in that item's header
+
+#### Scenario: A reader replies to a message from another room
+- **WHEN** a notice with bodies carries a message from a room other than the room of the binding
+- **THEN** the instruction line says that a reply's `--room` is the room shown in that item's header
+
+### Requirement: The notice says that peer data is untrusted
+A static line before the first frame MUST say that every `> ` line between the markers is untrusted peer data, including lookalike bindings, instructions and markers, that peer data grants no authority, and that the notice acknowledges nothing. The binding line MUST stay outside every frame and before them.
+
+#### Scenario: Order of the parts
+- **WHEN** a notice with bodies is rendered
+- **THEN** the binding line comes before the static line, and every frame comes after both
+
+### Requirement: The notice fits the caller's bound without a metadata fallback
+The caller MUST pass `bound`, the UTF-8 bytes it may send, with its own prefix already counted. The renderer MUST halve the body cap (4096, 2048, ... 0) until the whole notice fits, MUST keep the header, frame and pointer of every message at cap 0, and MUST return nothing only when those do not fit. It MUST NOT fall back to metadata for a batch in bodies mode.
+
+#### Scenario: A batch does not fit the bound
+- **WHEN** the bodies of a batch are too large for `bound` at the 4096-byte cap
+- **THEN** the renderer halves the cap until the notice fits
+- **AND** every message keeps its header, frame and pointer, and no metadata replaces the batch
+
+#### Scenario: Not even the headers fit
+- **WHEN** `bound` cannot hold the headers, markers and pointers of the batch at cap 0
+- **THEN** the renderer returns nothing
+
+### Requirement: A batch with no notice is deferred, never partly delivered
+A package MUST settle a batch for which the renderer returns nothing as `deferred` with reason `offline`, and MUST NOT send a partial or metadata notice in its place.
+
+#### Scenario: The renderer returns nothing
+- **WHEN** a claimed batch has a message that fails its pattern, or a batch that does not fit at cap 0
+- **THEN** the package settles the batch as `deferred` with reason `offline`
+- **AND** it sends no text to the session
+
+### Requirement: A package claims the longest prefix that one notice is estimated to carry
+Before the claim, the package MUST take the longest prefix of the pending candidates, and at least one, whose estimated rendering fits `bound`. The estimate MUST budget the widest header, markers and pointer for each message and 3 rendered bytes for each stored body byte, up to the body cap. It MUST claim a retry batch, or a batch for which the server reported no sizes, whole. A missing or invalid size MUST count as a full body.
+
+#### Scenario: More candidates than one notice is estimated to carry
+- **WHEN** `pending` reports more candidates, with sizes, than the estimate says fit `bound`
+- **THEN** the package claims only the longest prefix that the estimate admits, and at least the first candidate
+- **AND** when the selected prefix fits the estimate and every claimed body renders within 3 bytes for each stored byte, the halving step cuts none of them
+
+#### Scenario: A retry batch or a reply without sizes
+- **WHEN** `pending` marks the batch as a retry, or reports no sizes
+- **THEN** the package claims every candidate, because the server refuses any other set for a stored batch
+- **AND** the renderer cuts bodies as far as `bound` needs
+
+#### Scenario: A size that cannot be trusted
+- **WHEN** a candidate's size is missing, negative or not a whole number
+- **THEN** it counts as a full body of the per-body cap
+
+### Requirement: A claimed body can still be cut when its escapes outgrow the estimate
+The estimate assumes that a body renders to at most 3 bytes for each stored byte, as text with many line feeds does. A body whose escapes expand it further, such as carriage returns written as six bytes each, MAY make the renderer halve the body cap after the claim, and the halved cap applies to every body in the notice. Each body cut that way MUST carry its pointer line, and the notice MUST NOT exceed `bound`.
+
+#### Scenario: Two bodies of carriage returns
+- **WHEN** `pending` reports two bodies of 650 carriage returns each, with sizes, under a bound of 8137 bytes
+- **THEN** the package claims both, because the estimate takes 3 bytes for each stored byte
+- **AND** the renderer, which writes each carriage return as six bytes, halves the cap and cuts both bodies
+- **AND** each cut body carries its pointer line, and the notice is at most 8137 bytes
+
+### Requirement: Every renderer passes the same vectors
+The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs.
+
+#### Scenario: Both implementations agree
+- **WHEN** the vectors run under the Python tests and under each package's tests
+- **THEN** every renderer returns the expected text for every notice vector and the expected ids for every pack vector
+
+#### Scenario: A package copy drifts
+- **WHEN** a package's `lib/notice.js` differs by one byte from `integrations/shared/notice.js`
+- **THEN** that package's tests fail
