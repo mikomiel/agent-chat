@@ -1,10 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
+import { PassThrough } from "node:stream"
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createThread } from "../lib/appserver.js"
 import { createReceiver, processStartTime } from "../lib/receiver.js"
+import { startWorker } from "../lib/worker.js"
 import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES, WAKE_PREFIX } from "../lib/channel.js"
 import { fakeAppServer } from "./fake-app-server.js"
 
@@ -132,13 +135,14 @@ function hookDouble({ events, receipt = "written", answer = true, sendOk = true 
 }
 
 // `skew` returns milliseconds added to the receiver's clock, so a test can move the policy's time without moving the timers.
-async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread, skew = () => 0 } = {}) {
+// `start` replaces the worker double's `startProcess`, to run the real worker wrapper over a fake child process.
+async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread, skew = () => 0, start } = {}) {
   const clock = scheduler()
   const events = []
   const worker = workerDouble({ events, handlers, gate, joinErrors })
   let exitCode
   const receiver = createReceiver({ ...baseConfig, ...(thread ? { appServer: APP_SERVER } : {}), ...config }, { sessionId: "session-1", ownerPid: 4242 }, {
-    startProcess: worker.startProcess,
+    startProcess: start ?? worker.startProcess,
     openThread: options => { thread?.opened.push(options); return thread },
     now: () => clock.now() + skew(),
     random: () => 0.5,
@@ -519,6 +523,73 @@ test("a worker error on a heartbeat still retires the worker and rejoins", async
   await r.clock.advance(3750)
   assert.equal(r.worker.bootIds.length, 2, "and the rejoin starts a new one")
   assert.notEqual(r.receiver.state(), "offline")
+})
+
+// The real worker wrapper over a fake child process, so the receiver meets the codes the product's worker gives. The
+// wrapper's own deadline timer is the one stub: a hand-written replacement for the global, restored when the test ends.
+function realWorkers(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  const children = []
+  const start = (workerConfig, identity) => startWorker(workerConfig, identity, {
+    spawnImpl: () => {
+      const child = new EventEmitter()
+      child.stdin = new PassThrough()
+      child.stdout = new PassThrough()
+      child.kill = () => {}
+      child.frames = []
+      child.stdin.on("data", chunk => { for (const line of chunk.toString().split("\n").filter(Boolean)) child.frames.push(JSON.parse(line)) })
+      children.push(child)
+      return child
+    },
+  })
+  const joined = child => child.stdout.write(`${JSON.stringify({ id: 0, result: {
+    session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+    room_id: ROOM, host: "synthetic-host", harness: "codex", instance_file: "/tmp/agent-chat-state/boot.json",
+  } })}\n`)
+  const fire = ms => { for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() } }
+  return { children, start, joined, fire }
+}
+
+// A request that gets no answer is uncertain, and the worker's deadline says so with the core's code: the receiver
+// rejoins. A worker that exits is another matter, and chat stays off.
+test("a heartbeat that outlives the worker's deadline retires that worker and rejoins with a fresh one", async t => {
+  const workers = realWorkers(t)
+  const r = await rig({ start: workers.start })
+  workers.joined(workers.children[0])
+  await settle() // joined; its first heartbeat is written and never answered
+  assert.equal(workers.children[0].frames.at(-1).op, "heartbeat")
+  workers.fire(22_000)
+  await settle()
+  assert.notEqual(r.receiver.state(), "offline", "a timeout is not a permanent disable")
+  assert.equal(workers.children[0].stdin.writableEnded, true, "the worker that missed its deadline is stopped")
+  assert.equal(workers.children.length, 1, "and the new one waits out the back-off")
+  await r.clock.advance(3750)
+  assert.equal(workers.children.length, 2, "a fresh worker joins")
+  assert.equal(workers.children[1].frames[0].op, "join")
+  assert.notEqual(workers.children[1].frames[0].boot_id, workers.children[0].frames[0].boot_id)
+  workers.joined(workers.children[1])
+  await settle()
+  assert.notEqual(r.receiver.state(), "offline")
+  assert.equal(workers.children[1].frames.at(-1).op, "heartbeat", "the rejoined worker reports")
+})
+
+test("a worker that exits with a heartbeat in flight latches chat off and starts no other", async t => {
+  const workers = realWorkers(t)
+  const r = await rig({ start: workers.start })
+  workers.joined(workers.children[0])
+  await settle()
+  assert.equal(workers.children[0].frames.at(-1).op, "heartbeat")
+  workers.children[0].emit("close", 1, null)
+  await settle()
+  assert.equal(r.receiver.state(), "offline")
+  assert.match((await r.op(turn())).sent[0].message, /Agent Chat stopped \(heartbeat:CHAT_REQUEST_UNCERTAIN\)/)
+  await r.clock.advance(120_000)
+  assert.equal(workers.children.length, 1, "no rejoin")
 })
 
 const joinRefusal = workerCode => Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", workerCode, operation: "join" })

@@ -117,6 +117,56 @@ test("closing the worker ends its stdin and settles the request in flight as unc
   assert.deepEqual(await stopping, { code: 0, signal: null })
 })
 
+// The node:test timer mock needs Node 20.11, and the package supports 20.0. This stub records each timer, fires one on demand
+// and restores the originals when the test ends, so a failing test cannot leak it.
+function stubTimeouts(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  return {
+    fire(ms) {
+      for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() }
+    },
+  }
+}
+
+const heartbeatState = { native_state: "idle", stopped: false, plan_mode: false }
+
+// A request whose outcome is unknown is the core's REQUEST_UNCERTAIN, which the receiver rejoins. The CHAT_ code is for a
+// worker that was stopped or died, which it does not.
+test("a request that outlives the parent-side deadline rejects with the core's REQUEST_UNCERTAIN and stops the worker", async t => {
+  const clock = stubTimeouts(t)
+  const { child } = harness()
+  const worker = startWorker(config, identity, { spawnImpl: () => child })
+  child.stdout.write(`${JSON.stringify({ id: 0, result: joinedRecord })}\n`)
+  await worker.ready
+  const heartbeat = worker.request("heartbeat", { state: heartbeatState })
+  clock.fire(22_000)
+  await assert.rejects(heartbeat, { code: "REQUEST_UNCERTAIN", operation: "heartbeat" })
+  assert.equal(child.stdin.writableEnded, true, "the worker that missed its deadline is stopped")
+})
+
+test("a join that outlives the parent-side deadline is the same uncertain request", async t => {
+  const clock = stubTimeouts(t)
+  const { child } = harness()
+  const worker = startWorker(config, identity, { spawnImpl: () => child })
+  clock.fire(22_000)
+  await assert.rejects(worker.ready, { code: "REQUEST_UNCERTAIN", operation: "join" })
+})
+
+test("a worker that exits with a request in flight settles it with the CHAT_ code, not the core's", async () => {
+  const { child } = harness()
+  const worker = startWorker(config, identity, { spawnImpl: () => child })
+  child.stdout.write(`${JSON.stringify({ id: 0, result: joinedRecord })}\n`)
+  await worker.ready
+  const heartbeat = worker.request("heartbeat", { state: heartbeatState })
+  child.emit("close", 1, null)
+  await assert.rejects(heartbeat, { code: "CHAT_REQUEST_UNCERTAIN", operation: "heartbeat" })
+})
+
 test("a failure description carries fixed codes only", () => {
   assert.equal(describeFailure(Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", operation: "join", workerCode: "STALE_INSTANCE" })),
     "join:CHAT_WORKER_REFUSED:STALE_INSTANCE")

@@ -220,7 +220,12 @@ sends its request: it does not wait for the worker to end its instance.
   receiver does nothing, no rejoin starts, no budget is spent, and the next
   heartbeat is the retry. The same codes in a worker error, or in a refused
   claim, status or settle reply, start the rejoin; `STALE_INSTANCE` always does,
-  and a `BINDING_CONFLICT` after the join still ends chat.
+  and a `BINDING_CONFLICT` after the join still ends chat. A worker request
+  that gets no answer within the worker wrapper's 22-second deadline, the join
+  included, is `REQUEST_UNCERTAIN`: the receiver stops that worker and rejoins.
+  A worker that is stopped, or that exits, with a request in flight reports
+  `CHAT_REQUEST_UNCERTAIN` instead. That is not a rejoin code, so chat ends
+  (see Fail closed).
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for that session. The receiver stays
   up and answers every hook with a refusal; the first output after the latch
@@ -513,7 +518,7 @@ cd integrations/codex
 node --test
 ```
 
-The suite covers config refusal, the worker join frame and frame validation,
+The suite covers config refusal, the worker join frame, frame validation and request deadline,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
 the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the WebSocket client against a
 fake control socket on a real Unix socket, the receiver's state, delivery,
