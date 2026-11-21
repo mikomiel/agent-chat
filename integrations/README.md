@@ -27,16 +27,17 @@ implied by a nearby version.
 An integration release is tested only with the core of the same version: both
 ship at the product version, and a package at one release with a core at
 another is an untested combination. A row therefore names the package version
-and the core version it was run with in its Evidence cell. The rows below were recorded before
-the packages shared the product version. They name the package at `0.1.0`, and
-the core they ran with is not recorded.
+and the core version it was run with in its Evidence cell. The Pi and DeepSeek
+rows below were recorded before the packages shared the product version. They
+name the package at `0.1.0`, and the core they ran with is not recorded. The
+OpenCode row records no run, so no core version applies.
 
 | Package | Harness surface | Verified release | Evidence |
 |---|---|---|---|
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | eligibility: `ctx.agents.get` and the session header `origin`, plus `roots()` and `isOwnedBy()` where the registry has them | `NOT RUN` on `0.2.2-rc.5` | No run. The published type declarations were compared; nothing was executed. `@deepseek-ai/dsh-agent` `0.2.2-rc.1` declares `AgentRegistry.roots()`, `AgentRegistry.isOwnedBy(id, owner)` and `CreateAgentOptions.parentAgent`. `0.2.2-rc.2` to `0.2.2-rc.5` declare none of them, and `enter(agent)` takes no owner; `get(id)` and `list()` remain. In `0.2.2-rc.5` the host's own subagent test is `session.header.origin === 'subagent'`, and the subagent child factory sets that value. The package reads which registry surface it finds and uses that header test where `roots()` and `isOwnedBy()` are both absent; a registry with only one of them refuses every agent. |
-| `agent-chat-opencode` 0.1.0 | OpenCode server plugin: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.synthetic` (`delivery: "steer"`, `resume: false`), `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.execution.*`, `session.inbox.*`, `session.agent.selected`, `session.compaction.*`, `session.created`/`deleted`/`forked` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
+| `agent-chat-opencode` 0.8.0 | OpenCode server plugin: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.synthetic` (`delivery: "steer"`, `resume: false`), `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.execution.*`, `session.inbox.*`, `session.agent.selected`, `session.compaction.*`, `session.created`/`deleted`/`forked` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
@@ -129,6 +130,7 @@ package is covered when its directory appears.
 | Pi | `AGENT_CHAT_PI_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 | DeepSeek Harness | `AGENT_CHAT_DEEPSEEK_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 | Claude Code | `AGENT_CHAT_CLAUDE_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
+| OpenCode | `AGENT_CHAT_OPENCODE_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 
 The variable names the private `0600` config file. `AGENT_CHAT_DELEGATED_CHILD=1`
 keeps a harness process that a session starts on purpose from joining chat.
@@ -173,7 +175,7 @@ release.
    that its config file names in `python`, so point `python` at an interpreter
    that has this version installed.
 2. **Download, verify and extract the tarball** of the harness (`pi`,
-   `deepseek` or `claude-code`) in one block. The block needs `bash`, `curl`,
+   `deepseek`, `claude-code` or `opencode`) in one block. The block needs `bash`, `curl`,
    `tar` and GNU coreutils `sha256sum`. macOS has no GNU `sha256sum`: install
    coreutils with Homebrew (`brew install coreutils`) and put its `gnubin`
    directory first on `PATH` in the shell that runs the block:
@@ -229,6 +231,7 @@ release.
 | Claude Code | tag `v<version>`, or `agent-chat-claude-code-<version>.tgz` | `claude plugin marketplace add mikomiel/agent-chat#v<version>`, then `claude plugin install agent-chat@agent-chat`. Offline: extract the tarball and run `claude --plugin-dir <extracted-dir>`. |
 | Pi | `agent-chat-pi-<version>.tgz` | `pi install <absolute-extracted-dir>`. Pi loads a local path in place, without copying it. |
 | DeepSeek Harness | `agent-chat-deepseek-<version>.tgz` | Set the `name` of the Cordis `insert` row to `<absolute-extracted-dir>/extensions/agent-chat.js`. See the [package README](deepseek/README.md#install). |
+| OpenCode | `agent-chat-opencode-<version>.tgz` | Put `<absolute-extracted-dir>` in `plugins` in a global `opencode.jsonc`. See the [package README](opencode/README.md#install). |
 
 Claude Code installs by tag through the repository's `.claude-plugin/marketplace.json`.
 `claude plugin marketplace add owner/repo#<ref>` pins the catalog to a ref, so

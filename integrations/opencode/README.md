@@ -20,7 +20,10 @@ the Agent Chat tools. See "Known limits" for why.
 - OpenCode 2.x. The surfaces were read from the `2.3.2` packages and have
   never been loaded by a live server. The plugin API is new; check it again on
   each OpenCode upgrade.
-- A Python 3.11+ interpreter with the `agent-chat` package installed.
+- A Python 3.11+ interpreter with the same version of the core installed: the PyPI
+  distribution `sessionyard`, which provides the `agent_chat` import. Do not install
+  `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
+  field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token accepted by it.
 - Node built-ins only inside the plugin: `node:child_process`, `node:fs`,
   `node:crypto`. Whether OpenCode's plugin runtime exposes them is not
@@ -51,6 +54,25 @@ loads is inferred from the published loader code, which checks the shape of
 the export. It is not verified on a live server. If a release refuses it, the
 fix is to add the dependency and wrap the export in `Plugin.define`; record
 that here.
+
+### Install a pinned release
+
+Without a checkout, install the release that matches your core. The release
+asset is `agent-chat-opencode-<version>.tgz`. Download, verify and extract it
+into an absolute directory with the checked block in
+[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release):
+it extracts only after the `SHA256SUMS` check passes. Then use that directory
+in `plugins`, as above:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["<absolute-extracted-dir>"]
+}
+```
+
+The configuration names that path, so keep the directory and its layout: the
+plugin imports `../lib/`. Install the core at the same version first.
 
 ## Configure
 
