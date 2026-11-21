@@ -139,14 +139,22 @@ sends its request: it does not wait for the worker to end its instance.
   native session id and a fresh boot id. A later join (a rejoin) gets a new
   boot id; the next turn output announces the new binding, which says it
   supersedes every earlier one, and the old `instance_file` is no longer valid.
-  The binding text is capped at 2,048 bytes.
+  The binding text is capped at 2,048 bytes. Before the first join the receiver
+  renders the longest binding this config could get (UUIDs, `<boot id>.json` in
+  the state directory, a host name of 63 characters, the core's longest); when
+  that does not fit, it does not join, and chat stays off with
+  `CHAT_BINDING_TOO_LONG` (a long `python` path is the usual cause). A join
+  whose own binding still does not fit (a host outside the core's grammar) is
+  ended at once with the same code, and one that lacks a field with
+  `CHAT_PROTOCOL_INVALID`; a binding is never joined and then left unshown.
 - **Presence.** A heartbeat every 30 seconds, and one on every state change,
   carries `native_state`, `stopped` and `plan_mode`. It carries no title. The
   flags are facts of their own: `plan_mode` follows the Plan Mode rule (see
-  State), and `stopped` is set by a local stop or an interruption that a read
-  found, whether or not the session is in Plan Mode, and outside Plan Mode by
-  any state that is neither idle nor busy. Delivery is still decided by one
-  state, Plan Mode first (see Busy delivery). A
+  State), and `stopped` follows the running state alone, whatever the Plan
+  Mode: a local stop, an interruption that a read found, or a state that is
+  neither idle nor busy (unknown, offline). `native_state` is `unknown` in Plan
+  Mode. Delivery is still decided by one state, Plan Mode first (see Busy
+  delivery). A
   heartbeat belongs to the worker that was live when its tick started. A tick
   that was waiting for an app-server read when that worker was retired (for
   example by `STALE_INSTANCE`) is dropped when the read returns: it sends
@@ -178,9 +186,9 @@ sends its request: it does not wait for the worker to end its instance.
   turn, a mode it does not know): it is newer than the hooks' idle, so the
   running state stays unknown. Only a read that failed or found the thread
   offline is dropped, and then the state follows the hooks. Any later hook
-  event discards the read. A read that refuses (busy,
-  Plan Mode, stopped, unknown) is newer than every read that began before it,
-  so an older read that lands after it is dropped. Once a hook event has
+  event discards the read. Reads can overlap when one is slow; only the newest
+  read that started is kept, so an older one that lands after it, whatever it
+  says, is dropped. Once a hook event has
   discarded the last read, Plan Mode follows the hook's hint alone, as in the
   Claude and Pi packages: `plan` sets it and a later hook with another mode
   ends it. The hint can be stale, since a session put into Plan Mode while a
@@ -196,9 +204,11 @@ sends its request: it does not wait for the worker to end its instance.
   the connect (at most 7.5 seconds), and the receiver gets that wait less 1.5
   seconds (at most 6) for the whole reply, its state report included. The
   receiver starts a claim only with 2.5 seconds of that left. When the claim is
-  granted, and again after the status request, it checks that the hook is still
-  connected and in time; a hook that is not gets nothing more, and no status
-  request. The reply is printed as `additionalContext`
+  granted, after the status request, and right before the notice is written,
+  it checks that the hook is still connected and in time; a hook that is not
+  gets nothing more (after the grant, not even a status request). This check
+  comes before the reservation check, so a write that cannot happen settles
+  retryable even when the reservation ran out too. The reply is printed as `additionalContext`
   and settled `handed` only after the hook confirms it wrote and flushed the
   output.
 - **No idle wake yet.** The idle wake is a follow-up, tracked in #154. Until it
@@ -208,8 +218,11 @@ sends its request: it does not wait for the worker to end its instance.
   heartbeat carry no claim that the session can be woken.
 - **Settlement.** A refused output settles `failed`, and so does a claimed batch
   that was never sent because the hook was gone or its time was up when the
-  claim was granted or after the status request: nothing reached the output, so
-  it is offered again, whatever is left of the reservation. A failed write, a
+  claim was granted, after the status request or right before the write:
+  nothing reached the output, so it is retryable. The ledger accepts that
+  settlement only while the reservation holds; one that reaches it after the
+  reservation expired is closed by the ledger as `uncertain` (`claim_expired`,
+  `agent_chat/deliveries.py`), like any expired claim. A failed write, a
   missing receipt or a reservation too short to write inside settles
   `uncertain`. The
   adapter never writes the same attempt twice. The ledger, not the adapter,

@@ -196,6 +196,49 @@ test("a session start joins, reports unknown and stopped, and announces the bind
   assert.deepEqual(Object.keys(r.worker.log.find(entry => entry.op === "heartbeat").state).sort(), ["native_state", "plan_mode", "stopped"])
 })
 
+// A binding that could not be shown must not be joined for. The receiver renders the longest binding any join could give this
+// config (UUIDs, `<boot id>.json` in the state directory, a 63-character host) and refuses before the join when it does not
+// fit: chat stays off, with the code, and no worker starts. The bound is the worst case, so a path that fits with the host
+// this join would give, but not with the longest one, is refused too.
+test("an interpreter path that makes the longest binding too long starts no worker and says so; one byte shorter joins", async () => {
+  const sized = await rig()
+  const shown = bytes((await sized.begin()).sent[0].context)
+  const host = "synthetic-host"
+  const fits = baseConfig.python.length + (MAX_BINDING_BYTES - shown) - (63 - host.length) // the longest binding is exactly the limit
+  const python = length => `/usr/bin/${"p".repeat(length - "/usr/bin/".length)}`
+  const joins = await rig({ config: { python: python(fits) } })
+  assert.equal(joins.worker.bootIds.length, 1, "the longest binding is exactly the limit: it joins")
+  assert.ok(bytes((await joins.begin()).sent[0].context) <= MAX_BINDING_BYTES)
+  for (const length of [fits + 1, 4000]) {
+    const r = await rig({ config: { python: python(length) } })
+    assert.equal(r.worker.bootIds.length, 0, `no worker for a ${length}-byte interpreter path`)
+    assert.equal(r.receiver.state(), "offline")
+    const start = await r.op({ op: "start", wait_ms: 5000 })
+    assert.deepEqual(start.sent, [{ disabled: true, message: "Agent Chat stopped (CHAT_BINDING_TOO_LONG); the Codex session is unchanged." }])
+  }
+})
+
+// The worst case rests on the core's grammar. A join whose own binding does not fit after all (a host outside that grammar),
+// or lacks a field, is not kept: the worker is stopped at once and chat stays off with the code, not joined and silent.
+test("a join whose own binding does not fit, or lacks a field, is ended at once and says so", async () => {
+  for (const [change, code] of [
+    [joined => ({ ...joined, host: "h".repeat(MAX_BINDING_BYTES) }), "CHAT_BINDING_TOO_LONG"],
+    [joined => ({ ...joined, instance_file: "" }), "CHAT_PROTOCOL_INVALID"],
+  ]) {
+    const double = workerDouble()
+    const r = await rig({ start: (config, identity) => {
+      const worker = double.startProcess(config, identity)
+      return { ...worker, ready: worker.ready.then(change) }
+    } })
+    assert.equal(double.bootIds.length, 1, code)
+    assert.equal(double.state.stops, 1, `the joined worker is stopped (${code})`)
+    assert.deepEqual(double.ops("heartbeat"), [], code)
+    assert.equal(r.receiver.state(), "offline", code)
+    const start = await r.op({ op: "start", wait_ms: 5000 })
+    assert.deepEqual(start.sent, [{ disabled: true, message: `Agent Chat stopped (${code}); the Codex session is unchanged.` }])
+  }
+})
+
 test("the binding is announced once, then re-announced by every later start event", async () => {
   const r = await rig()
   await r.begin()
@@ -377,6 +420,51 @@ test("a hook that goes while the status request uses up the reservation settles 
   const r = await rig({ skew: () => skewMs, handlers: { pending: () => ({ messages: ["m1"] }), status: () => { skewMs += 29_800; hook.close(); return { muted: false } } } })
   await r.begin()
   await r.op(turn({ patience_ms: 30_000 }), hook)
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+})
+
+// The hook is asked once more right before the write: the status request can come back just in time and the notice be
+// rendered after the hook's time ran out. Nothing is sent then, and the batch is offered again.
+test("a notice that is ready only after the hook's time ran out is not sent, and settles failed", async () => {
+  let skewMs = 0
+  let afterStatus = 0
+  const r = await rig({ skew: () => (afterStatus > 0 && ++afterStatus > 3 ? skewMs + 2000 : skewMs), handlers: {
+    pending: () => ({ messages: ["m1"] }),
+    status: () => { skewMs += 5900; afterStatus = 1; return { muted: false } }, // 100 ms before the 6-second deadline
+  } })
+  await r.begin()
+  const hook = await r.op(turn())
+  assert.equal(r.worker.ops("status").length, 1)
+  assert.equal(hook.sent.some(frame => typeof frame.context === "string" && frame.context.includes("m1")), false, "nothing was sent")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+})
+
+// Right before the write, a hook that is gone or out of time comes first: nothing can be written to it, so the batch is
+// not handed and is offered again, even when the reservation ran out too.
+test("right before the write, a hook out of time settles failed even when the reservation ran out too", async () => {
+  let skewMs = 0
+  let afterStatus = 0
+  const r = await rig({ skew: () => (afterStatus > 0 && ++afterStatus > 3 ? skewMs + 30_000 : skewMs), handlers: {
+    pending: () => ({ messages: ["m1"] }),
+    status: () => { skewMs += 5900; afterStatus = 1; return { muted: false } },
+  } })
+  await r.begin()
+  const hook = await r.op(turn())
+  assert.equal(hook.sent.some(frame => typeof frame.context === "string" && frame.context.includes("m1")), false, "nothing was sent")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+})
+
+test("a hook that goes after the status check and before the write gets nothing, and the batch settles failed", async () => {
+  let afterStatus = 0
+  let hook
+  const r = await rig({ skew: () => { if (afterStatus > 0 && ++afterStatus === 3) hook.close(); return 0 }, handlers: {
+    pending: () => ({ messages: ["m1"] }),
+    status: () => { afterStatus = 1; return { muted: false } },
+  } })
+  await r.begin()
+  hook = hookDouble({ events: r.events })
+  await r.op(turn(), hook)
+  assert.equal(hook.sent.some(frame => typeof frame.context === "string" && frame.context.includes("m1")), false, "nothing was sent")
   assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
 })
 
@@ -1450,7 +1538,7 @@ test("the hook's plan hint yields to the app-server read, which is the authority
   const cases = [
     { mode: "plan", plan: false, expected: { native_state: "idle", stopped: false, plan_mode: false } },
     { mode: "default", plan: true, expected: { native_state: "unknown", stopped: false, plan_mode: true } },
-    { mode: "plan", plan: null, expected: { native_state: "unknown", stopped: false, plan_mode: true } },
+    { mode: "plan", plan: null, expected: { native_state: "unknown", stopped: true, plan_mode: true } },
     { mode: "default", plan: null, expected: { native_state: "unknown", stopped: true, plan_mode: false } },
   ]
   for (const { mode, plan, expected } of cases) {
@@ -1470,7 +1558,7 @@ test("the hook's plan hint yields to the app-server read, which is the authority
 test("a read that confirmed the mode but not the running state keeps its plan answer, over the hint, and stays unknown", async () => {
   for (const [plan, hint, expected] of [
     [false, "plan", { native_state: "unknown", stopped: true, plan_mode: false }],
-    [true, "default", { native_state: "unknown", stopped: false, plan_mode: true }],
+    [true, "default", { native_state: "unknown", stopped: true, plan_mode: true }],
   ]) {
     const thread = threadDouble({ observation: { reason: "unknown", observed: { status: "unknown", stopped: false, plan } } })
     const r = await rig({ thread })
@@ -1511,10 +1599,22 @@ test("an unknown read with no mode leaves Plan Mode to the hint, and the running
   await r.op({ op: "stop", permission_mode: "plan" })
   r.worker.log.length = 0
   await r.clock.advance(30_000)
-  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true })
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: true, plan_mode: true })
   await r.op({ op: "stop", permission_mode: "default" }) // a hook event drops the read; the next one is read again
   await r.clock.advance(30_000)
   assert.equal(r.receiver.state(), "unknown", "the hint is default now, and the read still does not know the running state")
+})
+
+// `stopped` is the running state's, whatever the Plan Mode: a Plan Mode hint does not turn an unknown read into a running one.
+test("a Plan Mode hint and then a systemError read report unknown and stopped, in Plan Mode", async () => {
+  const thread = threadDouble({ observation: { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } } })
+  const r = await rig({ thread })
+  await r.begin()
+  await r.op(turn({ permission_mode: "plan" }))
+  await r.op({ op: "stop", permission_mode: "plan" })
+  await r.clock.advance(30_000)
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: true, plan_mode: true })
+  assert.equal(r.receiver.state(), "plan", "delivery is still decided by Plan Mode first")
 })
 
 // The heartbeat's flags are facts of their own. Plan Mode does not hide an interruption that a read found: both are reported.
@@ -1637,6 +1737,29 @@ test("a read that a session start overtook and that refuses does not make the ne
   releases[1](IDLE)
   await settle()
   assert.equal(r.receiver.state(), null, "the newer read is kept")
+})
+
+// Reads can overlap: one that is slow is still out when the next tick reads. Only the newest read that started is kept, so the
+// older one, landing late with an answer of its own, neither replaces the newer one nor makes it stale.
+test("an older read that lands after a newer one started is dropped, and the newer one's Plan Mode or child answer applies", async () => {
+  const UNKNOWN = { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }
+  const CHILD = { reason: "child", observed: { status: "unknown", stopped: false, plan: null } }
+  for (const [newer, expected] of [[reading("plan", { plan: true }), "plan"], [CHILD, "offline"]]) {
+    const releases = []
+    const thread = threadDouble({ observation: () => new Promise(resolve => { releases.push(resolve) }) })
+    const r = await rig({ thread })
+    await idleSession(r)
+    await r.clock.advance(30_000) // the older read is out
+    await r.clock.advance(30_000) // the newer read starts
+    assert.equal(releases.length, 2)
+    releases[0](UNKNOWN) // the older one lands first, after the newer one started
+    await settle()
+    assert.equal(r.receiver.state(), null, "the older read is dropped: it did not set unknown")
+    releases[1](newer)
+    await settle()
+    assert.equal(r.receiver.state(), expected, `the newer read applies (${expected})`)
+    if (expected === "offline") assert.equal(r.worker.state.stops, 1, "the child answer ended chat")
+  }
 })
 
 // ---- a retired worker's tick commits nothing -----------------------------------------------------------------------

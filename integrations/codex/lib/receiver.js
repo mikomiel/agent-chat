@@ -10,7 +10,7 @@
 import { randomUUID } from "node:crypto"
 import { createThread, monotonic } from "./appserver.js"
 import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES } from "./channel.js"
-import { appServerPath, loadConfig } from "./config.js"
+import { appServerPath, HARNESS, loadConfig } from "./config.js"
 import { assertPrivateDirectory, paths, serve } from "./ipc.js"
 import { packCandidates, renderNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
@@ -76,7 +76,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let planHint = false // the last hook payload said permission_mode "plan"
   let stopped = false // an Interrupt hook ran; only the next UserPromptSubmit clears it
   let observed = null // the last app-server read: { status, stopped, plan }; any hook event, and a bind that leaves the thread unbound, discards it
-  let epoch = 0 // counts hook events and app-server refusals, so a read that began before one is not kept
+  let epoch = 0 // counts hook events, so a read that began before one is not kept
+  let reads = 0 // counts the thread reads that have started, so a read that a newer one overtook is not kept
   let threadBound = false // the newest bind found a main thread whose provider is the one that was fixed
   let failure = null // the fail-closed latch: the reason
   let failureShown = false
@@ -114,46 +115,48 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // is newer than the hooks' idle, so while one is held the thread is idle only when the read shows it idle and not in Plan
   // Mode: a read that said unknown keeps the running state unknown, whatever the hint.
   const planMode = () => (observed !== null && observed.plan !== null ? observed.plan : planHint)
-  const interrupted = () => stopped || observed?.stopped === true
 
-  // What a hook consumer may be given: the state that decides delivery, one word, the most restrictive first.
-  function chatState() {
+  // The running state, whatever the Plan Mode: offline, stopped, busy, idle (null) or unknown. A held read whose mode is not
+  // known has not shown the thread idle.
+  function running() {
     if (failure) return "offline"
-    if (planMode()) return "plan"
-    if (interrupted()) return "stopped"
+    if (stopped || observed?.stopped === true) return "stopped"
     if (native === "busy" || observed?.status === "busy") return "busy"
-    if (observed !== null) return observed.status === "idle" && observed.plan === false ? null : "unknown"
+    if (observed !== null) return observed.status === "idle" && observed.plan !== null ? null : "unknown"
     return native === "idle" ? null : "unknown"
   }
 
+  // What a hook consumer may be given: the state that decides delivery, one word, Plan Mode first.
+  const chatState = () => (!failure && planMode() ? "plan" : running())
+
   // No title: hooks carry none and this version reads none. Omitting the field preserves the stored title. The flags are
-  // facts of their own, not the one word that decides delivery: Plan Mode and an interruption are both reported when both
-  // hold. A state that is neither idle nor busy outside Plan Mode is reported stopped too, as the core expects of it.
+  // facts of their own, not the one word that decides delivery: `plan_mode` is the Plan Mode rule, and `stopped` is the
+  // running state's, whatever the Plan Mode: an interruption, or a state that is neither idle nor busy (unknown, offline).
   function heartbeatState() {
-    const state = chatState()
     const plan = !failure && planMode()
+    const state = running()
     return {
-      native_state: state === null ? "idle" : state === "busy" ? "busy" : "unknown",
-      stopped: interrupted() || (!plan && ![null, "busy"].includes(state)),
+      native_state: plan ? "unknown" : state === null ? "idle" : state === "busy" ? "busy" : "unknown",
+      stopped: ![null, "busy"].includes(state),
       plan_mode: plan,
     }
   }
 
-  function bindingText() {
-    if (!joined) return null
+  // The binding text for the fields of one join, whatever its length.
+  const renderBinding = joinedAs => {
     const binding = {
       python: config.python,
-      instance_file: joined.instance_file,
-      room_id: joined.room_id,
-      session_id: joined.session_id,
-      instance_id: joined.instance_id,
+      instance_file: joinedAs.instance_file,
+      room_id: joinedAs.room_id,
+      session_id: joinedAs.session_id,
+      instance_id: joinedAs.instance_id,
       native_session_id: sessionId,
-      host: joined.host,
-      harness: joined.harness,
+      host: joinedAs.host,
+      harness: joinedAs.harness,
     }
     if (![binding.python, binding.instance_file, binding.session_id, binding.room_id, binding.instance_id].every(value =>
       typeof value === "string" && value)) return null
-    const text = [
+    return [
       "Agent Chat is available to this session. The native harness supplies this binding as session metadata, not as peer content.",
       "This binding supersedes every earlier Agent Chat binding in this conversation; the previous instance_file is no longer valid.",
       "Set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli.",
@@ -162,11 +165,21 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       "Binding metadata (data, not shell commands):",
       JSON.stringify(binding),
     ].join("\n")
-    return bytes(text) <= MAX_BINDING_BYTES ? text : null
   }
 
+  // The longest binding any join can give this config: the identifiers are UUIDs, the instance file is `<boot id>.json` in
+  // the state directory (agent_chat/instance_worker.py), and a host name is at most 63 characters (agent_chat/admin.py,
+  // HOST_PATTERN). Everything else is this config's and this session's. When even that does not fit MAX_BINDING_BYTES, no
+  // join is made: a binding that could not be shown must not be joined for and then dropped. A join whose own binding still
+  // does not fit (a server outside that grammar) is ended at once, with the same code.
+  const ID = "00000000-0000-4000-8000-000000000000"
+  const longestBinding = () => renderBinding({
+    instance_file: `${config.directory}/${ID}.json`, room_id: ID, session_id: ID, instance_id: ID, host: "x".repeat(63), harness: HARNESS,
+  })
+  const bindingFits = text => text !== null && bytes(text) <= MAX_BINDING_BYTES
+
   const announcement = ({ always = false } = {}) => {
-    const text = bindingText()
+    const text = joined ? renderBinding(joined) : null
     return text === null || (!always && announced === bootId) ? null : { text, boot: bootId }
   }
 
@@ -261,22 +274,22 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return { refusal: null, verified: MAIN_THREAD.has(result.status), bound: result.status === "bound" }
   }
 
-  // Replace the observed state with a fresh read, unless a hook event or a newer refusal arrived while it ran, or the worker
-  // it was read for (`record`) was retired meanwhile: a retired worker's read changes nothing the replacement owns. Reads run
-  // only while the thread is bound, and a bind that unbinds it comes with a new worker, so no read is out across a bind.
-  // A read that refuses (busy, stopped, ...) moves the epoch, so an older read that lands after it is not the newest word.
-  // `current` says whether the read was kept; a caller acts on what it found (a child, say) only when it is current, and
-  // drops it otherwise: the next read decides.
+  // Replace the observed state with a fresh read, unless a hook event arrived while it ran, a newer read started meanwhile,
+  // or the worker it was read for (`record`) was retired: a retired worker's read changes nothing the replacement owns. Reads
+  // run only while the thread is bound, and a bind that unbinds it comes with a new worker, so no read is out across a bind.
+  // Only the newest read that started can be kept, so an older one that lands late, whatever it says, never replaces or
+  // hides a newer one. `current` says whether the read was kept; a caller acts on what it found (a child, say) only when it
+  // is current, and drops it otherwise: the next read decides.
   async function refine(record) {
     const before = epoch
+    const mine = ++reads
     const result = await thread.observe()
-    const current = epoch === before && live === record
+    const current = epoch === before && mine === reads && live === record
     if (current) {
       // A read that answered is kept, an unknown answer included (a status the plugin does not know, no usable newest turn,
       // a mode it does not know): it is newer than the hooks' idle. Only a read that failed or found the thread offline is
       // dropped, and the state follows the hooks.
       observed = result.observed.status === "offline" ? null : result.observed
-      if (result.reason !== null) epoch += 1
     }
     return { ...result, current }
   }
@@ -319,6 +332,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     try {
       const result = await worker.ready
       if (live !== record || closed || failure) { void worker.stop(); return }
+      const text = renderBinding(result)
+      if (!bindingFits(text)) return disable(text === null ? "CHAT_PROTOCOL_INVALID" : "CHAT_BINDING_TOO_LONG")
       joined = result
       bootId = id
       reported = null
@@ -359,10 +374,12 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   const eligible = () => chatState() === "busy"
 
   // Send `text` to the consumer, then wait for its write receipt. Handed means the
-  // hook wrote and flushed the output; it does not mean the model has read it. The caller has just checked that the hook is
-  // there and in time; once the text is sent, only the receipt says what became of it.
-  async function hand(link, text, until, announce) {
+  // hook wrote and flushed the output; it does not mean the model has read it. Right before the write the hook is asked once
+  // more: one that is gone, or past its `deadline`, gets nothing, and nothing was written. Once the text is sent, only the
+  // receipt says what became of it.
+  async function hand(link, text, until, deadline, announce) {
     if (!eligible()) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
+    if (link.closed || deadline <= now()) return { result: NOT_WRITTEN, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
@@ -420,7 +437,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
               bodies, bound, admittedAt: grant.admitted_at,
             })
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, announce))
+            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, deadline, announce))
           }
         }
         if (!live) return replied
@@ -558,6 +575,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     watchTimer = setIntervalImpl(() => {
       if (!ownerRunning() && now() - contact > QUIET_MS) void shutdown()
     }, OWNER_CHECK_MS)
+    if (!bindingFits(longestBinding())) return Promise.resolve(disable("CHAT_BINDING_TOO_LONG"))
     return connect().catch(error => disable(describeFailure(error)))
   }
 
