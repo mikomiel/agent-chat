@@ -124,8 +124,8 @@ release-please open or update one release pull request: it bumps
 lock disagrees with `pyproject.toml` fails before it can reach `main`. That
 update is observed after both a
 maintainer merge and a merge by the repository's own automation. The same pull
-request moves every `integrations/*/package.json` and the Claude Code
-`plugin.json` to the new version (the globs under `extra-files` in
+request moves every `integrations/*/package.json`, the Claude Code
+`plugin.json` and the Codex `plugin.json` to the new version (the globs under `extra-files` in
 `release-please-config.json`), because each harness package is released at the
 product version; `tests/test_release_artifacts.py` fails a release pull request
 that leaves one behind. Merging the
