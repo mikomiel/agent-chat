@@ -120,8 +120,16 @@ The service and its host-token provisioning are documented in the product
 - **One owner per server.** OpenCode loads a plugin once per location, so one
   server can run several plugin instances. Every instance joins one
   process-wide registry. The first instance owns the joins. Every instance
-  reads its own event stream and forwards events to the owner, and the
-  registry drops an event id it has already seen. When the owner's instance
+  reads its own event stream and forwards events to the owner. The registry
+  accepts a session's events from one stream only, the instance that delivered
+  that session first, and drops another instance's copy of them. It does not
+  rely on an event-id memory for this, because the published plugin and client
+  types document no order for event ids and a bounded memory forgets an old id. A `session.forked` or
+  `session.deleted` event is the exception: it is recorded and passed on from
+  any stream. A session is released when its stream is reset or its instance
+  leaves, and the next stream that delivers it takes it over. The registry
+  keeps one entry per held session and removes it on deletion or release. It
+  still drops an event id it has already seen. When the owner's instance
   is torn down, the next one takes over only after the old owner's workers
   and the removal of its binding entries have ended. A session that is still in
   its `session.get` lookup has no worker and no entry, so it does not delay the
@@ -187,16 +195,24 @@ The service and its host-token provisioning are documented in the product
   ended inside a gap is covered too, because the gap alone invalidates the
   proof. A compaction that was running when the gap came is not ended by the
   gap, and no check runs while it is running: the session stays `busy`, and the
-  check runs only after that compaction's own `ended` or `failed` event. That
-  is decided before every host call the check makes, not when it is asked for:
-  a check queued behind an earlier context operation reads nothing if a
-  compaction began, or a newer gap came, while it waited. The same holds
-  between its list, its put and its confirming list. A check that stops this
-  way ends without error and stays owed, and a failure it meets after it was
-  overtaken is ignored. A compaction that started while a check was running
-  counts as an overlap even if it has already ended or failed: the check does
-  not clear the obligation, and a failure it met is ignored. Only a failure of
-  a current check that no compaction overlapped turns that session's chat off.
+  check runs only after that compaction's own `ended` or `failed` event.
+  One rule says whether a check may still act. A check is current only while
+  that session's chat is on, no compaction runs, no newer gap or compaction
+  start or end has come, and nothing has withdrawn or replaced the binding. A
+  rejoin after `STALE_INSTANCE` does both: it clears the old binding, then
+  publishes a new one. The check asks the rule after every host call it awaits
+  and before the next one, and again in the step in which it would prove the
+  binding or turn chat off. So a check queued behind an earlier context
+  operation reads nothing if a compaction began, or a newer gap came, while it
+  waited, and the same holds between its list, its put and its confirming list.
+  A check that is no longer current ends without error: it puts nothing,
+  proves nothing and ignores its failure. A compaction that started while a
+  check was running counts the same way, even if it has already ended or
+  failed. The obligation then stays owed. Only a failure of a current check
+  turns that session's chat off, and the check does that itself, in that same
+  step, not after the answer has passed through a promise. The gate stays
+  closed until a check proves the binding, and a check that ended stale is
+  asked for again at the session's next event, not at the rejoin.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input
@@ -291,7 +307,20 @@ unverified, inferred, or a deliberate choice.
   would race for the same sessions.
 - **Locations.** Whether the owner's context can read and drive a session that
   belongs to another location. If it cannot, that session never joins.
-- **Instruction entries.** The entries surface is typed experimental. Whether
+- **Streams and event order.** The published plugin and client types (`2.3.2`)
+  do not say whether one session's events can arrive on more than one
+  instance's stream, and they document no order of event ids or of
+  `durable.seq`. The registry assumes that a stream delivers a session's events
+  in order, and takes each session from the first stream that delivered it.
+  This fails open in one case. If the stream that holds a session stops
+  carrying it while another stream still delivers it, the owner keeps the last
+  state it saw, and a session last seen running stays eligible. That happens if
+  two streams each carry only some of one session's events, or if a session
+  moves to another location (`session.moved`, which the plugin does not
+  subscribe to). A reset of the holding stream or the departure of its instance
+  releases the session, and a quiet stream does not. After a release the next
+  stream that delivers the session takes it, including a lagging stream whose
+  first event is an old one.- **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
   after each put, each compaction and each gap. After a crash an entry can remain with a
   stale binding. The next join replaces it. An owner change waits for the old
@@ -338,6 +367,11 @@ unverified, inferred, or a deliberate choice.
   emits those events during a compaction is not verified. The host read named in
   the previous item is the candidate that would close this, and the plugin does
   not rely on it.
+- **A join's own publish is not a read-back.** The put and the confirming list
+  of a join or a rejoin do not follow the currency rule above. If a compaction
+  ends between that put and that list, the confirmation fails and that
+  session's chat is turned off. A later `context()` call is serialised behind
+  it, so the order of puts and removals still holds.
 - **A user input is not an operator.** A `user` inbox item clears the stop
   latch whether an operator or an API client sent it.
 - **Persisted idle sessions** join at their first event after the server

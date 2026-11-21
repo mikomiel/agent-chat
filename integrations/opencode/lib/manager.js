@@ -47,7 +47,8 @@ export function isRootSession(info, sessionID) {
   return (info.parentID === undefined || info.parentID === null) && (info.fork === undefined || info.fork === null)
 }
 
-const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
+// The id of the session an event belongs to, or null when it names none.
+export const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
 
 // The id of the session a `session.forked` event describes, or null for any other event.
 export const forkedSessionOf = event => (event?.type === "session.forked" ? sessionOf(event) : null)
@@ -151,9 +152,12 @@ export function createManager(ctx, config, parts, {
   }
 
   // Put the binding entry back or turn this session's chat off: no entry, no chat. The delivery keeps its gate
-  // closed until this succeeds.
+  // closed until this succeeds. The delivery decides, and it calls this handler in the step in which it decided,
+  // while its check was still current: a failure is never carried over a promise hop and interpreted here later, when
+  // a compaction, a gap or a new binding may have made it stale. Nothing is awaited here, and the delivery's answer
+  // ("proved", "stale" or "failed") needs no handling: it never rejects, and a stale check stays owed for the next event.
   function readBack(record) {
-    record.delivery.verifyContext().catch(error => {
+    void record.delivery.verifyContext(error => {
       try { void record.lifecycle.disable(describeFailure(error)) } catch { /* already latched */ }
     })
   }

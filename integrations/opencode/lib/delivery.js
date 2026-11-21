@@ -13,11 +13,16 @@
 //
 // A compaction may drop the binding entry, and a lost event stream may have hidden one. From `session.compaction.ended`
 // and from a stream gap the gate stays closed until the entry has been read back (`verifyContext`); a read-back that
-// fails keeps it closed, and the manager then turns chat off. A read-back proves only that the entry exists at that
-// moment, never that a compaction has ended: a compaction already seen running stays running across a gap, and only
-// its own terminal event (`ended` or `failed`) clears it. A read-back touches the host only while no compaction
-// runs and no newer gap or end has superseded it. That is checked before every host call it makes, so one queued
-// before a compaction began, or overtaken by a newer gap, stops without error and the obligation stays owed.
+// fails keeps it closed, and the caller's `onFailed` then turns chat off. A read-back proves only that the entry exists
+// at that moment, never that a compaction has ended: a compaction already seen running stays running across a gap, and
+// only its own terminal event (`ended` or `failed`) clears it.
+//
+// ONE CURRENCY RULE. A read-back is for one obligation and one binding. It is current only while chat is open and on,
+// no compaction runs, no newer gap, compaction start or end has come, and no `context()` call has withdrawn or
+// replaced the binding. It asks that after every host call it awaits, before the next one, and again at the point
+// where it would act on a failure or prove the binding. A check that is not current does nothing more and reports
+// "stale": it neither puts, nor fails, nor proves, and the obligation stays owed for the next event. It reports
+// "proved" or "failed" only in the step in which it was still current, and it calls `onFailed` in that same step.
 //
 // State is read from events only. A fact the events have not shown is unknown, and unknown never reads as idle.
 import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES, monotonicNow } from "./channel.js"
@@ -43,6 +48,7 @@ export function createDelivery(ctx, sessionID, {
   let unverified = false // a compaction ended, or the stream broke, and the binding entry has not been read back since
   let compactions = 0 // compaction starts, endings and gaps so far: a read-back that began before the latest one proves nothing
   let verifying = null // the `compactions` value a queued read-back was asked for: one read per obligation
+  let generation = 0 // `context()` calls so far: a read-back made for an earlier call is for a binding that is gone
   let agent = null
   let pending = null // at most one issued input: { id, resolve, timer, deadline }
   let published = null // the binding text the entry should hold now
@@ -228,11 +234,12 @@ export function createDelivery(ctx, sessionID, {
     return Array.isArray(entries) && entries.some(entry => entry?.key === BINDING_KEY && entry.value === text)
   }
 
-  // Put the entry and confirm it. `may` is asked before the confirming list: false stops there, and the result is
-  // false. A put that left no entry means no binding context, which means chat off.
-  async function publish(text, may = () => true) {
+  // Put the entry and confirm it. `current` is asked after the put and before the confirming list: false stops there,
+  // and the result is false. A put that left no entry means no binding context, which means chat off. A caller that
+  // passes a `current` re-asks it for the failure this throws.
+  async function publish(text, current = () => true) {
     await ctx.session.instructions.entry.put({ sessionID, key: BINDING_KEY, value: text })
-    if (!may()) return false
+    if (!current()) return false
     // The surface is experimental.
     if (!await holds(text)) throw contextFailure()
     return true
@@ -245,10 +252,12 @@ export function createDelivery(ctx, sessionID, {
     if (closed) return Promise.resolve()
     if (text === null) {
       published = null
+      generation += 1
       return queued(() => Promise.resolve(ctx.session.instructions.entry.remove({ sessionID, key: BINDING_KEY })).catch(() => {}))
     }
     if (typeof text !== "string" || !text) return Promise.reject(contextFailure())
     published = text
+    generation += 1
     return queued(async () => {
       try { await publish(text) } catch { throw contextFailure() }
     })
@@ -260,34 +269,37 @@ export function createDelivery(ctx, sessionID, {
     return unverified && !compacting && !closed && !disabled && verifying !== compactions
   }
 
-  // May the read-back asked for at `mark` still touch the host? Not while a compaction runs, and not once a newer gap
-  // or a compaction start or end has superseded it, even a compaction that has ended again by now. Asked before every
-  // host call it makes, and again for any failure it meets.
-  const mayRead = mark => !compacting && compactions === mark
-
-  // After a compaction: put the entry back when it is gone or changed, then reopen the gate. Only the latest
-  // compaction's read-back reopens it. A rejection of a current check leaves the gate closed. Resolves quietly when
-  // nothing is published. A check that is superseded, or that overlaps a compaction, stops without error and the
-  // obligation stays owed: the next terminal event, or the first event after the newest gap, asks again.
-  function verifyContext() {
+  // After a compaction or a gap: put the entry back when it is gone or changed, then reopen the gate. Only the latest
+  // obligation's read-back reopens it. Resolves, and never rejects, with one of:
+  //   "proved"  the entry is there and the read-back was current throughout; the gate may reopen
+  //   "failed"  a host call failed while the read-back was current; `onFailed(error)` was called in that step
+  //   "stale"   it stopped, or its failure was ignored, because it was no longer current; the obligation stays owed
+  // Nothing published is trivially proved. `onFailed` may re-enter the delivery, so nothing is touched after it runs.
+  function verifyContext(onFailed = () => {}) {
     const mark = compactions
-    const proved = () => { if (compactions === mark) unverified = false }
-    if (closed || published === null) { proved(); return Promise.resolve() }
+    const binding = generation
+    // Asked after every host call, and again for the failure and the proof. Everything that can change across an
+    // await is here: a compaction or a gap, a withdrawn or replaced binding, and a chat that was closed or disabled.
+    const current = () => !closed && !disabled && !compacting && compactions === mark && generation === binding
+    if (closed) return Promise.resolve("stale")
+    if (published === null) { unverified = false; return Promise.resolve("proved") }
     const text = published
     verifying = mark
-    const stopped = () => { if (verifying === mark) verifying = null }
-    const may = () => mayRead(mark)
+    const stale = () => { if (verifying === mark) verifying = null; return "stale" }
     return queued(async () => {
       try {
-        if (!may()) return stopped()
-        if (!await holds(text)) {
-          if (!may() || !await publish(text, may)) return stopped()
-        }
+        if (!current()) return stale() // the wait behind earlier context operations
+        const found = await holds(text)
+        if (!current()) return stale() // asked before the put, which is made in the same step
+        if (!found && !await publish(text, current)) return stale()
       } catch {
-        if (!may()) return stopped() // a failure that overlapped a compaction, or a newer gap, is not evidence
-        throw contextFailure()
+        if (!current()) return stale() // a failure that overlapped a compaction, a newer gap or a new binding is no evidence
+        try { onFailed(contextFailure()) } catch { /* the caller's handler is its own; the outcome stands */ }
+        return "failed"
       }
-      proved()
+      if (!current()) return stale() // the last host call proves nothing about a binding that has since changed
+      unverified = false
+      return "proved"
     })
   }
 

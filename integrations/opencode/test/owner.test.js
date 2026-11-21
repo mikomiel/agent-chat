@@ -8,7 +8,7 @@ import { monotonicNow } from "../lib/channel.js"
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
 const flush = async () => { for (let index = 0; index < 8; index++) await tick() }
-const event = (id, type = "session.execution.started") => ({ id, type, data: { sessionID: "ses_a" } })
+const event = (id, type = "session.execution.started", sessionID = "ses_a") => ({ id, type, data: { sessionID } })
 
 function fakeMember(name, log, { feedThrows = false } = {}) {
   const member = {
@@ -49,7 +49,7 @@ test("the first member owns the joins and the others stand by", async () => {
   // An event read by any member goes to the owner, once.
   first.dispatch(event("e1"))
   second.dispatch(event("e1"))
-  second.dispatch(event("e2"))
+  second.dispatch(event("e2", undefined, "ses_b")) // ses_a is read from the stream that delivered it first, so e2 is another session's
   assert.deepEqual(log.slice(1), ["feed first e1", "feed first e2"])
   second.resetStream()
   assert.equal(log.at(-1), "reset first")
@@ -565,4 +565,116 @@ test("a compaction that ends after the stream broke and before it resumed is rea
   await flush()
   assert.equal(entries.size, 1) // the entry is back
   assert.equal(delivery.state(), null)
+})
+
+// Review 6003650164, finding 3: a session's state events are accepted from one stream only. Ids are not documented
+// as ordered and the host does not say that one stream covers a session, so no bounded id memory can promise that a
+// delayed duplicate is recognised. The stream that delivered the session first is its ordered source.
+test("a session's events are accepted from the stream that delivered it first, and a later stream's copy is dropped", async () => {
+  const registry = createRegistry()
+  const log = []
+  const first = fakeMember("first", log)
+  const second = fakeMember("second", log)
+  registry.attach(first)
+  registry.attach(second)
+  await flush()
+  log.length = 0
+  first.dispatch(event("e1"))
+  second.dispatch(event("e2")) // ses_a belongs to the first stream now
+  first.dispatch(event("e3"))
+  second.dispatch(event("e4", undefined, "ses_b")) // a session that the second stream delivered first is its own
+  first.dispatch(event("e5", undefined, "ses_b"))
+  assert.deepEqual(log, ["feed first e1", "feed first e3", "feed first e4"])
+})
+
+test("a copy that the wrong stream delivered first does not hide the pinned stream's copy of the same event", async () => {
+  const registry = createRegistry()
+  const log = []
+  const first = fakeMember("first", log)
+  const second = fakeMember("second", log)
+  registry.attach(first)
+  registry.attach(second)
+  await flush()
+  log.length = 0
+  first.dispatch(event("e0"))
+  second.dispatch(event("e1")) // dropped by the pin, so its id must not be remembered as seen
+  first.dispatch(event("e1"))
+  assert.deepEqual(log, ["feed first e0", "feed first e1"])
+})
+
+test("a session is released when its stream is reset or its member leaves, and the next stream that delivers it takes it", async () => {
+  const registry = createRegistry()
+  const log = []
+  const owner = fakeMember("owner", log)
+  const one = fakeMember("one", log)
+  const two = fakeMember("two", log)
+  registry.attach(owner)
+  registry.attach(one)
+  const detachTwo = registry.attach(two)
+  await flush()
+  log.length = 0
+  one.dispatch(event("e1"))
+  two.dispatch(event("e2")) // dropped: the first stream holds ses_a
+  one.resetStream() // its stream was lost, so the session is not tied to it any more
+  assert.equal(log.at(-1), "reset owner")
+  two.dispatch(event("e3"))
+  one.dispatch(event("e4")) // the second stream holds it now
+  await detachTwo()
+  one.dispatch(event("e5")) // and a member that leaves releases what it held
+  assert.deepEqual(log.filter(line => line.startsWith("feed")), ["feed owner e1", "feed owner e3", "feed owner e5"])
+})
+
+test("a fork or a deletion is passed on from any stream, not only from the one that holds the session", async () => {
+  const registry = createRegistry()
+  const log = []
+  const first = fakeMember("first", log)
+  const second = fakeMember("second", log)
+  registry.attach(first)
+  registry.attach(second)
+  await flush()
+  log.length = 0
+  first.dispatch(event("e1"))
+  first.dispatch(event("e2", undefined, "ses_b"))
+  second.dispatch(deletedEvent("e3", "ses_a"))
+  second.dispatch(forkedEvent("e4", "ses_b"))
+  assert.deepEqual(log, ["feed first e1", "feed first e2", "feed first e3", "feed first e4"])
+})
+
+// The session of the finding: started and finished on one stream, then a delayed duplicate of the start arrives from
+// another stream after the first stream's ids have long left the bounded memory.
+test("a delayed duplicate start from another stream does not mark an idle session running once its id was evicted", async () => {
+  const registry = createRegistry()
+  let delivery = null
+  const ctx = { ...streamCtx([]), session: { get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }) } }
+  const parts = {
+    createDelivery: (hostCtx, id) => {
+      if (id !== "ses_a") return { seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve("proved"), dispose() {} }
+      delivery = createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} })
+      return delivery
+    },
+    createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) } },
+  }
+  // Real members whose stream the test drives by hand.
+  const streams = {}
+  const attach = name => {
+    const member = createMember(name === "a" ? ctx : streamCtx([]), {}, parts)
+    return Object.assign(member, { pump(dispatch, reset) { streams[name] = { dispatch, reset }; return () => {} } })
+  }
+  registry.attach(attach("a"))
+  registry.attach(attach("b"))
+  await flush()
+  const send = (name, item) => streams[name].dispatch(item)
+  send("a", event("e0", "session.agent.selected"))
+  send("a", { id: "e0b", type: "session.inbox.enqueued", data: { sessionID: "ses_a", item: { type: "user" } } })
+  send("a", event("e1", "session.execution.started"))
+  send("a", event("e2", "session.execution.succeeded"))
+  await flush()
+  assert.notEqual(delivery, null)
+  assert.equal(delivery.heartbeatState().native_state, "idle") // started and finished
+  assert.notEqual(delivery.state(), null)
+  for (let index = 0; index < 1100; index++) send("a", event(`filler-${index}`, "session.execution.started", `ses_other_${index}`))
+  send("b", event("e1", "session.execution.started")) // the delayed duplicate: its id was evicted long ago
+  await flush()
+  assert.equal(delivery.heartbeatState().native_state, "idle") // still idle
+  assert.notEqual(delivery.state(), null) // so no notice can be handed over
 })

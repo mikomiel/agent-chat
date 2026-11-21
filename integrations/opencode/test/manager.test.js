@@ -2,6 +2,8 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { EVENT_TYPES, createManager, isRootSession } from "../lib/manager.js"
 import { createDelivery } from "../lib/delivery.js"
+import { createLifecycle } from "../lib/lifecycle.js"
+import { BINDING_KEY } from "../lib/channel.js"
 
 const config = { chatEnabled: true, directory: "/tmp/state", serverOrigin: "https://chat.example", hostToken: "synthetic-token", python: "/usr/bin/python3" }
 const flush = async () => { for (let index = 0; index < 8; index++) await new Promise(resolve => setImmediate(resolve)) }
@@ -25,7 +27,8 @@ function stubParts({ observe = () => false, verify = () => Promise.resolve(), st
         },
         reset() { delivery.resets += 1; delivery.owed = true },
         needsReadBack: () => delivery.owed, // owed after a gap and after an end, and asked for once
-        verifyContext() { delivery.owed = false; return verify(id) },
+        // The delivery contract: it never rejects, and it calls `onFailed` itself when a current check fails.
+        verifyContext(onFailed) { delivery.owed = false; return verify(id).then(() => "proved", error => { onFailed(error); return "failed" }) },
         dispose() { delivery.disposed += 1 },
       }
       deliveries.set(id, delivery)
@@ -749,3 +752,166 @@ test("a compaction whose end is lost in a gap cannot reach synthetic before the 
   assert.equal(synthetic.length, 1)
   void sent
 })
+
+// Review 6003650164, findings 1 and 2: a read-back is acted on only while it is still current, and the decision to
+// disable chat is made in the same step as the check that it is.
+// A host double whose next `list` waits until the test settles it.
+function holdableCtx() {
+  const entries = new Map()
+  const puts = []
+  const held = { next: false, entered: false, settle: null }
+  const ctx = {
+    session: {
+      async get({ sessionID }) { return root(sessionID) },
+      synthetic() { return Promise.resolve({ id: "msg_1" }) },
+      instructions: {
+        entry: {
+          async put({ key, value }) { puts.push(value); entries.set(key, value) },
+          async list() {
+            if (held.next) {
+              held.next = false
+              held.entered = true
+              await new Promise((resolve, reject) => { held.settle = { resolve, reject } })
+            }
+            return [...entries].map(([key, value]) => ({ key, value }))
+          },
+          async remove({ key }) { entries.delete(key) },
+        },
+      },
+    },
+  }
+  return { ctx, entries, puts, held }
+}
+
+const tickAfter = async count => { for (let tick = 0; tick < count; tick++) await Promise.resolve() }
+
+test("a failed read-back is never acted on once a compaction has begun, whatever the order of the microtasks", async () => {
+  const violations = []
+  const outcomes = [] // per offset: what the delivery saw and the lifecycle was told, in order
+  for (let offset = 0; offset <= 8; offset++) {
+    const rig = holdableCtx()
+    const order = []
+    let delivery = null
+    const parts = stubParts()
+    parts.createDelivery = (hostCtx, id) => {
+      delivery = Object.assign(createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }), { id })
+      const observe = delivery.observe
+      delivery.observe = item => { if (item.type === "session.compaction.started") order.push("started"); return observe(item) }
+      return delivery
+    }
+    const manager = createManager(rig.ctx, config, parts)
+    const send = (type, data = {}) => manager.feed(event(type, "ses_a", data))
+    send("session.execution.started")
+    await flush()
+    await delivery.context("binding text")
+    const lifecycle = parts.lifecycles.get("ses_a")
+    const disable = lifecycle.disable
+    lifecycle.disable = reason => { order.push("disable"); return disable(reason) }
+    rig.entries.clear() // a compaction dropped the entry
+    rig.held.next = true
+    manager.reset()
+    await flush()
+    send("session.agent.selected", { agent: "build" }) // the first event after the gap: the read-back starts and its list is held
+    send("session.inbox.enqueued", { item: { type: "user" } })
+    send("session.execution.started")
+    await flush()
+    assert.equal(rig.held.entered, true, `offset ${offset}`)
+    rig.held.settle.reject(new Error("unavailable"))
+    await tickAfter(offset)
+    send("session.compaction.started", { reason: "auto" })
+    await flush()
+    if (order.join() === "started,disable") violations.push(offset)
+    outcomes.push(`${offset}:${order.join(">") || "none"}`)
+  }
+  assert.deepEqual(violations, []) // the offsets at which chat was disabled after the compaction had begun
+  // Positive control: the sweep must reach both sides of the decision, or an empty result would prove nothing.
+  assert.equal(outcomes.some(line => line.endsWith(":started")), true, outcomes.join(" "))
+  assert.equal(outcomes.some(line => line.endsWith(":disable>started")), true, outcomes.join(" "))
+})
+
+// A real manager, delivery and lifecycle around a worker double. The first heartbeat after the join waits for the test.
+async function staleInstanceRun(answer) {
+  const rig = holdableCtx()
+  const notices = []
+  let delivery = null
+  let lifecycle = null
+  let retry = null
+  let starts = 0
+  const heartbeat = { reject: null }
+  const joinedFor = number => ({
+    session_id: "11111111-1111-4111-8111-111111111111", instance_id: `2222222${number}-2222-4222-8222-222222222222`,
+    room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "opencode",
+    instance_file: `/tmp/agent-chat-state/boot-${number}.json`,
+  })
+  const workerFor = number => ({
+    ready: Promise.resolve(joinedFor(number)),
+    closed: new Promise(() => {}),
+    request: operation => (operation === "heartbeat" && heartbeat.reject === "armed"
+      ? new Promise((_resolve, reject) => { heartbeat.reject = reject })
+      : Promise.resolve({})),
+    stop: async () => ({ code: 0, signal: null }),
+  })
+  const parts = {
+    createDelivery: (hostCtx, id) => {
+      delivery = createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} })
+      return delivery
+    },
+    createLifecycle: (bus, ownDelivery, passedConfig, options) => {
+      lifecycle = createLifecycle(bus, ownDelivery, passedConfig, {
+        ...options,
+        now: () => 1_000,
+        random: () => 0,
+        setTimeoutImpl: fn => { retry = fn; return 1 },
+        clearTimeoutImpl: () => {},
+        setIntervalImpl: () => 0,
+        clearIntervalImpl: () => {},
+      })
+      return lifecycle
+    },
+    startProcess: () => workerFor(++starts),
+  }
+  const manager = createManager(rig.ctx, config, parts, { notice: text => notices.push(text) })
+  const send = (type, data = {}) => manager.feed(event(type, "ses_a", data))
+  send("session.execution.started")
+  await flush()
+  assert.match(rig.entries.get(BINDING_KEY), /boot-1\.json/) // the first binding is confirmed
+  rig.entries.clear() // a compaction dropped the entry
+  rig.held.next = true
+  heartbeat.reject = "armed" // the next heartbeat is the one that answers STALE_INSTANCE
+  manager.reset() // a gap: the state change drives a heartbeat, which waits
+  await flush()
+  send("session.agent.selected", { agent: "build" }) // the first event after the gap: the read-back's list is held
+  send("session.inbox.enqueued", { item: { type: "user" } })
+  send("session.execution.started")
+  await flush()
+  assert.equal(rig.held.entered, true)
+  const firstPuts = rig.puts.length
+  heartbeat.reject(Object.assign(new Error("STALE_INSTANCE"), { code: "STALE_INSTANCE", operation: "heartbeat" }))
+  await flush() // the lifecycle withdrew the binding and scheduled its rejoin; the read-back's list is still pending
+  assert.equal(typeof retry, "function")
+  if (answer === "resolve") rig.held.settle.resolve()
+  else rig.held.settle.reject(new Error("unavailable"))
+  await flush()
+  return { rig, notices, send, firstPuts, retry: () => retry(), lifecycle: () => lifecycle, delivery: () => delivery, starts: () => starts }
+}
+
+for (const answer of ["resolve", "reject"]) {
+  test(`STALE_INSTANCE while the read-back's list is pending (${answer}): the withdrawn binding is not put back, chat stays on, and the rejoin goes on`, async () => {
+    const run = await staleInstanceRun(answer)
+    assert.equal(run.rig.puts.length, run.firstPuts) // no put of the withdrawn text
+    assert.equal(run.rig.entries.has(BINDING_KEY), false)
+    assert.notEqual(run.lifecycle().state(), "offline") // chat is not disabled
+    assert.equal(run.notices.some(text => /stopped/.test(text)), false)
+    run.retry() // the backoff ends: the rejoin
+    await flush()
+    await flush()
+    assert.equal(run.starts(), 2)
+    assert.match(run.rig.entries.get(BINDING_KEY), /boot-2\.json/) // the new binding is published
+    assert.notEqual(run.lifecycle().state(), "offline")
+    // The old check proved nothing, so the obligation is still owed: the next event reads the new binding back.
+    run.send("session.execution.started")
+    await flush()
+    assert.equal(run.delivery().needsReadBack(), false)
+    assert.equal(run.delivery().state(), null)
+  })
+}
