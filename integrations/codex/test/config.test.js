@@ -158,6 +158,17 @@ test("a record in a private directory below private and sticky ones loads", () =
   finally { rmSync(root, { recursive: true, force: true }) }
 })
 
+test("a record whose own name holds U+FFFD is refused, though its directory is private; the same record by a valid name loads", () => {
+  const { root, dir, file } = nested()
+  try {
+    const lossy = join(dir, "\uFFFD.json")
+    renameSync(file, lossy)
+    assert.equal(loadConfig({ [ENV]: lossy }), null)
+    renameSync(lossy, file)
+    assert.deepEqual(loadConfig({ [ENV]: file }), base, "control: the same record by a valid name loads")
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test("a record below a group- or world-writable directory that is not sticky is refused", () => {
   for (const mode of [0o770, 0o707, 0o777]) {
     const { root, file } = nested(mode)

@@ -541,6 +541,10 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   the old process's end closes the receiver. An interrupt in the old process
   also stops delivery in the new one until its next prompt. All four are
   tracked in #156.
+- **Codex as PID 1.** A pid of 1 is never taken as a live owner. A Codex that
+  runs as a container's entrypoint therefore loses its receiver after the quiet
+  window, though Codex still runs. Run the container with an init process
+  (`docker run --init`). This is tracked in #158.
 - **A delegate's hooks.** Codex gives a subagent's hooks the parent session
   id. Whether `UserPromptSubmit` and `PostToolUse` inside a subagent carry
   `agent_id` is not confirmed. Without `appServer` only `agent_id` and

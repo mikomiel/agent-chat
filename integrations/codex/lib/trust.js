@@ -139,7 +139,8 @@ export function trustedDirectory(directory, options) {
 // opens the returned path and compares what it opened (fstat) with the identity, so a file swapped between the two is refused.
 export function trustedFile(path, options = {}) {
   const rule = settings(options)
-  if (typeof path !== "string" || path.endsWith("/")) throw refusal(rule.refuse)
+  // The last name is held to the walk's rule too: one with U+FFFD may be a lossy spelling of another file's name.
+  if (typeof path !== "string" || path.endsWith("/") || path.includes("\uFFFD")) throw refusal(rule.refuse)
   try {
     const checked = checkedChain(dirname(path), rule)
     const target = join(checked.real, basename(path))
@@ -160,7 +161,7 @@ export function trustedSocket(path, options = {}) {
   const { refuse, lstat, readlink, uid } = rule
   // A socket is a file: a spelling that ends in a separator names a directory, and lstat of it fails where the connect
   // to the resolved name would not.
-  if (typeof path !== "string" || path.endsWith("/")) throw refusal(refuse)
+  if (typeof path !== "string" || path.endsWith("/") || path.includes("\uFFFD")) throw refusal(refuse)
   // The spelling is bounded too, so the configured path that a later check looks at again is one the kernel can look up.
   fittingSocketPath(path, refuse)
   try {

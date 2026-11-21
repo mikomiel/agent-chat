@@ -141,6 +141,7 @@ test("with the real file system: a spelling through a literal U+FFFD directory i
     assert.equal(realpathSync.native(literal), literal, "control: the literal directory exists and is its own real path")
     assert.throws(() => trustedDirectory(literal), { code: "CHAT_UNTRUSTED" })
     assert.throws(() => trustedSocket(`${literal}/s.sock`), { code: "CHAT_UNTRUSTED" })
+    assert.throws(() => trustedSocket(`${bad.root}/\uFFFD`), { code: "CHAT_UNTRUSTED" }, "a last name with U+FFFD")
   } finally { bad.close() }
   return undefined
 })
