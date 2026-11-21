@@ -132,6 +132,62 @@ test("context: a confirmation that finds other text twice rejects after two puts
   assert.equal(ctx.calls.put.length, 2)
 })
 
+test("context: no second put once the binding is withdrawn or the context is torn down while the confirmation ran", async () => {
+  for (const end of ["withdraw", "replace", "dispose", "disable"]) {
+    const { ctx, context } = make()
+    const entry = ctx.session.instructions.entry
+    const list = entry.list
+    let release
+    entry.list = async input => { // the confirmation finds other text, and answers only after the end below
+      entry.list = list
+      ctx.entries.set(BINDING_KEY, "earlier owner's binding")
+      const snapshot = await list(input)
+      await new Promise(resolve => { release = resolve })
+      return snapshot
+    }
+    const publish = context.context("binding")
+    await flush()
+    assert.equal(typeof release, "function", end)
+    if (end === "withdraw") void context.context(null)
+    else if (end === "replace") void context.context("newer binding")
+    else context[end]()
+    const puts = ctx.calls.put.filter(input => input.value === "binding").length
+    release()
+    await assert.rejects(publish, { code: "CHAT_CONTEXT_UNAVAILABLE" }, end)
+    assert.equal(ctx.calls.put.filter(input => input.value === "binding").length, puts, end)
+  }
+})
+
+test("context: a repair makes no second put once a newer signal overtook its confirmation", async () => {
+  const { ctx, context } = make()
+  await context.context("binding")
+  ctx.entries.clear()
+  compacted(context)
+  const entry = ctx.session.instructions.entry
+  const list = entry.list
+  let lists = 0
+  let release
+  entry.list = async input => {
+    lists += 1
+    if (lists === 2) { // the repair's confirming list: the entry was dropped again, and the answer waits
+      ctx.entries.clear()
+      const snapshot = await list(input)
+      await new Promise(resolve => { release = resolve })
+      return snapshot
+    }
+    return list(input)
+  }
+  const repair = context.repair()
+  await flush()
+  await flush()
+  assert.equal(typeof release, "function")
+  compacted(context) // a newer signal: the repair is no longer current
+  const puts = ctx.calls.put.length
+  release()
+  assert.equal(await repair, false)
+  assert.equal(ctx.calls.put.length, puts)
+})
+
 test("context: a failing removal is not an error and a disposed object publishes nothing", async () => {
   const { ctx, context } = make(fakeCtx({ removeFails: true }))
   await context.context("text")

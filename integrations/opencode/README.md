@@ -191,8 +191,9 @@ The service and its host-token provisioning are documented in the product
   seconds, whether or not anything is owed. An entry can change with no signal
   the plugin sees: a compaction that ends inside a gap after the read-back, a
   call that lands after its time limit, or a host that answers again after a
-  failed check. So any such change gets a repair attempt at the next tick, at
-  most 30 seconds later; the attempt then runs its list, put and confirming list.
+  failed check. So any such change has a repair requested at the next tick, at
+  most 30 seconds later. A tick that lands while a check is in flight makes that
+  check run once more when it ends, instead of starting a host call at the tick.
   The tick costs
   one list per joined session, plus a put and a confirming list only when the
   entry is wrong.

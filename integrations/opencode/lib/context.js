@@ -106,15 +106,19 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
   // Put the entry and confirm it. `current` is asked after the put and before the confirming list: false stops there,
   // and the result is false. A put that left no entry throws: the caller decides what that means.
   // A put of an earlier owner that ran out of time can land between this put and its confirming list, so a confirmation
-  // that finds other text puts once more before it fails.
-  async function publish(text, current = () => true) {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+  // that finds other text puts once more before it fails. The second put is made only while the work is still wanted:
+  // `current` false ends a repair with false, and `wanted` false (the binding was withdrawn, replaced or torn down) fails
+  // a join's publish, so a stale binding is never written over a newer one.
+  async function publish(text, { current = () => true, wanted = () => true } = {}) {
+    for (let attempt = 0; ; attempt += 1) {
       await call("put", { sessionID, key: BINDING_KEY, value: text })
       if (!current()) return false
       // The surface is experimental.
       if (await holds(text)) return true
+      if (attempt >= 1) throw contextFailure()
+      if (!current()) return false
+      if (!wanted()) throw contextFailure()
     }
-    throw contextFailure()
   }
 
   // Publish the binding text, replacing any earlier one under the same key; null removes it. Rejects when the
@@ -133,7 +137,8 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
     const binding = generation
     return queued(async () => {
       const current = currentAt(compactions, binding) // from the start of this publish to its confirmation
-      try { await publish(text) } catch { throw contextFailure() }
+      const wanted = () => !closed && !disabled && generation === binding
+      try { await publish(text, { wanted }) } catch { throw contextFailure() }
       // A confirmed put is a read-back of this binding, when nothing has overlapped it.
       if (current()) unverified = false
     })
@@ -179,7 +184,7 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
       try {
         const found = await holds(text)
         if (!current()) return done(false) // asked before the put, which is made in the same step
-        if (!found && !await publish(text, current)) return done(false)
+        if (!found && !await publish(text, { current })) return done(false)
       } catch {
         return done(false) // a failed call proves nothing either way, and turns nothing off
       }
