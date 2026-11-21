@@ -109,6 +109,9 @@ jobs:
       - name: Test the OpenCode integration contract
         working-directory: integrations/opencode
         run: node --test
+      - name: Test the Codex integration contract
+        working-directory: integrations/codex
+        run: node --test
 
   build:
     name: build

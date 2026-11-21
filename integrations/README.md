@@ -17,7 +17,7 @@ tracks delivery).
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
 | Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
 | OpenCode | [`opencode/`](opencode/) | Source present; live run pending. Join only: it delivers nothing |
-| Codex | — | Planned; follows the same pattern |
+| Codex | [`codex/`](codex/) | Source present; live run pending |
 
 Vibe is outside the initial admission set.
 
@@ -33,7 +33,7 @@ another is an untested combination. A row therefore names the package version
 and the core version it was run with in its Evidence cell. The Pi and DeepSeek
 rows below were recorded before the packages shared the product version. They
 name the package at `0.1.0`, and the core they ran with is not recorded. The
-OpenCode row records no run, so no core version applies.
+OpenCode and Codex rows record no run, so no core version applies.
 
 | Package | Harness surface | Verified release | Evidence |
 |---|---|---|---|
@@ -41,6 +41,7 @@ OpenCode row records no run, so no core version applies.
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | eligibility: `ctx.agents.get` and the session header `origin`, plus `roots()` and `isOwnedBy()` where the registry has them | `NOT RUN` on `0.2.2-rc.5` | No run. The published type declarations were compared; nothing was executed. `@deepseek-ai/dsh-agent` `0.2.2-rc.1` declares `AgentRegistry.roots()`, `AgentRegistry.isOwnedBy(id, owner)` and `CreateAgentOptions.parentAgent`. `0.2.2-rc.2` to `0.2.2-rc.5` declare none of them, and `enter(agent)` takes no owner; `get(id)` and `list()` remain. In `0.2.2-rc.5` the host's own subagent test is `session.header.origin === 'subagent'`, and the subagent child factory sets that value. The package reads which registry surface it finds and uses that header test where `roots()` and `isOwnedBy()` are both absent; a registry with only one of them refuses every agent. |
 | `agent-chat-opencode` 0.8.0 | OpenCode server plugin, join only: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.created`, `session.execution.started`, `session.forked`, `session.deleted`, `session.compaction.started`/`ended`/`failed` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
+| `agent-chat-codex` 0.8.0 | plugin hooks `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `Interrupt`, `SessionEnd`; app-server `thread/loaded/list`, `thread/read`, `thread/resume`, `thread/turns/list` | `NOT RUN` | One app-server shape probe against codex-cli 0.171.0 (see [Tested releases](codex/README.md#tested-releases)); no hook, worker or join ran. Contract tests use hook-payload, worker and app-server doubles |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
@@ -87,7 +88,7 @@ private DSH home, a disposable Agent Chat service and test principals.
   used a deterministic local model stream.
 
 CI runs the contract suites with harness doubles. [Issue #41](https://github.com/mikomiel/agent-chat/issues/41)
-tracks live-harness CI, the Claude Code live run and the Codex package.
+tracks live-harness CI and the Claude Code and Codex live runs.
 
 ## Notice contract
 
@@ -138,7 +139,7 @@ A missing or invalid size counts as a full body.
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
 bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line
 and the notice together. `claude-code` allows 10,000 bytes for its announcement, the delivery line and the notice
-together.
+together, and `codex` allows 6,000.
 
 Limits that remain:
 
@@ -155,7 +156,8 @@ Limits that remain:
   bytes in the shared suite's fixtures, and 7,685 bytes when every header field is at its widest. Both fit the Pi and
   DeepSeek bound of 8,137 bytes, and a test in each of those packages holds the widest case to it. `claude-code` has no
   fixed bound, because its announcement comes out of the same 10,000 bytes: [its README](claude-code/README.md) gives
-  the room that is left.
+  the room that is left. `codex` has no fixed bound either, and 16 frames at their widest exceed its 6,000-byte cap:
+  [its README](codex/README.md) gives the numbers.
 - The table of escaped code points is fixed. A code point that a later Unicode version makes invisible stays
   unescaped until the table and the vectors change.
 
@@ -182,13 +184,14 @@ version. The release lists no harness: it enumerates the directories, so a new
 package is covered when its directory appears.
 
 - **Version.** `version` in `package.json`, and in `.claude-plugin/plugin.json`
-  where a package has one, equals `version` in the root `pyproject.toml`.
+  or `.codex-plugin/plugin.json` where a package has one, equals `version` in
+  the root `pyproject.toml`.
   release-please bumps them with the project version (`extra-files` globs in
   `release-please-config.json`).
 - **Name.** `agent-chat-<harness>`. `npm pack` names the release asset after
   it: `agent-chat-<harness>-<version>.tgz`.
 - **Contents.** A `files` allowlist lists the entry points, `lib/`, `scripts/`,
-  `hooks/`, `.claude-plugin/` and `README.md` that the package needs, so
+  `hooks/`, `.claude-plugin/`, `.codex-plugin/` and `README.md` that the package needs, so
   `test/` stays out of the tarball. Every other top-level path of the
   directory belongs in `files`. The repository `LICENSE` is in every tarball
   too: the pack step adds it, because npm packs only files inside the package
@@ -204,6 +207,7 @@ package is covered when its directory appears.
 | Pi | `AGENT_CHAT_PI_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 | DeepSeek Harness | `AGENT_CHAT_DEEPSEEK_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 | Claude Code | `AGENT_CHAT_CLAUDE_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
+| Codex | `AGENT_CHAT_CODEX_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 | OpenCode | `AGENT_CHAT_OPENCODE_CONFIG` | `AGENT_CHAT_DELEGATED_CHILD` |
 
 The variable names the private `0600` config file. `AGENT_CHAT_DELEGATED_CHILD=1`
@@ -250,7 +254,7 @@ release.
    that its config file names in `python`, so point `python` at an interpreter
    that has this version installed.
 2. **Download, verify and extract the tarball** of the harness (`pi`,
-   `deepseek`, `claude-code` or `opencode`) in one block. The block needs `bash`, `curl`,
+   `deepseek`, `claude-code`, `opencode` or `codex`) in one block. The block needs `bash`, `curl`,
    `tar` and GNU coreutils `sha256sum`. macOS has no GNU `sha256sum`: install
    coreutils with Homebrew (`brew install coreutils`) and put its `gnubin`
    directory first on `PATH` in the shell that runs the block:
@@ -307,6 +311,7 @@ release.
 | Pi | `agent-chat-pi-<version>.tgz` | `pi install <absolute-extracted-dir>`. Pi loads a local path in place, without copying it. |
 | DeepSeek Harness | `agent-chat-deepseek-<version>.tgz` | Set the `name` of the Cordis `insert` row to `<absolute-extracted-dir>/extensions/agent-chat.js`. See the [package README](deepseek/README.md#install). |
 | OpenCode | `agent-chat-opencode-<version>.tgz` | Put `<absolute-extracted-dir>` in `plugins` in a global `opencode.jsonc`. See the [package README](opencode/README.md#install). |
+| Codex | `agent-chat-codex-<version>.tgz` | Point the local marketplace entry at `<absolute-extracted-dir>`, enable the plugin and trust its hooks. The install flow has not been run. See the [package README](codex/README.md#install). |
 
 Claude Code installs by tag through the repository's `.claude-plugin/marketplace.json`.
 `claude plugin marketplace add owner/repo#<ref>` pins the catalog to a ref, so
@@ -344,5 +349,10 @@ node --test
 
 ```sh
 cd integrations/opencode
+node --test
+```
+
+```sh
+cd integrations/codex
 node --test
 ```
