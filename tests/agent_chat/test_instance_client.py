@@ -16,7 +16,7 @@ import pytest
 
 from agent_chat import instance_client
 from agent_chat.instance_file import read_instance
-from agent_chat.models import ChatError, DeliveryClaim, Heartbeat, ReceiptDelivery
+from agent_chat.models import ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -514,6 +514,34 @@ def test_claim_with_bodies_refuses_invalid_content_as_uncertain(monkeypatch, cha
         instance_client.claim(instance, uuid4(), DeliveryClaim(messages=[message]), True)
     # The same row is fine for the metadata grant: only bodies mode reads these fields.
     assert instance_client.claim(instance, uuid4(), DeliveryClaim(messages=[message]))["dispatch"] is True
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_a_claim_or_settlement_carrying_refused_is_uncertain(monkeypatch, refused):
+    # The claim and settlement paths call the server directly: the worker's outage marker there is uncertain too.
+    message, attempt = str(uuid4()), uuid4()
+    marker = {"refused": "SERVICE_UNAVAILABLE"} if refused else {}
+    instance = _canned(
+        monkeypatch, lambda instance_id, _session: {**_grant_reply(instance_id, [_granted(message)]), **marker}
+    )
+    claim = DeliveryClaim(messages=[message])
+    if refused:
+        with pytest.raises(ChatError, match="^REQUEST_UNCERTAIN$"):
+            instance_client.claim(instance, uuid4(), claim)
+    else:
+        assert instance_client.claim(instance, uuid4(), claim)["dispatch"] is True
+    result = DeliveryResult(outcome="handed")
+    instance = _canned(
+        monkeypatch,
+        lambda instance_id, _session: {
+            "instance_id": instance_id, "id": str(attempt), "outcome": "handed", "reason": None, **marker
+        },
+    )
+    if refused:
+        with pytest.raises(ChatError, match="^REQUEST_UNCERTAIN$"):
+            instance_client.settle(instance, attempt, result)
+    else:
+        assert instance_client.settle(instance, attempt, result)["outcome"] == "handed"
 
 
 def _grant_at(instance_id, rows, admitted_at, expires_at):
