@@ -376,6 +376,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       if (live !== record) return
       // A child found by a read that a hook event or a rebind overtook says nothing about the thread now: the next read decides.
       if (result.current && result.reason === "child") return disable("CHAT_CHILD_THREAD")
+      // A current read that finds another provider unbinds the thread, as a bind does: the state follows the hooks, the worker
+      // stays, and the next tick binds again.
+      if (result.current && result.reason === "stale_binding") setBound(false)
     }
     return exclusive(() => beat(record))
   }
@@ -483,6 +486,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (failure) return link.send(disabledReply())
     // A start event always announces: a compaction or resume may have dropped the earlier text.
     const announce = announcement({ always: true })
+    // The earlier receipt is for text this start may have dropped: until this write is confirmed, the next hook announces again.
+    announced = null
     const message = announce ? `Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.` : undefined
     if (!announce) return link.send({ context: null })
     await link.send({ context: announce.text, ack: true, message })
@@ -531,8 +536,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return link.send({ ok: true })
   }
 
-  async function onEnd(_request, link) {
+  // An end from a process that another one has replaced (a resume adopted the new one) is late: the session goes on in the new
+  // process, so it changes nothing. An end that names no owner (a hook from before owner_pid) ends the receiver, as it did.
+  async function onEnd(request, link) {
     await link.send({ ok: true })
+    if (Number.isInteger(request.owner_pid) && request.owner_pid !== owner) return
     void shutdown()
   }
 
@@ -571,7 +579,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   function handle(first, link) {
     contact = now()
     if (closed) return link.send({ disabled: true })
-    adoptOwner(first.owner_pid)
+    if (first.op !== "end") adoptOwner(first.owner_pid) // an end never moves the owner watch
     switch (first.op) {
       case "start": return onStart(first, link)
       case "turn": return onTurn(first, link)

@@ -83,7 +83,8 @@ async function dispatch(name, { payload, config, where, io, deadline, now }) {
     : io.connect(where.socket))
   // A start and a turn name the process that runs this hook's command, Codex. A
   // session resumed in a new process reattaches to the old receiver, which must
-  // then watch the new one.
+  // then watch the new one. An end names it too, so a late end from the old process
+  // does not end the receiver that the new one adopted.
   const owner = io.owner()
   // The hook's one deadline for a turn: the time to wait for the reply is what is left of it, and the receiver is given that
   // less the margin, so a reply that it sends in its time is one this hook is still there to write.
@@ -99,7 +100,7 @@ async function dispatch(name, { payload, config, where, io, deadline, now }) {
     case "tool": return turn("tool", "PostToolUse", await open(0))
     case "stop": return quiet(await open(0), { op: "stop", permission_mode: mode }, 3_500)
     case "interrupt": return quiet(await open(0), { op: "interrupt" }, 1_500)
-    default: return quiet(await open(0), { op: "end" }, 800)
+    default: return quiet(await open(0), { op: "end", owner_pid: owner }, 800)
   }
 }
 

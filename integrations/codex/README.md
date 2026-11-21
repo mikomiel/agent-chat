@@ -124,12 +124,12 @@ or a stop.
 
 | Event | Command | Timeout | What it does |
 |---|---|---|---|
-| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it. A start also resets what the earlier hooks left, as a fresh session starts: the read is dropped, the running state goes back to unknown and the Plan Mode hint is set from the start's own `permission_mode` (cleared when it has none), so a turn that died cannot leave the session `busy` for the heartbeat. The reset state goes out in a heartbeat at once, not at the next period, and the announcement does not wait for it. A local stop stays until a prompt clears it. |
+| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it; until the hook confirms that write, the binding counts as unannounced, and the next prompt or tool hook carries it. A start also resets what the earlier hooks left, as a fresh session starts: the read is dropped, the running state goes back to unknown and the Plan Mode hint is set from the start's own `permission_mode` (cleared when it has none), so a turn that died cannot leave the session `busy` for the heartbeat. The reset state goes out in a heartbeat at once, not at the next period, and the announcement does not wait for it. A local stop stays until a prompt clears it. |
 | `UserPromptSubmit` | `prompt` | 10 s | Reports the session busy, or in Plan Mode when `permission_mode` is `plan`, and clears a local stop. Then delivers a claimed batch as `additionalContext`. May start a missing receiver. |
 | `PostToolUse` | `tool` | 10 s | The same as `prompt`, between tool calls, without clearing a stop. Never starts a receiver. |
 | `Stop` | `stop` | 5 s | Reports the session idle. Prints nothing: Codex expects JSON or nothing from `Stop`, and a decision there would continue the turn. |
 | `Interrupt` | `interrupt` | 3 s | Latches a local stop. Prints nothing. |
-| `SessionEnd` | `session-end` | 3 s | Ends the instance, stops the worker and removes the socket. |
+| `SessionEnd` | `session-end` | 3 s | Ends the instance, stops the worker and removes the socket. The request names the Codex process; an end from a process that a resume replaced changes nothing (see End). |
 
 Codex allows `Interrupt` and `SessionEnd` one second by default and three at
 most. The hook's own limit for each is 2 seconds. A `SessionEnd` hook only
@@ -319,6 +319,11 @@ sends its request: it does not wait for the worker to end its instance.
   process is identified by its pid and its start time, so another process that
   reuses the pid does not keep a dead owner's receiver alive. A hook command
   may run through a shell, so the owner hint skips up to two shell ancestors.
+  A start and a turn move the owner watch to the process they name; an end
+  never does. A `SessionEnd` ends the receiver only when it names the owner
+  that is watched now, so a late end from a process that a resume replaced
+  changes nothing. An end that names no owner (a hook from before the end
+  carried one) ends the receiver, as it did before.
 
 ### App-server control socket
 
@@ -434,7 +439,9 @@ rule has already excluded.
    an earlier bind recorded and not with an aborted one. The thread's model
    provider is recorded when the bind completes; a read that later shows another
    provider is a `stale_binding`: the thread still joins, but it is unbound, so no
-   read is taken and the state follows the hooks. Each later heartbeat binds again
+   read is taken and the state follows the hooks. A current heartbeat read that
+   finds another provider unbinds the thread the same way, and the worker stays;
+   one that a hook event overtook is dropped. Each later heartbeat binds again
    until a bind finds the thread with the provider that was recorded. A
    heartbeat bind that a hook event (a session start, say) overtook is dropped,
    as a read is: it records nothing, a child it found does not end chat, and the

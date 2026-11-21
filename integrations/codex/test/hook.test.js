@@ -151,8 +151,8 @@ test("a turn hook's wait and the receiver's patience come out of one deadline th
   }
 })
 
-test("a start and a turn name the process that runs Codex, so a resumed session moves the owner watch", async () => {
-  for (const name of ["session-start", "prompt", "tool"]) {
+test("a start, a turn and an end name the process that runs Codex, so a resumed session moves the owner watch", async () => {
+  for (const name of ["session-start", "prompt", "tool", "session-end"]) {
     const result = await run(name, base, { owner: () => 777 })
     assert.equal(result.calls[0].owner_pid, 777, name)
   }
@@ -287,7 +287,7 @@ test("an interrupt reports a stop and prints nothing, whatever the receiver answ
 test("a session end asks the receiver to end and never starts one", async () => {
   const result = await run("session-end", { ...base, hook_event_name: "SessionEnd", reason: "other" }, { reply: { ok: true } })
   assert.equal(result.code, 0)
-  assert.deepEqual(result.calls, [{ op: "end" }])
+  assert.deepEqual(result.calls, [{ op: "end", owner_pid: 100 }])
   const gone = await run("session-end", base, { up: false })
   assert.equal(gone.code, 0)
   assert.deepEqual(gone.started, [])

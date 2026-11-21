@@ -300,6 +300,18 @@ test("beside an unannounced binding, widest metadata rows are claimed exactly wh
   assert.match(over.sent[0].context, /^Agent Chat is available/)
 })
 
+// A start drops the earlier receipt before it announces: a compaction may have removed the text, so a start whose write is
+// not confirmed leaves the binding unannounced, and the next tool hook carries it.
+test("a start whose announcement is not confirmed leaves the binding to the next tool hook", async () => {
+  for (const hook of [{ receipt: "failed" }, { answer: false }]) {
+    const r = await rig()
+    await r.begin() // the first start is confirmed
+    await r.op({ op: "start", wait_ms: 0 }, hookDouble({ events: r.events, ...hook })) // a compaction: no confirmed write
+    const tool = await r.op(turn({ event: "tool" }))
+    assert.match(tool.sent[0].context ?? "", /Agent Chat is available/, JSON.stringify(hook))
+  }
+})
+
 test("the binding is announced once, then re-announced by every later start event", async () => {
   const r = await rig()
   await r.begin()
@@ -887,6 +899,26 @@ test("a session end closes the listener first, ends the worker and exits", async
   assert.deepEqual(r.events.filter(event => event === "exit:0").length, 1)
 })
 
+// A resumed session's new process adopts the receiver. A late end from the old one changes nothing; the new one's end ends it.
+test("a late session end from a replaced owner leaves the receiver to the owner that adopted it", async () => {
+  const r = await rig()
+  await r.op({ op: "start", wait_ms: 5000, owner_pid: 4242, permission_mode: "default" })
+  await r.op({ op: "start", wait_ms: 0, owner_pid: 5151, permission_mode: "default" }) // the resume in a new process
+  const late = await r.op({ op: "end", owner_pid: 4242 })
+  await settle()
+  assert.deepEqual(late.sent, [{ ok: true }])
+  assert.equal(r.exitCode, undefined, "the old process's end does not end the receiver")
+  assert.equal(r.worker.state.stops, 0)
+  const tool = await r.op(turn({ event: "tool", owner_pid: 5151 }))
+  assert.equal(tool.sent.length, 1)
+  assert.notEqual(tool.sent[0].disabled, true, "the new owner's hook is still served")
+  const end = await r.op({ op: "end", owner_pid: 5151 })
+  await settle()
+  assert.deepEqual(end.sent, [{ ok: true }])
+  assert.equal(r.exitCode, 0, "the adopting owner's end ends it")
+  assert.equal(r.worker.state.stops, 1)
+})
+
 test("a receiver whose owner is gone and that nothing has contacted ends itself", async () => {
   let owner = true
   const r = await rig({ alive: () => owner })
@@ -1202,6 +1234,41 @@ test("a Stop hook with a default hint, then a resume that confirms Plan Mode and
     await server.close()
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// A current read that finds another provider unbinds the thread, as a bind would: the state follows the hooks (not unknown
+// and stopped), the worker stays, and the next tick binds again.
+test("a heartbeat read that finds another provider unbinds the thread, follows the hooks and binds again at the next tick", async () => {
+  const stale = { reason: "stale_binding", observed: { status: "unknown", stopped: false, plan: null } }
+  const thread = threadDouble({ observation: stale })
+  const r = await rig({ thread })
+  await r.begin()
+  await r.op({ op: "stop", permission_mode: "default" })
+  thread.calls.length = 0
+  await r.clock.advance(30_000) // the read finds provider B
+  assert.deepEqual(thread.calls, ["observe"])
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "idle", stopped: false, plan_mode: false })
+  assert.notEqual(r.receiver.state(), "offline")
+  assert.equal(r.worker.state.stops, 0, "the worker stays")
+  await r.clock.advance(30_000) // unbound: the next tick binds again
+  assert.equal(thread.calls[1], "bind")
+})
+
+test("a provider answer from a read that a hook event overtook is dropped: the thread stays bound", async () => {
+  let release
+  let reads = 0
+  const stale = { reason: "stale_binding", observed: { status: "unknown", stopped: false, plan: null } }
+  const thread = threadDouble({ observation: () => (++reads === 1 ? new Promise(resolve => { release = () => resolve(stale) }) : IDLE) })
+  const r = await rig({ thread })
+  await r.begin()
+  await r.op({ op: "stop", permission_mode: "default" })
+  thread.calls.length = 0
+  await r.clock.advance(30_000) // the tick's read is out
+  await r.op({ op: "stop", permission_mode: "default" }) // a hook event overtakes it
+  release()
+  await settle()
+  await r.clock.advance(30_000)
+  assert.deepEqual(thread.calls, ["observe", "observe"], "still bound: the next tick reads, it does not bind")
 })
 
 test("a changed provider leaves the thread unbound: the worker joins and hook delivery continues", async () => {
