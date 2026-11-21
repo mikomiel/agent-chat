@@ -1,8 +1,9 @@
 // The receiver's view of one Codex thread through the app-server control socket, and the idle wake.
 //
 // The app-server speaks JSON-RPC over a WebSocket. A control socket is a Unix socket, so this is a minimal RFC 6455
-// client over node:net: one HTTP Upgrade, masked client text frames, unfragmented server text frames without reserved
-// bits (no extension is negotiated) and with the shortest form of the length, ping answered with pong. It owns the wire,
+// client over node:net: one HTTP Upgrade, masked client text frames, and server frames that are whole and unfragmented
+// (text, close, ping, pong) without reserved bits (no extension is negotiated), with the shortest form of the length, UTF-8
+// text and control frames of at most 125 bytes; ping is answered with pong. It owns the wire,
 // the thread reads and the add-then-delete fence. It owns no chat policy: the receiver decides when to read and what a
 // refusal means, and settles the claim.
 //
@@ -61,11 +62,24 @@ function encode(opcode, payload) {
   return Buffer.concat([head, mask, body])
 }
 
-// One complete server frame from the front of `buffer`, or null when more bytes are needed.
+// A text frame is UTF-8 (RFC 6455 section 5.6): the decoder throws on a byte sequence that is not, where `toString` would
+// turn it into U+FFFD and let a reply that is not text say what it likes. A leading BOM is kept, as it is by `toString`.
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+
+// One complete server frame from the front of `buffer`, or null when more bytes are needed. Every rule of RFC 6455 section 5
+// that this client relies on is checked here, in one place, and a frame that breaks one throws: the frame is never dispatched.
+// What passes is whole and unfragmented, one of text, close, ping and pong, with `text` set for a text frame.
 function decode(buffer) {
   if (buffer.length < 2) return null
+  const opcode = buffer[0] & 0x0f
   if ((buffer[0] & 0x70) !== 0) throw failure("APP_SERVER_PROTOCOL") // RSV1-3 mean an extension, and none was negotiated
+  if ((buffer[0] & 0x80) === 0) throw failure("APP_SERVER_PROTOCOL") // FIN=0 starts a fragmented message, which is not supported
+  // Opcode 0 is a continuation, which only follows a frame with FIN=0, so it is refused too; 2 is binary, and nothing here
+  // sends or reads binary; the rest are reserved.
+  if (opcode !== 0x1 && opcode !== 0x8 && opcode !== 0x9 && opcode !== 0xa) throw failure("APP_SERVER_PROTOCOL")
   if ((buffer[1] & 0x80) !== 0) throw failure("APP_SERVER_PROTOCOL") // a server never masks
+  // A control frame carries at most 125 bytes, so a 126 or 127 in the length field is refused before the rest of it is waited for.
+  if (opcode >= 0x8 && (buffer[1] & 0x7f) > 125) throw failure("APP_SERVER_PROTOCOL")
   let length = buffer[1] & 0x7f
   let offset = 2
   // RFC 6455 wants the shortest form of a length: a longer one is a protocol error, not another spelling of the same frame.
@@ -84,7 +98,12 @@ function decode(buffer) {
   }
   if (length > MAX_FRAME) throw failure("APP_SERVER_PROTOCOL")
   if (buffer.length < offset + length) return null
-  return { fin: (buffer[0] & 0x80) !== 0, opcode: buffer[0] & 0x0f, payload: buffer.subarray(offset, offset + length), size: offset + length }
+  const payload = buffer.subarray(offset, offset + length)
+  let text = null
+  if (opcode === 0x1) {
+    try { text = UTF8.decode(payload) } catch { throw failure("APP_SERVER_PROTOCOL") }
+  }
+  return { opcode, payload, text, size: offset + length }
 }
 
 // The control socket is the peer of every read and of the wake, so it passes the trust check of lib/trust.js before each
@@ -178,11 +197,10 @@ export function openAppServer(path, { createConnection = net.createConnection, c
         try { frame = decode(buffer) } catch (error) { return fail(error.code) }
         if (!frame) return undefined
         buffer = buffer.subarray(frame.size)
-        if (frame.opcode === 0x1 && frame.fin) dispatch(frame.payload.toString("utf8"))
-        else if (frame.opcode === 0x9 && frame.payload.length <= 125) void write(0xa, frame.payload)
-        else if (frame.opcode === 0xa) continue
+        // `decode` passed only text, close, ping and pong, whole; a pong answers nothing this client sent, so it is dropped.
+        if (frame.opcode === 0x1) dispatch(frame.text)
+        else if (frame.opcode === 0x9) void write(0xa, frame.payload)
         else if (frame.opcode === 0x8) return fail("APP_SERVER_CLOSED")
-        else return fail("APP_SERVER_PROTOCOL") // fragmented, binary or unknown: refuse
         if (closed) return undefined
       }
     }
@@ -343,8 +361,15 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     const mode = resumed.collaborationMode?.mode
     observed.plan = mode === "default" ? false : mode === "plan" ? true : null
     if (observed.plan !== false) return { reason: observed.plan === true ? "plan" : "unknown", observed }
-    const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline))
-    if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
+    let turns
+    try {
+      turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline))
+      if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
+    } catch (error) {
+      // The mode was validated by the answer above, and a lookup that then fails or is malformed does not take it back. The
+      // error carries what was known, so `observe` can report the mode; the status is unknown, and the wake still fails.
+      throw Object.assign(error, { observed: { ...observed, status: "unknown" } })
+    }
     // Only a newest turn that is known to be finished clears the thread. A turn that is running is busy; an interrupted one is
     // stopped; no turn, a turn without a status and a status that is not known say nothing, and an unknown state never wakes.
     const newest = turns.data[0]?.status
@@ -417,10 +442,15 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
 
     // What the thread is now, from reads only. `reason` is the delivery refusal a wake would give, or null.
     // observed: { status: "idle"|"busy"|"offline"|"unknown", stopped, plan: true|false|null }
+    // A read that fails is offline, with no mode. The one exception is a failed lookup of the newest turn, after the
+    // `thread/resume` answer had shown the mode: that is unknown, and keeps the mode, so the mode it showed still counts.
     async observe() {
       try {
         return await withConnection(link => evaluate(link, Infinity))
-      } catch { return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } } }
+      } catch (error) {
+        if (error?.observed) return { reason: "unknown", observed: error.observed }
+        return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } }
+      }
     },
 
     // Queue `text` as one user turn and fence it. Resolves { outcome, reason } for the settle call. Three things prove

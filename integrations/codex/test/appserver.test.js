@@ -185,6 +185,99 @@ test("a length is read only in its shortest form: 16 bits from 126 and 64 bits f
   })
 })
 
+// A server frame built one field at a time, so that each rule of RFC 6455 section 5 can be broken alone. `form` is how the length
+// is spelled ("short" is 7 bits, or 16 or 64 bits); by default it is the shortest form that holds it.
+function wire(opcode, payload = "", { fin = true, rsv = 0, form } = {}) {
+  const body = Buffer.from(payload)
+  const spelled = form ?? (body.length < 126 ? "short" : body.length < 65536 ? 16 : 64)
+  const wide = Buffer.alloc(8)
+  wide.writeBigUInt64BE(BigInt(body.length))
+  const length = spelled === "short" ? Buffer.from([body.length])
+    : spelled === 16 ? Buffer.from([126, body.length >> 8, body.length & 0xff])
+      : Buffer.concat([Buffer.from([127]), wide])
+  return Buffer.concat([Buffer.from([(fin ? 0x80 : 0) | rsv | opcode]), length, body])
+}
+
+// What a text frame may not carry: bytes that are not UTF-8, which `toString` would turn into U+FFFD and let through.
+const NOT_UTF8 = [
+  ["a lone continuation byte", [0x80]], ["a byte that never occurs", [0xff]], ["a truncated sequence", [0xe2, 0x82]],
+  ["an overlong encoding", [0xc0, 0xaf]], ["a surrogate", [0xed, 0xa0, 0x80]], ["a code point past U+10FFFF", [0xf4, 0x90, 0x80, 0x80]],
+]
+// A JSON reply to `message` whose one string value ends with `tail`: well formed JSON, so only its encoding can refuse it.
+const replyWith = (message, tail) => Buffer.concat([Buffer.from(`{"id":${message.id},"result":{"data":["${THREAD}"],"nextCursor":null,"note":"`), Buffer.from(tail), Buffer.from('"}}')])
+
+// Every rule of RFC 6455 section 5 that the client relies on fails the connection before any frame is dispatched: no reply is
+// read from a frame that breaks one, and a reply that follows it on the wire is not read either. `refused` rows must reject the
+// pending request with APP_SERVER_PROTOCOL; the other rows are the controls, which show that a valid frame of each kind still works.
+test("a server frame that breaks a rule of RFC 6455 section 5 fails the connection with APP_SERVER_PROTOCOL before any dispatch", async () => {
+  const settling = message => serverFrame(0x1, JSON.stringify({ id: message.id, result: { data: [THREAD], nextCursor: null } }))
+  const most = "x".repeat(125) // the longest payload a control frame may carry
+  const over = "x".repeat(126)
+  const rows = [
+    // fragmentation is not supported
+    ["a text frame with FIN=0", () => wire(0x1, "{}", { fin: false }), "refused"],
+    ["a continuation frame (opcode 0) with FIN=1", () => wire(0x0, "{}"), "refused"],
+    ["a continuation frame (opcode 0) with FIN=0", () => wire(0x0, "{}", { fin: false }), "refused"],
+    ["a binary frame (opcode 2)", message => wire(0x2, JSON.stringify({ id: message.id, result: {} })), "refused"],
+    ...[3, 4, 5, 6, 7, 11, 12, 13, 14, 15].map(opcode => [`a reserved opcode (${opcode})`, () => wire(opcode, "{}"), "refused"]),
+    // control frames
+    ["a ping with FIN=0", () => wire(0x9, "hi", { fin: false }), "refused"],
+    ["a pong with FIN=0", () => wire(0xa, "hi", { fin: false }), "refused"],
+    ["a close with FIN=0", () => wire(0x8, Buffer.from([0x03, 0xe8]), { fin: false }), "refused"],
+    ["a ping of 126 bytes", () => wire(0x9, over), "refused"],
+    ["a pong of 126 bytes", () => wire(0xa, over), "refused"],
+    ["a close of 126 bytes", () => wire(0x8, over), "refused"],
+    ["a pong of 70000 bytes in the 64-bit form", () => wire(0xa, "x".repeat(70_000)), "refused"],
+    ["a ping that claims 126 bytes, header only: refused without waiting for the rest", () => wire(0x9, over).subarray(0, 4), "refused"],
+    // text is UTF-8
+    ...NOT_UTF8.map(([label, bytes]) => [`a text frame with ${label}`, message => wire(0x1, replyWith(message, bytes)), "refused"]),
+    ["a text frame with a BOM, which is kept and which JSON does not allow", message => wire(0x1, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(JSON.stringify({ id: message.id, result: {} }))])), "refused"],
+    // the rules from before: no reserved bit, no mask, the shortest form of a length, and a length within the limit
+    ...[0x40, 0x20, 0x10].map(rsv => [`a text frame with reserved bit 0x${rsv.toString(16)}`, () => wire(0x1, "{}", { rsv }), "refused"]),
+    ["a ping with RSV1", () => wire(0x9, "hi", { rsv: 0x40 }), "refused"],
+    // the mask bit alone, on frames that are otherwise well formed: nothing else about them could refuse them
+    ["a text frame with the mask bit set", message => { const frame = wire(0x1, replyWith(message, "")); frame[1] |= 0x80; return frame }, "refused"],
+    ["a ping with the mask bit set", () => { const frame = wire(0x9, "hi"); frame[1] |= 0x80; return frame }, "refused"],
+    ["a masked text frame with its key", () => Buffer.from([0x81, 0x82, 1, 2, 3, 4, 0, 0]), "refused"],
+    ["a text frame with a 16-bit length that fits in 7 bits", () => wire(0x1, "{}", { form: 16 }), "refused"],
+    ["a text frame with a 64-bit length that fits in 7 bits", () => wire(0x1, "{}", { form: 64 }), "refused"],
+    ["a text frame with a 64-bit length that fits in 16 bits", () => wire(0x1, "x".repeat(300), { form: 64 }), "refused"],
+    ["a text frame with a 64-bit length with its top bit set, header only", () => Buffer.from([0x81, 127, 0x80, 0, 0, 0, 0, 0, 0x01, 0x00]), "refused"],
+    ["a text frame one byte over the frame limit, header only", () => Buffer.from([0x81, 127, 0, 0, 0, 0, 0, 0x40, 0x00, 0x01]), "refused"],
+    // what still works
+    ["a text frame with FIN=1", () => Buffer.alloc(0), "settles"],
+    ["a text frame with multi-byte UTF-8", message => wire(0x1, replyWith(message, "é€𝄞")), "settles"],
+    ["a ping of 125 bytes, which is answered with its payload", () => wire(0x9, most), { pong: most }],
+    ["a ping of no bytes, which is answered", () => wire(0x9), { pong: "" }],
+    ["a pong of 125 bytes, which is dropped", () => wire(0xa, most), "settles"],
+    ["a pong of no bytes, which is dropped", () => wire(0xa), "settles"],
+    ["a close", () => wire(0x8, Buffer.from([0x03, 0xe8])), "closed"],
+  ]
+  for (const [label, frame, outcome] of rows) {
+    const handler = (message, connection) => {
+      connection.socket.write(frame(message))
+      if (outcome !== "closed") connection.socket.write(settling(message))
+      return undefined
+    }
+    await withServer(handler, async (path, server) => {
+      const link = await openAppServer(path)
+      const pending = link.request("thread/loaded/list", {}, 1500)
+      if (outcome === "refused") {
+        await assert.rejects(pending, { code: "APP_SERVER_PROTOCOL" }, label)
+        assert.deepEqual(server.state.pongs, [], `${label}: nothing was answered`)
+      } else if (outcome === "closed") await assert.rejects(pending, { code: "APP_SERVER_CLOSED" }, label)
+      else {
+        assert.deepEqual((await pending).data, [THREAD], label)
+        if (typeof outcome === "object") {
+          for (let waited = 0; server.state.pongs.length < 1 && waited < 1000; waited += 10) await new Promise(resolve => setTimeout(resolve, 10))
+          assert.deepEqual(server.state.pongs, [outcome.pong], `${label}: the pong carries the ping's payload`)
+        }
+        link.close()
+      }
+    })
+  }
+})
+
 test("an error reply carries its code and never its message", async () => {
   await withServer(() => ({ error: { code: -32600, message: "secret detail" } }), async path => {
     const link = await openAppServer(path)
@@ -557,6 +650,26 @@ test("a collaboration mode other than default is plan, and an unreadable one is 
   }
 })
 
+// The mode comes from the `thread/resume` answer, and the newest turn is looked up after it. A lookup that fails, or answers in a
+// way that is not the documented one, leaves the status unknown and the wake refused, but does not take back the mode that the
+// answer before it had validated: the receiver ends a Plan Mode memory on `plan: false`, whatever came after it.
+test("a lookup of the newest turn that fails or is malformed leaves the mode that thread/resume showed, and the wake is still refused", async () => {
+  for (const [label, answer] of [
+    ["an error reply", () => ({ error: { code: -32000, message: "no" } })],
+    ["data that is not a list", () => ok({ data: "none", nextCursor: null })],
+    ["no data", () => ok({})],
+    ["a connection that drops", (message, connection) => { connection.socket.destroy(); return undefined }],
+  ]) {
+    const { result } = await observeWith({ "thread/turns/list": answer })
+    assert.deepEqual(result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: false } }, label)
+    const { result: woken, methods } = await wakeWith({ "thread/turns/list": answer })
+    assert.deepEqual(woken, { outcome: "failed", reason: "native_unavailable" }, `${label}: the wake fails and adds nothing`)
+    assert.equal(methods.includes("thread/queue/add"), false, label)
+  }
+  const unseen = await observeWith({ "thread/resume": () => ({ error: { code: -32600, message: "no rollout found" } }), "thread/turns/list": () => ({ error: { code: -32000, message: "no" } }) })
+  assert.deepEqual(unseen.result, { reason: "unknown", observed: { status: "idle", stopped: false, plan: null } }, "no mode was validated, so none is reported")
+})
+
 test("a child or a changed provider found by a later read is refused by name", async () => {
   let record = thread()
   await withServer(main({ "thread/read": () => ok({ thread: record }) }), async path => {
@@ -684,19 +797,29 @@ test("deleted:true means it never dispatched: deferred, and no confirmation is a
 })
 
 // A fence reply that is read as `deleted: true` is the one thing that settles a wake `deferred`, so a frame that must not be read
-// can never be allowed to say it: with a reserved bit set, or a length spelled in a longer form than it needs, the connection
-// fails, and a failed fence is uncertain.
+// can never be allowed to say it: with a reserved bit set, a length spelled in a longer form than it needs, FIN=0, an opcode
+// that is not text, or text that is not UTF-8, the connection fails, and a failed fence is uncertain.
 test("a fence reply in a frame that is not well formed is not read: the wake is uncertain, never deferred", async () => {
   const fenced = (bit, form = "short") => (message, connection) => {
     connection.socket.write(framed(form, JSON.stringify({ id: message.id, result: { deleted: true } }), bit))
     return undefined
   }
+  const fencedWith = build => (message, connection) => {
+    connection.socket.write(build(message))
+    return undefined
+  }
+  const deleted = message => JSON.stringify({ id: message.id, result: { deleted: true } })
   const control = await wakeWith({ "thread/queue/delete": fenced(0) })
   assert.deepEqual(control.result, { outcome: "deferred", reason: "busy" }, "control: the same reply, well formed, proves the removal")
   for (const [label, handler] of [
     ["0x40", fenced(0x40)], ["0x20", fenced(0x20)], ["0x10", fenced(0x10)],
     ["a short payload with a 16-bit length", fenced(0, 16)],
     ["a short payload with a 64-bit length", fenced(0, 64)],
+    ["FIN=0", fencedWith(message => wire(0x1, deleted(message), { fin: false }))],
+    ["a binary frame", fencedWith(message => wire(0x2, deleted(message)))],
+    ["text that is not UTF-8", fencedWith(message => wire(0x1, Buffer.concat([
+      Buffer.from(`{"id":${message.id},"result":{"deleted":true,"note":"`), Buffer.from([0xff]), Buffer.from('"}}'),
+    ])))],
   ]) {
     const { result, methods } = await wakeWith({ "thread/queue/delete": handler })
     assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, label)

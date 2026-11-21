@@ -163,15 +163,27 @@ sends its request: it does not wait for the worker to end its instance.
   fresh can say so, since a stale one may be older than the switch into Plan Mode), so meanwhile the
   receiver claims no hook delivery and the heartbeat reports Plan Mode. A read that shows no mode
   changes nothing: a busy thread, one that is not loaded, an unreadable or untrusted socket, a
-  changed provider. The receiver reads the thread only while no turn is known to run, so after a
-  prompt in default mode the delivery waits for the next `Stop` and the first read after it.
+  changed provider. A read whose `thread/resume` answer showed default mode, but whose lookup of
+  the newest turn then failed or answered in a way that is not the documented one, is unknown and
+  refuses the wake, but it keeps the mode it showed: it ends the memory. The receiver reads the
+  thread only while no turn is known to run, so after a prompt in default mode the delivery waits
+  for the next `Stop` and the first read after it.
+  Reads land in any order, so each is numbered when it starts (the wake's own reading when the
+  receiver hands the wake to the thread). A read changes nothing that a newer read has set: a Plan
+  Mode read that started before a default-mode read cannot bring the memory back by landing after
+  it, hook event or not, and a default-mode read that started before a Plan Mode read cannot end
+  it. The same holds for the busy or idle answer the receiver holds.
   Reads are taken only on a thread whose bind decided the route (a main thread, a fixed provider
   and a queue probe that answered). When a bind leaves the route undecided, for example because the
-  queue probe stayed silent, no read can end the memory, so it is cleared and stays clear until a
-  later bind decides the route: the session is hook-only for Plan Mode, as one without a control
-  socket is. While the route is decided, the memory can still stay for as long as every read
-  refuses before it reaches the mode (the app-server gone, an unreadable thread), and hook
-  delivery stays withheld until a read shows the mode or the receiver ends.
+  queue probe stayed silent, no read can end the memory, so it is cleared, together with the answer
+  of the last read (which carries a mode of its own), and stays clear until a later bind decides the
+  route: the state and the heartbeat follow the hooks at once, with no hook event in between, as
+  for a session without a control socket. A read that was out across such a bind changes nothing
+  when it lands, even when a later bind has decided the route again, because it started before the
+  bind that cleared what it would set; and a read that would clear a wake clears nothing then. While
+  the route is decided, the memory can still stay for as long as every read refuses before it
+  reaches the mode (the app-server gone, an unreadable thread), and hook delivery stays withheld
+  until a read shows the mode or the receiver ends.
 - **Busy delivery.** A `prompt` or `tool` hook asks the receiver for a batch
   while the turn runs. The receiver claims only when the session is busy, and
   never in Plan Mode, while stopped or in an unknown state. The reply is
@@ -441,7 +453,10 @@ already excluded.
    write of the add frame. The session
    must still be idle, not stopped and not in Plan Mode by that fresh reading,
    and by the receiver's own state: no hook event may have arrived since the
-   read that cleared the wake, and no newer app-server read may have refused it.
+   read that cleared the wake, and no newer app-server read may have refused it,
+   and the route must still be decided: a bind that left it undecided since the
+   wake was cleared settles the attempt `deferred` as `unknown`, whatever the
+   fresh reading shows.
    The decision does not rest on cached state alone. A read that refuses for any
    of the reasons below is a newer state of its own, whatever the hooks say, and
    the receiver adopts it. Otherwise nothing is sent and the attempt settles
@@ -729,11 +744,17 @@ exercised live.
   directory, as its canonical path, as its working directory and as the
   directory it keeps the binding file in.
 - The app-server client answers a server request with a method-not-found error
-  and refuses a fragmented, binary or masked server frame, a frame with a
-  reserved bit set (it negotiates no extension) and a frame whose length is not in
-  its shortest form (16 bits from 126, 64 bits from 65536; a 64-bit length with
-  its top bit set is over the frame limit). The connection fails and the frame is
-  never read, so a fence reply cannot say `deleted: true` through one. It
+  and checks every server frame against RFC 6455 section 5 before it reads it. It
+  refuses a frame with FIN=0 (fragmentation is not supported, so a continuation
+  frame is refused too), an opcode that is not text, close, ping or pong (binary
+  included), a control frame with FIN=0 or more than 125 bytes of payload, a text
+  frame that is not valid UTF-8, a masked frame, a frame with a reserved bit set
+  (it negotiates no extension) and a frame whose length is not in its shortest
+  form (16 bits from 126, 64 bits from 65536; a 64-bit length with its top bit set
+  is over the frame limit). The connection fails as a protocol error and the frame
+  is never read, so a fence reply cannot say `deleted: true` through one. A close
+  frame ends the connection and a pong is dropped; the body of a close is not
+  checked. It
   times a wake's reservation and deadlines on one monotonic clock (the receiver
   passes its own to its thread), so an adjusted wall clock cannot give a wake more
   time than its reservation has; whether that clock counts a suspended host's time
