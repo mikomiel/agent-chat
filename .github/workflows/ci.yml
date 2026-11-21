@@ -106,6 +106,9 @@ jobs:
       - name: Test the Claude Code integration contract
         working-directory: integrations/claude-code
         run: node --test
+      - name: Test the OpenCode integration contract
+        working-directory: integrations/opencode
+        run: node --test
       - name: Test the Codex integration contract
         working-directory: integrations/codex
         run: node --test
