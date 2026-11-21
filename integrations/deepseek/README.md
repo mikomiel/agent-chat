@@ -15,7 +15,10 @@ the native state, the delivery fence and the bounded rejoin scheduler.
   [compatibility matrix](../README.md#compatibility).
   The Cordis plugin API is in developer preview. Re-verify the integration on
   each DSH upgrade.
-- A Python 3.11+ interpreter with the `agent-chat` package installed.
+- A Python 3.11+ interpreter with the same version of the core installed: the PyPI
+  distribution `sessionyard`, which provides the `agent_chat` import. Do not install
+  `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
+  field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token accepted by it.
 - The Web profile. The plugin waits for the `webServer` service, so a headless,
   SDK or ACP profile never runs it.
@@ -46,6 +49,17 @@ itself is not a profile gate. The Web-only behavior comes from
 server service exists the injected callback never runs, and the plugin
 registers nothing. This matters because a Home-level patch also reaches
 `dsh --profile headless`.
+
+### Install a pinned release
+
+Without a checkout, install the release that matches your core. The release
+asset is `agent-chat-deepseek-<version>.tgz`. Download, verify and extract it
+into an absolute directory with the checked block in
+[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release):
+it extracts only after the `SHA256SUMS` check passes. Then set the row's `name`
+to `<absolute-extracted-dir>/extensions/agent-chat.js`. Keep the extracted layout
+intact: the extension imports `../lib/config.js`. Install the core at the same
+version first.
 
 ## Configure
 
