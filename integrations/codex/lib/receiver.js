@@ -108,27 +108,34 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   })
 
   // The hook says whether a turn runs and whether the operator interrupted it; the app-server read, when there is one, is the
-  // authority for Plan Mode and adds a busy, idle or interrupted answer that a hook cannot give while nothing runs. The read's
-  // two answers stand apart: a mode it confirmed (`plan` true or false) decides Plan Mode even when the running state is
-  // unknown, and one it could not tell (`plan: null`) leaves Plan Mode to the hook's `permission_mode` hint. A read is newer
-  // than the hooks' idle, so the thread is idle only when the read shows it idle and not in Plan Mode.
+  // authority for Plan Mode and adds a busy, idle, interrupted or unknown answer that a hook cannot give while nothing runs.
+  // The read's two answers stand apart: a mode it confirmed (`plan` true or false) decides Plan Mode even when the running
+  // state is unknown, and one it could not tell (`plan: null`) leaves Plan Mode to the hook's `permission_mode` hint. A read
+  // is newer than the hooks' idle, so while one is held the thread is idle only when the read shows it idle and not in Plan
+  // Mode: a read that said unknown keeps the running state unknown, whatever the hint.
+  const planMode = () => (observed !== null && observed.plan !== null ? observed.plan : planHint)
+  const interrupted = () => stopped || observed?.stopped === true
+
+  // What a hook consumer may be given: the state that decides delivery, one word, the most restrictive first.
   function chatState() {
     if (failure) return "offline"
-    const plan = observed !== null && observed.plan !== null ? observed.plan : planHint
-    if (plan) return "plan"
-    if (stopped || observed?.stopped === true) return "stopped"
+    if (planMode()) return "plan"
+    if (interrupted()) return "stopped"
     if (native === "busy" || observed?.status === "busy") return "busy"
     if (observed !== null) return observed.status === "idle" && observed.plan === false ? null : "unknown"
     return native === "idle" ? null : "unknown"
   }
 
-  // No title: hooks carry none and this version reads none. Omitting the field preserves the stored title.
+  // No title: hooks carry none and this version reads none. Omitting the field preserves the stored title. The flags are
+  // facts of their own, not the one word that decides delivery: Plan Mode and an interruption are both reported when both
+  // hold. A state that is neither idle nor busy outside Plan Mode is reported stopped too, as the core expects of it.
   function heartbeatState() {
     const state = chatState()
+    const plan = !failure && planMode()
     return {
       native_state: state === null ? "idle" : state === "busy" ? "busy" : "unknown",
-      stopped: state === "plan" ? stopped : ![null, "busy"].includes(state),
-      plan_mode: state === "plan",
+      stopped: interrupted() || (!plan && ![null, "busy"].includes(state)),
+      plan_mode: plan,
     }
   }
 
@@ -265,10 +272,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const result = await thread.observe()
     const current = epoch === before && live === record
     if (current) {
-      // A read is kept when it answered something: a running state (idle or busy) or a confirmed mode. One that answered
-      // neither (offline, or unknown with no mode) is dropped, and the state follows the hooks.
-      const answered = result.observed.status === "idle" || result.observed.status === "busy" || result.observed.plan !== null
-      observed = answered ? result.observed : null
+      // A read that answered is kept, an unknown answer included (a status the plugin does not know, no usable newest turn,
+      // a mode it does not know): it is newer than the hooks' idle. Only a read that failed or found the thread offline is
+      // dropped, and the state follows the hooks.
+      observed = result.observed.status === "offline" ? null : result.observed
       if (result.reason !== null) epoch += 1
     }
     return { ...result, current }
@@ -352,13 +359,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   const eligible = () => chatState() === "busy"
 
   // Send `text` to the consumer, then wait for its write receipt. Handed means the
-  // hook wrote and flushed the output; it does not mean the model has read it. A hook that is gone, or whose time (`deadline`)
-  // is up, before the text is sent has written nothing: that is not handed, and the batch can be offered again. Once the
-  // text is sent, only the receipt says what became of it.
-  async function hand(link, text, until, deadline, announce) {
+  // hook wrote and flushed the output; it does not mean the model has read it. The caller has just checked that the hook is
+  // there and in time; once the text is sent, only the receipt says what became of it.
+  async function hand(link, text, until, announce) {
     if (!eligible()) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
-    if (link.closed || deadline <= now()) return { result: NOT_WRITTEN, replied: false }
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
     if (isDone(done, "written")) {
@@ -395,13 +400,19 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (!live || check(grant, "claim")) return false
         if (grant.dispatch !== true || typeof grant.attempt_id !== "string") return false
         const reservation = Number(grant.reservation_ms)
+        // A hook that is gone, or out of time, before anything was sent to it has written nothing: the batch is not handed and
+        // can be offered again. That is asked as soon as the grant is in, and again after the status request, before the
+        // reservation is weighed, since a short reservation says nothing about a write that cannot happen.
+        const unreachable = () => link.closed || deadline <= now()
         let result
         let replied = false
-        if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = UNCERTAIN
+        if (unreachable()) result = NOT_WRITTEN
+        else if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = UNCERTAIN
         else {
           const state = await ask("status")
           if (!live) return false
           if (check(state, "status")) result = { outcome: "deferred", reason: "unknown" }
+          else if (unreachable()) result = NOT_WRITTEN
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
           else if (started + reservation - now() <= MIN_RESERVATION_MS) result = UNCERTAIN // the status call used the reservation
           else {
@@ -409,7 +420,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
               bodies, bound, admittedAt: grant.admitted_at,
             })
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, deadline, announce))
+            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, announce))
           }
         }
         if (!live) return replied

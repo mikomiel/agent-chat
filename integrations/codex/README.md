@@ -141,7 +141,12 @@ sends its request: it does not wait for the worker to end its instance.
   supersedes every earlier one, and the old `instance_file` is no longer valid.
   The binding text is capped at 2,048 bytes.
 - **Presence.** A heartbeat every 30 seconds, and one on every state change,
-  carries `native_state`, `stopped` and `plan_mode`. It carries no title. A
+  carries `native_state`, `stopped` and `plan_mode`. It carries no title. The
+  flags are facts of their own: `plan_mode` follows the Plan Mode rule (see
+  State), and `stopped` is set by a local stop or an interruption that a read
+  found, whether or not the session is in Plan Mode, and outside Plan Mode by
+  any state that is neither idle nor busy. Delivery is still decided by one
+  state, Plan Mode first (see Busy delivery). A
   heartbeat belongs to the worker that was live when its tick started. A tick
   that was waiting for an app-server read when that worker was retired (for
   example by `STALE_INSTANCE`) is dropped when the read returns: it sends
@@ -168,7 +173,12 @@ sends its request: it does not wait for the worker to end its instance.
   unknown. The mode and the running state are two answers of the read: a
   mode it confirmed decides Plan Mode even when its running state is unknown
   (the newest turn failed, or there is none), and the state then stays unknown,
-  not idle. Any later hook event discards the read. A read that refuses (busy,
+  not idle. A read that answered is kept even when its answer is unknown (a
+  status the plugin does not know, such as `systemError`, no usable newest
+  turn, a mode it does not know): it is newer than the hooks' idle, so the
+  running state stays unknown. Only a read that failed or found the thread
+  offline is dropped, and then the state follows the hooks. Any later hook
+  event discards the read. A read that refuses (busy,
   Plan Mode, stopped, unknown) is newer than every read that began before it,
   so an older read that lands after it is dropped. Once a hook event has
   discarded the last read, Plan Mode follows the hook's hint alone, as in the
@@ -185,8 +195,10 @@ sends its request: it does not wait for the worker to end its instance.
   deadline, its own limit: the wait for the reply is what is left of it after
   the connect (at most 7.5 seconds), and the receiver gets that wait less 1.5
   seconds (at most 6) for the whole reply, its state report included. The
-  receiver starts a claim only with 2.5 seconds of that left, and sends the
-  notice only before it runs out. The reply is printed as `additionalContext`
+  receiver starts a claim only with 2.5 seconds of that left. When the claim is
+  granted, and again after the status request, it checks that the hook is still
+  connected and in time; a hook that is not gets nothing more, and no status
+  request. The reply is printed as `additionalContext`
   and settled `handed` only after the hook confirms it wrote and flushed the
   output.
 - **No idle wake yet.** The idle wake is a follow-up, tracked in #154. Until it
@@ -195,8 +207,9 @@ sends its request: it does not wait for the worker to end its instance.
   delivery. Nothing in this version queues a turn, and the join frame and the
   heartbeat carry no claim that the session can be woken.
 - **Settlement.** A refused output settles `failed`, and so does a claimed batch
-  that was never sent because the hook was gone or its time was up before the
-  write: nothing reached the output, so it is offered again. A failed write, a
+  that was never sent because the hook was gone or its time was up when the
+  claim was granted or after the status request: nothing reached the output, so
+  it is offered again, whatever is left of the reservation. A failed write, a
   missing receipt or a reservation too short to write inside settles
   `uncertain`. The
   adapter never writes the same attempt twice. The ledger, not the adapter,

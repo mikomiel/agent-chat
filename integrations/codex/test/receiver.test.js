@@ -352,6 +352,34 @@ test("a hook that is gone, or out of time, before the write settles failed and r
   assert.deepEqual(late.worker.ops("settle")[0].result, { outcome: "failed", reason: "native_unavailable" })
 })
 
+// The claim can take long, and the hook can go or run out of time meanwhile. That is asked as soon as the grant is in: a hook
+// that cannot be written to makes no status request, and the batch settles failed (offered again), never uncertain, even
+// when the reservation has also run short by then.
+test("a claim that comes back after the hook went, or after its time, asks for no status and settles failed, not uncertain", async () => {
+  for (const [label, took, close] of [["gone", 0, true], ["out of time", 6500, false], ["gone with the reservation used up", 29_800, true]]) {
+    let skewMs = 0
+    const hook = hookDouble()
+    const r = await rig({ skew: () => skewMs, handlers: {
+      pending: () => ({ messages: ["m1"] }),
+      claim: fields => { skewMs += took; if (close) hook.close(); return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(row) } },
+    } })
+    await r.begin()
+    await r.op(turn(), hook)
+    assert.deepEqual(r.worker.ops("status"), [], `no status request (${label})`)
+    assert.equal(hook.sent.some(frame => typeof frame.context === "string" && frame.context.includes("m1")), false, `nothing written (${label})`)
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }], label)
+  }
+})
+
+test("a hook that goes while the status request uses up the reservation settles failed, not uncertain", async () => {
+  let skewMs = 0
+  const hook = hookDouble()
+  const r = await rig({ skew: () => skewMs, handlers: { pending: () => ({ messages: ["m1"] }), status: () => { skewMs += 29_800; hook.close(); return { muted: false } } } })
+  await r.begin()
+  await r.op(turn({ patience_ms: 30_000 }), hook)
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+})
+
 test("Plan Mode is reported and nothing is claimed", async () => {
   const r = await rig({ handlers: { pending: () => ({ messages: ["m1"] }) } })
   await r.begin()
@@ -1454,6 +1482,50 @@ test("a read that confirmed the mode but not the running state keeps its plan an
     assert.equal(r.receiver.state(), plan ? "plan" : "unknown", `plan ${plan}, hint ${hint}`)
     assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, expected, `plan ${plan}, hint ${hint}`)
   }
+})
+
+// A read that answered, and said it does not know, is newer than the hooks' idle: the state stays unknown until a hook event.
+// The mode falls back to the hint when the read could not tell it; the running state does not.
+for (const [label, observation] of [
+  ["a status the plugin does not know (systemError)", { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }],
+  ["no newest turn, in default mode", { reason: "unknown", observed: { status: "unknown", stopped: false, plan: false } }],
+  ["no newest turn, in a mode it could not tell", { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }],
+]) {
+  test(`a Stop hook and then a read that finds ${label} reports unknown, not idle`, async () => {
+    const thread = threadDouble({ observation })
+    const r = await rig({ thread })
+    await idleSession(r)
+    assert.equal(r.worker.ops("heartbeat").length, 0)
+    assert.equal(r.receiver.state(), null, "control: the Stop hook alone says idle")
+    await r.clock.advance(30_000)
+    assert.equal(r.receiver.state(), "unknown")
+    assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: true, plan_mode: false })
+  })
+}
+
+test("an unknown read with no mode leaves Plan Mode to the hint, and the running state unknown", async () => {
+  const thread = threadDouble({ observation: { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } } })
+  const r = await rig({ thread })
+  await r.begin()
+  await r.op(turn({ permission_mode: "plan" }))
+  await r.op({ op: "stop", permission_mode: "plan" })
+  r.worker.log.length = 0
+  await r.clock.advance(30_000)
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true })
+  await r.op({ op: "stop", permission_mode: "default" }) // a hook event drops the read; the next one is read again
+  await r.clock.advance(30_000)
+  assert.equal(r.receiver.state(), "unknown", "the hint is default now, and the read still does not know the running state")
+})
+
+// The heartbeat's flags are facts of their own. Plan Mode does not hide an interruption that a read found: both are reported.
+// What a hook consumer may be given does not change: Plan Mode still decides that.
+test("a read that shows Plan Mode and an interrupted newest turn reports both, with no Interrupt hook", async () => {
+  const thread = threadDouble({ observation: { reason: "stopped", observed: { status: "idle", stopped: true, plan: true } } })
+  const r = await rig({ thread })
+  await idleSession(r)
+  await r.clock.advance(30_000)
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: true, plan_mode: true })
+  assert.equal(r.receiver.state(), "plan", "delivery is decided as before")
 })
 
 // A read decides Plan Mode only until a hook event discards it. After that the hook's permission_mode hint decides, as in the
