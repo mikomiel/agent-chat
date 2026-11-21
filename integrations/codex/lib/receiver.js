@@ -324,12 +324,20 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     })
   }
 
-  // One heartbeat tick: bind the thread again when the join came without a decided queue route, read the thread while
-  // nothing is known to run, then report. The read runs outside the worker queue so a slow app-server never holds up a delivery.
+  // A route that is off (the newest bind's probe answered no) was decided on one socket. When the path names another one now
+  // (the app-server restarted, or another took the path), that answer says nothing about it, and nothing else would look: only
+  // a positive route wakes, and a wake probes the socket it reaches by itself. One `lstat` on a heartbeat, and no connection
+  // unless the socket changed. A thread that cannot tell is not replaced.
+  const routeReplaced = () => thread.route === false && thread.replaced?.() === true
+
+  // One heartbeat tick: bind the thread again when the join came without a decided queue route, or when the route is off and
+  // its probe was taken on a socket that is not the one at the path now (the bind probes the socket that is there); read the
+  // thread while nothing is known to run, then report. The read runs outside the worker queue so a slow app-server never holds
+  // up a delivery.
   // A tick belongs to the worker `record` that started it. The reads outlive a retirement, so after each one a tick
   // whose worker is gone drops what it learned and sends nothing; the replacement binds and reads for itself.
   async function tick(record) {
-    if (thread && !threadBound) {
+    if (thread && (!threadBound || routeReplaced())) {
       const check = await bindThread(() => live === record)
       if (live !== record) return
       if (check.refusal) return disable(check.refusal)
@@ -592,12 +600,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 }
 
 export async function runReceiver(argv, env) {
-  const [sessionId, owner] = argv
+  const [sessionId, owner, directory] = argv
   const loaded = loadConfig(env)
   if (!loaded || typeof sessionId !== "string" || !sessionId) return 1
   // The state directory is resolved and checked once, here, and its canonical path stands for it from then on: the socket and
   // its bind lock, and the worker's working directory and the directory it keeps the binding file in (`config.directory`).
   const config = { ...loaded, directory: assertPrivateDirectory(loaded.directory) }
+  // The hook resolved the same path before it started this process and handed over the directory it found. A link that moved
+  // between the two makes this the other directory, and the hook and every later hook look for the receiver in the first: so
+  // this one joins nothing and creates nothing there. An argument that is missing counts as a mismatch.
+  if (config.directory !== directory) return 1
   const where = paths(config.directory, sessionId)
   let listener = null
   const receiver = createReceiver(config, { sessionId, ownerPid: Number(owner) }, {

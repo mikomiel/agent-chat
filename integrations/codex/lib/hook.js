@@ -143,8 +143,10 @@ export function nodeIo() {
     }),
     // The receiver must outlive this hook and carry no session credential: it is
     // detached, its stdio is ignored and its whole environment is the config path.
+    // The directory this hook resolved goes in its arguments (a path is not a credential):
+    // the receiver resolves the config path itself and refuses to run unless it finds this one.
     startReceiver(config, sessionId) {
-      const child = spawn(process.execPath, [RECEIVER, sessionId, String(ownerOf(process.ppid))], {
+      const child = spawn(process.execPath, [RECEIVER, sessionId, String(ownerOf(process.ppid)), config.directory], {
         detached: true, stdio: "ignore", cwd: config.directory, env: { [CODEX_CHAT_CONFIG_ENV]: raw },
       })
       child.on("error", () => {})

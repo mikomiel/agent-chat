@@ -851,6 +851,35 @@ test("a thread status that is a property name of every object is unknown, not a 
   }
 })
 
+// A table is indexed with a string, and an array coerces to the string of its elements: a status type of `["idle"]` would index
+// the table as `idle`, read as clear and let a wake through (`["active"]` would read as busy, `["notLoaded"]` as offline).
+// A type that is not a string is no status. It is unknown, like a name that the table lacks.
+for (const [label, type] of [
+  ["an array of the idle status name", ["idle"]], ["an array of the active status name", ["active"]],
+  ["an array of the notLoaded status name", ["notLoaded"]], ["a nested array of a status name", [["idle"]]],
+  ["a number", 7], ["an object", {}], ["an object with a status name as a key", { idle: true }], ["null", null], ["a boolean", true],
+]) {
+  test(`a thread status type that is ${label} is unknown: a read refuses and a wake sends no add`, async () => {
+    const read = { "thread/read": () => ok({ thread: thread({ status: { type } }) }) }
+    const seen = await observeWith(read)
+    assert.deepEqual(seen.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } })
+    assert.equal(seen.methods.includes("thread/resume"), false, "nothing is read past the status")
+    const woken = await wakeWith(read)
+    assert.deepEqual(woken.result, { outcome: "deferred", reason: "unknown" })
+    assert.equal(woken.methods.includes("thread/queue/add"), false, "no add frame")
+  })
+}
+
+test("a resume answer whose status type is not a string is unknown too, whatever it would print as", async () => {
+  for (const type of [["idle"], ["active"], 7, {}]) {
+    const resume = { "thread/resume": () => ok({ thread: thread({ status: { type } }), collaborationMode: { mode: "default", settings: {} } }) }
+    assert.equal((await observeWith(resume)).result.reason, "unknown", `read: ${JSON.stringify(type)}`)
+    const woken = await wakeWith(resume)
+    assert.deepEqual(woken.result, { outcome: "deferred", reason: "unknown" }, `wake: ${JSON.stringify(type)}`)
+    assert.equal(woken.methods.includes("thread/queue/add"), false, "no add frame")
+  }
+})
+
 // Both connections of a wake must reach the one socket that was checked: the same device and inode.
 // A wake on a thread that no bind has probed asks the probe first, on the add connection, before it opens the reading's.
 const PROBE = "thread/queue/delete"
@@ -969,6 +998,27 @@ test("a bind on a replaced socket probes it again, and a bind on the same socket
     assert.deepEqual(await bound.bind(), { status: "bound", route: false }, "the replacement was probed, and answered differently")
     assert.equal(second.methods().includes("thread/queue/delete"), true)
     assert.equal(bound.route, false)
+  } finally { await first.close(); await second?.close() }
+})
+
+// The receiver asks this at each heartbeat while the route is not positive: one lstat of the configured path, no connection.
+test("the thread tells whether its path still names the socket of its newest probe: one lstat, and nothing is connected to", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    assert.equal(bound.replaced(), false, "nothing was probed, so there is no socket to compare with")
+    await bound.bind()
+    assert.equal(bound.replaced(), false, "the probed socket is still there")
+    const connections = first.state.connections
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.replaced(), true, "the path names another socket now")
+    assert.equal(first.state.connections + second.state.connections, connections, "asking connected to nothing")
+    assert.deepEqual(await bound.bind(), { status: "bound", route: true })
+    assert.equal(bound.replaced(), false, "the replacement was probed: it is the socket that counts now")
+    renameSync(path, `${path}.gone`)
+    assert.equal(bound.replaced(), false, "a path that names nothing has no other socket to probe")
   } finally { await first.close(); await second?.close() }
 })
 

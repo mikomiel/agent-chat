@@ -42,8 +42,10 @@ function classify(error, refuse) {
 }
 
 // The real path of a directory that nobody else can change: it is not a symlink, and it and every directory above it
-// pass `guarded`.
-export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, realpath = realpathSync, uid = process.geteuid() } = {}) {
+// pass `guarded`. The path is resolved by realpath(3), which walks it the way the kernel does: a `..` after a symlink names
+// the parent of the link's target. `realpathSync` collapses such a `..` against the link's own directory first, so it would
+// name another directory than the one `lstat` and `connect` reach for the same string, and the rule would judge that one.
+export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, realpath = realpathSync.native, uid = process.geteuid() } = {}) {
   try {
     if (lstat(directory).isSymbolicLink()) throw refusal(refuse)
     const real = realpath(directory)

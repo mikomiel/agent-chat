@@ -232,6 +232,9 @@ const isCompleteRecord = thread =>
   typeof thread.ephemeral === "boolean" && (typeof thread.source === "string" || (thread.source !== null && typeof thread.source === "object"))
 
 const STATUS = Object.assign(Object.create(null), { idle: "idle", active: "busy", notLoaded: "offline" }) // no prototype: `constructor` is not a status
+// The status a record shows, in this package's words: "unknown" for anything that is not a known status. The type must be a
+// string before it is looked up, because a table lookup turns its key into text: `["idle"]` would find `idle`.
+const statusOf = record => (typeof record.status?.type === "string" ? STATUS[record.status.type] : undefined) ?? "unknown"
 
 // The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket.
 export function createThread({ path, threadId, open = openAppServer, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
@@ -304,7 +307,7 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     const thread = await read(link, deadline)
     const refusal = refusing(thread)
     if (refusal) return { reason: refusal, observed }
-    observed.status = STATUS[thread.status?.type] ?? "unknown"
+    observed.status = statusOf(thread)
     if (observed.status !== "idle") return { reason: observed.status, observed }
     // thread/resume subscribes this connection; the connection closes as soon as the reading ends.
     let resumed = null
@@ -316,7 +319,7 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     if (!isChildThread(record) && !complete(record)) return { reason: "unknown", observed } // it cannot show the origin or the provider
     const newer = refusing(record)
     if (newer) return { reason: newer, observed }
-    observed.status = STATUS[record.status.type] ?? "unknown"
+    observed.status = statusOf(record)
     if (observed.status !== "idle") return { reason: observed.status, observed }
     const mode = resumed.collaborationMode?.mode
     observed.plan = mode === "default" ? false : mode === "plan" ? true : null
@@ -337,6 +340,16 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     // The answer of the newest probe that finished, whichever socket it was taken on; `wake` probes again when the socket it
     // reaches is another one.
     get route() { return probed === null ? null : probed.route },
+    // Whether the path now names another socket than the one of the newest probe: an `lstat` of the path, and no connection.
+    // False before any probe has finished, and false while the path names nothing (the app-server is down): there is no
+    // other socket to probe, and the heartbeat's read keeps reporting offline. A probe says what the app-server behind one
+    // socket does, so a route that is off was decided on one socket and nothing would look at another: the receiver asks
+    // this of such a route and binds again when it is true, which probes the socket that is there.
+    replaced() {
+      if (probed === null) return false
+      try { lstatSync(path) } catch (error) { if (error?.code === "ENOENT") return false }
+      return !sameSocket({ path, dev: probed.dev, ino: probed.ino })
+    },
 
     // Check the thread before the receiver joins: it must be loaded, its record must be complete, it must not be a
     // child, and it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in
@@ -393,7 +406,8 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     //   deleted:true                       - the delete removed it before it dispatched: deferred (busy).
     //   a userMessage with its client id   - it dispatched: handed.
     //   anything else is uncertain: `deleted:false` says only that it is no longer queued (it may have dispatched or been
-    //   dropped), so without the matching userMessage by the end of the reservation it is uncertain; so is a lost add reply, a
+    //   dropped), so without the matching userMessage by the settlement deadline (`limit`, SETTLE_MS before the end of the
+    //   reservation) it is uncertain; so is a lost add reply, a
     //   reply without a submission id, and a delete that fails or is not answered, which prove neither removal nor dispatch.
     // A failure before the add frame is written is failed; any failure after it is uncertain. Nothing retries.
     // The wake reads the thread again (`evaluate`: the same four reads as `observe`, the newest turn last), and

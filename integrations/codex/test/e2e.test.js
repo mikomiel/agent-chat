@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -14,6 +14,7 @@ import { fakeAppServer } from "./fake-app-server.js"
 // worker protocol and logs every request, and the app-server, by a fake control
 // socket. The test can then see what was settled and what was queued.
 const HOOK = fileURLToPath(new URL("../scripts/hook.js", import.meta.url))
+const RECEIVER = fileURLToPath(new URL("../scripts/receiver.js", import.meta.url))
 const ROOM = "33333333-3333-4333-8333-333333333333"
 const SESSION = "e2e-session-1"
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -325,4 +326,60 @@ test("a state directory named through a link is resolved once: the worker is joi
     assert.equal(joined.directory, f.state, "the join frame names the canonical directory, not the path through the link")
     assert.ok(existsSync(paths(f.state, "e2e-through-link").socket), "the socket is in the canonical directory")
   } finally { await f.cleanup() }
+})
+
+// ---- the receiver serves the directory its hook resolved, and no other ------------------------------------------------------
+
+test("the hook starts the receiver with the canonical state directory as its last argument, and no credential travels in the arguments", { timeout: 60_000 }, async t => {
+  if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
+  if (!existsSync("/proc/self/cmdline")) return t.skip("the arguments of the receiver are read from /proc")
+  const f = fixture("e2e-handoff", false, { through: true })
+  try {
+    const started = await hook(f.env, "session-start", { session_id: "e2e-handoff", permission_mode: "default", hook_event_name: "SessionStart", source: "startup" })
+    assert.equal(started.code, 0)
+    const [joined] = f.ops("join")
+    assert.ok(joined, "the receiver joined")
+    const argv = readFileSync(`/proc/${joined.ppid}/cmdline`, "utf8").split("\0").filter(Boolean) // [node, receiver.js, session, owner, directory]
+    assert.equal(argv.length, 5, `the receiver is given its session, its owner and its directory: ${argv.slice(2).join(" ")}`)
+    assert.equal(argv[2], "e2e-handoff")
+    assert.match(argv[3], /^\d+$/)
+    assert.equal(argv[4], f.state, "the directory the hook resolved")
+    assert.notEqual(argv[4], join(f.root, "via", "s"), "not the path through the link that the config names")
+    assert.equal(argv.join(" ").includes("synthetic-host-token"), false, "no credential in the arguments")
+  } finally { await f.cleanup() }
+})
+
+test("a receiver refuses a state directory that no longer resolves to the one its hook resolved: it exits without joining and creates nothing", { timeout: 60_000 }, async t => {
+  if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
+  const f = fixture("e2e-moved-link", false, { through: true })
+  const moved = join(f.root, "moved")
+  const private_ = join(moved, "s")
+  let child = null
+  try {
+    // The hook resolved `<root>/via/s` to `<root>/real/s` and started a receiver for it. Before that receiver resolves the
+    // same path, `via` is pointed at `<root>/moved`, which holds a private `s` of its own: a directory the rule accepts.
+    mkdirSync(moved, { mode: 0o755 })
+    chmodSync(moved, 0o755)
+    mkdirSync(private_, { mode: 0o700 })
+    chmodSync(private_, 0o700)
+    symlinkSync(moved, join(f.root, "via.next"))
+    renameSync(join(f.root, "via.next"), join(f.root, "via"))
+    // The receiver is started the way the hook starts it, with the directory the hook resolved as its last argument.
+    child = spawn(process.execPath, [RECEIVER, "e2e-moved-link", String(process.pid), f.state], { stdio: "ignore", cwd: f.state, env: f.env })
+    const ended = await new Promise(resolve => {
+      const timer = setTimeout(() => resolve("still running after 8 s"), 8_000)
+      child.on("exit", code => { clearTimeout(timer); resolve(code) })
+    })
+    assert.equal(ended, 1, "the receiver ends with a refusal")
+    assert.deepEqual(readdirSync(f.state), [], "nothing is created in the directory the hook resolved")
+    assert.deepEqual(readdirSync(private_), [], "nothing is created in the directory the link leads to now: no socket, no lock, no worker")
+  } finally {
+    // A receiver that did not refuse is still running, with a worker below it: stop exactly those two.
+    const workers = [f.state, private_].flatMap(directory => {
+      try { return readFileSync(join(directory, "worker.log"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.op === "join").map(entry => entry.pid) } catch { return [] }
+    })
+    if (child && child.exitCode === null && child.signalCode === null) process.kill(child.pid, "SIGKILL")
+    for (const pid of workers) if (Number.isInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL")
+    await f.cleanup()
+  }
 })

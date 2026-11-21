@@ -271,11 +271,12 @@ that a hook connects to.
 
 - the socket is itself a socket, not a symlink, owned by the current user;
 - its directory is not a symlink, and the directory and every directory above it
-  (links above it resolved first) is owned by the current user or by root and is
-  not writable by group or other. A directory that is writable by others but has
-  the sticky bit set, such as `/tmp`, passes: others cannot remove or rename
-  what the current user owns in it, and the socket's owner is checked on its
-  own;
+  (links above it resolved first, the way the kernel walks a path: a `..` after a
+  link names the parent of the link's target) is owned by the current user or by
+  root and is not writable by group or other. A directory that is writable by
+  others but has the sticky bit set, such as `/tmp`, passes: others cannot remove
+  or rename what the current user owns in it, and the socket's owner is checked
+  on its own;
 - the connection goes to the checked path with those links resolved;
 - that real path is at most 103 bytes long: `sun_path` holds 104 bytes on macOS
   and the BSDs (108 on Linux), terminator included, and a longer path must never
@@ -283,9 +284,11 @@ that a hook connects to.
   socket other than the one that was checked (reported for older Node, not
   reproduced on the release this was written on, which refuses it). The limit
   is on the resolved pathname, so a short spelling that resolves to a long path
-  is refused, and a path that is too long is refused rather than reported as
-  absent. The receiver measures the public socket path and the private name it
-  binds under the same limit before it listens.
+  is refused. Once its directory has resolved, a path that is too long is refused
+  rather than reported as absent, whether or not a socket is there; a directory
+  that is missing is reported as absent first, before the length is looked at.
+  The receiver measures the public socket path and the private name it binds
+  under the same limit before it listens.
 
 The state directory that holds the receiver socket must itself pass the directory
 part of the rule (it is also required to be `0700` and the user's own), and a
@@ -294,11 +297,16 @@ the receiver each take its canonical path (every link above it resolved) and
 use that path, and no other spelling of it, for everything they keep there: the
 start lock, the socket and its bind lock, the working directory of a receiver
 that a hook starts, and the worker's directory, which holds the binding file. A
-link that moves after the check changes none of them. The hook and the receiver
-resolve it separately, so a link moved between the two can leave them in two
-trusted directories: the hook then gets no answer and prints nothing. A hook
-whose receiver socket is untrusted prints nothing and exits 0, as it does for
-an absent receiver, and it starts no receiver on top of that socket.
+link that moves after the check changes none of them. The hook starts the
+receiver with the canonical path it resolved as the last of the receiver's
+arguments (a path is not a credential), and the receiver resolves the configured
+path itself. Before it creates, binds or starts anything it requires the two to
+be the same string. A link that moved between the two makes them differ: the
+receiver then exits without joining and creates nothing, so no receiver serves a
+directory that the hook is not looking in, and the hook gets no answer and
+prints nothing. A hook whose receiver socket is untrusted prints nothing and
+exits 0, as it does for an absent receiver, and it starts no receiver on top of
+that socket.
 
 The wake adds one more check, because it uses two connections (step 5): the
 connection that carries the add is checked first and its socket's identity (device
@@ -346,15 +354,22 @@ already excluded.
    refuses the wake.
 2. **Probe.** One `thread/queue/delete` of a random id must answer
    `{ "deleted": false }` within 1 second. Any other answer, an error
-   included, leaves the wake route off; no answer within the second leaves it
-   undecided until the next bind. The answer belongs to the socket it was taken
-   on (its device and inode): it says what the app-server behind that socket
-   does. A bind on another socket probes again. A wake that reaches another
-   socket than the probed one, or one probed with a negative answer, probes it
-   first, on the connection that will carry the add, and sends the add only after
-   a positive answer; a wake that cannot finish that probe sends nothing and
-   settles `failed`. A wake on a thread that no bind has probed (the receiver
-   wakes none) has no answer to reuse, so it probes first in the same way.
+   included, leaves the wake route off for that socket; no answer within the
+   second leaves it undecided until the next bind. The answer belongs to the
+   socket it was taken on (its device and inode): it says what the app-server
+   behind that socket does. A bind on another socket probes again. While the
+   route is off (the newest bind's probe answered no), each heartbeat `lstat`s the
+   path once, and connects to nothing unless the path names a socket other than
+   the one that probe was taken on (a restarted app-server, another one, or none
+   for the moment): the receiver then binds again, which probes the socket that
+   is there, so a route that was off on the old socket is decided again without a
+   restart. A positive route is not checked this way: a wake probes the socket it
+   reaches. A wake that reaches another socket than the probed one, or one probed
+   with a negative answer, probes it first, on the connection that will carry the
+   add, and sends the add only after a positive answer; a wake that cannot finish
+   that probe sends nothing and settles `failed`. A wake on a thread that no bind
+   has probed (the receiver wakes none) has no answer to reuse, so it probes first
+   in the same way.
 3. **Poll.** Every 2 seconds, when addressed messages are pending, the receiver
    reads the thread: `thread/loaded/list`, `thread/read`, then `thread/resume`,
    and last the newest turn from `thread/turns/list`. It must be idle, in
@@ -418,8 +433,9 @@ already excluded.
      the submission was removed, and nothing proves that it was handed.
      `deleted: false` is one of them. It says only that the submission is no longer
      queued, which may mean that it dispatched or that something else took it out,
-     so the receiver reads `thread/items/list` until the reservation ends, and
-     settles `handed` only if the matching item shows. A competing turn that
+     so the receiver reads `thread/items/list` within the wake's settlement
+     deadline (every request of the wake ends 1 second before the reservation
+     does), and settles `handed` only if the matching item shows. A competing turn that
      finishes before the delete is the same case: the delete may find nothing to
      remove, and the attempt is `handed` only if the matching item shows. So are an
      add whose reply is lost or carries no submission id, and a delete that fails
@@ -550,7 +566,10 @@ exercised live.
   that of the path at those moments, not of the peer behind an open connection,
   and a device and inode can be reused once the old socket is gone, so it shows
   that the path names the same file, not that the same listener has been there the
-  whole time. A live run on a real release is still needed.
+  whole time. The heartbeat's check for a replaced socket (step 2 of the idle
+  wake) rests on the same identity, so a replacement that reuses the device and
+  inode of the socket that was probed is not seen. A live run on a real release is
+  still needed.
 - **Sandboxing.** Whether a hook command and the detached receiver may use the
   state directory's socket, the control socket and the network under every
   sandbox profile is not confirmed. A profile that blocks them leaves chat off.
@@ -634,7 +653,8 @@ exercised live.
 - The host token is read from that file only. It travels to the worker on
   stdin. The receiver environment is the config path alone and the worker
   environment is empty. No token appears in argv or in any log line, and hooks
-  never forward it.
+  never forward it. The receiver's arguments are the session id, the pid of its
+  owner and the canonical state directory.
 - The variable is part of the Codex environment, so a command the session runs
   as the same user can read the file. Use a host token that is meant for this
   session.
@@ -699,10 +719,10 @@ node --test
 The suite covers config refusal, the worker join frame, frame validation and request deadline,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
 the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included), the hook and the client against a real receiver socket
-on trusted and untrusted paths, the state directory resolved once behind a link, the WebSocket client against a
+on trusted and untrusted paths, the state directory resolved once behind a link and handed to the receiver, which refuses a directory that resolves differently, the WebSocket client against a
 fake control socket on a real Unix socket (the wake's own reading before the add on a second connection, the
-socket identity across its two connections, the probe that belongs to one socket, the newest-turn statuses, the bind's commit fence for a retired worker, and the trust rule against real file systems), the receiver's state, delivery,
-wake, settlement, rejoin and shutdown with a manual clock, the hook commands
+socket identity across its two connections, the probe that belongs to one socket, the newest-turn statuses and thread statuses that are not strings, the bind's commit fence for a retired worker, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery,
+wake (a route probed negative on a socket that is later replaced included), settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
 hint), the plugin shape that Codex reads, and runs of the real hook and
 receiver processes against a fake worker and a fake app-server. It needs no

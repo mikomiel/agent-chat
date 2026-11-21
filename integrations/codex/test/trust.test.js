@@ -1,6 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { fittingSocketPath, MAX_SOCKET_PATH_BYTES, sameSocket, trustedDirectory, trustedSocket } from "../lib/trust.js"
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 // The one trust rule for the app-server control socket and the receiver's own socket, against a file system that is a table
 // of path -> { kind, uid, mode, dev, ino }; a path that is not in it is not there.
@@ -120,4 +123,42 @@ test("the limit is measured on the real path: a short spelling that resolves to 
   const resolving = { ...table(entries), realpath: path => (path === "/short" ? long.directory : path) }
   assert.ok(Buffer.byteLength("/short/s.sock") < 103)
   assert.throws(() => trustedSocket("/short/s.sock", resolving), untrusted)
+})
+
+// ---- the real file system: a path is resolved the way the kernel walks it -------------------------------------------------
+
+// `link/../state` names the parent of the link's target and then `state`. `fs.realpathSync` collapses the `..` against the
+// link's own directory first, so it names another directory: one that the `lstat` of the very same string never looked at.
+// The layout holds both directories, so a wrong answer is the wrong directory and not an error. Every directory gets an
+// explicit mode, because a umask of 002 would leave the default one group-writable, which the rule refuses.
+function walked(stateMode = 0o700) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "act-")))
+  const make = (mode, ...names) => {
+    const path = join(root, ...names)
+    mkdirSync(path, { mode })
+    chmodSync(path, mode)
+    return path
+  }
+  const lexical = make(0o700, "state") // what a `..` collapsed on the string names
+  make(0o755, "other")
+  const inner = make(0o755, "other", "inner")
+  const kernel = make(stateMode, "other", "state") // what the kernel reaches: the parent of the link's target, then `state`
+  symlinkSync(inner, join(root, "link"))
+  return { root, lexical, kernel, named: `${root}/link/../state` } // `join` would collapse the `..`, and the string is the point
+}
+
+test("with the real file system: `link/../state` is the directory the kernel reaches through the link, not the one a lexical `..` names", () => {
+  const w = walked()
+  try {
+    assert.equal(trustedDirectory(w.named), w.kernel)
+    assert.notEqual(w.kernel, w.lexical)
+  } finally { rmSync(w.root, { recursive: true, force: true }) }
+})
+
+test("with the real file system: the trust decision is taken on the directory the kernel reaches, so a lexical twin that is private does not vouch for it", () => {
+  const w = walked(0o770) // the directory behind the link is writable by its group; the one a lexical `..` names is private
+  try {
+    assert.throws(() => trustedDirectory(w.named), { code: "CHAT_UNTRUSTED" })
+    assert.equal(trustedDirectory(w.lexical), w.lexical, "control: the lexical twin passes by itself")
+  } finally { rmSync(w.root, { recursive: true, force: true }) }
 })

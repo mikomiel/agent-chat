@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createThread } from "../lib/appserver.js"
@@ -1660,4 +1660,85 @@ test("a receiver does not start in a state directory below a directory that othe
     await assert.rejects(runReceiver(["session-1", "1"], { AGENT_CHAT_CODEX_CONFIG: file }), { code: "CHAT_SOCKET_DIRECTORY" })
     assert.deepEqual(readdirSync(state), [], "no socket, no lock, no worker directory")
   } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+// ---- a queue probe that was not positive belongs to the socket it was taken on ----------------------------------------------
+
+// Another listener takes over `path` without that path ever being bound twice: it listens under a second name and is renamed
+// over the first, so the two sockets have different inodes and the first one is still alive. Closing a Node listener unlinks
+// the name it was bound under, which by then is the replacement's, so the first listener is closed last.
+async function takeOver(path, handler) {
+  const spare = `${path}.next`
+  const next = await fakeAppServer(spare, handler)
+  renameSync(spare, path)
+  return next
+}
+const eventually = async (check, what, limit = 5000) => {
+  for (let waited = 0; !check() && waited < limit; waited += 5) await new Promise(resolve => setTimeout(resolve, 5))
+  assert.ok(check(), `${what} never happened`)
+}
+// The app-server end of an idle, default-mode main thread that records what is queued. `deleted` is its answer to the queue
+// probe, and to the fence after an add: `true` is not the documented answer to a probe, `false` is.
+function controlSocket(deleted, queued) {
+  const record = { id: "session-1", parentThreadId: null, agentRole: null, ephemeral: false, source: "cli", modelProvider: "openai", status: { type: "idle" } }
+  const ok = result => ({ result })
+  return message => {
+    switch (message.method) {
+      case "thread/loaded/list": return ok({ data: ["session-1"], nextCursor: null })
+      case "thread/read": return ok({ thread: record })
+      case "thread/turns/list": return ok({ data: [{ id: "t1", status: "completed" }], nextCursor: null })
+      case "thread/resume": return ok({ thread: record, collaborationMode: { mode: "default", settings: {} } })
+      case "thread/queue/delete": return ok({ deleted })
+      case "thread/queue/add":
+        queued.push(message.params)
+        return ok({ queuedSubmission: { id: `q${queued.length}`, input: message.params.input, clientUserMessageId: message.params.clientUserMessageId } })
+      case "thread/items/list":
+        return ok({ data: queued.map(entry => ({ turnId: "t", item: { type: "userMessage", id: "i", clientId: entry.clientUserMessageId, content: entry.input } })), nextCursor: null })
+      default: return { error: { code: -32601, message: "method not found" } }
+    }
+  }
+}
+
+test("a queue probe that was negative on one socket is decided again when the path names another one: the receiver wakes without a restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "acr-"))
+  const path = join(dir, "s.sock")
+  const queued = []
+  const first = await fakeAppServer(path, controlSocket(true, queued)) // answers the probe `deleted: true`: not the documented answer
+  let second
+  let r
+  let binds = 0
+  // The thread reads the receiver's manual clock, so the reservation of a wake is measured on the clock that issued it.
+  const real = createThread({ path, threadId: "session-1", now: () => (r ? r.clock.now() : Date.now()) })
+  const thread = Object.assign(Object.create(real), { opened: [], bind(options) { binds += 1; return real.bind(options) } })
+  try {
+    r = await rig({ thread, handlers: wakeHandlers() })
+    await eventually(() => r.worker.bootIds.length === 1, "the join, which waits for the bind of the first socket")
+    assert.equal(thread.route, false, "the probe on the first socket was negative")
+    await idleSession(r)
+    await r.clock.advance(70_000) // two heartbeats, and every wake poll between them, on the socket that was probed
+    await eventually(() => r.worker.ops("heartbeat").length === 2, "both heartbeats, with the reads they wait for")
+    assert.deepEqual(r.worker.ops("claim"), [], "a route that is not positive wakes nothing")
+    assert.equal(binds, 1, "the socket is the one that was probed: no heartbeat binds again, so none connects for it")
+    second = await takeOver(path, controlSocket(false, queued)) // an app-server that answers the probe as documented
+    // The next heartbeat finds another socket at the path and binds again. The real I/O of that bind must run on a clock that
+    // stands still, or the read limit of the bind (3 s of this clock) runs out under it: the clock moves a second at a time,
+    // and stops after the step in which the heartbeat started the bind.
+    for (let step = 0; step < 31 && binds === 1; step += 1) await r.clock.advance(1_000)
+    assert.equal(binds, 2, "the heartbeat bound again: the path names another socket than the probe was taken on")
+    await eventually(() => thread.route === true, "the replacement to be probed")
+    for (let poll = 0; poll < 60 && r.worker.ops("claim").length === 0; poll += 1) {
+      await r.clock.advance(2_000) // one wake poll
+      for (let waited = 0; r.worker.ops("claim").length === 0 && waited < 100; waited += 5) await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    assert.equal(r.worker.ops("claim").length, 1, "the next wake poll claims: the receiver is wake-capable without a restart")
+    await eventually(() => queued.length === 1, "the queued wake")
+    assert.match(queued[0].clientUserMessageId, /^agent-chat:attempt-1$/)
+    await eventually(() => r.worker.ops("settle").length === 1, "the settle after the wake")
+    assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "handed", reason: null })
+    assert.equal(first.methods().includes("thread/queue/add"), false, "nothing was ever queued on the socket that failed the probe")
+  } finally {
+    await first.close()
+    await second?.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
