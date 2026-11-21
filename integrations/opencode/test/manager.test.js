@@ -606,7 +606,6 @@ test("a heartbeat tick that finds its session gone ends that session's chat, and
             if (answer === "wrong-session") return Promise.reject(missing("ses_other")) // another session's answer
             if (answer === "error") return Promise.reject(new Error("unavailable"))
             if (answer === "silent") return new Promise(() => {})
-            if (answer === "held") return new Promise((resolve, reject) => { rig.answerList = { resolve, reject } })
             return Promise.resolve([...entries].filter(([name]) => name.startsWith(`${sessionID}/`))
               .map(([name, value]) => ({ key: name.slice(sessionID.length + 1), value })))
           },
@@ -853,6 +852,77 @@ for (const [kind, shared] of [["a tombstone", "deleted"], ["fork evidence", "for
     assert.deepEqual(manager.sessions(), [])
   })
 }
+
+// Review 6006011023, finding 2: a lookup answer that names a parent or a fork is explicit evidence, as the feed's events
+// are. It is shared, so the next owner never asks again, and a later answer that is root-shaped cannot make it a root.
+for (const [kind, answer] of [
+  ["a parent", { id: "ses_a", parentID: "ses_parent" }],
+  ["a fork source", { id: "ses_a", fork: { sessionID: "ses_source", boundary: {} } }],
+]) {
+  test(`a lookup answer that names ${kind} is shared: the next owner never looks the session up or joins it`, async () => {
+    const sets = { deleted: new Set(), forked: new Set() }
+    const first = createManager(fakeCtx(() => answer), config, stubParts(), sets)
+    first.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    assert.deepEqual([...sets.forked], ["ses_a"])
+    const parts = stubParts()
+    const ctx = fakeCtx(root) // a later lookup would answer root-shaped
+    const successor = createManager(ctx, config, parts, sets)
+    successor.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    assert.deepEqual(ctx.lookups, [])
+    assert.equal(parts.lifecycles.size, 0)
+    assert.deepEqual(successor.sessions(), [])
+  })
+}
+
+// An answer that proves nothing about this session only refuses it in this owner's own cache.
+for (const [kind, answer] of [
+  ["another session's", { id: "ses_other", parentID: "ses_parent" }],
+  ["one without an id", { parentID: "ses_parent" }],
+  ["a null", null],
+  ["a string", "ses_a"],
+]) {
+  test(`a lookup answer that is ${kind} stays an owner-local refusal and adds no fork evidence`, async () => {
+    const sets = { deleted: new Set(), forked: new Set() }
+    const firstCtx = fakeCtx(() => answer)
+    const first = createManager(firstCtx, config, stubParts(), sets)
+    first.feed(event("session.execution.started", "ses_a"))
+    first.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    assert.deepEqual(firstCtx.lookups, ["ses_a"]) // refused here from now on
+    assert.deepEqual([...sets.forked], [])
+    const parts = stubParts()
+    const ctx = fakeCtx(root)
+    const successor = createManager(ctx, config, parts, sets)
+    successor.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    assert.deepEqual(ctx.lookups, ["ses_a"]) // the next owner asks for itself
+    assert.deepEqual(successor.sessions(), ["ses_a"])
+  })
+}
+
+// Review 6006011023, finding 1: a missing-session answer is reported to the owner of the process, which decides. The manager
+// ends nothing itself: the report reaches it as a received `session.deleted` event, as the registry sends it.
+test("a missing-session answer is passed to the injected report and the manager does not end the record on its own", async () => {
+  const reported = []
+  const parts = stubParts()
+  const createContextStub = parts.createContext
+  let options = null
+  parts.createContext = (hostCtx, id, passed) => { options = passed; return createContextStub(hostCtx, id) }
+  const sets = { deleted: new Set(), forked: new Set() }
+  const manager = createManager(fakeCtx(root), config, parts, { ...sets, reportDeleted: id => reported.push(id) })
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  options.onMissing()
+  assert.deepEqual(reported, ["ses_a"])
+  assert.deepEqual([...sets.deleted], [])
+  assert.deepEqual(manager.sessions(), ["ses_a"])
+  manager.feed(event("session.deleted", "ses_a")) // the registry's dispatch of the same report
+  await flush()
+  assert.deepEqual(manager.sessions(), [])
+  assert.equal(parts.lifecycles.get("ses_a").stops, 1)
+})
 
 // Review 6003407206, finding 2: a deletion is fenced when it is received, not queued behind the lookup.
 test("a deletion that arrives during the lookup stops it before a worker starts or a join is sent", async () => {

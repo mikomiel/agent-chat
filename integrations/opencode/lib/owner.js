@@ -16,6 +16,8 @@
 // already refuses the id. A fork record is dropped when its session is deleted, so `forks` holds the forks and child
 // sessions that are not deleted yet. `deletions` holds one id for each deleted session. These two sets are the only
 // state that grows with the sessions the process sees.
+// A deletion that an owner learns from the host, as a missing-session answer, is dispatched as a `session.deleted` event.
+// It takes the same path as one from the stream, so the current owner ends its record even when an older owner asked.
 //
 // FAILOVER. When the owner's instance is torn down, the registry waits until that owner's workers have ended and
 // only then promotes the next member. A session rejoins at its next event. Registry changes run one at a time.
@@ -40,8 +42,12 @@ export function createRegistry() {
 
   function promote() {
     owner = members[0] ?? null
-    if (owner) owner.activate(forks, deletions)
+    if (owner) owner.activate(forks, deletions, reportDeleted)
   }
+
+  // A deletion an owner learned from the host, not from the stream. It is a received `session.deleted` event: recorded
+  // as a tombstone, then fed to the current owner, which need not be the one that asked, so it ends its own record.
+  const reportDeleted = sessionID => dispatch({ type: "session.deleted", data: { sessionID } })
 
   function dispatch(event) {
     // Recorded before the owner check: a fork or deletion event between two owners is kept for the next one.
@@ -132,7 +138,9 @@ export function createMember(ctx, config, parts, { managerOptions = {}, sleep = 
       void pump(dispatch, reset).catch(() => {})
       return () => controller.abort()
     },
-    activate(forked, deleted) { manager = createManager(ctx, config, parts, { ...managerOptions, forked, deleted }) },
+    activate(forked, deleted, reportDeleted) {
+      manager = createManager(ctx, config, parts, { ...managerOptions, forked, deleted, reportDeleted })
+    },
     async deactivate() {
       const ending = manager
       manager = null

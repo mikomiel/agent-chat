@@ -18,6 +18,8 @@
 // evidence that outlives every cache: it is kept in its own set, never evicted, dropped only when the session is
 // deleted, and shared with the next owner. It is fenced when it is received, whenever it arrives: a lookup still pending
 // finds its record dead, and a session already joined ends its chat. A lookup that fails or answers later cannot undo it.
+// A lookup answer for the session that names a fork or a parent is the same evidence and is kept the same way, so the
+// next owner never asks again. An answer that is unreadable or for another session is not: it only refuses locally.
 //
 // A DELETION IS FENCED WHEN IT IS RECEIVED, as a fork is: it is not queued behind a lookup that is still running. The
 // record is ended at once, so a lookup that answers afterwards finds its record dead and starts no worker and sends
@@ -28,8 +30,10 @@
 // A DELETION CAN BE MISSED, AND THE TICK FINDS IT. The host has no replay and no cursor, so a `session.deleted` event
 // can be lost with no gap marker, and nothing else would end that session's worker and binding. The heartbeat tick
 // reads the binding entry, and every such read first reads the session: a deleted one fails it with the core's
-// `Session.NotFoundError`. The binding context reports that answer (`onMissing`), and it takes the deletion path above.
-// A timeout, any other error and a session that is found change nothing. No host call is added for this.
+// `Session.NotFoundError`. The binding context reports that answer (`onMissing`), and the manager passes it to
+// `reportDeleted`. The registry sets that to a received `session.deleted` event: the tombstone, and the current owner's
+// record, which may not be the one that asked. Alone, the manager ends its own record. A timeout, any other error and a
+// session that is found change nothing. No host call is added for this.
 //
 // A LOOKUP HOLDS NOTHING BACK. A record still in its eligibility lookup has no worker and no binding entry, so
 // `stop()` ends it at once and waits only for the worker and entry cleanup of joined sessions. A lookup that never
@@ -62,6 +66,10 @@ export function isRootSession(info, sessionID) {
   return (info.parentID === undefined || info.parentID === null) && (info.fork === undefined || info.fork === null)
 }
 
+// An answer for this session that names a parent or a fork source.
+const namesParent = (info, sessionID) => info !== null && typeof info === "object" && info.id === sessionID
+  && ((info.parentID !== undefined && info.parentID !== null) || (info.fork !== undefined && info.fork !== null))
+
 // The id of the session an event belongs to, or null when it names none.
 export const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
 
@@ -83,6 +91,7 @@ export function createManager(ctx, config, parts, {
   notice = () => {},
   forked = new Set(), // fork evidence: session ids that are never roots; the registry hands every owner the same set
   deleted = new Set(), // deletion tombstones: ids of sessions that ended; never evicted, shared like `forked`
+  reportDeleted = null, // where a deletion this manager learned from the host goes; the registry sets it. Alone: markDeleted
 } = {}) {
   const records = new Map() // session id -> { id, context, lifecycle, chain, dead, closing }
   const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
@@ -162,6 +171,9 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (!isRootSession(info, record.id)) {
+      // An answer for this very session that names a parent or a fork is fork evidence, as the feed's is: shared and kept.
+      // An unreadable answer, or one for another session, proves nothing: only this owner's cache refuses it.
+      if (namesParent(info, record.id)) forked.add(record.id)
       refuse(record.id, Infinity)
       records.delete(record.id)
       record.dead = true
@@ -170,7 +182,7 @@ export function createManager(ctx, config, parts, {
     const handlers = new Map()
     const bus = { on(name, fn) { handlers.set(name, [...(handlers.get(name) ?? []), fn]) } }
     record.fire = (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload) }
-    record.context = parts.createContext(ctx, record.id, { onMissing: () => markDeleted(record.id) })
+    record.context = parts.createContext(ctx, record.id, { onMissing: () => (reportDeleted ?? markDeleted)(record.id) })
     record.lifecycle = parts.createLifecycle(bus, record.context, config, {
       startProcess: parts.startProcess,
       notice: text => notice(String(text)),

@@ -155,7 +155,11 @@ The service and its host-token provisioning are documented in the product
   answers or fails, and a session that has already joined ends its chat. The
   record is its own set. No cache evicts it, it holds a session until that
   session is deleted, and the next owner receives it, including an event that
-  arrived between two owners.
+  arrived between two owners. A `session.get` answer for the session that names
+  a `parentID` or a `fork` is the same evidence and goes into the same set, so
+  the next owner does not ask again, and a later answer that looks like a root
+  cannot change it. An answer that is unreadable, or is for another session,
+  proves nothing: it only refuses the session in the owner's own bounded cache.
   A `session.deleted` event is fenced when it is received and not behind the
   lookup: the record ends at once, so a lookup that answers after the deletion
   starts no worker and sends no join. Events still queued for that session are
@@ -172,7 +176,10 @@ The service and its host-token provisioning are documented in the product
   instruction-entry call first reads the session, so a deleted session fails
   that read with `Session.NotFoundError` naming it. An answer in time with that
   error ends the session's chat through the path above, at the next tick that
-  reads the entry, wherever the deletion happened. A repair already in flight can
+  reads the entry, wherever the deletion happened. The owner reports it to the
+  registry as a received `session.deleted` event: the tombstone is recorded, and
+  the current owner ends its own record, which can be a different owner than the
+  one that asked, joined or still in its lookup. A repair already in flight can
   defer that read past the tick, as for any repair. No host call is added for it.
   A timeout, any other error, and a session that is found change nothing. Events
   of one session run in order on that session's own chain. A fault there ends that session's
@@ -344,7 +351,8 @@ unverified, inferred, or a deliberate choice.
   list. The repair completes at the first ask after the host answers.
 - **Forks.** Whether a fork sets `parentID` is unknown. A session with a `fork`
   field or a `parentID` never joins, and a `session.created` event that names a
-  parent ends the chat of a session that had joined.
+  parent ends the chat of a session that had joined. A lookup answer that names
+  either is kept for the next owner as an event is.
 - **Plain JavaScript plugin.** See "Install".
 - **Node built-ins.** Whether the plugin runtime allows `node:child_process`.
 - **Connection key.** How the connection-key work in issues #126 to #128
