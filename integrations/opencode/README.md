@@ -327,6 +327,16 @@ unverified, inferred, or a deliberate choice.
   leave a parked steer item that later drained into an unrelated prompt. That
   was not re-tested on a current release.
 
+- **Two edges of the first-heartbeat gate.** Both heal themselves.
+  [Issue #155](https://github.com/mikomiel/agent-chat/issues/155) tracks them.
+  First, during a handoff, a removal by the previous owner that timed out and
+  lands after the successor proved its binding is not seen as taking the proof
+  back. The first heartbeat can then go out with no entry, and the next tick's
+  read-back puts the entry back. Second, a proof made by a repair that the
+  manager started does not wake a tick that is waiting for it. The first
+  heartbeat then waits for the next tick. If that is later than the server
+  lease, it gets `STALE_INSTANCE`, and the session rejoins.
+
 ### Not verified on a live release
 
 - **Entry read-back.** That `entry.list` returns the stored value strictly
