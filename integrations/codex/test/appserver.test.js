@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { CLIENT_ID_PREFIX, createThread, isChildThread, MIN_ADD_MS, openAppServer } from "../lib/appserver.js"
@@ -58,6 +58,17 @@ test("the client upgrades once, declares experimentalApi, acknowledges and close
     link.close()
     for (let waited = 0; server.state.open && waited < 1000; waited += 10) await new Promise(resolve => setTimeout(resolve, 10))
     assert.equal(server.state.open, 0)
+  })
+})
+
+test("the client announces the package version, which release-please moves with package.json", async () => {
+  const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+  assert.match(version, /^\d+\.\d+\.\d+/)
+  await withServer(main(), async (path, server) => {
+    const link = await openAppServer(path)
+    assert.equal(server.log[0].method, "initialize")
+    assert.equal(server.log[0].params.clientInfo.version, version)
+    link.close()
   })
 })
 

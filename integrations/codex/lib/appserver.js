@@ -10,6 +10,7 @@
 // thread/loaded/list, thread/turns/list, thread/items/list, thread/resume with excludeTurns, and the experimental
 // thread/queue/add and thread/queue/delete, which need capabilities.experimentalApi at initialize.
 import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { readFileSync } from "node:fs"
 import net from "node:net"
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -17,7 +18,10 @@ const MAX_HEAD = 16 * 1024
 const MAX_FRAME = 4 * 1024 * 1024
 const REQUEST_MS = 3_000
 const CONNECT_MS = 2_000
-const CLIENT = { name: "agent-chat-codex", title: "Agent Chat", version: "0.1.0" }
+// The client version is the package's own, read from package.json (the file lives one level above lib/ in a checkout and
+// in the release tarball), so release-please moving the package version moves this one too.
+const { version: PACKAGE_VERSION } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
+const CLIENT = { name: "agent-chat-codex", title: "Agent Chat", version: PACKAGE_VERSION }
 // The queue id prefix: the wake's client message id is this plus the attempt id.
 export const CLIENT_ID_PREFIX = "agent-chat:"
 // A wake is not started with less than this left of its reservation.

@@ -6,8 +6,8 @@ import {
 import { packCandidates, renderNotice } from "../lib/notice.js"
 
 // What the package owns around the shared notice renderer: the byte limits, the two prefixes and the reduction of
-// a claimed batch to server-issued identifiers for a queued turn. The renderer's own contract suite belongs to the
-// shared notice work and is not repeated here.
+// a claimed batch to server-issued identifiers for a queued turn. The renderer's own contract suite runs from
+// test/notice.test.js and is not repeated here.
 const joined = {
   session_id: "11111111-1111-4111-8111-111111111111",
   instance_id: "22222222-2222-4222-8222-222222222222",

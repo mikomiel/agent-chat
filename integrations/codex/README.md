@@ -90,7 +90,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
-| `noticeBodies` | Optional. `true` includes message bodies in a notice delivered by a hook; default metadata only. A wake never carries bodies. |
+| `noticeBodies` | Optional. `true` includes message bodies in a notice delivered by a hook, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. A wake never carries bodies. |
 | `appServer` | Optional. `unix://` followed by the absolute path of the Codex app-server control socket. Without it the package is hook-only: no thread check, no idle wake. Any other form is a refused config. |
 
 Name the file in the environment of the Codex process:
@@ -158,15 +158,22 @@ sends its request: it does not wait for the worker to end its instance.
   longer one to a file and shows a preview. `hooks/hooks.json` sets
   `additionalContextLimit` to 6,000 on the three events that carry context,
   and the receiver budgets UTF-8 bytes (6,000 for the binding, the delivery
-  line and the notice together), which are never fewer than tokens. The binding
-  and the notice share the budget; bodies fall back to metadata, and a batch
-  that cannot fit even as metadata is deferred, never truncated into a false
-  delivery. The hook refuses any text over the budget as a second check.
+  line and the notice together), which are never fewer than tokens. The
+  binding, the delivery line and the notice share that cap: the receiver
+  subtracts the bytes of the first two from it before the claim and passes the
+  rest to the renderer as its bound. In bodies mode the renderer cuts bodies to
+  fit and never falls back to metadata; a batch whose headers, markers and
+  pointers alone do not fit is deferred, never partly delivered. The hook
+  refuses any text over the budget as a second check.
 - **Notice.** `lib/notice.js` is a byte-identical copy of the shared notice
-  renderer. A body sits between two marker lines that carry a random nonce,
-  every body line starts with `> `, and controls and invisible code points are
-  written as escape text. The Codex parts (the delivery prefix, the byte limit
-  and the delivery call) live in `lib/channel.js`.
+  renderer, [`../shared/notice.js`](../shared/notice.js). A body sits between
+  two marker lines that carry a random nonce, every body line starts with `> `,
+  and controls and invisible code points are written as escape text. Each
+  message header names its own room. The Codex parts (the delivery prefix, the
+  byte limit and the delivery call) live in `lib/channel.js`. Edit the shared
+  file and copy it over; `test/notice.test.js` fails on any difference. The
+  [notice contract](../README.md#notice-contract) lists what framing and
+  packing do not cover.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
 - **Delegated sessions.** A session that is not the main thread never joins:
@@ -314,6 +321,19 @@ exercised live.
   subagents, and a stop that happens while the receiver is down is not seen
   until the next turn event. With `appServer`, an interrupted last turn is also
   read.
+- **Large retry batches.** A retry batch is claimed whole, up to 16 messages;
+  only a first claim is packed to fit. With short synthetic values in the
+  binding line (interpreter, state file and host), 16 frames at body cap 0 and
+  the adapter's own lines take 7,688 bytes when every header field is at its
+  widest. The 6,000-byte output cap leaves 5,945 bytes after the delivery line,
+  and 3,895 bytes once the longest binding announcement (2,048 bytes and two
+  line feeds) is counted too. A batch that does not fit renders nothing and is
+  deferred. Sixteen messages with short bodies also take more than 3,895 bytes,
+  so a full retry batch is deferred while an announcement of that size is in
+  front of it. One message at its widest takes 1,598 bytes in the same
+  fixture, which leaves 2,297 bytes at the smallest bound for longer
+  interpreter, state and host values, so a packed first claim can be delivered.
+  `test/notice.test.js` holds a first claim to that bound.
 - **Self-started turns.** `UserPromptSubmit` also fires for turns the operator
   did not type. Each is a turn start to the receiver and may be delivered to.
 - **No sender receipts.** This version neither reads nor renders the receipts
@@ -376,8 +396,8 @@ node --test
 ```
 
 The suite covers config refusal, the worker join frame and frame validation,
-the rejoin policy pinned to `agent_chat/models.py`, the notice limits and the
-wake rows, the socket and its start handshake, the WebSocket client against a
+the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
+the notice limits at the smallest bound and the wake rows, the socket and its start handshake, the WebSocket client against a
 fake control socket on a real Unix socket, the receiver's state, delivery,
 wake, settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
