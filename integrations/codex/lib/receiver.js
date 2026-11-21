@@ -273,6 +273,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const before = epoch
     const result = await thread.observe()
     const current = epoch === before && live === record
+    sawPlan(record, result.observed)
     if (current) {
       adopt(result.observed)
       if (result.reason !== null) { newestRefusal = result.reason; epoch += 1 }
@@ -281,10 +282,26 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // Keep an app-server reading as the observed state. A read that shows a mode sets or ends the Plan Mode memory; one that
-  // shows none (a busy or an unreadable thread) leaves it as it was.
+  // shows none (a busy or an unreadable thread) leaves it as it was. The memory exists only while reads can end it: with no
+  // decided route (`threadBound`) the session is hook-only for Plan Mode.
   function adopt(read) {
     observed = read.status === "idle" || read.status === "busy" ? read : null
-    if (read.plan !== null) planSeen = read.plan
+    if (read.plan !== null) planSeen = threadBound && read.plan
+  }
+
+  // A read that shows Plan Mode is evidence about the mode whenever it was taken. A hook event makes a read stale for the
+  // observed state and for a wake, but says nothing about the mode (`permission_mode` is only a hint), so the evidence is
+  // kept unless the worker the read was made for is gone. A read that shows another mode ends the memory only while it is
+  // fresh (`adopt`): a stale read may be older than the Plan Mode switch it would undo.
+  function sawPlan(record, read) {
+    if (live === record && threadBound && read.plan === true) planSeen = true
+  }
+
+  // A bind decides the route. Without one no read comes, so nothing could end the Plan Mode memory: it is cleared and stays
+  // clear until a bind decides the route and reads resume.
+  function routeDecided(bound) {
+    threadBound = bound
+    if (!bound) planSeen = false
   }
 
   async function connect() {
@@ -301,7 +318,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       if (check.refusal) return disable(check.refusal)
       // The bind took time: a rejoin whose episode ran out meanwhile starts nothing.
       try { policy.check() } catch (error) { return disable(describeFailure(error)) }
-      threadBound = check.bound
+      routeDecided(check.bound)
       if (!check.verified) {
         firstAttempt()
         rejoinTimer = setTimeoutImpl(() => { void connect() }, HEARTBEAT_MS)
@@ -351,7 +368,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       const check = await bindThread(() => live === record)
       if (live !== record) return
       if (check.refusal) return disable(check.refusal)
-      threadBound = check.bound
+      routeDecided(check.bound)
     }
     if (thread && threadBound && !stopped && native !== "busy") {
       const result = await refine(record)
@@ -457,7 +474,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             else if (wake) {
               // The claim and the status call took time: the add is sent only if nothing newer than the clearing read arrived.
               result = await thread.wake({
-                text: WAKE_PREFIX + notice, attemptId: grant.attempt_id, until: started + reservation, proceed: fresh => wakeStale(cleared, fresh),
+                text: WAKE_PREFIX + notice, attemptId: grant.attempt_id, until: started + reservation, proceed: fresh => {
+                  const stale = wakeStale(cleared, fresh)
+                  sawPlan(record, fresh.observed) // whether or not the reading is still fresh enough to adopt
+                  return stale
+                },
               })
               wakeAfter = now() + (result.outcome === "handed" ? 0 : WAKE_RETRY_MS)
               // A hook event since the clearing read is newer than the confirmation, so its state stays. Otherwise the

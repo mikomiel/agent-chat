@@ -156,14 +156,22 @@ sends its request: it does not wait for the worker to end its instance.
   and for an idle session. The two mode fields differ in what they can end. A hook's
   `permission_mode` is only a hint: `plan` sets Plan Mode, and a later hook with another mode
   ends a Plan Mode that a hook set, but it cannot end one that a read showed. A later hook event
-  discards the read's busy or idle answer, but not a Plan Mode that the read showed. That stays,
-  whatever the hook events say, until a later read shows another mode, so meanwhile the receiver
-  claims no hook delivery and the heartbeat reports Plan Mode. A read that shows no mode
+  discards the read's busy or idle answer, but not a Plan Mode that the read showed, and that
+  holds for a read that a hook event made stale while it ran: a hook says nothing about the
+  mode, so Plan Mode that a read shows is kept whenever the read was taken. It stays, whatever
+  the hook events say, until a later read shows another mode (only a read that is still
+  fresh can say so, since a stale one may be older than the switch into Plan Mode), so meanwhile the
+  receiver claims no hook delivery and the heartbeat reports Plan Mode. A read that shows no mode
   changes nothing: a busy thread, one that is not loaded, an unreadable or untrusted socket, a
   changed provider. The receiver reads the thread only while no turn is known to run, so after a
-  prompt in default mode the delivery waits for the next `Stop` and the first read after it. If no
-  read reaches the mode again (the app-server is gone, or the thread is no longer a bound main
-  thread), hook delivery stays withheld until the receiver ends.
+  prompt in default mode the delivery waits for the next `Stop` and the first read after it.
+  Reads are taken only on a thread whose bind decided the route (a main thread, a fixed provider
+  and a queue probe that answered). When a bind leaves the route undecided, for example because the
+  queue probe stayed silent, no read can end the memory, so it is cleared and stays clear until a
+  later bind decides the route: the session is hook-only for Plan Mode, as one without a control
+  socket is. While the route is decided, the memory can still stay for as long as every read
+  refuses before it reaches the mode (the app-server gone, an unreadable thread), and hook
+  delivery stays withheld until a read shows the mode or the receiver ends.
 - **Busy delivery.** A `prompt` or `tool` hook asks the receiver for a batch
   while the turn runs. The receiver claims only when the session is busy, and
   never in Plan Mode, while stopped or in an unknown state. The reply is
@@ -494,7 +502,8 @@ exercised live.
 - **Plan Mode from a hook.** Whether `permission_mode` `plan` in a hook payload
   follows the Plan collaboration mode is not confirmed. The app-server read is
   the authority when it exists, and a hook event cannot end a Plan Mode that it
-  showed (see State); without `appServer`, a session put into Plan
+  showed (see State); without `appServer`, or with a route that no bind has
+  decided (a silent queue probe), a session put into Plan
   Mode while idle is seen only if a hook payload says so.
 - **A delegate's hooks.** Codex gives a subagent's hooks the parent session
   id. Whether `UserPromptSubmit` and `PostToolUse` inside a subagent carry
@@ -720,9 +729,11 @@ exercised live.
   directory, as its canonical path, as its working directory and as the
   directory it keeps the binding file in.
 - The app-server client answers a server request with a method-not-found error
-  and refuses a fragmented, binary or masked server frame, and a frame with a
-  reserved bit set, since it negotiates no extension: the connection fails and the
-  frame is never read, so a fence reply cannot say `deleted: true` through one. It
+  and refuses a fragmented, binary or masked server frame, a frame with a
+  reserved bit set (it negotiates no extension) and a frame whose length is not in
+  its shortest form (16 bits from 126, 64 bits from 65536; a 64-bit length with
+  its top bit set is over the frame limit). The connection fails and the frame is
+  never read, so a fence reply cannot say `deleted: true` through one. It
   times a wake's reservation and deadlines on one monotonic clock (the receiver
   passes its own to its thread), so an adjusted wall clock cannot give a wake more
   time than its reservation has; whether that clock counts a suspended host's time

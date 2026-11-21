@@ -143,6 +143,48 @@ test("a server frame with a reserved bit set fails the connection and is never d
   }
 })
 
+// RFC 6455 gives a length one form only, the shortest: 7 bits up to 125, 16 bits from 126, 64 bits from 65536. A frame that
+// spells it the long way is a protocol error, not another way to write the same frame; so is a 64-bit length with its top bit set.
+// `framed` builds a text frame with the length in the form asked for ("short", 16 or 64 bits), whether or not it is the shortest.
+function framed(form, payload, bit = 0) {
+  const body = Buffer.from(payload)
+  const wide = Buffer.alloc(8)
+  wide.writeBigUInt64BE(BigInt(body.length))
+  const head = form === 16 ? Buffer.from([0x81, 126, body.length >> 8, body.length & 0xff])
+    : form === 64 ? Buffer.concat([Buffer.from([0x81, 127]), wide])
+      : Buffer.from([0x81, body.length])
+  const frame = Buffer.concat([head, body])
+  frame[0] |= bit
+  return frame
+}
+
+test("a length is read only in its shortest form: 16 bits from 126 and 64 bits from 65536, and a 64-bit length with its top bit is refused", async () => {
+  const reply = (form, length) => (message, connection) => {
+    const base = JSON.stringify({ id: message.id, result: { pad: "" } })
+    connection.socket.write(framed(form, JSON.stringify({ id: message.id, result: { pad: "x".repeat(length - Buffer.byteLength(base)) } })))
+    return undefined
+  }
+  for (const [form, length, accepted] of [
+    ["short", 125, true], [16, 126, true], [16, 65535, true], [64, 65536, true], [64, 70_000, true],
+    [16, 125, false], [16, 40, false], [64, 65535, false], [64, 126, false], [64, 40, false],
+  ]) {
+    await withServer(reply(form, length), async path => {
+      const link = await openAppServer(path)
+      const label = `${form} form, ${length} bytes`
+      if (accepted) assert.equal((await link.request("thread/loaded/list", {}, 2000)).pad.length > 0, true, label)
+      else await assert.rejects(link.request("thread/loaded/list", {}, 2000), { code: "APP_SERVER_PROTOCOL" }, label)
+      link.close()
+    })
+  }
+  await withServer((message, connection) => {
+    connection.socket.write(Buffer.from([0x81, 127, 0x80, 0, 0, 0, 0, 0, 0x01, 0x00])) // 2^63 + 256: only the header is sent
+    return undefined
+  }, async path => {
+    const link = await openAppServer(path)
+    await assert.rejects(link.request("thread/loaded/list", {}, 2000), { code: "APP_SERVER_PROTOCOL" }, "top bit set")
+  })
+})
+
 test("an error reply carries its code and never its message", async () => {
   await withServer(() => ({ error: { code: -32600, message: "secret detail" } }), async path => {
     const link = await openAppServer(path)
@@ -642,19 +684,22 @@ test("deleted:true means it never dispatched: deferred, and no confirmation is a
 })
 
 // A fence reply that is read as `deleted: true` is the one thing that settles a wake `deferred`, so a frame that must not be read
-// can never be allowed to say it: with a reserved bit set the connection fails, and a failed fence is uncertain.
-test("a fence reply with a reserved bit set is not read: the wake is uncertain, never deferred", async () => {
-  const fenced = bit => (message, connection) => {
-    const frame = serverFrame(0x1, JSON.stringify({ id: message.id, result: { deleted: true } }))
-    frame[0] |= bit
-    connection.socket.write(frame)
+// can never be allowed to say it: with a reserved bit set, or a length spelled in a longer form than it needs, the connection
+// fails, and a failed fence is uncertain.
+test("a fence reply in a frame that is not well formed is not read: the wake is uncertain, never deferred", async () => {
+  const fenced = (bit, form = "short") => (message, connection) => {
+    connection.socket.write(framed(form, JSON.stringify({ id: message.id, result: { deleted: true } }), bit))
     return undefined
   }
   const control = await wakeWith({ "thread/queue/delete": fenced(0) })
-  assert.deepEqual(control.result, { outcome: "deferred", reason: "busy" }, "control: the same reply without the bit proves the removal")
-  for (const bit of [0x40, 0x20, 0x10]) {
-    const { result, methods } = await wakeWith({ "thread/queue/delete": fenced(bit) })
-    assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, `0x${bit.toString(16)}`)
+  assert.deepEqual(control.result, { outcome: "deferred", reason: "busy" }, "control: the same reply, well formed, proves the removal")
+  for (const [label, handler] of [
+    ["0x40", fenced(0x40)], ["0x20", fenced(0x20)], ["0x10", fenced(0x10)],
+    ["a short payload with a 16-bit length", fenced(0, 16)],
+    ["a short payload with a 64-bit length", fenced(0, 64)],
+  ]) {
+    const { result, methods } = await wakeWith({ "thread/queue/delete": handler })
+    assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, label)
     assert.equal(methods.filter(method => method === "thread/queue/add").length, 1, "nothing is retried")
   }
 })

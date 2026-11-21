@@ -1551,6 +1551,150 @@ for (const [label, fresh, reason, state] of [
   })
 }
 
+// A hook event makes a read stale: its busy or idle answer is dropped, and so is any wake cleared before it. The Plan Mode it
+// showed is not dropped: that is evidence about the mode, which no hook event can give.
+test("a read that shows Plan Mode after a hook event made it stale still counts: the next prompt or tool event claims nothing and the heartbeat reports plan", async () => {
+  let release
+  const thread = threadDouble({ route: false, observation: () => new Promise(resolve => { release = () => resolve({ reason: "plan", observed: { status: "idle", stopped: false, plan: true } }) }) })
+  const r = await rig({ thread, handlers: { pending: () => ({ messages: ["m1"] }) } })
+  await r.begin()
+  await r.op(turn())
+  await r.op({ op: "stop", permission_mode: "default" })
+  await r.clock.advance(30_000) // the tick reads the thread and waits for the answer
+  await r.op({ op: "stop", permission_mode: "default" }) // a hook event arrives while the read is out
+  release()
+  await settle()
+  r.worker.log.length = 0
+  assert.equal(r.receiver.state(), "plan")
+  for (const event of ["prompt", "tool"]) {
+    const hook = await r.op(turn({ event, permission_mode: "default" }))
+    assert.equal(r.receiver.state(), "plan", event)
+    assert.deepEqual(hook.sent, [{ context: null }], `${event}: nothing is printed`)
+  }
+  assert.deepEqual(r.worker.ops("claim"), [], "nothing was claimed")
+  await r.clock.advance(30_000)
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true })
+})
+
+test("a wake's own reading that shows Plan Mode counts even when a hook event made it stale: the add is refused as before, and the next prompt claims nothing", async () => {
+  const thread = threadDouble({ fresh: reading("plan", { plan: true }) })
+  let armed = false
+  let r = null
+  r = await rig({ thread, handlers: wakeHandlers({ status: () => {
+    if (armed) { armed = false; void r.receiver.handle({ op: "stop", permission_mode: "default" }, hookDouble()) }
+    return { muted: false }
+  } }) })
+  await idleSession(r)
+  armed = true
+  await r.clock.advance(2000)
+  assert.deepEqual(thread.adds, [], "no add frame was written")
+  assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "deferred", reason: "busy" }, "the hook event is what refused the wake, as before")
+  assert.equal(r.receiver.state(), "plan")
+  const claims = r.worker.ops("claim").length
+  const hook = await r.op(turn({ permission_mode: "default" }))
+  assert.equal(r.worker.ops("claim").length, claims, "the prompt claims nothing")
+  assert.deepEqual(hook.sent, [{ context: null }])
+})
+
+// Only a fresh read can say the thread left Plan Mode: a stale one may be older than the switch into it.
+test("a read that shows default mode but was made stale by a hook event does not end a Plan Mode that an earlier read showed; a fresh one does", async () => {
+  let mode = "plan"
+  let release
+  const thread = threadDouble({
+    route: false,
+    observation: () => (mode === "hold"
+      ? new Promise(resolve => { release = () => resolve(IDLE) })
+      : { reason: mode === "plan" ? "plan" : null, observed: { status: "idle", stopped: false, plan: mode === "plan" } }),
+  })
+  const r = await rig({ thread })
+  await r.begin()
+  await r.clock.advance(30_000) // a fresh read shows Plan Mode
+  assert.equal(r.receiver.state(), "plan")
+  mode = "hold"
+  await r.clock.advance(30_000) // the next read is out
+  await r.op({ op: "stop", permission_mode: "default" }) // a hook event arrives while it is
+  release() // it shows default mode, and it is stale
+  await settle()
+  assert.equal(r.receiver.state(), "plan", "a stale read does not end Plan Mode")
+  mode = "default"
+  await r.clock.advance(30_000)
+  assert.equal(r.receiver.state(), null, "a fresh read does")
+})
+
+// A worker that was retired owns nothing, and neither does the read it started: its Plan Mode is not the replacement's evidence.
+test("a retired tick's read that shows Plan Mode comes back late and leaves the replacement no memory of it", async () => {
+  let release
+  let reads = 0
+  let refuse = false
+  let open
+  const second = { promise: new Promise(resolve => { open = resolve }) }
+  const thread = threadDouble({ observation: () => (++reads === 1 ? new Promise(resolve => { release = () => resolve(reading("plan", { plan: true })) }) : IDLE) })
+  const r = await rig({ thread, gate: boot => (boot === 2 ? second : undefined), handlers: wakeHandlers({ pending: () => (refuse ? { refused: "STALE_INSTANCE" } : { messages: [] }) }) })
+  await idleSession(r)
+  await r.clock.advance(30_000) // the tick starts and waits on its read
+  refuse = true
+  await r.clock.advance(2000) // a wake poll finds the lease gone: the worker is retired
+  assert.equal(r.worker.state.stops, 1)
+  refuse = false
+  await r.clock.advance(3750) // the rejoin starts, and its join stays open
+  assert.equal(r.worker.bootIds.length, 2)
+  release()
+  await settle()
+  assert.equal(r.receiver.state(), null, "the old read's Plan Mode is not the replacement's")
+})
+
+// With no route decided (an unprobed queue, a changed provider) the receiver does not read the thread, so no read could end
+// the Plan Mode memory: it is cleared when a bind leaves the route undecided, and the session is hook-only for Plan Mode, as one
+// without a control socket is. `replaced` makes every tick bind again.
+test("a bind that leaves the route undecided ends the Plan Mode memory: nothing could end it, so the state follows the hooks", async () => {
+  let binds = 0
+  const plan = { reason: "plan", observed: { status: "idle", stopped: false, plan: true } }
+  const thread = Object.assign(threadDouble({ route: false, bind: () => ({ status: ++binds < 3 ? "bound" : "unprobed" }), observation: plan }), { replaced: () => true })
+  const r = await rig({ thread, handlers: { pending: () => ({ messages: ["m1"] }) } })
+  await r.begin()
+  await r.clock.advance(30_000) // the tick binds again (still decided) and reads: Plan Mode
+  assert.equal(r.receiver.state(), "plan")
+  await r.op(turn({ permission_mode: "default" }))
+  assert.equal(r.receiver.state(), "plan", "a hook in default mode does not end what a read showed")
+  r.worker.log.length = 0
+  await r.clock.advance(30_000) // the tick binds again: the probe is silent, so the route is undecided
+  assert.equal(binds, 3)
+  assert.equal(r.receiver.state(), "busy", "the hook's state stands now")
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "busy", stopped: false, plan_mode: false })
+  assert.equal(thread.calls.filter(call => call === "observe").length, 1, "and nothing was read")
+  const after = await r.op(turn({ event: "tool", permission_mode: "default" }))
+  assert.match(after.sent[0].context, /"id":"m1"/, "hook delivery resumes")
+})
+
+// A read that was out when a bind left the route undecided comes back after it: it cannot bring the memory back, fresh or stale,
+// because no later read would end it.
+for (const stale of [false, true]) {
+  test(`a ${stale ? "stale" : "fresh"} read that shows Plan Mode after a bind left the route undecided does not bring the Plan Mode memory back`, async () => {
+    let binds = 0
+    let release
+    let replaced = false
+    const thread = Object.assign(threadDouble({
+      route: false,
+      bind: () => ({ status: ++binds === 1 ? "bound" : "unprobed" }),
+      observation: () => new Promise(resolve => { release = () => resolve({ reason: "plan", observed: { status: "idle", stopped: false, plan: true } }) }),
+    }), { replaced: () => replaced })
+    const r = await rig({ thread })
+    await r.begin()
+    await r.op(turn())
+    await r.op({ op: "stop", permission_mode: "default" })
+    await r.clock.advance(30_000) // the tick reads the thread and waits for the answer
+    if (stale) await r.op({ op: "stop", permission_mode: "default" })
+    replaced = true
+    await r.clock.advance(30_000) // the next tick binds again, and the route stays undecided
+    assert.equal(binds, 2)
+    release()
+    await settle()
+    await r.op({ op: "stop", permission_mode: "default" }) // a hook event discards what the read itself showed
+    assert.notEqual(r.receiver.state(), "plan", "no memory of Plan Mode is left, and no read could end one")
+    assert.equal(r.receiver.state(), null)
+  })
+}
+
 test("a Plan Mode that the wake's own reading showed outlasts a later hook event too", async () => {
   const thread = threadDouble({ fresh: reading("plan", { plan: true }) })
   const r = await rig({ handlers: wakeHandlers(), thread })

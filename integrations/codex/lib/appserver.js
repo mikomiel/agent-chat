@@ -2,8 +2,9 @@
 //
 // The app-server speaks JSON-RPC over a WebSocket. A control socket is a Unix socket, so this is a minimal RFC 6455
 // client over node:net: one HTTP Upgrade, masked client text frames, unfragmented server text frames without reserved
-// bits (no extension is negotiated), ping answered with pong. It owns the wire, the thread reads and the add-then-delete
-// fence. It owns no chat policy: the receiver decides when to read and what a refusal means, and settles the claim.
+// bits (no extension is negotiated) and with the shortest form of the length, ping answered with pong. It owns the wire,
+// the thread reads and the add-then-delete fence. It owns no chat policy: the receiver decides when to read and what a
+// refusal means, and settles the claim.
 //
 // Every operation opens its own connection and closes it. A connection that called thread/resume is subscribed to
 // the thread's events, so it must not outlive the read. The wake is the one operation with two: one for the add, one for
@@ -67,14 +68,17 @@ function decode(buffer) {
   if ((buffer[1] & 0x80) !== 0) throw failure("APP_SERVER_PROTOCOL") // a server never masks
   let length = buffer[1] & 0x7f
   let offset = 2
+  // RFC 6455 wants the shortest form of a length: a longer one is a protocol error, not another spelling of the same frame.
+  // A 127-form with its top bit set is far over MAX_FRAME, so the size check below refuses it too.
   if (length === 126) {
     if (buffer.length < 4) return null
     length = buffer.readUInt16BE(2)
+    if (length < 126) throw failure("APP_SERVER_PROTOCOL")
     offset = 4
   } else if (length === 127) {
     if (buffer.length < 10) return null
     const wide = buffer.readBigUInt64BE(2)
-    if (wide > BigInt(MAX_FRAME)) throw failure("APP_SERVER_PROTOCOL")
+    if (wide > BigInt(MAX_FRAME) || wide < 65536n) throw failure("APP_SERVER_PROTOCOL")
     length = Number(wide)
     offset = 10
   }
