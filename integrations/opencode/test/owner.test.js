@@ -233,7 +233,7 @@ test("activate builds a manager that takes events, and deactivate stops it and p
   const ctx = { ...streamCtx([]), session: { get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID } } } }
   const stops = []
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
     createLifecycle: (bus) => { bus.on("session_start", () => {}); return { stop: () => { stops.push("stop"); return Promise.resolve({ code: 0 }) } } },
   }
   const member = createMember(ctx, {}, parts)
@@ -363,13 +363,18 @@ test("a removal that a session ended before the teardown began still holds the s
 })
 
 // Review 6003305717, finding 1: fork evidence is carried across a promotion.
-function realMember(lookups, started = []) {
+function realMember(lookups, started = [], { stuck = [] } = {}) {
   const ctx = {
     ...streamCtx([]),
-    session: { get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID, agent: "build" } } },
+    session: {
+      get: ({ sessionID }) => {
+        lookups.push(sessionID)
+        return stuck.includes(sessionID) ? new Promise(() => {}) : Promise.resolve({ id: sessionID, agent: "build" })
+      },
+    },
   }
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
     createLifecycle: bus => {
       bus.on("session_start", payload => started.push(payload.nativeSessionId))
       return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) }
@@ -422,6 +427,69 @@ test("a fork event that arrives between two owners is kept for the next one", as
   await flush()
   assert.deepEqual(lookupsNext, [])
   assert.deepEqual(started, [])
+})
+
+// Review 6003513413, finding 2: deletion tombstones are carried across a promotion, as fork evidence is.
+const deletedEvent = (id, sessionID) => ({ id, type: "session.deleted", data: { sessionID } })
+
+test("a deletion that one owner observed is still refused by the next owner", async () => {
+  const registry = createRegistry()
+  const lookupsNext = []
+  const started = []
+  const detachFirst = registry.attach(realMember([]))
+  registry.attach(realMember(lookupsNext, started))
+  await flush()
+  registry.dispatch(deletedEvent("e1", "ses_gone"))
+  await flush()
+  await detachFirst() // the next member becomes the owner
+  await flush()
+  registry.dispatch(startedEvent("e2", "ses_gone"))
+  await flush()
+  assert.deepEqual(lookupsNext, [])
+  assert.deepEqual(started, [])
+})
+
+test("a deletion event that arrives between two owners is kept for the next one", async () => {
+  const registry = createRegistry()
+  const lookupsNext = []
+  const started = []
+  const first = realMember([])
+  let openGate
+  const gate = new Promise(resolve => { openGate = resolve })
+  const deactivate = first.deactivate
+  first.deactivate = async () => { await gate; return deactivate() } // the old owner is still ending
+  const detachFirst = registry.attach(first)
+  registry.attach(realMember(lookupsNext, started))
+  await flush()
+  const detaching = detachFirst()
+  await flush()
+  assert.equal(registry.owner(), null)
+  registry.dispatch(deletedEvent("e1", "ses_gone")) // no owner to take it
+  openGate()
+  await detaching
+  await flush()
+  registry.dispatch(startedEvent("e2", "ses_gone"))
+  await flush()
+  assert.deepEqual(lookupsNext, [])
+  assert.deepEqual(started, [])
+})
+
+// Review 6003513413, finding 3: a pending eligibility lookup must not keep the registry ownerless.
+test("a lookup that never answers does not hold back failover, and the standby serves other sessions", async () => {
+  const registry = createRegistry()
+  const lookupsFirst = []
+  const started = []
+  const detachFirst = registry.attach(realMember(lookupsFirst, [], { stuck: ["ses_stuck"] }))
+  registry.attach(realMember([], started))
+  await flush()
+  registry.dispatch(startedEvent("e1", "ses_stuck"))
+  await flush()
+  assert.deepEqual(lookupsFirst, ["ses_stuck"]) // the lookup is pending for good
+  const outcome = await Promise.race([detachFirst().then(() => "promoted"), new Promise(resolve => setTimeout(resolve, 300, "hung").unref())])
+  assert.equal(outcome, "promoted")
+  registry.dispatch(startedEvent("e2", "ses_other"))
+  await flush()
+  assert.deepEqual(started, ["ses_other"])
 })
 
 // Review 6003305717, finding 2, ordering: `pump` resets when the stream breaks, before the wait and the resubscribe.

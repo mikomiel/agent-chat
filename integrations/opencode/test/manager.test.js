@@ -16,12 +16,16 @@ function stubParts({ observe = () => false, verify = () => Promise.resolve(), st
     lifecycles,
     createDelivery(_ctx, id) {
       const delivery = {
-        id, seeded: null, seen: [], resets: 0, disposed: 0,
+        id, seeded: null, seen: [], resets: 0, disposed: 0, owed: false,
         seed(info) { delivery.seeded = info },
-        observe(item) { delivery.seen.push(item.type); return observe(id, item) },
-        reset() { delivery.resets += 1 },
-        isCompacting: () => false, // the real delivery answers this one; the manager's own order is tested with it
-        verifyContext: () => verify(id),
+        observe(item) {
+          delivery.seen.push(item.type)
+          if (item.type === "session.compaction.ended") delivery.owed = true
+          return observe(id, item)
+        },
+        reset() { delivery.resets += 1; delivery.owed = true },
+        needsReadBack: () => delivery.owed, // owed after a gap and after an end, and asked for once
+        verifyContext() { delivery.owed = false; return verify(id) },
         dispose() { delivery.disposed += 1 },
       }
       deliveries.set(id, delivery)
@@ -376,6 +380,53 @@ test("fork evidence is kept in the set the manager is given, and a deleted sessi
   assert.equal(forked.has("ses_a"), false) // the session has ended, so the set stays bounded by live forks
 })
 
+// Review 6003513413, finding 2: a deletion is a tombstone in its own set, like fork evidence, never in the refusal cache.
+test("a deletion survives more refusals than the cache holds, and a later event triggers no lookup", async () => {
+  const parts = stubParts()
+  const ctx = fakeCtx(id => (id === "ses_gone" ? root(id) : new Error("unavailable")))
+  const manager = createManager(ctx, config, parts, { now: () => 1_000 })
+  manager.feed(event("session.deleted", "ses_gone"))
+  for (let index = 0; index < 1_100; index++) manager.feed(event("session.execution.started", `ses_other_${index}`))
+  await flush()
+  manager.feed(event("session.execution.started", "ses_gone"))
+  await flush()
+  assert.equal(ctx.lookups.includes("ses_gone"), false)
+  assert.equal(parts.lifecycles.has("ses_gone"), false)
+})
+
+test("a deleted fork is tombstoned too, so a late event does not look it up", async () => {
+  const parts = stubParts()
+  const ctx = fakeCtx(root) // a lookup would show root-shaped metadata
+  const manager = createManager(ctx, config, parts)
+  manager.feed(event("session.forked", "ses_fork", { parentID: "ses_source" }))
+  manager.feed(event("session.deleted", "ses_fork"))
+  manager.feed(event("session.execution.started", "ses_fork"))
+  await flush()
+  assert.deepEqual(ctx.lookups, [])
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("deletion tombstones are kept in the set the manager is given", async () => {
+  const deleted = new Set()
+  const manager = createManager(fakeCtx(root), config, stubParts(), { deleted })
+  manager.feed(event("session.deleted", "ses_a"))
+  assert.equal(deleted.has("ses_a"), true)
+})
+
+// Review 6003513413, finding 3: a lookup has no worker and no binding, so a lookup that never answers holds nothing back.
+test("a lookup that never answers does not hold back stop, which still ends the other sessions", async () => {
+  const parts = stubParts()
+  const ctx = { session: { get: ({ sessionID }) => (sessionID === "ses_stuck" ? new Promise(() => {}) : Promise.resolve(root(sessionID))) } }
+  const manager = createManager(ctx, config, parts)
+  manager.feed(event("session.execution.started", "ses_stuck"))
+  manager.feed(event("session.execution.started", "ses_ok"))
+  await flush()
+  const outcome = await Promise.race([manager.stop(), new Promise(resolve => setTimeout(resolve, 300, "hung").unref())])
+  assert.equal(outcome, true)
+  assert.equal(parts.lifecycles.get("ses_ok").stops, 1)
+  assert.equal(parts.lifecycles.has("ses_stuck"), false)
+})
+
 // Finding 2: a gap invalidates the binding proof, and the manager reads the binding back.
 test("a stream gap reads the binding back for every live session, at its first event after the gap", async () => {
   const verified = []
@@ -513,6 +564,70 @@ test("a compaction that spans a gap and then fails is read back after the failur
   assert.equal(run.listsSince(), 1) // the gap's read-back was owed, and it runs now
   assert.equal(run.delivery.state(), null)
   assert.equal(run.synthetic.length, 0)
+})
+
+// Review 6003513413, finding 1: an owed read-back that was queued before a compaction began must not read during it.
+test("an owed read-back queued behind an earlier operation does not read or disable chat once a compaction begins", async () => {
+  const entries = new Map()
+  let lists = 0
+  let heldCall = 0
+  let releaseList = null
+  let failFrom = Infinity
+  const ctx = {
+    session: {
+      async get({ sessionID }) { return root(sessionID) },
+      synthetic() { return Promise.resolve({ id: "msg_1" }) },
+      instructions: {
+        entry: {
+          async put({ key, value }) { entries.set(key, value) },
+          async list() {
+            const call = ++lists
+            if (call === heldCall) await new Promise(resolve => { releaseList = resolve })
+            if (call >= failFrom) throw new Error("unavailable")
+            return [...entries].map(([key, value]) => ({ key, value }))
+          },
+          async remove({ key }) { entries.delete(key) },
+        },
+      },
+    },
+  }
+  let delivery = null
+  const parts = stubParts()
+  parts.createDelivery = (hostCtx, id) => {
+    // The stub lifecycle is keyed by the delivery's id.
+    delivery = Object.assign(createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }), { id })
+    return delivery
+  }
+  const manager = createManager(ctx, config, parts)
+  const send = (type, data = {}) => manager.feed(event(type, "ses_a", data))
+  send("session.execution.started")
+  await flush()
+  await delivery.context("binding text")
+  heldCall = lists + 1
+  const earlier = delivery.context("binding text") // its own check is held, so later context operations queue behind it
+  await flush()
+  assert.equal(typeof releaseList, "function")
+  manager.reset()
+  await flush()
+  send("session.agent.selected", { agent: "build" }) // the first event after the gap: a read-back is owed and queued
+  send("session.inbox.enqueued", { item: { type: "user" } })
+  send("session.execution.started")
+  await flush()
+  send("session.compaction.started", { reason: "auto" }) // begins before the queued read can
+  await flush()
+  const before = lists
+  failFrom = lists + 1 // a read from here on would be rejected
+  releaseList()
+  await earlier
+  await flush()
+  assert.equal(lists, before) // no entry.list during the compaction
+  assert.deepEqual(parts.lifecycles.get("ses_a").disables, []) // and chat is still on
+  failFrom = Infinity
+  send("session.compaction.ended", { reason: "auto" })
+  await flush()
+  assert.equal(lists, before + 1) // the owed read-back runs after the end
+  assert.deepEqual(parts.lifecycles.get("ses_a").disables, [])
+  assert.equal(delivery.state(), null)
 })
 
 test("a compaction whose end is lost in a gap cannot reach synthetic before the binding is read back", async () => {

@@ -15,7 +15,8 @@
 // and from a stream gap the gate stays closed until the entry has been read back (`verifyContext`); a read-back that
 // fails keeps it closed, and the manager then turns chat off. A read-back proves only that the entry exists at that
 // moment, never that a compaction has ended: a compaction already seen running stays running across a gap, and only
-// its own terminal event (`ended` or `failed`) clears it. The manager runs a read-back only while none is running.
+// its own terminal event (`ended` or `failed`) clears it. A read-back never starts while one is running: that is
+// checked where the read would begin, so one queued before a compaction began waits for the end and stays owed.
 //
 // State is read from events only. A fact the events have not shown is unknown, and unknown never reads as idle.
 import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES, monotonicNow } from "./channel.js"
@@ -40,6 +41,7 @@ export function createDelivery(ctx, sessionID, {
   let compacting = false
   let unverified = false // a compaction ended, or the stream broke, and the binding entry has not been read back since
   let compactions = 0 // compaction endings and gaps so far: a read-back that began before the latest one proves nothing
+  let verifying = null // the `compactions` value a queued read-back was asked for: one read per obligation
   let agent = null
   let pending = null // at most one issued input: { id, resolve, timer, deadline }
   let published = null // the binding text the entry should hold now
@@ -246,14 +248,24 @@ export function createDelivery(ctx, sessionID, {
     })
   }
 
+  // A read-back is owed after a compaction ended and after a gap, until one that began while nothing was compacting
+  // has succeeded. Whoever drives it asks here, so it is asked for once per obligation and never during a compaction.
+  function needsReadBack() {
+    return unverified && !compacting && !closed && !disabled && verifying !== compactions
+  }
+
   // After a compaction: put the entry back when it is gone or changed, then reopen the gate. Only the latest
   // compaction's read-back reopens it. A rejection leaves the gate closed. Resolves quietly when nothing is published.
+  // A compaction that began while this waited behind an earlier context operation is seen where the read would
+  // start: nothing is read, the obligation stays owed and the next terminal event asks again.
   function verifyContext() {
     const mark = compactions
     const proved = () => { if (compactions === mark) unverified = false }
     if (closed || published === null) { proved(); return Promise.resolve() }
     const text = published
+    verifying = mark
     return queued(async () => {
+      if (compacting) { if (verifying === mark) verifying = null; return }
       try { if (!await holds(text)) await publish(text) } catch { throw contextFailure() }
       proved()
     })
@@ -273,7 +285,5 @@ export function createDelivery(ctx, sessionID, {
     attempts.clear()
   }
 
-  const isCompacting = () => compacting
-
-  return { state, heartbeatState, observe, seed, reset, deliver, sendChat, context, verifyContext, isCompacting, disable, dispose }
+  return { state, heartbeatState, observe, seed, reset, deliver, sendChat, context, needsReadBack, verifyContext, disable, dispose }
 }

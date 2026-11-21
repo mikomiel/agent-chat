@@ -552,24 +552,28 @@ test("a read-back that fails after a gap keeps the gate closed", async () => {
 })
 
 // Review 6003407206, finding 1: a gap does not end a compaction that was already observed running.
-test("a compaction that spans a gap keeps the gate closed even after a read-back, until its own end", async () => {
+test("a compaction that spans a gap keeps the gate closed and the read-back owed, until its own end", async () => {
   const ctx = fakeCtx()
   const { delivery } = running(ctx)
   await delivery.context("binding")
   delivery.observe(event("session.compaction.started", { reason: "auto" }))
   delivery.reset() // the stream broke while the compaction ran
-  assert.equal(delivery.isCompacting(), true) // the gap does not end it
   delivery.observe(event("session.agent.selected", { agent: "build" }))
   delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
   delivery.observe(event("session.execution.started"))
-  await delivery.verifyContext() // proves the entry exists, not that the compaction ended
+  assert.equal(delivery.needsReadBack(), false) // owed, but not while the compaction runs: the gap did not end it
+  const lists = ctx.calls.list
+  await delivery.verifyContext() // asked for anyway: it reads nothing and proves nothing
+  assert.equal(ctx.calls.list, lists)
   assert.equal(delivery.state(), "busy")
   assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "deferred", reason: "busy" })
   assert.equal(ctx.calls.synthetic.length, 0)
   delivery.observe(event("session.compaction.ended", { reason: "auto" }))
-  assert.equal(delivery.isCompacting(), false)
-  assert.equal(delivery.state(), "busy") // the end is not enough: the entry is read back once more
+  assert.equal(delivery.state(), "busy") // the end is not enough: the entry is read back first
+  assert.equal(delivery.needsReadBack(), true)
   await delivery.verifyContext()
+  assert.equal(ctx.calls.list, lists + 1)
+  assert.equal(delivery.needsReadBack(), false)
   assert.equal(delivery.state(), null)
 })
 
@@ -583,11 +587,67 @@ test("a compaction that fails after a gap clears with its terminal event, and th
   delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
   delivery.observe(event("session.execution.started"))
   assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), false)
   delivery.observe(event("session.compaction.failed", { reason: "auto" }))
-  assert.equal(delivery.isCompacting(), false)
-  assert.equal(delivery.state(), "busy") // the gap's read-back is still owed
+  assert.equal(delivery.needsReadBack(), true) // the gap's read-back was owed all along, and may start now
+  assert.equal(delivery.state(), "busy") // and it is still owed
   await delivery.verifyContext()
   assert.equal(delivery.state(), null)
+})
+
+// Review 6003513413, finding 1: whether a compaction runs is checked where the read would start, not when it is asked for.
+test("a read-back queued behind an earlier operation does not read once a compaction began, and stays owed", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  const list = ctx.session.instructions.entry.list
+  let lists = 0
+  let releaseList = null
+  ctx.session.instructions.entry.list = async () => {
+    lists += 1
+    if (lists === 1) await new Promise(resolve => { releaseList = resolve }) // the earlier operation's own check
+    return list()
+  }
+  const earlier = delivery.context("binding")
+  await flush()
+  assert.equal(typeof releaseList, "function")
+  delivery.reset() // a read-back is owed
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  const read = delivery.verifyContext() // queued behind the earlier operation
+  delivery.observe(event("session.compaction.started", { reason: "auto" })) // begins before the read can
+  releaseList()
+  await earlier
+  await read
+  assert.equal(lists, 1) // no read began mid-compaction
+  assert.equal(delivery.state(), "busy")
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  assert.equal(delivery.state(), "busy") // still owed: the skipped read proved nothing
+  await delivery.verifyContext()
+  assert.equal(lists, 2) // the read runs once the compaction has ended
+  assert.equal(delivery.state(), null)
+})
+
+test("a read-back is asked for once per obligation, and again after a newer one", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  assert.equal(delivery.needsReadBack(), false) // nothing is owed
+  delivery.reset()
+  assert.equal(delivery.needsReadBack(), true)
+  const first = delivery.verifyContext()
+  assert.equal(delivery.needsReadBack(), false) // queued for this gap already
+  delivery.reset() // a second gap makes the queued read prove nothing
+  assert.equal(delivery.needsReadBack(), true)
+  await first
+  assert.equal(delivery.needsReadBack(), true)
+  await delivery.verifyContext()
+  assert.equal(delivery.needsReadBack(), false)
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  assert.equal(delivery.needsReadBack(), true)
+  ctx.session.instructions.entry.list = async () => { throw new Error("unavailable") }
+  await assert.rejects(delivery.verifyContext(), { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  assert.equal(delivery.needsReadBack(), false) // a read that failed is not asked for again in the same epoch
 })
 
 // Finding 4 (non-blocking): reservation arithmetic and receipt checks share one monotonic clock.

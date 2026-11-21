@@ -123,8 +123,10 @@ The service and its host-token provisioning are documented in the product
   reads its own event stream and forwards events to the owner, and the
   registry drops an event id it has already seen. When the owner's instance
   is torn down, the next one takes over only after the old owner's workers
-  and the removal of its binding entries have ended. A session then rejoins at
-  its next event. An instance that leaves without owning is a gap for the
+  and the removal of its binding entries have ended. A session that is still in
+  its `session.get` lookup has no worker and no entry, so it does not delay the
+  takeover, and a lookup that answers late starts nothing. A session then
+  rejoins at its next event. An instance that leaves without owning is a gap for the
   owner too: its stream may have carried events no other stream did, so the
   owner treats it as a lost event stream.
 - **One lifecycle per root session, one fault boundary each.** A session
@@ -134,16 +136,21 @@ The service and its host-token provisioning are documented in the product
   confirmed, so a session that might be a fork stays out. A `session.forked`
   event is recorded before any lookup or join, and it is kept while lookups
   are refused; a lookup already in flight cannot join afterwards, whether it
-  answers or fails. The record is its own set. No cache evicts it, a session
-  that is deleted drops it, and the next owner receives it, including an
-  event that arrived between two owners. A `session.deleted` event is fenced
-  the same way, when it is received and not behind the lookup: the session is
-  refused and its record ends at once, so a lookup that answers after the
-  deletion starts no worker and sends no join. Events still queued for that
-  session are dropped, and a delivery pending on it settles `uncertain`. Events
-  of one session run in order on that session's own chain. A fault there ends
-  that session's chat and no other. A faulted or deleted session does not
-  rejoin in this process.
+  answers or fails. The record is its own set. No cache evicts it, and the
+  next owner receives it, including an event that arrived between two owners.
+  A `session.deleted` event is fenced when it is received and not behind the
+  lookup: the record ends at once, so a lookup that answers after the deletion
+  starts no worker and sends no join. Events still queued for that session are
+  dropped, and a delivery pending on it settles `uncertain`. The deletion is
+  also a tombstone in a set of its own, kept the same way: no cache evicts it,
+  and the next owner receives it, including a deletion that arrived between
+  two owners. A later event for a deleted session is never looked up. A deleted
+  fork drops its fork record, because the tombstone covers it. The tombstone
+  set is never trimmed, so it grows with the deleted sessions of one process.
+  Events of one session run in order on that session's own chain. A fault
+  there ends that session's chat and no other. A faulted session stays out
+  while its refusal is in the bounded lookup cache, which holds 1,024 entries
+  and drops the oldest first.
 - **State comes from durable events only.** `session.execution.started`
   means busy. `succeeded`, `failed` and `interrupted` mean idle. A fact no
   event has shown is `unknown`, and `unknown` never reads as idle. A lost or
@@ -178,7 +185,10 @@ The service and its host-token provisioning are documented in the product
   ended inside a gap is covered too, because the gap alone invalidates the
   proof. A compaction that was running when the gap came is not ended by the
   gap, and no check runs while it is running: the session stays `busy`, and the
-  check runs only after that compaction's own `ended` or `failed` event.
+  check runs only after that compaction's own `ended` or `failed` event. That
+  is decided where the read would start, not when it is asked for: a check
+  queued behind an earlier context operation reads nothing if a compaction began
+  while it waited, and it stays owed.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input
@@ -300,16 +310,26 @@ unverified, inferred, or a deliberate choice.
   shows one. The same holds after a lost event stream: the agent and the stop
   latch are reset, so a session is claimed for again only after a fresh
   `agent.selected` event and a `user` inbox item, even if neither changed.
-- **A compaction whose end is lost.** A compaction seen running is kept running
-  across a stream gap. If its `ended` or `failed` event falls inside the gap,
-  the session reads `busy` and gets no claim or send until a later compaction
-  event arrives. The check the gap owes also waits for that event. The gate
-  fails closed and the plugin says nothing about it.
-  The plugin has no bounded timeout and no host read for this. `session.get`
-  shows no compaction field in the `2.3.2` types. `session.context` returns
+- **A compaction whose end is lost.** A compaction the plugin saw start is kept
+  running across a stream gap. If its `ended` or `failed` event falls inside
+  the gap, the session reads `busy` and gets no claim or send until a later
+  compaction event arrives. The check the gap owes also waits for that event.
+  The gate fails closed and the plugin says nothing about it. The plugin has no
+  bounded timeout and no host read for this. `session.get` shows no compaction
+  field in the `2.3.2` types. `session.context` returns
   messages that include a compaction message with status `running`, `completed`
   or `failed`, but whether it lists a compaction that is still running is not
   documented, so the plugin does not rely on it.
+- **A compaction whose start is missed.** A compaction that began inside a gap
+  has no `session.compaction.started` event, so the plugin does not know that it
+  runs. The first event after the gap does not prove such a compaction over, and
+  the plugin cannot tell. It reads the entry back then, treats the session as not
+  compacting, and can reopen the gate once fresh agent, user and run events
+  arrive, while that compaction still runs. Its `ended` event, if it arrives,
+  closes the gate until the entry has been read back again. Whether the host
+  emits those events during a compaction is not verified. The host read named in
+  the previous item is the candidate that would close this, and the plugin does
+  not rely on it.
 - **A user input is not an operator.** A `user` inbox item clears the stop
   latch whether an operator or an API client sent it.
 - **Persisted idle sessions** join at their first event after the server

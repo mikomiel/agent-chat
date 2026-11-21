@@ -6,22 +6,28 @@
 // is refused too: when in doubt a session stays out. A parent pointer is not trusted as a root test either way.
 //
 // A GAP IS READ BACK AT THE FIRST EVENT AFTER IT. The stream resets when it breaks, before it resumes, so a read-back
-// run at the reset would end before the gap does. A session is marked stale at the reset instead, and its entry is
-// read back at the first event it sees afterwards: the stream has resumed by then, so whatever it missed is over.
-// The exception is a compaction already seen running: a read-back then proves only that the entry exists, so it waits
-// for that compaction's own `ended` or `failed` event.
+// run at the reset would end before the gap does. The delivery owes the read-back from the reset, and the manager asks
+// for it at the first event the session handles afterwards: the stream has resumed by then, so whatever it missed is
+// over. The exception is a compaction already seen running: a read-back then proves only that the entry exists, so the
+// delivery holds it back until that compaction's own `ended` or `failed` event.
 //
 // FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
 // never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
 // answers later cannot undo it.
 //
 // A DELETION IS FENCED WHEN IT IS RECEIVED, as a fork is: it is not queued behind a lookup that is still running. The
-// record is ended and the session refused at once, so a lookup that answers afterwards finds its record dead and
-// starts no worker and sends no join.
+// record is ended at once, so a lookup that answers afterwards finds its record dead and starts no worker and sends
+// no join. The deletion is also a tombstone in its own set, like fork evidence: no cache evicts it, and the next owner
+// receives it, so a late event for that session is never looked up again.
+//
+// A LOOKUP HOLDS NOTHING BACK. A record still in its eligibility lookup has no worker and no binding entry, so
+// `stop()` ends it at once and waits only for the worker and entry cleanup of joined sessions. A lookup that never
+// answers cannot keep the next owner waiting, and its late answer finds the manager inactive and starts nothing.
 //
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
-// rejection there disables chat for that session only. A session that faulted or was deleted never rejoins in this
-// process, so a worker that is still ending is never raced by a second join.
+// rejection there disables chat for that session only. A deleted session never rejoins in this process. A session
+// that faulted stays out while its refusal is in the bounded lookup cache, so a worker that is still ending is not
+// raced by a second join until that entry is evicted.
 import { describeFailure } from "./worker.js"
 
 // The events the manager reads. Session events of other kinds, such as every tool call, are never subscribed to.
@@ -46,12 +52,16 @@ const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.
 // The id of the session a `session.forked` event describes, or null for any other event.
 export const forkedSessionOf = event => (event?.type === "session.forked" ? sessionOf(event) : null)
 
+// The id of the session a `session.deleted` event describes, or null for any other event.
+export const deletedSessionOf = event => (event?.type === "session.deleted" ? sessionOf(event) : null)
+
 export function createManager(ctx, config, parts, {
   now = Date.now,
   notice = () => {},
   forked = new Set(), // fork evidence: session ids that are never roots; the registry hands every owner the same set
+  deleted = new Set(), // deletion tombstones: ids of sessions that ended; never evicted, shared like `forked`
 } = {}) {
-  const records = new Map() // session id -> { id, delivery, lifecycle, chain, dead, closing, stale }
+  const records = new Map() // session id -> { id, delivery, lifecycle, chain, dead, closing }
   const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
   const closings = new Set() // ends still in flight, so stop() also waits for a session that ended before it was called
   let active = true
@@ -63,7 +73,7 @@ export function createManager(ctx, config, parts, {
   }
 
   function isRefused(id) {
-    if (forked.has(id)) return true
+    if (forked.has(id) || deleted.has(id)) return true
     const until = refused.get(id)
     if (until === undefined) return false
     if (until > now()) return true
@@ -135,13 +145,9 @@ export function createManager(ctx, config, parts, {
   function handle(record, event) {
     if (!active || record.dead || !record.delivery) return
     if (record.delivery.observe(event)) record.fire("state_changed", {})
-    // A compaction ended, or this is the first event since a gap: either may have dropped the binding entry, so a
-    // read-back is owed. It waits while a compaction seen running has not reached its own terminal event.
-    if (event.type === "session.compaction.ended") record.stale = true
-    if (record.stale && !record.delivery.isCompacting()) {
-      record.stale = false
-      readBack(record)
-    }
+    // A compaction ended, or this is the first event since a gap: either may have dropped the binding entry. The
+    // delivery owes that read-back and says when it may start.
+    if (record.delivery.needsReadBack()) readBack(record)
   }
 
   // Put the binding entry back or turn this session's chat off: no entry, no chat. The delivery keeps its gate
@@ -156,10 +162,11 @@ export function createManager(ctx, config, parts, {
     if (!active) return
     const id = sessionOf(event)
     if (id === null) return
-    if (event.type === "session.deleted" && forked.delete(id)) return // the fork has ended: its evidence is spent
     if (event.type === "session.deleted") {
       // Fenced here, not on the record's chain: a lookup still in flight finds its record dead before it can join.
-      refuse(id, Infinity)
+      // The tombstone refuses the id from now on, so a fork record for it is spent.
+      deleted.add(id)
+      forked.delete(id)
       const known = records.get(id)
       if (known) void dispose(known)
       return
@@ -175,7 +182,7 @@ export function createManager(ctx, config, parts, {
     if (isRefused(id)) return
     let record = records.get(id)
     if (!record) {
-      record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null, stale: false }
+      record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
       records.set(id, record)
       const first = event
       record.chain = record.chain.then(() => start(record, first)).catch(error => isolate(record, error))
@@ -189,8 +196,7 @@ export function createManager(ctx, config, parts, {
     for (const record of [...records.values()]) {
       record.chain = record.chain.then(() => {
         if (record.dead || !record.delivery) return
-        record.delivery.reset()
-        record.stale = true // read back at the next event, once the stream has resumed
+        record.delivery.reset() // a read-back is owed now, and asked for at the next event, once the stream has resumed
         record.fire("state_changed", {})
       }).catch(error => isolate(record, error))
     }
@@ -199,7 +205,11 @@ export function createManager(ctx, config, parts, {
   // Ends every session, and waits for every end already in flight. Resolves true only when every worker end is proved.
   async function stop() {
     active = false
-    const pending = [...records.values()].map(record => record.chain.then(() => dispose(record), () => dispose(record)))
+    // A record with no lifecycle is still in its lookup: no worker, no entry, so nothing to wait for. A joined session
+    // waits for its chain, then for the cleanup its disposal starts.
+    const pending = [...records.values()].map(record => (record.lifecycle
+      ? record.chain.then(() => dispose(record), () => dispose(record))
+      : dispose(record)))
     const results = await Promise.all([...pending, ...closings])
     return results.every(proved => proved === true)
   }
