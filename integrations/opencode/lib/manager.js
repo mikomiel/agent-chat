@@ -8,10 +8,16 @@
 // A GAP IS READ BACK AT THE FIRST EVENT AFTER IT. The stream resets when it breaks, before it resumes, so a read-back
 // run at the reset would end before the gap does. A session is marked stale at the reset instead, and its entry is
 // read back at the first event it sees afterwards: the stream has resumed by then, so whatever it missed is over.
+// The exception is a compaction already seen running: a read-back then proves only that the entry exists, so it waits
+// for that compaction's own `ended` or `failed` event.
 //
 // FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
 // never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
 // answers later cannot undo it.
+//
+// A DELETION IS FENCED WHEN IT IS RECEIVED, as a fork is: it is not queued behind a lookup that is still running. The
+// record is ended and the session refused at once, so a lookup that answers afterwards finds its record dead and
+// starts no worker and sends no join.
 //
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
 // rejection there disables chat for that session only. A session that faulted or was deleted never rejoins in this
@@ -128,14 +134,11 @@ export function createManager(ctx, config, parts, {
 
   function handle(record, event) {
     if (!active || record.dead || !record.delivery) return
-    if (event.type === "session.deleted") {
-      refuse(record.id, Infinity)
-      void dispose(record)
-      return
-    }
     if (record.delivery.observe(event)) record.fire("state_changed", {})
-    // A compaction ended, or this is the first event since a gap: either may have dropped the binding entry.
-    if (record.stale || event.type === "session.compaction.ended") {
+    // A compaction ended, or this is the first event since a gap: either may have dropped the binding entry, so a
+    // read-back is owed. It waits while a compaction seen running has not reached its own terminal event.
+    if (event.type === "session.compaction.ended") record.stale = true
+    if (record.stale && !record.delivery.isCompacting()) {
       record.stale = false
       readBack(record)
     }
@@ -154,6 +157,13 @@ export function createManager(ctx, config, parts, {
     const id = sessionOf(event)
     if (id === null) return
     if (event.type === "session.deleted" && forked.delete(id)) return // the fork has ended: its evidence is spent
+    if (event.type === "session.deleted") {
+      // Fenced here, not on the record's chain: a lookup still in flight finds its record dead before it can join.
+      refuse(id, Infinity)
+      const known = records.get(id)
+      if (known) void dispose(known)
+      return
+    }
     if (event.type === "session.forked") {
       // This session is a fork: never a root. Recorded before any refusal check, lookup or join, so a fork is not
       // dropped during a temporary lookup refusal, and a lookup still in flight finds its record dead.

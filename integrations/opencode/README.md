@@ -136,9 +136,14 @@ The service and its host-token provisioning are documented in the product
   are refused; a lookup already in flight cannot join afterwards, whether it
   answers or fails. The record is its own set. No cache evicts it, a session
   that is deleted drops it, and the next owner receives it, including an
-  event that arrived between two owners. Events of one session run in order on that session's own chain. A fault there ends that session's
-  chat and no other. A faulted or deleted session does not rejoin in this
-  process.
+  event that arrived between two owners. A `session.deleted` event is fenced
+  the same way, when it is received and not behind the lookup: the session is
+  refused and its record ends at once, so a lookup that answers after the
+  deletion starts no worker and sends no join. Events still queued for that
+  session are dropped, and a delivery pending on it settles `uncertain`. Events
+  of one session run in order on that session's own chain. A fault there ends
+  that session's chat and no other. A faulted or deleted session does not
+  rejoin in this process.
 - **State comes from durable events only.** `session.execution.started`
   means busy. `succeeded`, `failed` and `interrupted` mean idle. A fact no
   event has shown is `unknown`, and `unknown` never reads as idle. A lost or
@@ -147,7 +152,10 @@ The service and its host-token provisioning are documented in the product
   unverified. Only fresh events clear the first three. The fourth waits for a
   read-back of the entry, which runs at the session's first event after the
   gap: the stream has resumed by then, so a compaction that ended inside the
-  gap is already over.
+  gap is already over. A compaction already seen running is the exception: a
+  gap does not end it, and a read-back would prove only that the entry exists.
+  It counts as running until its own `session.compaction.ended` or `failed`
+  event, and the read-back waits for that event.
 - **Stop and Plan Mode.** Every session starts chat-stopped. A `user` inbox
   item clears the stop. An interrupt with reason `user` sets it again. Other
   interrupt reasons do not. While the selected agent is `plan`, the session
@@ -161,13 +169,16 @@ The service and its host-token provisioning are documented in the product
   anything is offered: no heartbeat, no pending read, no claim. There is no
   fallback to a prompt message. After a compaction, and after a lost event
   stream, the plugin checks the entry again and puts it back, or turns that
-  session's chat off. The session reads `busy` from `session.compaction.ended`,
-  and from the gap, until that check has succeeded, so no claim and no send
-  runs in between. The check after a gap waits for the session's first event
-  after it, and a check that fails then turns that session's chat off. A
-  compaction or a gap that comes while an earlier check is
-  still running is covered by its own check. A compaction that ended inside a
-  gap is covered too, because the gap alone invalidates the proof.
+  session's chat off. The session reads `busy` from `session.compaction.started`
+  until `ended` or `failed`, and from `ended` and from the gap until that check
+  has succeeded, so no claim and no send runs in between. The check after a gap
+  waits for the session's first event after it, and a check that fails then
+  turns that session's chat off. A compaction or a gap that comes while an
+  earlier check is still running is covered by its own check. A compaction that
+  ended inside a gap is covered too, because the gap alone invalidates the
+  proof. A compaction that was running when the gap came is not ended by the
+  gap, and no check runs while it is running: the session stays `busy`, and the
+  check runs only after that compaction's own `ended` or `failed` event.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input
@@ -289,6 +300,16 @@ unverified, inferred, or a deliberate choice.
   shows one. The same holds after a lost event stream: the agent and the stop
   latch are reset, so a session is claimed for again only after a fresh
   `agent.selected` event and a `user` inbox item, even if neither changed.
+- **A compaction whose end is lost.** A compaction seen running is kept running
+  across a stream gap. If its `ended` or `failed` event falls inside the gap,
+  the session reads `busy` and gets no claim or send until a later compaction
+  event arrives. The check the gap owes also waits for that event. The gate
+  fails closed and the plugin says nothing about it.
+  The plugin has no bounded timeout and no host read for this. `session.get`
+  shows no compaction field in the `2.3.2` types. `session.context` returns
+  messages that include a compaction message with status `running`, `completed`
+  or `failed`, but whether it lists a compaction that is still running is not
+  documented, so the plugin does not rely on it.
 - **A user input is not an operator.** A `user` inbox item clears the stop
   latch whether an operator or an API client sent it.
 - **Persisted idle sessions** join at their first event after the server

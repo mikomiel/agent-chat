@@ -20,6 +20,7 @@ function stubParts({ observe = () => false, verify = () => Promise.resolve(), st
         seed(info) { delivery.seeded = info },
         observe(item) { delivery.seen.push(item.type); return observe(id, item) },
         reset() { delivery.resets += 1 },
+        isCompacting: () => false, // the real delivery answers this one; the manager's own order is tested with it
         verifyContext: () => verify(id),
         dispose() { delivery.disposed += 1 },
       }
@@ -407,6 +408,111 @@ test("a read-back that fails after a gap turns that session's chat off and no ot
   await flush()
   assert.equal(parts.lifecycles.get("ses_a").disables.length, 1)
   assert.equal(parts.lifecycles.get("ses_b").disables.length, 0)
+})
+
+// Review 6003407206, finding 2: a deletion is fenced when it is received, not queued behind the lookup.
+test("a deletion that arrives during the lookup stops it before a worker starts or a join is sent", async () => {
+  let release
+  const lookups = []
+  const parts = stubParts()
+  const ctx = { session: { get: ({ sessionID }) => { lookups.push(sessionID); return new Promise(resolve => { release = resolve }) } } }
+  const manager = createManager(ctx, config, parts)
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  manager.feed(event("session.deleted", "ses_a")) // received while `session.get` is still pending
+  release(root("ses_a")) // the lookup resolves after the deletion, root-shaped
+  await flush()
+  assert.equal(parts.lifecycles.size, 0) // no lifecycle: no worker starts and no join is sent
+  assert.equal(parts.deliveries.size, 0)
+  assert.deepEqual(manager.sessions(), [])
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(lookups, ["ses_a"]) // the deleted session is not looked up again
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("a deletion for a session that was never seen is refused without a lookup", async () => {
+  const parts = stubParts()
+  const ctx = fakeCtx(root)
+  const manager = createManager(ctx, config, parts)
+  manager.feed(event("session.deleted", "ses_a"))
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(ctx.lookups, [])
+  assert.equal(parts.lifecycles.size, 0)
+  assert.deepEqual(manager.sessions(), [])
+})
+
+// Review 6003407206, finding 1: a compaction already observed running is not ended by the gap that follows it, and
+// the binding is read back only once its own terminal event has arrived.
+async function compactionAcrossGap() {
+  const entries = new Map()
+  const synthetic = []
+  const lists = { count: 0 }
+  const ctx = {
+    session: {
+      async get({ sessionID }) { return root(sessionID) },
+      synthetic(input) { synthetic.push(input); return Promise.resolve({ id: "msg_1" }) },
+      instructions: {
+        entry: {
+          async put({ key, value }) { entries.set(key, value) },
+          async list() { lists.count += 1; return [...entries].map(([key, value]) => ({ key, value })) },
+          async remove({ key }) { entries.delete(key) },
+        },
+      },
+    },
+  }
+  let delivery = null
+  const parts = stubParts()
+  parts.createDelivery = (hostCtx, id) => {
+    delivery = createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} })
+    return delivery
+  }
+  const manager = createManager(ctx, config, parts)
+  const send = (type, data = {}) => manager.feed(event(type, "ses_a", data))
+  send("session.execution.started")
+  await flush()
+  await delivery.context("binding text")
+  send("session.compaction.started", { reason: "auto" })
+  await flush()
+  manager.reset() // the stream gaps while the compaction runs
+  await flush()
+  const before = lists.count
+  send("session.agent.selected", { agent: "build" }) // the stream resumes
+  send("session.inbox.enqueued", { item: { type: "user" } })
+  send("session.execution.started")
+  await flush()
+  const batch = { content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }
+  let refusal = null
+  void delivery.deliver(batch, 5_000).then(result => { refusal = result })
+  await flush()
+  return { send, delivery, entries, synthetic, batch, refusal: () => refusal, listsSince: () => lists.count - before }
+}
+
+test("a compaction that spans a gap is read back only after its own end, and then reopens the gate", async () => {
+  const run = await compactionAcrossGap()
+  assert.deepEqual(run.refusal(), { outcome: "deferred", reason: "busy" }) // no compaction end has been seen
+  assert.equal(run.synthetic.length, 0)
+  assert.equal(run.listsSince(), 0) // no read-back while the compaction is still running
+  run.send("session.compaction.ended", { reason: "auto" })
+  await flush()
+  assert.equal(run.listsSince(), 1) // one read-back, after the end
+  assert.equal(run.entries.size, 1)
+  assert.equal(run.delivery.state(), null)
+  const sent = run.delivery.deliver(run.batch, 5_000)
+  await flush()
+  assert.equal(run.synthetic.length, 1)
+  void sent
+})
+
+test("a compaction that spans a gap and then fails is read back after the failure, not before", async () => {
+  const run = await compactionAcrossGap()
+  assert.equal(run.listsSince(), 0)
+  run.send("session.compaction.failed", { reason: "auto" })
+  await flush()
+  assert.equal(run.listsSince(), 1) // the gap's read-back was owed, and it runs now
+  assert.equal(run.delivery.state(), null)
+  assert.equal(run.synthetic.length, 0)
 })
 
 test("a compaction whose end is lost in a gap cannot reach synthetic before the binding is read back", async () => {

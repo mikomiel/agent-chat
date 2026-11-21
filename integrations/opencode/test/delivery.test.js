@@ -551,6 +551,45 @@ test("a read-back that fails after a gap keeps the gate closed", async () => {
   assert.equal(ctx.calls.synthetic.length, 0)
 })
 
+// Review 6003407206, finding 1: a gap does not end a compaction that was already observed running.
+test("a compaction that spans a gap keeps the gate closed even after a read-back, until its own end", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.reset() // the stream broke while the compaction ran
+  assert.equal(delivery.isCompacting(), true) // the gap does not end it
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  await delivery.verifyContext() // proves the entry exists, not that the compaction ended
+  assert.equal(delivery.state(), "busy")
+  assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "deferred", reason: "busy" })
+  assert.equal(ctx.calls.synthetic.length, 0)
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  assert.equal(delivery.isCompacting(), false)
+  assert.equal(delivery.state(), "busy") // the end is not enough: the entry is read back once more
+  await delivery.verifyContext()
+  assert.equal(delivery.state(), null)
+})
+
+test("a compaction that fails after a gap clears with its terminal event, and the gap's read-back reopens the gate", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  assert.equal(delivery.state(), "busy")
+  delivery.observe(event("session.compaction.failed", { reason: "auto" }))
+  assert.equal(delivery.isCompacting(), false)
+  assert.equal(delivery.state(), "busy") // the gap's read-back is still owed
+  await delivery.verifyContext()
+  assert.equal(delivery.state(), null)
+})
+
 // Finding 4 (non-blocking): reservation arithmetic and receipt checks share one monotonic clock.
 test("the default clock is monotonic: a wall-clock step cannot decide whether a reservation is over", async t => {
   const realNow = Date.now

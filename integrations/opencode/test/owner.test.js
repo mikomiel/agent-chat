@@ -4,6 +4,7 @@ import { createMember, createRegistry, globalRegistry } from "../lib/owner.js"
 import { EVENT_TYPES } from "../lib/manager.js"
 import { createDelivery } from "../lib/delivery.js"
 import { createLifecycle } from "../lib/lifecycle.js"
+import { monotonicNow } from "../lib/channel.js"
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
 const flush = async () => { for (let index = 0; index < 8; index++) await tick() }
@@ -272,7 +273,7 @@ test("a non-owner that leaves while a delivery is pending settles it uncertain, 
   assert.equal(deliveries[0].state(), null)
   let settled = null
   void deliveries[0]
-    .deliver({ content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }, Date.now() + 60_000)
+    .deliver({ content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }, monotonicNow() + 60_000)
     .then(result => { settled = result })
   await flush()
   assert.equal(settled, null) // issued, waiting for its delivered event

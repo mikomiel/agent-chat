@@ -13,7 +13,9 @@
 //
 // A compaction may drop the binding entry, and a lost event stream may have hidden one. From `session.compaction.ended`
 // and from a stream gap the gate stays closed until the entry has been read back (`verifyContext`); a read-back that
-// fails keeps it closed, and the manager then turns chat off.
+// fails keeps it closed, and the manager then turns chat off. A read-back proves only that the entry exists at that
+// moment, never that a compaction has ended: a compaction already seen running stays running across a gap, and only
+// its own terminal event (`ended` or `failed`) clears it. The manager runs a read-back only while none is running.
 //
 // State is read from events only. A fact the events have not shown is unknown, and unknown never reads as idle.
 import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES, monotonicNow } from "./channel.js"
@@ -148,10 +150,12 @@ export function createDelivery(ctx, sessionID, {
   // The event stream broke or restarted: events may be missing, so every observation is stale. The selected agent
   // and the stop latch are observations too: a missed agent switch or operator interrupt must not stay hidden, so
   // both go back to their start values and only fresh events clear them. So is the binding proof: a compaction
-  // may have ended inside the gap, so the entry counts as unverified until the next read-back.
+  // may have ended inside the gap, so the entry counts as unverified until the next read-back. A compaction already
+  // observed running is the exception: nothing in a gap proves it over, and a read-back would prove only that the
+  // entry exists, so the manager waits. `compacting` stays set until the compaction's own terminal event, so one whose
+  // terminal event fell inside the gap keeps the gate closed until a later compaction event (a known limit).
   function reset() {
     executing = null
-    compacting = false
     agent = null
     stopped = true
     unverified = true
@@ -269,5 +273,7 @@ export function createDelivery(ctx, sessionID, {
     attempts.clear()
   }
 
-  return { state, heartbeatState, observe, seed, reset, deliver, sendChat, context, verifyContext, disable, dispose }
+  const isCompacting = () => compacting
+
+  return { state, heartbeatState, observe, seed, reset, deliver, sendChat, context, verifyContext, isCompacting, disable, dispose }
 }
