@@ -101,7 +101,7 @@ def test_the_integrations_directory_holds_packages() -> None:
 
 
 def test_release_please_bumps_the_uv_lock_and_the_integration_manifests() -> None:
-    """The whole list is pinned: the uv.lock entry unchanged, then the two directory globs.
+    """The whole list is pinned: the uv.lock entry unchanged, then the three directory globs.
 
     A glob names every package directory, so a new harness needs no edit here or
     in the config. ``path`` is matched against the target branch's tree by
@@ -116,6 +116,7 @@ def test_release_please_bumps_the_uv_lock_and_the_integration_manifests() -> Non
         },
         {"type": "json", "path": "integrations/*/package.json", "glob": True, "jsonpath": "$.version"},
         {"type": "json", "path": "integrations/*/.claude-plugin/plugin.json", "glob": True, "jsonpath": "$.version"},
+        {"type": "json", "path": "integrations/*/.codex-plugin/plugin.json", "glob": True, "jsonpath": "$.version"},
     ]
 
 
@@ -212,6 +213,17 @@ def test_a_claude_plugin_is_at_the_package_version_and_listed_in_the_marketplace
     assert (ROOT / entry["source"]).resolve() == package.resolve()
     # plugin.json wins when both set a version, and `claude plugin validate` warns.
     assert "version" not in entry
+
+
+@pytest.mark.parametrize(
+    "package",
+    [path for path in PACKAGES if (path / ".codex-plugin" / "plugin.json").is_file()],
+    ids=lambda path: path.name,
+)
+def test_a_codex_plugin_is_at_the_package_version_and_bumped_by_release_please(package: Path) -> None:
+    plugin = read_json(package / ".codex-plugin" / "plugin.json")
+    assert plugin["version"] == read_json(package / "package.json")["version"]
+    assert covered(f"integrations/{package.name}/.codex-plugin/plugin.json")
 
 
 def test_the_marketplace_is_a_valid_catalog_of_relative_plugin_sources() -> None:

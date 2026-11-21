@@ -21,7 +21,10 @@ releases](#tested-releases).
   first one with the queue methods used for the idle wake, is not documented
   (see [Known limits](#known-limits)).
 - Node 20 or newer on the `PATH` of the Codex process: the hooks run `node`.
-- A Python 3.11+ interpreter with the `agent-chat` package installed.
+- A Python 3.11+ interpreter with the same version of the core installed: the PyPI
+  distribution `sessionyard`, which provides the `agent_chat` import. Do not install
+  `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
+  field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token accepted by it.
 - A POSIX host. The receiver and the hooks talk over a Unix socket; the
   contract tests run on Linux.
@@ -50,6 +53,19 @@ node "${PLUGIN_ROOT}/scripts/hook.js" <command>
 `PLUGIN_ROOT` is the environment variable Codex sets for a plugin's hook
 commands. A Codex hook handler takes a command string and has no form with a
 separate argument list, so the string form is the only one used.
+
+### Install a pinned release
+
+Without a checkout, install the release that matches your core. The release
+asset is `agent-chat-codex-<version>.tgz`. Download, verify and extract it into
+an absolute directory with the checked block in
+[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release):
+it extracts only after the `SHA256SUMS` check passes. Then point the local
+marketplace entry at the extracted directory instead of a checkout, enable the
+plugin and trust its hooks as above. Keep the extracted layout intact: the
+hooks run `scripts/hook.js`, which imports `../lib/`. Install the core at the
+same version first. The install flow has not been run (see [Known
+limits](#known-limits)).
 
 ## Configure
 
