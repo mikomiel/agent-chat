@@ -1,4 +1,4 @@
-import test from "node:test"
+import test, { mock } from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
@@ -115,6 +115,18 @@ test("closing the worker ends its stdin and settles the request in flight as unc
   assert.equal(child.stdin.writableEnded, true)
   child.emit("close", 0, null)
   assert.deepEqual(await stopping, { code: 0, signal: null })
+})
+
+test("a request that outlives the parent-side deadline rejects with the core's REQUEST_UNCERTAIN", async t => {
+  mock.timers.enable({ apis: ["setTimeout"] })
+  t.after(() => mock.timers.reset())
+  const { child } = harness()
+  const worker = startWorker(config, identity, { spawnImpl: () => child })
+  child.stdout.write(`${JSON.stringify({ id: 0, result: joinedRecord })}\n`)
+  await worker.ready
+  const heartbeat = worker.request("heartbeat", { state: { native_state: "idle", stopped: false, plan_mode: false } })
+  mock.timers.tick(22_000)
+  await assert.rejects(heartbeat, { code: "REQUEST_UNCERTAIN", operation: "heartbeat" })
 })
 
 test("a failure description carries fixed codes only", () => {

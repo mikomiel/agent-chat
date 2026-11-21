@@ -1,6 +1,9 @@
-import test from "node:test"
+import test, { mock } from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
+import { PassThrough } from "node:stream"
 import { createAgentChat } from "../lib/lifecycle.js"
+import { startWorker } from "../lib/worker.js"
 import { MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
 import { renderNotice } from "../lib/notice.js"
 
@@ -481,4 +484,49 @@ test("a non-transport join refusal fails closed and latches", async () => {
   assert.equal(lifecycle.state(), "offline")
   assert.equal(globalThis[Symbol.for("agent-chat.pi.disabled")], true)
   delete globalThis[Symbol.for("agent-chat.pi.disabled")]
+})
+
+// A request that outlives the parent-side deadline has an unknown outcome. The real worker reports the core's
+// own code for it, so the lifecycle rejoins instead of latching chat off.
+const stdioChild = () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.kill = () => {}
+  return child
+}
+
+test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
+  mock.timers.enable({ apis: ["setTimeout"] })
+  t.after(() => {
+    mock.timers.reset()
+    delete globalThis[Symbol.for("agent-chat.pi.disabled")] // a disable would otherwise leak into later tests
+  })
+  const children = []
+  const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
+  const retries = []
+  const { pi, emit, ctx, notices } = fakePi()
+  const lifecycle = createAgentChat(pi, config, {
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    now: () => 0,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    clearTimeoutImpl: () => {},
+    setIntervalImpl: () => 0,
+    clearIntervalImpl: () => {},
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  children[0].stdout.write(`${JSON.stringify({ id: 0, result: joined })}\n`)
+  await flush() // joined and bound; the first heartbeat is written and never answered
+  mock.timers.tick(22_000)
+  await flush()
+  assert.doesNotMatch(notices.join("\n"), /stopped/, "not a permanent disable")
+  assert.match(notices.join("\n"), /reconnecting/)
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.equal(retries.length, 1)
+  assert.equal(retries[0].ms, 2500)
+  retries[0].fn()
+  await flush()
+  assert.equal(children.length, 2, "a fresh worker joins after the back-off")
 })
