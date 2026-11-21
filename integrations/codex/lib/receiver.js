@@ -184,9 +184,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   const WIDEST_METADATA_ROW = { id: ID, kind: "consultation", room_id: ID, history_after: "9".repeat(19) }
   const metadataFits = (count, bound) => renderNotice(joined, config.python, Array(count).fill(WIDEST_METADATA_ROW), { bound }) !== null
 
-  const announcement = ({ always = false } = {}) => {
+  // `from` is the start generation the caller began under: a turn passes the one it arrived in, so a start that came after
+  // it makes its receipt not count.
+  const announcement = ({ always = false, from = shown } = {}) => {
     const text = joined ? renderBinding(joined) : null
-    return text === null || (!always && announced === bootId) ? null : { text, boot: bootId, shown }
+    return text === null || (!always && announced === bootId) ? null : { text, boot: bootId, shown: from }
   }
   // A confirmed write of `announce` counts only while no start has dropped the receipts since it was made.
   const confirm = announce => { if (announce.shown === shown) announced = announce.boot }
@@ -512,18 +514,19 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   async function onTurn(request, link) {
     // One deadline for the whole reply, taken when the request arrives: the state report below spends it too.
     const deadline = now() + clamp(request.patience_ms, 30_000)
+    const from = shown // and the start generation it arrived in: a receipt for this turn's announcement counts only under it
     setNative(request, "busy", request.event)
     if (failure) return link.send(disabledReply())
     let replied = false
     if (inflight) void report() // a slow request never stacks up behind every tool call
     else {
       await report()
-      replied = (await guard(deliver({ link, announce: announcement(), deadline }))) === true
+      replied = (await guard(deliver({ link, announce: announcement({ from }), deadline }))) === true
     }
     if (replied) return undefined
     // The state report and the delivery can each end the binding this turn began with,
     // so announce the binding that is current now, never one read before them.
-    const current = announcement()
+    const current = announcement({ from })
     return current ? announceOnly(link, current) : link.send({ context: null })
   }
 

@@ -124,7 +124,7 @@ or a stop.
 
 | Event | Command | Timeout | What it does |
 |---|---|---|---|
-| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it; until the hook confirms that write, the binding counts as unannounced, and the next prompt or tool hook carries it. A receipt for an announcement sent before the start (an earlier hook's, still on its way) no longer counts. A start also resets what the earlier hooks left, as a fresh session starts: the read is dropped, the running state goes back to unknown and the Plan Mode hint is set from the start's own `permission_mode` (cleared when it has none), so a turn that died cannot leave the session `busy` for the heartbeat. The reset state goes out in a heartbeat at once, not at the next period, and the announcement does not wait for it. A local stop stays until a prompt clears it. |
+| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it; until the hook confirms that write, the binding counts as unannounced, and the next prompt or tool hook carries it. A receipt for an announcement made by a hook that arrived before the start no longer counts, even when that hook announces after the start. A start also resets what the earlier hooks left, as a fresh session starts: the read is dropped, the running state goes back to unknown and the Plan Mode hint is set from the start's own `permission_mode` (cleared when it has none), so a turn that died cannot leave the session `busy` for the heartbeat. The reset state goes out in a heartbeat at once, not at the next period, and the announcement does not wait for it. A local stop stays until a prompt clears it. |
 | `UserPromptSubmit` | `prompt` | 10 s | Reports the session busy, or in Plan Mode when `permission_mode` is `plan`, and clears a local stop. Then delivers a claimed batch as `additionalContext`. May start a missing receiver. |
 | `PostToolUse` | `tool` | 10 s | The same as `prompt`, between tool calls, without clearing a stop. Never starts a receiver. |
 | `Stop` | `stop` | 5 s | Reports the session idle. Prints nothing: Codex expects JSON or nothing from `Stop`, and a decision there would continue the turn. |
@@ -510,6 +510,14 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   reading unknown.
 - **The idle wake.** A message for an idle session waits for the session's own
   next hook. The wake is not part of this version; it is tracked in #154.
+- **A resume while the old process still runs.** A hook of the old Codex
+  process that is still waiting when a new process resumes the session can
+  still hand the batch. The messages then go to the context that is ending, and
+  the resumed process is not offered them. A receiver is also found by state
+  directory and session id only. A session resumed with a different config that
+  uses the same state directory reuses the running receiver and its binding
+  until that receiver exits. End the session before you change the config.
+  Both are tracked in #156.
 - **A delegate's hooks.** Codex gives a subagent's hooks the parent session
   id. Whether `UserPromptSubmit` and `PostToolUse` inside a subagent carry
   `agent_id` is not confirmed. Without `appServer` only `agent_id` and

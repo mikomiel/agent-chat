@@ -132,15 +132,17 @@ export async function runHook(name, io) {
 // a shell, and then this process's parent is that shell, which exits with the hook.
 // Skip up to two shells by reading /proc; where /proc is absent the parent is the answer.
 // With `proven`, only a process that /proc shows is not a shell is the answer, and every
-// fallback (no /proc, a shell with no parent, a third shell) is null.
+// fallback (no /proc, a shell with no parent, a third shell) is null. The process reached
+// after the second shell is read too, so Codex under two shells is proven.
 export function ownerOf(pid, read = path => readFileSync(path, "utf8"), { proven = false } = {}) {
   const fallback = value => (proven ? null : value)
   let current = pid
-  for (let hop = 0; hop < 2; hop += 1) {
+  for (let hop = 0; hop <= 2; hop += 1) {
     try {
       const stat = read(`/proc/${current}/stat`)
       const name = stat.slice(stat.indexOf("(") + 1, stat.lastIndexOf(")"))
       if (!SHELLS.has(name)) return current
+      if (hop === 2) return fallback(current) // a third shell: two is the most it skips
       const parent = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]) // field 4: index 0 is field 3
       if (!Number.isInteger(parent) || parent <= 1) return fallback(current)
       current = parent

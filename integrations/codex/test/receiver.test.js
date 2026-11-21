@@ -954,6 +954,26 @@ test("a receipt that lands after a start reset does not mark the binding announc
   assert.match(next.sent[0].context ?? "", /Agent Chat is available/, "the binding is still announced")
 })
 
+// A turn's receipts belong to the start generation the turn arrived in. A turn that arrived before a start, and makes its
+// announcement only after that start, has its receipt dropped: the start may have removed the text, so the binding stays due.
+test("a turn that arrived before a start does not mark the binding announced, even when it announces after the start", async () => {
+  let hold = false
+  let release
+  const r = await rig({ handlers: { heartbeat: () => (hold ? new Promise(resolve => { release = () => resolve({}) }) : {}) } })
+  await r.op({ op: "start", wait_ms: 5000 }, hookDouble({ events: r.events, answer: false })) // nothing confirmed yet
+  hold = true
+  const tool = r.op(turn({ event: "tool" })) // its state report waits: it has not reached announcement() yet
+  await settle()
+  assert.equal(typeof release, "function", "the turn waits on its state report")
+  hold = false
+  await r.op({ op: "start", wait_ms: 0 }, hookDouble({ events: r.events, answer: false })) // a compaction, not confirmed
+  release()
+  const first = await tool
+  assert.match(first.sent[0]?.context ?? "", /Agent Chat is available/, "the turn announced after the start, and its write was confirmed")
+  const next = await r.op(turn({ event: "tool" }))
+  assert.match(next.sent[0].context ?? "", /Agent Chat is available/, "the binding is still announced")
+})
+
 test("a receiver whose owner is gone and that nothing has contacted ends itself", async () => {
   let owner = true
   const r = await rig({ alive: () => owner })

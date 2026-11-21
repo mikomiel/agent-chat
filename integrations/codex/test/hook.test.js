@@ -177,7 +177,7 @@ test("the owner skips the shell that runs a hook command, and stops at anything 
 test("the proven owner is null wherever the owner is a fallback, and the end then names no owner", async () => {
   const table = {
     50: "50 (sh) S 40 0", 40: "40 (codex) S 30 0", 60: "60 (bash) S 50 0", 70: "70 (sh) S 1 0",
-    80: "80 (sh) S 81 0", 81: "81 (sh) S 82 0", 82: "82 (sh) S 40 0",
+    80: "80 (sh) S 81 0", 81: "81 (sh) S 82 0", 82: "82 (sh) S 40 0", 83: "83 (sh) S 84 0", 84: "84 (bash) S 98 0",
   }
   const read = path => {
     const text = table[Number(path.split("/")[2])]
@@ -189,6 +189,10 @@ test("the proven owner is null wherever the owner is a fallback, and the end the
   assert.equal(ownerOf(99, read, { proven: true }), null, "no /proc")
   assert.equal(ownerOf(70, read, { proven: true }), null, "a shell with no parent")
   assert.equal(ownerOf(80, read, { proven: true }), null, "a third shell")
+  assert.equal(ownerOf(60, read, { proven: true }), 40, "Codex under two shells is read and proven")
+  assert.equal(ownerOf(83, read, { proven: true }), null, "two shells and then no /proc record")
+  // Start and turn keep their answers: the hint with its fallbacks.
+  for (const [pid, owner] of [[40, 40], [50, 40], [60, 40], [70, 70], [80, 82], [83, 98], [99, 99]]) assert.equal(ownerOf(pid, read), owner, `start and turn: ${pid}`)
   assert.equal(ownerOf(99, read), 99, "the start and turn owner keeps its fallback")
   const guessed = await run("session-end", { ...base, hook_event_name: "SessionEnd", reason: "other" }, { reply: { ok: true }, provenOwner: () => null })
   assert.deepEqual(guessed.calls, [{ op: "end" }])
