@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { createMember, createRegistry, globalRegistry } from "../lib/owner.js"
 import { EVENT_TYPES } from "../lib/manager.js"
-import { createContext } from "../lib/context.js"
+import { createContext, CALL_TIMEOUT_MS } from "../lib/context.js"
 import { createLifecycle } from "../lib/lifecycle.js"
 import { BINDING_KEY } from "../lib/channel.js"
 
@@ -702,44 +702,54 @@ test("a session deleted while the stream was down, with a reconnect that marks n
   assert.equal(workers.length, 1)
 })
 
-// Review 6006011023, finding 1: a not-found answer is a deletion for the whole process, not for the manager that asked. The
-// old owner's rejoin probe is still open when it is torn down, and the successor joins the session before it answers.
-test("a not-found answer to the old owner's rejoin probe ends the chat that the successor already joined", async () => {
+// Reviews 6006011023 and 6006085502: definitive evidence about a session is a fact about the process, not about the call
+// that learned it. Two members of one registry share one host, each with the real context and lifecycle. `holdList` and
+// `holdLookup` hold the host's next entry list or `session.get` answer, and the test settles it. A call's time limit is
+// in the test's hands too: `armed()` lists the limits that are still running.
+function twoMembers() {
   const registry = createRegistry()
-  const entries = new Map()
-  const workers = []
-  const timers = { old: {}, successor: {} }
-  const lookups = []
+  const callTimers = []
+  const host = {
+    registry, entries: new Map(), workers: [], lookups: [], timers: { old: {}, successor: {} },
+    held: null, heldLookup: null, holdList: false, holdLookup: false, stale: null,
+    armed: () => callTimers.filter(timer => !timer.cleared && timer.ms === CALL_TIMEOUT_MS),
+  }
   const stale = Object.assign(new Error("STALE_INSTANCE"), { code: "STALE_INSTANCE" })
-  const missing = Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID: "ses_a" })
-  let holdNext = false
-  let held = null
   const ctx = {
     ...streamCtx([]),
     session: {
-      get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID, agent: "build" } },
+      get: ({ sessionID }) => {
+        host.lookups.push(sessionID)
+        if (!host.holdLookup) return Promise.resolve({ id: sessionID, agent: "build" })
+        host.holdLookup = false
+        return new Promise((resolve, reject) => { host.heldLookup = { resolve, reject } })
+      },
       instructions: {
         entry: {
-          put: ({ key, value }) => Promise.resolve(entries.set(key, value)),
-          remove: ({ key }) => Promise.resolve(entries.delete(key)),
-          list() { // `holdNext` holds the next list only: the old owner's probe
-            if (!holdNext) return Promise.resolve([...entries].map(([key, value]) => ({ key, value })))
-            holdNext = false
-            return new Promise((resolve, reject) => { held = { resolve, reject } })
+          put: ({ key, value }) => Promise.resolve(host.entries.set(key, value)),
+          remove: ({ key }) => Promise.resolve(host.entries.delete(key)),
+          list() {
+            if (!host.holdList) return Promise.resolve([...host.entries].map(([key, value]) => ({ key, value })))
+            host.holdList = false
+            return new Promise((resolve, reject) => { host.held = { resolve, reject } })
           },
         },
       },
     },
   }
   const partsFor = label => ({
-    createContext: (hostCtx, id, options) => createContext(hostCtx, id, { ...noTimers, ...options }),
+    createContext: (hostCtx, id, options) => createContext(hostCtx, id, {
+      ...options,
+      setTimeoutImpl: (fn, ms) => { const timer = { fn, ms, cleared: false }; callTimers.push(timer); return timer },
+      clearTimeoutImpl: timer => { if (timer) timer.cleared = true },
+    }),
     createLifecycle: (bus, context, passedConfig, options) => createLifecycle(bus, context, passedConfig, {
       ...options,
       now: () => 1_000,
       random: () => 0,
-      setTimeoutImpl: fn => { timers[label].retry = fn; return 1 },
+      setTimeoutImpl: fn => { host.timers[label].retry = fn; return 1 },
       clearTimeoutImpl: () => {},
-      setIntervalImpl: fn => { timers[label].tick = fn; return 1 },
+      setIntervalImpl: fn => { host.timers[label].tick = fn; return 1 },
       clearIntervalImpl: () => {},
     }),
     startProcess: () => {
@@ -751,46 +761,144 @@ test("a not-found answer to the old owner's rejoin probe ends the chat that the 
         ready: Promise.resolve({
           session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
           room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "opencode",
-          instance_file: `/tmp/agent-chat-state/ses_a-${workers.length}.json`,
+          instance_file: `/tmp/agent-chat-state/ses_a-${host.workers.length}.json`,
         }),
         closed,
-        // The old owner's heartbeat is refused as stale, which starts its backoff. The successor's answers.
-        request: op => (op === "heartbeat" && label === "old" ? Promise.reject(stale) : Promise.resolve({})),
+        request: op => (op === "heartbeat" && host.stale === label ? Promise.reject(stale) : Promise.resolve({})),
         stop: () => { worker.stopped = true; close({ code: 0, signal: null }); return closed },
       }
-      workers.push(worker)
+      host.workers.push(worker)
       return worker
     },
   })
   const config = { chatEnabled: true, directory: "/tmp/state", serverOrigin: "https://chat.example", hostToken: "synthetic-token", python: "/usr/bin/python3" }
-  const detachOld = registry.attach(createMember(ctx, config, partsFor("old")))
-  registry.attach(createMember(ctx, config, partsFor("successor")))
+  host.attach = label => registry.attach(createMember(ctx, config, partsFor(label)))
+  host.labels = () => host.workers.map(worker => worker.label)
+  return host
+}
+const missing = () => Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID: "ses_a" })
+
+// The old owner's rejoin probe is still open when it is torn down, and the successor joins the session before it answers.
+test("a not-found answer to the old owner's rejoin probe ends the chat that the successor already joined", async () => {
+  const host = twoMembers()
+  const detachOld = host.attach("old")
+  host.attach("successor")
   await flush()
-  registry.dispatch(startedEvent("e1", "ses_a"))
+  host.registry.dispatch(startedEvent("e1", "ses_a"))
   await flush()
-  assert.deepEqual(workers.map(worker => worker.label), ["old"])
-  timers.old.tick() // the heartbeat is refused as stale: the worker ends and a retry is scheduled
+  assert.deepEqual(host.labels(), ["old"])
+  host.stale = "old"
+  host.timers.old.tick() // the heartbeat is refused as stale: the worker ends and a retry is scheduled
   await flush()
-  assert.equal(workers[0].stopped, true)
-  holdNext = true
-  timers.old.retry() // the rejoin asks the host once more, and the answer is pending
+  assert.equal(host.workers[0].stopped, true)
+  host.holdList = true
+  host.timers.old.retry() // the rejoin asks the host once more, and the answer is pending
   await flush()
-  assert.equal(typeof held?.reject, "function")
-  assert.equal(workers.length, 1) // no worker before the answer
+  assert.equal(typeof host.held?.reject, "function")
+  assert.equal(host.workers.length, 1) // no worker before the answer
   await detachOld() // the old owner is torn down with its probe still open, and the successor is promoted
   await flush()
-  registry.dispatch(startedEvent("e2", "ses_a"))
+  host.registry.dispatch(startedEvent("e2", "ses_a"))
   await flush()
-  assert.deepEqual(workers.map(worker => worker.label), ["old", "successor"])
-  assert.equal(workers[1].stopped, false) // joined
-  assert.equal(entries.size, 1) // with its binding
-  held.reject(missing) // the old owner's probe finds the session gone
+  assert.deepEqual(host.labels(), ["old", "successor"])
+  assert.equal(host.workers[1].stopped, false) // joined
+  assert.equal(host.entries.size, 1) // with its binding
+  host.held.reject(missing()) // the old owner's probe finds the session gone
   await flush()
-  assert.equal(workers[1].stopped, true) // the successor's chat ends
-  assert.equal(entries.size, 0) // and its binding is withdrawn
-  const asked = lookups.length
-  registry.dispatch(startedEvent("e3", "ses_a")) // a late event is refused: the deletion is a tombstone
+  assert.equal(host.workers[1].stopped, true) // the successor's chat ends
+  assert.equal(host.entries.size, 0) // and its binding is withdrawn
+  const asked = host.lookups.length
+  host.registry.dispatch(startedEvent("e3", "ses_a")) // a late event is refused: the deletion is a tombstone
   await flush()
-  assert.equal(lookups.length, asked)
-  assert.equal(workers.length, 2)
+  assert.equal(host.lookups.length, asked)
+  assert.equal(host.workers.length, 2)
+})
+
+// Review 6006085502, finding 1: the old owner's lookup is still open when it is torn down, and its answer comes after the
+// successor joined. The answer names a parent: it is fork evidence for the process, so the successor's chat ends.
+test("a lookup answer that names a parent, released after the successor joined, ends the successor's chat", async () => {
+  const host = twoMembers()
+  const detachOld = host.attach("old")
+  host.attach("successor")
+  await flush()
+  host.holdLookup = true
+  host.registry.dispatch(startedEvent("e1", "ses_a")) // the old owner's lookup is pending
+  await flush()
+  assert.equal(typeof host.heldLookup?.resolve, "function")
+  await detachOld() // a lookup holds nothing back
+  await flush()
+  host.registry.dispatch(startedEvent("e2", "ses_a")) // the successor's own lookup answers root-shaped
+  await flush()
+  assert.deepEqual(host.labels(), ["successor"])
+  assert.equal(host.workers[0].stopped, false) // joined
+  assert.equal(host.entries.size, 1) // with its binding
+  host.heldLookup.resolve({ id: "ses_a", parentID: "ses_parent" }) // the old owner's answer: a child
+  await flush()
+  assert.equal(host.workers[0].stopped, true) // the successor's chat ends
+  assert.equal(host.entries.size, 0) // and its binding is withdrawn
+  const asked = host.lookups.length
+  host.registry.dispatch(startedEvent("e3", "ses_a")) // a later event is refused: the child is fork evidence
+  await flush()
+  assert.equal(host.lookups.length, asked)
+  assert.equal(host.workers.length, 1)
+})
+
+// Review 6006085502, finding 2: the call's time limit releases the queue and ends the repair attempt. It does not make the
+// host's answer less true: a not-found that lands after the limit still ends the session.
+test("a not-found that lands after the time limit of a heartbeat tick's read still ends the session", async () => {
+  const host = twoMembers()
+  host.attach("old")
+  await flush()
+  host.registry.dispatch(startedEvent("e1", "ses_a"))
+  await flush()
+  assert.deepEqual(host.labels(), ["old"])
+  host.holdList = true
+  host.timers.old.tick() // the tick's read-back of the entry is held
+  await flush()
+  assert.equal(typeof host.held?.reject, "function")
+  assert.equal(host.armed().length, 1)
+  host.armed()[0].fn() // the time limit passes: the read fails and the queue is free
+  await flush()
+  assert.equal(host.workers[0].stopped, false) // nothing is known yet
+  host.held.reject(missing()) // the host answers after the limit
+  await flush()
+  assert.equal(host.workers[0].stopped, true)
+  assert.equal(host.entries.size, 0)
+  const asked = host.lookups.length
+  host.registry.dispatch(startedEvent("e2", "ses_a")) // the deletion is a tombstone
+  await flush()
+  assert.equal(host.lookups.length, asked)
+})
+
+// Review 6006085502, finding 2 again: the old owner's context is disposed when the answer lands, and the successor has
+// joined. The old owner's teardown waited for its held read until the limit; the not-found comes after both.
+test("a not-found that lands on the old owner's disposed context, after its limit, still ends the successor's chat", async () => {
+  const host = twoMembers()
+  const detachOld = host.attach("old")
+  host.attach("successor")
+  await flush()
+  host.registry.dispatch(startedEvent("e1", "ses_a"))
+  await flush()
+  host.holdList = true
+  host.timers.old.tick() // the old owner's read is held
+  await flush()
+  assert.equal(typeof host.held?.reject, "function")
+  const detaching = detachOld() // its binding removal is queued behind the held read
+  await flush()
+  host.armed()[0].fn() // the limit frees the queue, the teardown ends and the successor is promoted
+  await detaching
+  await flush()
+  host.registry.dispatch(startedEvent("e2", "ses_a"))
+  await flush()
+  assert.deepEqual(host.labels(), ["old", "successor"])
+  assert.equal(host.workers[0].stopped, true)
+  assert.equal(host.workers[1].stopped, false) // the successor joined
+  host.held.reject(missing()) // the old context is disposed and its limit has passed
+  await flush()
+  assert.equal(host.workers[1].stopped, true) // the evidence still reached the current owner
+  assert.equal(host.entries.size, 0)
+  const asked = host.lookups.length
+  host.registry.dispatch(startedEvent("e3", "ses_a"))
+  await flush()
+  assert.equal(host.lookups.length, asked) // and the tombstone refuses the id
 })

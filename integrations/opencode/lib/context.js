@@ -19,9 +19,10 @@
 // rejects, and its caller decides what a failed join means.
 //
 // A SESSION THAT IS GONE IS REPORTED, NOT REPAIRED. Every instruction-entry call first reads the session, so the tick's
-// read-back of a deleted session fails with `Session.NotFoundError`. A call that answers in time with it tells
-// `onMissing`, and the owner ends the session's chat. The call itself stays a failed call, as any other. A rejoin after
-// a backoff asks once more before it starts a worker (`probe()`), since a deletion can happen during the wait.
+// read-back of a deleted session fails with `Session.NotFoundError`. A call that answers with it tells `onMissing`, and
+// the owner ends the session's chat. The call itself stays a failed call, as any other. The answer is evidence about the
+// session, so it counts after the call's time limit and after this context was disposed. A rejoin after a backoff asks
+// once more before it starts a worker (`probe()`), since a deletion can happen during the wait.
 //
 // ONE CURRENCY RULE. A read-back is for one obligation and one binding. It proves the binding only while chat is open
 // and on, no newer gap or compaction signal has been applied, and no `context()` call has withdrawn or replaced the
@@ -59,7 +60,8 @@ const contextFailure = () => Object.assign(new Error("CHAT_CONTEXT_UNAVAILABLE")
 // upstream source (see README). Any other failure says nothing about the session.
 export const isMissing = (error, sessionID) => error?._tag === "Session.NotFoundError" && error.sessionID === sessionID
 
-// `onMissing` is told when a call that answered in time found the session gone. Its owner decides what that means.
+// `onMissing` is told whenever a call is answered with the session's own not-found, in time or late, and while this
+// context is open or not. Its owner decides what that means.
 export function createContext(ctx, sessionID, {
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
@@ -107,8 +109,10 @@ export function createContext(ctx, sessionID, {
       }
       const failed = answer(reject)
       new Promise(begin => begin(ctx.session.instructions.entry[name](input))).then(answer(resolve), error => {
-        // The heartbeat tick reads the entry, so a session deleted with no event seen is found here, within a tick.
-        if (!over && isMissing(error, sessionID)) { try { onMissing() } catch { /* advisory */ } }
+        // The heartbeat tick reads the entry, so a session deleted with no event seen is found here, within a tick. The
+        // answer is evidence about the session, not about this call: it counts after the time limit and after this
+        // context was disposed. The limit only releases the queue.
+        if (isMissing(error, sessionID)) { try { onMissing() } catch { /* advisory */ } }
         failed(error)
       })
     })

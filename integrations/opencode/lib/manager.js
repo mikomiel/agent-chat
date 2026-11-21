@@ -21,6 +21,12 @@
 // A lookup answer for the session that names a fork or a parent is the same evidence and is kept the same way, so the
 // next owner never asks again. An answer that is unreadable or for another session is not: it only refuses locally.
 //
+// DEFINITIVE EVIDENCE IS REPORTED WHENEVER IT LANDS. An answer that the host gives for a session, a not-found from any
+// instruction-entry call or a lookup that names a parent or a fork, is a fact about the session. It goes to
+// `reportDeleted` or `reportNotRoot`, which the registry sets to a received event, even when the answer comes after the
+// call's time limit or after this record, context or manager ended. The time limit only releases the queue, and whether
+// this record starts a worker is still decided by its own liveness.
+//
 // A DELETION IS FENCED WHEN IT IS RECEIVED, as a fork is: it is not queued behind a lookup that is still running. The
 // record is ended at once, so a lookup that answers afterwards finds its record dead and starts no worker and sends
 // no join. The deletion is also a tombstone in its own set, like fork evidence: no cache evicts it, and the next owner
@@ -91,7 +97,10 @@ export function createManager(ctx, config, parts, {
   notice = () => {},
   forked = new Set(), // fork evidence: session ids that are never roots; the registry hands every owner the same set
   deleted = new Set(), // deletion tombstones: ids of sessions that ended; never evicted, shared like `forked`
-  reportDeleted = null, // where a deletion this manager learned from the host goes; the registry sets it. Alone: markDeleted
+  // Where definitive evidence this manager learned from the host goes: a deleted session, a child or fork. The registry
+  // sets both, so the evidence reaches the current owner, which may not be this one. Alone, the manager acts on its own.
+  reportDeleted = null,
+  reportNotRoot = null,
 } = {}) {
   const records = new Map() // session id -> { id, context, lifecycle, chain, dead, closing }
   const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
@@ -138,14 +147,18 @@ export function createManager(ctx, config, parts, {
 
   // The eligibility lookup has the same time limit as one instruction-entry call: a lookup that never answers would hold
   // its session's chain, and every later event of that session, for ever. A lookup that runs out of time is a failed
-  // lookup. The host is not told to stop it, and its late answer settles a promise that already ended, so it reaches
-  // nothing: only `start` can create a worker, and it has moved on.
+  // lookup. The host is not told to stop it, and its late answer settles a promise that already ended, so it creates
+  // nothing: only `start` can create a worker, and it has moved on. An answer that names a parent or a fork is evidence
+  // about the session, not about this lookup, so it is reported whenever it lands: late, or after this manager stopped.
   function lookup(sessionID) {
     return new Promise((resolve, reject) => {
       const timer = setTimeoutImpl(() => reject(new Error("LOOKUP_TIMEOUT")), CALL_TIMEOUT_MS)
       timer?.unref?.() // a lookup that is never answered must not keep a stopping process alive for the limit
       const answer = settle => value => { clearTimeoutImpl(timer); settle(value) }
-      new Promise(begin => begin(ctx.session.get({ sessionID }))).then(answer(resolve), answer(reject))
+      new Promise(begin => begin(ctx.session.get({ sessionID }))).then(info => {
+        if (namesParent(info, sessionID)) { try { (reportNotRoot ?? markNotRoot)(sessionID) } catch { /* advisory */ } }
+        answer(resolve)(info)
+      }, answer(reject))
     })
   }
 
@@ -171,9 +184,8 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (!isRootSession(info, record.id)) {
-      // An answer for this very session that names a parent or a fork is fork evidence, as the feed's is: shared and kept.
-      // An unreadable answer, or one for another session, proves nothing: only this owner's cache refuses it.
-      if (namesParent(info, record.id)) forked.add(record.id)
+      // An answer that names this session's parent or fork was reported when it landed. An unreadable answer, or one for
+      // another session, proves nothing: only this owner's cache refuses it.
       refuse(record.id, Infinity)
       records.delete(record.id)
       record.dead = true
@@ -209,6 +221,16 @@ export function createManager(ctx, config, parts, {
     if (known) void dispose(known)
   }
 
+  // This session is a fork or a child: never a root. Recorded before any refusal check, lookup or join, so it is not
+  // dropped during a temporary lookup refusal, and a lookup still in flight, or a join already made, ends with it. After
+  // the deletion it is late: the tombstone already refuses the id, and a fork record for it would never be removed.
+  function markNotRoot(id) {
+    if (deleted.has(id)) return
+    forked.add(id)
+    const known = records.get(id)
+    if (known) void dispose(known)
+  }
+
   function feed(event) {
     if (!active) return
     const id = sessionOf(event)
@@ -218,14 +240,7 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (notRootSessionOf(event) !== null) {
-      // An event that arrives after the deletion is late: the tombstone already refuses the id, and a fork record for it
-      // would be one that no later event removes.
-      if (deleted.has(id)) return
-      // This session is a fork or a child: never a root. Recorded before any refusal check, lookup or join, so it is not
-      // dropped during a temporary lookup refusal, and a lookup still in flight, or a join already made, ends with it.
-      forked.add(id)
-      const known = records.get(id)
-      if (known) void dispose(known)
+      markNotRoot(id)
       return
     }
     if (isRefused(id)) return

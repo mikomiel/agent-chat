@@ -16,8 +16,10 @@
 // already refuses the id. A fork record is dropped when its session is deleted, so `forks` holds the forks and child
 // sessions that are not deleted yet. `deletions` holds one id for each deleted session. These two sets are the only
 // state that grows with the sessions the process sees.
-// A deletion that an owner learns from the host, as a missing-session answer, is dispatched as a `session.deleted` event.
-// It takes the same path as one from the stream, so the current owner ends its record even when an older owner asked.
+// Definitive evidence that an owner learns from the host is dispatched as the event that says the same: a missing-session
+// answer as `session.deleted`, a lookup answer that names a parent or a fork as `session.forked`. It takes the same path
+// as one from the stream, so the current owner ends its record even when an older owner asked, and even when the answer
+// came late or after that owner ended.
 //
 // FAILOVER. When the owner's instance is torn down, the registry waits until that owner's workers have ended and
 // only then promotes the next member. A session rejoins at its next event. Registry changes run one at a time.
@@ -42,12 +44,13 @@ export function createRegistry() {
 
   function promote() {
     owner = members[0] ?? null
-    if (owner) owner.activate(forks, deletions, reportDeleted)
+    if (owner) owner.activate(forks, deletions, { reportDeleted, reportNotRoot })
   }
 
-  // A deletion an owner learned from the host, not from the stream. It is a received `session.deleted` event: recorded
-  // as a tombstone, then fed to the current owner, which need not be the one that asked, so it ends its own record.
+  // Evidence an owner learned from the host, not from the stream. Each is a received event: recorded as a tombstone or as
+  // fork evidence, then fed to the current owner, which need not be the one that asked, so it ends its own record.
   const reportDeleted = sessionID => dispatch({ type: "session.deleted", data: { sessionID } })
+  const reportNotRoot = sessionID => dispatch({ type: "session.forked", data: { sessionID } })
 
   function dispatch(event) {
     // Recorded before the owner check: a fork or deletion event between two owners is kept for the next one.
@@ -138,9 +141,7 @@ export function createMember(ctx, config, parts, { managerOptions = {}, sleep = 
       void pump(dispatch, reset).catch(() => {})
       return () => controller.abort()
     },
-    activate(forked, deleted, reportDeleted) {
-      manager = createManager(ctx, config, parts, { ...managerOptions, forked, deleted, reportDeleted })
-    },
+    activate(forked, deleted, reports) { manager = createManager(ctx, config, parts, { ...managerOptions, forked, deleted, ...reports }) },
     async deactivate() {
       const ending = manager
       manager = null

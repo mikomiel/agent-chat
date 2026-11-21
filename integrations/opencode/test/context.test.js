@@ -1075,17 +1075,48 @@ for (const [label, error] of Object.entries({
   })
 }
 
-test("a read that runs out of time and later fails with not-found does not tell onMissing", async () => {
+// Review 6006085502: the not-found is evidence about the session, not about the call. The time limit releases the queue
+// and ends the repair attempt, and nothing more: the answer still counts when it lands after the limit.
+test("a read that runs out of time and later fails with not-found still tells onMissing, and the read stays failed", async () => {
   const { ctx, clock, told, context } = watched()
   await context.context("binding")
   const held = holdFirst(ctx.session.instructions.entry, "list")
   const read = context.refresh()
   await flush()
   armed(clock)[0].fn() // the time limit passes
-  assert.equal(await read, false)
-  held.settle.reject(notFound()) // the host answers after the limit: it is not an answer in time
+  assert.equal(await read, false) // the limit still ended the read, and released the queue
+  assert.deepEqual(told, []) // nothing is known yet
+  held.settle.reject(notFound()) // the host answers after the limit
   await flush()
-  assert.deepEqual(told, [])
+  assert.deepEqual(told, ["missing"])
+  assert.equal(context.owed(), true) // the repair attempt is still over: nothing was proved
+})
+
+test("a not-found that lands after the context was disposed is still told to onMissing", async () => {
+  const { ctx, told, context } = watched()
+  await context.context("binding")
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  void context.refresh()
+  await flush()
+  context.dispose() // the owner ended and disposed this context while the read was open
+  held.settle.reject(notFound())
+  await flush()
+  assert.deepEqual(told, ["missing"])
+})
+
+test("a late not-found for another session, or a late other failure, is not told to onMissing", async () => {
+  for (const error of [notFound("ses_other"), new Error("unavailable")]) {
+    const { ctx, clock, told, context } = watched()
+    await context.context("binding")
+    const held = holdFirst(ctx.session.instructions.entry, "list")
+    const read = context.refresh()
+    await flush()
+    armed(clock)[0].fn()
+    await read
+    held.settle.reject(error)
+    await flush()
+    assert.deepEqual(told, [])
+  }
 })
 
 test("an onMissing that throws changes nothing about the call", async () => {
@@ -1138,7 +1169,7 @@ for (const [label, error] of Object.entries({
   })
 }
 
-test("probe: a list that never answers resolves at the time limit, and a later not-found is not reported", async () => {
+test("probe: a list that never answers resolves at the time limit, and a later not-found is still reported", async () => {
   const { ctx, clock, told, context } = watched()
   const held = holdFirst(ctx.session.instructions.entry, "list")
   let done = false
@@ -1148,9 +1179,10 @@ test("probe: a list that never answers resolves at the time limit, and a later n
   assert.equal(armed(clock).length, 1)
   armed(clock)[0].fn() // the time limit passes
   await probed
+  assert.deepEqual(told, []) // nothing is known yet
   held.settle.reject(notFound()) // the host answers after the limit
   await flush()
-  assert.deepEqual(told, [])
+  assert.deepEqual(told, ["missing"])
 })
 
 test("probe: no host call once the context is closed or turned off", async () => {

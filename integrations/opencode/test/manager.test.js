@@ -902,6 +902,80 @@ for (const [kind, answer] of [
   })
 }
 
+// Review 6006085502, finding 1: the evidence in a lookup answer counts whenever it lands. It does not matter that the
+// manager has stopped, or that the lookup's own time limit has passed: the record may not start a worker, the fact is kept.
+test("a lookup answer that names a parent and lands after the manager stopped is still kept for the next owner", async () => {
+  let release
+  const sets = { deleted: new Set(), forked: new Set() }
+  const first = createManager({ session: { get: () => new Promise(resolve => { release = resolve }) } }, config, stubParts(), sets)
+  first.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  await first.stop() // the old owner is torn down with its lookup still open
+  release({ id: "ses_a", parentID: "ses_parent" })
+  await flush()
+  assert.deepEqual([...sets.forked], ["ses_a"])
+  const parts = stubParts()
+  const ctx = fakeCtx(root) // a later lookup would answer root-shaped
+  const successor = createManager(ctx, config, parts, sets)
+  successor.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(ctx.lookups, [])
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("a lookup that answers after its time limit, naming a fork, still leaves fork evidence for the next owner", async () => {
+  let release
+  const limits = []
+  const sets = { deleted: new Set(), forked: new Set() }
+  const ctx = { session: { get: () => new Promise(resolve => { release = resolve }) } }
+  const first = createManager(ctx, config, stubParts(), { ...sets, setTimeoutImpl: fn => { limits.push(fn); return 0 } })
+  first.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  limits[0]() // the lookup's time limit passes: a failed lookup
+  await flush()
+  assert.deepEqual([...sets.forked], []) // nothing is known yet
+  release({ id: "ses_a", fork: { sessionID: "ses_source", boundary: {} } }) // the host answers after the limit
+  await flush()
+  assert.deepEqual([...sets.forked], ["ses_a"])
+  const parts = stubParts()
+  const next = fakeCtx(root)
+  const successor = createManager(next, config, parts, sets)
+  successor.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(next.lookups, [])
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("a late lookup answer that proves nothing about the session adds no fork evidence", async () => {
+  for (const answer of [{ id: "ses_other", parentID: "ses_parent" }, null, root("ses_a")]) {
+    let release
+    const limits = []
+    const sets = { deleted: new Set(), forked: new Set() }
+    const ctx = { session: { get: () => new Promise(resolve => { release = resolve }) } }
+    const manager = createManager(ctx, config, stubParts(), { ...sets, setTimeoutImpl: fn => { limits.push(fn); return 0 } })
+    manager.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    limits[0]()
+    await flush()
+    release(answer)
+    await flush()
+    assert.deepEqual([...sets.forked], [])
+  }
+})
+
+test("the injected report of a lookup answer's evidence is called, and the manager keeps nothing itself", async () => {
+  const reported = []
+  const sets = { deleted: new Set(), forked: new Set() }
+  const manager = createManager(fakeCtx(() => ({ id: "ses_a", parentID: "ses_parent" })), config, stubParts(), {
+    ...sets, reportNotRoot: id => reported.push(id),
+  })
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(reported, ["ses_a"])
+  assert.deepEqual([...sets.forked], []) // the registry records it, as for any received event
+  assert.deepEqual(manager.sessions(), []) // this record is still refused here
+})
+
 // Review 6006011023, finding 1: a missing-session answer is reported to the owner of the process, which decides. The manager
 // ends nothing itself: the report reaches it as a received `session.deleted` event, as the registry sends it.
 test("a missing-session answer is passed to the injected report and the manager does not end the record on its own", async () => {

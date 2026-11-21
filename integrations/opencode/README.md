@@ -158,8 +158,12 @@ The service and its host-token provisioning are documented in the product
   arrived between two owners. A `session.get` answer for the session that names
   a `parentID` or a `fork` is the same evidence and goes into the same set, so
   the next owner does not ask again, and a later answer that looks like a root
-  cannot change it. An answer that is unreadable, or is for another session,
-  proves nothing: it only refuses the session in the owner's own bounded cache.
+  cannot change it. The owner reports it to the registry as a received
+  `session.forked` event, whenever it lands: after the lookup's time limit, or
+  after the owner that asked has ended. The current owner then ends any record
+  of that session, joined or pending. An answer that is unreadable, or is for
+  another session, proves nothing: it only refuses the session in the owner's
+  own bounded cache.
   A `session.deleted` event is fenced when it is received and not behind the
   lookup: the record ends at once, so a lookup that answers after the deletion
   starts no worker and sends no join. Events still queued for that session are
@@ -174,14 +178,17 @@ The service and its host-token provisioning are documented in the product
   replay and no cursor, and no later event would end that session's chat. The
   heartbeat tick finds it. Each tick reads the binding entry back, and every
   instruction-entry call first reads the session, so a deleted session fails
-  that read with `Session.NotFoundError` naming it. An answer in time with that
-  error ends the session's chat through the path above, at the next tick that
-  reads the entry, wherever the deletion happened. The owner reports it to the
-  registry as a received `session.deleted` event: the tombstone is recorded, and
-  the current owner ends its own record, which can be a different owner than the
-  one that asked, joined or still in its lookup. A repair already in flight can
-  defer that read past the tick, as for any repair. No host call is added for it.
-  A timeout, any other error, and a session that is found change nothing. Events
+  that read with `Session.NotFoundError` naming it. An answer with that error
+  ends the session's chat through the path above, at the next tick that reads the
+  entry, wherever the deletion happened. The owner reports it to the registry as
+  a received `session.deleted` event: the tombstone is recorded, and the current
+  owner ends its own record, which can be a different owner than the one that
+  asked, joined or still in its lookup. The answer counts when it lands after the
+  call's 10-second limit, and after the owner that asked has ended: the limit
+  frees the queue and ends the repair attempt, and nothing more. A repair
+  already in flight can defer that read past the tick, as for any repair. No
+  host call is added for it. A timeout, any other error, and a session that is
+  found change nothing. Events
   of one session run in order on that session's own chain. A fault there ends that session's
   chat and no other. A faulted session stays out while its refusal is in the
   bounded lookup cache, which holds 1,024 entries and drops the oldest first.
