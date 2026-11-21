@@ -29,10 +29,9 @@
 // and with it every later publish, repair and removal. A call that runs out of time counts as a failed call: a check
 // proves nothing and stays owed, a publish rejects, and a removal is not an error. The host is not told to stop the
 // call, so it may still land. While this context is open, a put or a removal that lands late owes the read-back again.
-// Once it is closed, a removal that lands after the next owner's publish deletes that binding until the next owner's
-// next tick puts it back. A put that lands after the removal that followed a failed join leaves a stale entry that
-// names an instance file that is no longer valid. The time limit trades a call that can hang for a call that can land
-// late.
+// Once it is closed or turned off, a put that lands late is removed again, best effort, so a failed join does not leave
+// its binding in the instructions. A removal that lands after the next owner's publish deletes that binding until the
+// next owner's next tick puts it back. The time limit trades a call that can hang for a call that can land late.
 //
 // WHY A PUT AT THE WRONG TIME IS HARMLESS. A put is never the last word. Every signal that can invalidate the entry
 // owes the read-back again when it is applied (`owe`). So a put or a proof that landed just before such a signal was
@@ -54,6 +53,7 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
   let unverified = false // a compaction signal or a gap was applied, and the binding entry has not been read back since
   let compactions = 0 // signals and gaps applied so far: a read-back that began before the latest one proves nothing
   let verifying = null // the `compactions` value of the read-back queued or running now: one at a time per obligation
+  let asks = 0 // heartbeat ticks so far: a check that a tick overlapped after its reads began asks once more
   let generation = 0 // `context()` calls so far: a read-back made for an earlier call is for a binding that is gone
   let published = null // the binding text the entry should hold now
   let contextQueue = Promise.resolve()
@@ -82,7 +82,14 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
       const timer = setTimeoutImpl(() => { over = true; reject(contextFailure()) }, CALL_TIMEOUT_MS)
       const answer = settle => value => {
         if (over) {
-          if (name !== "list" && !closed) owe()
+          if (name === "list") return
+          // A put that lands after this session's chat ended or was turned off would restore a binding that is no longer
+          // wanted: remove it again, best effort. While chat is open, the read-back is owed again instead.
+          if (closed || disabled) {
+            if (name === "put") new Promise(begin => begin(ctx.session.instructions.entry.remove({ sessionID, key: BINDING_KEY }))).catch(() => {})
+            return
+          }
+          owe()
           return
         }
         clearTimeoutImpl(timer)
@@ -167,7 +174,9 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
       if (verifying === mark) verifying = null // ended: when still owed, the next ask repeats it
       return proved
     }
+    let asked = null
     return queued(async () => {
+      asked = asks
       if (!unverified || !current()) return done(false) // discharged or overtaken while it waited: no host call
       try {
         const found = await holds(text)
@@ -177,16 +186,18 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
         return done(false) // a failed call proves nothing either way, and turns nothing off
       }
       if (!current()) return done(false) // the last host call proves nothing about a binding that has since changed
-      unverified = false
+      if (asks === asked) unverified = false // a tick that came after the reads began is not answered by them
       return done(true)
-    })
+    }).then(proved => (asked !== null && asks !== asked && askable() ? repair() : proved))
   }
 
-  // The heartbeat tick: owe the read-back again and ask for it. The epoch does not move, so a publish or a check in flight
-  // still proves; a check already running for this epoch is not doubled.
+  // The heartbeat tick: owe the read-back again and ask for it. The epoch does not move, so a publish in flight still
+  // proves. A check that is queued reads after the tick and answers it. A check whose reads already began does not: it
+  // runs once more when it ends, so the entry is read after every tick.
   function refresh() {
     if (closed || disabled) return Promise.resolve(false)
     unverified = true
+    asks += 1
     return repair()
   }
 

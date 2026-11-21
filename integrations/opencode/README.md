@@ -26,7 +26,10 @@ idle. Delivery is not part of this package; [issue
   distribution `sessionyard`, which provides the `agent_chat` import. Do not install
   `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
   field of the config file names this interpreter.
-- A reachable Agent Chat service and a host token accepted by it.
+- A reachable Agent Chat service and a host token provisioned for the
+  `opencode` harness. A token for another harness registers the session under
+  that harness, the plugin then refuses the reply, and the stray registration
+  stays until its lease expires.
 - Node built-ins only inside the plugin: `node:child_process`, `node:crypto`,
   `node:fs` and `node:path`. Whether OpenCode's plugin runtime exposes them is
   not verified. The package tests need Node 20 or newer.
@@ -95,7 +98,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `chatEnabled` | Must be `true`; any other value keeps chat off. |
 | `directory` | Absolute directory for the binding records, private to the user. |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
-| `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
+| `hostToken` | A host token for the `opencode` harness, accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
 
 Every key is fixed. The loader accepts exactly these five and refuses an
@@ -307,9 +310,11 @@ unverified, inferred, or a deliberate choice.
   can hang for a call that can land late. A removal that times out during an
   owner change can land after the next owner's put and delete its binding. The
   next owner's next tick puts it back, within 30 seconds. A put that times out
-  during a join can land after the removal that follows the failed join, and
-  leaves a stale entry with chat off. That entry names an instance file that is
-  no longer valid, and the next join replaces it.
+  during a join can land after the removal that follows the failed join. When
+  it lands, the plugin removes the entry again, best effort. If that removal
+  fails too, the entry stays until the next join replaces it. The worker may
+  still hold the instance file when its end request failed, so that entry can
+  name a usable binding until the server lease expires.
 - **The binding text asks, the plugin does not check.** The binding tells the
   session to preserve local stop, Plan Mode and approvals. The plugin reads
   none of the three.
@@ -332,8 +337,10 @@ unverified, inferred, or a deliberate choice.
   calls no `synthetic`, `prompt` or `interrupt`. Its only writes to a session
   are its binding entry, with `entry.put` and `entry.remove`. It reads with
   `session.get`, `entry.list` and its event subscription.
-- Every failure fails closed: a missing binding means no chat, and a failed
-  join turns that session's chat off.
+- A missing binding means no chat, and a failed join turns that session's chat
+  off. One case is best effort: a binding put that lands after its time limit,
+  once chat is off, is removed again; see "A late removal or put after the
+  end".
 
 ## Tested releases
 

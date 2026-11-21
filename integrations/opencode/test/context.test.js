@@ -269,28 +269,51 @@ test("a compaction that ends inside a gap after the gap's read-back is repaired 
   assert.equal(ctx.entries.get(BINDING_KEY), "binding")
 })
 
-test("a refresh does not move the epoch: a publish in flight still discharges, and a check already running is not doubled", async () => {
-  const { ctx, context } = make()
-  await context.context("binding")
+test("a refresh does not move the epoch: a publish in flight still discharges, and a queued check answers the tick", async () => {
+  const { ctx, context } = await (async () => { const made = make(); await made.context.context("binding"); return made })()
   const held = holdFirst(ctx.session.instructions.entry, "put")
   const publish = context.context("binding two")
   await flush()
   assert.equal(held.entered, true)
-  const refreshed = context.refresh() // queued behind the publish
+  const lists = ctx.calls.list
+  const refreshed = context.refresh() // queued behind the publish: it reads after the tick
   held.settle.resolve()
   await publish
   assert.equal(await refreshed, false) // the confirmed publish discharged it before the check began: no host call
+  assert.equal(ctx.calls.list, lists + 1) // only the publish's own confirmation
   assert.equal(context.owed(), false)
-  ctx.entries.clear()
+})
+
+test("a tick that lands while a check's read is in flight is not answered by that read: the check runs once more", async () => {
+  const { ctx, context } = make()
+  await context.context("binding")
   const listHeld = holdFirst(ctx.session.instructions.entry, "list")
+  const first = context.refresh() // its list is issued and waits
+  await flush()
+  assert.equal(listHeld.entered, true)
+  ctx.entries.clear() // an unseen compaction drops the entry after the list read it
+  const second = context.refresh() // the next tick: the running check is not doubled now
+  listHeld.settle.resolve() // the old list answers with the entry present
+  assert.equal(await second, false)
+  assert.equal(await first, true) // the follow-up check found the entry gone and put it back
+  assert.equal(ctx.entries.get(BINDING_KEY), "binding")
+  assert.equal(context.owed(), false)
+})
+
+test("a check that a tick overlapped runs once more and no more, even when the follow-up fails", async () => {
+  const { ctx, context } = make()
+  await context.context("binding")
+  const entry = ctx.session.instructions.entry
+  const listHeld = holdFirst(entry, "list")
   const first = context.refresh()
   await flush()
-  const lists = ctx.calls.list
-  assert.equal(await context.refresh(), false) // the running check is not doubled
+  context.refresh()
+  let calls = 0
+  entry.list = async () => { calls += 1; throw new Error("unavailable") } // later lists fail; the held one still answers
   listHeld.settle.resolve()
-  assert.equal(await first, true)
-  assert.equal(ctx.calls.list, lists + 2) // the held list and the put's confirmation: one check, not two
-  assert.equal(ctx.entries.get(BINDING_KEY), "binding two")
+  assert.equal(await first, false) // the follow-up's list failed
+  assert.equal(calls, 1) // one follow-up, no loop
+  assert.equal(context.owed(), true) // owed until the next ask
 })
 
 test("a refresh on a disabled or disposed context makes no host call", async () => {
@@ -860,6 +883,25 @@ test("a removal that lands after its time limit owes the read-back again, so a n
   assert.equal(await context.repair(), true)
   assert.equal(ctx.entries.get(BINDING_KEY), "binding two")
 })
+
+for (const end of ["disable", "dispose"]) {
+  test(`a binding put that lands after its time limit, once the context is ${end}d, is removed again`, async () => {
+    const { ctx, clock, context } = make()
+    const held = holdFirst(ctx.session.instructions.entry, "put") // a join's put waits
+    const publish = context.context("binding")
+    await flush()
+    assert.equal(held.entered, true)
+    armed(clock)[0].fn() // it runs out of time: the join fails
+    await assert.rejects(publish, { code: "CHAT_CONTEXT_UNAVAILABLE" })
+    context[end]() // chat is off for this session
+    const removals = ctx.calls.remove.length
+    held.settle.resolve() // the late put lands
+    await flush()
+    await flush()
+    assert.equal(ctx.calls.remove.length, removals + 1)
+    assert.equal(ctx.entries.has(BINDING_KEY), false)
+  })
+}
 
 test("a list that answers after its time limit owes nothing, because a read changes nothing", async () => {
   const { ctx, clock, context } = await gapped()
