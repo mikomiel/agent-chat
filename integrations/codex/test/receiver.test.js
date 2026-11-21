@@ -1339,6 +1339,60 @@ test("a rejoin whose read finds a listed thread unloaded starts no worker, and a
   }
 })
 
+// Positive evidence only. The real thread against a fake app-server: a record joins only when its origin is a non-empty string or an
+// object and its status is one that a loaded thread documents. A record that shows less is no basis for a join, and nothing is
+// probed or started on it.
+const documented = (over = {}) => ({
+  id: "session-1", parentThreadId: null, agentRole: null, ephemeral: false, source: "cli", modelProvider: "openai", status: { type: "idle" }, ...over,
+})
+const withoutStatus = () => { const record = documented(); delete record.status; return record }
+for (const [label, record, joins] of [
+  ["the documented shapes", documented(), true],
+  ["an active thread", documented({ status: { type: "active", activeFlags: [] } }), true],
+  ["a thread in systemError", documented({ status: { type: "systemError" } }), true],
+  ["an object origin", documented({ source: { custom: "x" } }), true],
+  ["an empty origin", documented({ source: "" }), false],
+  ["an array origin", documented({ source: ["cli"] }), false],
+  ["an empty array origin", documented({ source: [] }), false],
+  ["a numeric origin", documented({ source: 7 }), false],
+  ["no status", withoutStatus(), false],
+  ["a status without a type", documented({ status: {} }), false],
+  ["a status type that is not known", documented({ status: { type: "future" } }), false],
+  ["an empty status type", documented({ status: { type: "" } }), false],
+  ["the status type unknown", documented({ status: { type: "unknown" } }), false],
+  ["a status type that is not a string", documented({ status: { type: ["idle"] } }), false],
+  ["a status that is only a string", documented({ status: "idle" }), false],
+]) {
+  test(`a thread read with ${label} ${joins ? "starts the worker" : "starts no worker and probes nothing"}`, async () => {
+    const waitFor = async (check, what) => {
+      for (let waited = 0; !check() && waited < 3000; waited += 5) await new Promise(resolve => setTimeout(resolve, 5))
+      assert.ok(check(), `${what} never happened`)
+    }
+    const dir = mkdtempSync(join(tmpdir(), "acr-"))
+    const answers = {
+      "thread/loaded/list": () => ({ result: { data: ["session-1"], nextCursor: null } }),
+      "thread/read": () => ({ result: { thread: record } }),
+      "thread/queue/delete": () => ({ result: { deleted: false } }),
+    }
+    const server = await fakeAppServer(join(dir, "s.sock"), message => answers[message.method]?.() ?? { error: { code: -32601, message: "no" } })
+    try {
+      const thread = Object.assign(createThread({ path: join(dir, "s.sock"), threadId: "session-1" }), { opened: [] })
+      const r = await rig({ thread })
+      if (joins) await waitFor(() => r.worker.bootIds.length === 1, "the join")
+      else {
+        await waitFor(() => server.methods().includes("thread/read"), "the read")
+        await waitFor(() => server.state.open === 0, "the bind to end")
+        await settle()
+        assert.equal(r.worker.bootIds.length, 0, "no worker starts")
+        assert.equal(server.methods().includes("thread/queue/delete"), false, "nothing is probed")
+      }
+    } finally {
+      await server.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
 // The time allowed for a bind is for the thread read. When the read is in, the bind says so and the queue probe runs on
 // its own limit; a probe that does not finish costs the route, never the join.
 test("a thread read that arrives at 2.5 seconds with a probe that stays silent still joins, hook-only", async () => {
@@ -1480,6 +1534,100 @@ test("a read that began before a hook event is not kept", async () => {
   release()
   await settle()
   assert.equal(r.receiver.state(), "plan", "the stale read did not override the newer hint")
+})
+
+// A turn that dies (the process is killed, the session is resumed elsewhere) sends no Stop, so the hooks leave the receiver busy
+// for good. A session start, whatever its source, resets that as a fresh session would have, and drops the read.
+test("a session start after a turn that died resets the running state: the heartbeat reads the thread again", async () => {
+  const thread = threadDouble()
+  const r = await rig({ thread })
+  await r.begin()
+  await r.op(turn())
+  await r.clock.advance(30_000)
+  assert.equal(r.receiver.state(), "busy")
+  assert.equal(thread.calls.filter(call => call === "observe").length, 0, "a busy session is not read")
+  await r.op({ op: "start", wait_ms: 5000 })
+  assert.equal(r.receiver.state(), "unknown")
+  await r.clock.advance(30_000)
+  assert.equal(thread.calls.filter(call => call === "observe").length, 1, "the heartbeat read the thread")
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "idle", stopped: false, plan_mode: false })
+})
+
+test("a session start that resumes in Plan Mode keeps the hint until a read or hook says otherwise", async () => {
+  const r = await rig({ thread: threadDouble() })
+  await r.begin()
+  await r.op({ op: "start", wait_ms: 5000, permission_mode: "plan" })
+  assert.equal(r.receiver.state(), "plan")
+  await r.op({ op: "start", wait_ms: 5000, permission_mode: "default" })
+  assert.notEqual(r.receiver.state(), "plan")
+})
+
+test("a session start after a turn that died no longer blocks the wake poll", async () => {
+  const thread = threadDouble()
+  const r = await rig({ thread, handlers: wakeHandlers() })
+  await r.begin()
+  await r.op(turn())
+  await r.clock.advance(4000)
+  assert.deepEqual(thread.wakes, [], "a busy session is not woken")
+  await r.op({ op: "start", wait_ms: 5000 })
+  await r.clock.advance(2000)
+  assert.equal(thread.wakes.length, 1, "after the start the wake poll reads the thread and goes on")
+})
+
+test("a session start does not clear an interrupt that was latched: the state stays stopped until a prompt", async () => {
+  const thread = threadDouble()
+  const r = await rig({ thread, handlers: wakeHandlers() })
+  await r.begin()
+  await r.op(turn())
+  await r.op({ op: "interrupt" })
+  assert.equal(r.receiver.state(), "stopped")
+  await r.op({ op: "start", wait_ms: 5000 })
+  assert.equal(r.receiver.state(), "stopped")
+  await r.clock.advance(30_000)
+  assert.deepEqual(thread.wakes, [], "a stopped session is not woken")
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: true, plan_mode: false })
+  await r.op(turn())
+  assert.equal(r.receiver.state(), "busy", "a prompt clears it")
+})
+
+test("a session start drops the Plan Mode hint that a dead turn left", async () => {
+  const r = await rig()
+  await r.begin()
+  await r.op(turn({ permission_mode: "plan" }))
+  assert.equal(r.receiver.state(), "plan")
+  await r.op({ op: "start", wait_ms: 5000 })
+  assert.equal(r.receiver.state(), "unknown")
+})
+
+// What a read showed is dropped by the start too, not only what the hooks set: until the next read the state is unknown.
+for (const [label, observation] of [
+  ["Plan Mode", { reason: "plan", observed: { status: "idle", stopped: false, plan: true } }],
+  ["an interrupted turn", { reason: "stopped", observed: { status: "idle", stopped: true, plan: null } }],
+]) {
+  test(`a session start drops the read that showed ${label}`, async () => {
+    const thread = threadDouble({ observation })
+    const r = await rig({ thread })
+    await idleSession(r)
+    await r.clock.advance(30_000)
+    assert.notEqual(r.receiver.state(), null)
+    assert.notEqual(r.receiver.state(), "unknown", "the read set the state")
+    await r.op({ op: "start", wait_ms: 5000 })
+    assert.equal(r.receiver.state(), "unknown", "the read did not survive the start")
+  })
+}
+
+test("a read that began before a session start is not kept", async () => {
+  let release
+  const thread = threadDouble({ observation: () => new Promise(resolve => { release = () => resolve(IDLE) }) })
+  const r = await rig({ thread })
+  await r.begin()
+  await r.op(turn())
+  await r.op({ op: "stop", permission_mode: "default" })
+  await r.clock.advance(30_000)
+  await r.op({ op: "start", wait_ms: 5000 })
+  release()
+  await settle()
+  assert.equal(r.receiver.state(), "unknown", "the stale read did not set the state the start reset")
 })
 
 test("an app-server that cannot be read leaves the hooks' state in place", async () => {

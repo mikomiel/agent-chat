@@ -118,7 +118,7 @@ or a stop.
 
 | Event | Command | Timeout | What it does |
 |---|---|---|---|
-| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it. |
+| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it. A start also resets what the earlier hooks left, as a fresh session starts: the read is dropped, the running state goes back to unknown and the Plan Mode hint is set from the start's own `permission_mode` (cleared when it has none), so a turn that died cannot leave the session `busy` for the heartbeat or block a wake. A local stop stays until a prompt clears it. |
 | `UserPromptSubmit` | `prompt` | 10 s | Reports the session busy, or in Plan Mode when `permission_mode` is `plan`, and clears a local stop. Then delivers a claimed batch as `additionalContext`. May start a missing receiver. |
 | `PostToolUse` | `tool` | 10 s | The same as `prompt`, between tool calls, without clearing a stop. Never starts a receiver. |
 | `Stop` | `stop` | 5 s | Reports the session idle. Prints nothing: Codex expects JSON or nothing from `Stop`, and a decision there would continue the turn. |
@@ -149,7 +149,7 @@ sends its request: it does not wait for the worker to end its instance.
   `idle` (`Stop`) and a stop (`Interrupt`). A missing or non-string
   `permission_mode` makes the state `unknown`. With `appServer` configured the
   receiver also reads the thread while nothing is known to run: its status
-  (`idle`, `active`, `notLoaded`), the status of its newest turn (`completed`
+  (`idle`, `active`, `notLoaded`; `systemError` is a documented loaded status that reads as unknown), the status of its newest turn (`completed`
   clears it, `inProgress` is busy, `interrupted` is stopped, and anything else
   is unknown), and its collaboration mode (`plan` or `default`, from
   `thread/resume` with `excludeTurns`). The read, when there is one, is the authority for Plan Mode
@@ -207,9 +207,12 @@ sends its request: it does not wait for the worker to end its instance.
   - With `appServer`, every worker start, the first join and each rejoin
     alike, waits for a positive check from a read taken for that start: a
     loaded thread with a complete record (an `ephemeral` flag, a `source` and a
-    model provider) that is not a child. A thread the app-server does not list
-    yet, a read that does not answer within 3 seconds, a read that fails and a
-    record that lacks one of those fields each mean no join yet, and so does a
+    model provider) and a documented loaded status (`idle`, `active` or
+    `systemError`) that is not a child. The `source` is documented as a
+    non-empty string or an object. A thread the app-server does not list yet, a
+    read that does not answer within 3 seconds, a read that fails, a record that
+    lacks one of those fields or has an empty or array `source`, and a status that is
+    absent or not one of those three each mean no join yet, and so does a
     complete record whose status is `notLoaded` (the thread left the loaded list
     between the list and the read). An answer that arrives after the 3 seconds
     is dropped and verifies nothing, and no earlier read counts for a later one:
@@ -351,9 +354,11 @@ already excluded.
    loaded threads (`thread/loaded/list`) and reads it (`thread/read`). A child
    thread refuses the session. The worker joins only once this bind's own reads
    show a loaded thread that is not a child and whose record is complete: an
-   `ephemeral` flag, a `source` and a model provider. A thread that is not
-   loaded yet or whose read says `notLoaded`, a read that fails, a record that
-   lacks one of those fields and a read that does not answer within 3 seconds
+   `ephemeral` flag, a `source` (a non-empty string or an object) and a model
+   provider, with a status that is `idle`, `active` or `systemError`. A thread
+   that is not loaded yet or whose read says `notLoaded`, a read that fails, a
+   record that lacks one of those fields or has an empty or array `source`, a status
+   that is absent or unknown, and a read that does not answer within 3 seconds
    mean no join yet, and the
    receiver asks again every 30 seconds. The provider recorded by an earlier
    bind, and an answer that arrives after the 3 seconds, never verify a later
@@ -405,8 +410,8 @@ already excluded.
    status of a finished turn). So a thread that has never had a turn is not woken
    until it has one: an empty list says nothing about the thread. The
    `thread/resume` answer is a record of its own and must be complete: this
-   thread's id, a status, the origin (`source`), the `ephemeral` flag and a model
-   provider. It must agree with the read and with the bound provider. An answer
+   thread's id, a status, the origin (`source`, a non-empty string or an object),
+   the `ephemeral` flag and a model provider. It must agree with the read and with the bound provider. An answer
    that shows the thread active, in Plan Mode, a child, or on another provider,
    that has a mode that is not `default` or `plan`, or that is missing, is
    another thread's, or lacks any of those fields, refuses the wake. The
@@ -512,10 +517,11 @@ exercised live.
   is not attached through `--remote` exposes a control socket is not
   confirmed. Without one there is no wake route: a message waits for the next
   turn.
-- **The thread record fields.** The join check needs `ephemeral` as a boolean
-  and `source` as a string or object, next to the model provider. They were
-  read from the generated protocol types, not from a live record. A release
-  that omits one of them leaves the receiver at no join, and chat stays off.
+- **The thread record fields.** The join check needs `ephemeral` as a boolean,
+  `source` as a non-empty string or an object, a status of `idle`, `active` or
+  `systemError`, and the model provider. They were read from the generated
+  protocol types, not from a live record. A release that omits one of them, or
+  reports another status, leaves the receiver at no join, and chat stays off.
 - **Experimental queue methods.** The queue methods need `experimentalApi`.
   Their behaviour, including the documented pause of the queue after an
   interrupted turn, was read from the app-server documentation, not run.
@@ -722,10 +728,15 @@ exercised live.
 - The worker runs the configured Python interpreter with `-I` and the state
   directory, as its canonical path, as its working directory and as the
   directory it keeps the binding file in.
-- The app-server client answers a server request with a method-not-found error
-  completes the upgrade only on a 101 answer with `Upgrade: websocket`, a `Connection`
+- The app-server client answers a server request with a method-not-found error.
+  It completes the upgrade only on an answer whose status line is `HTTP/1.1 101`
+  followed by a space or the end of the line, whose header lines are all
+  `name: value` with a token for a name, and whose whole head, terminator included,
+  is within 16 KiB. The answer needs `Upgrade: websocket`, a `Connection`
   header with the `Upgrade` token (any case) and the `Sec-WebSocket-Accept` proof,
-  and refuses an answer that names an extension or a subprotocol (none is offered). It
+  and it is refused if it names an extension or a subprotocol (none is offered). A
+  refused answer fails the connection as a protocol error before the client sends
+  `initialize` or anything else. It
   checks every server frame against RFC 6455 section 5 before it reads it. It
   refuses a frame with FIN=0 (fragmentation is not supported, so a continuation
   frame is refused too), an opcode that is not text, close, ping or pong (binary

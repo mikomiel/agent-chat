@@ -81,7 +81,7 @@ async function dispatch(name, { payload, config, where, io }) {
   const turn = event => ({ op: "turn", event, permission_mode: mode, patience_ms: PATIENCE_MS, owner_pid: owner })
   switch (name) {
     case "session-start":
-      return converse(await open(4_000), "SessionStart", { op: "start", wait_ms: 5_000, owner_pid: owner }, 8_000, io)
+      return converse(await open(4_000), "SessionStart", { op: "start", wait_ms: 5_000, owner_pid: owner, permission_mode: mode }, 8_000, io)
     case "prompt": return converse(await open(2_500), "UserPromptSubmit", turn("prompt"), 7_500, io)
     case "tool": return converse(await open(0), "PostToolUse", turn("tool"), 7_500, io)
     case "stop": return quiet(await open(0), { op: "stop", permission_mode: mode }, 3_500)

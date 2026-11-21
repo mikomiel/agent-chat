@@ -98,15 +98,26 @@ test("session start prints the binding as additionalContext and acknowledges onl
     hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: "Agent Chat is available to this session." },
   })
   assert.equal(result.stdout.length, 1, "one JSON object, written once")
-  assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000, owner_pid: 100 }])
+  assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000, owner_pid: 100, permission_mode: "default" }])
   assert.deepEqual(result.sent, [{ op: "done", outcome: "written" }])
   assert.deepEqual(result.log, ["call:start", "write:start", "write:end", "send:done", "close"])
+})
+
+test("a SessionStart without a permission mode starts with none", async () => {
+  const { permission_mode: _, ...bare } = base
+  const result = await run("session-start", { ...bare, hook_event_name: "SessionStart", source: "resume" }, { reply: { context: "binding", ack: true } })
+  assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000, owner_pid: 100, permission_mode: undefined }])
+})
+
+test("a SessionStart that resumes in Plan Mode passes the mode", async () => {
+  const result = await run("session-start", { ...base, hook_event_name: "SessionStart", source: "resume", permission_mode: "plan" }, { reply: { context: "binding", ack: true } })
+  assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000, owner_pid: 100, permission_mode: "plan" }])
 })
 
 test("every SessionStart source is the same start event", async () => {
   for (const source of ["startup", "resume", "clear", "compact", "fork"]) {
     const result = await run("session-start", { ...base, hook_event_name: "SessionStart", source }, { reply: { context: "binding", ack: true } })
-    assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000, owner_pid: 100 }], source)
+    assert.deepEqual(result.calls, [{ op: "start", wait_ms: 5000, owner_pid: 100, permission_mode: "default" }], source)
     assert.equal(json(result.stdout).hookSpecificOutput.hookEventName, "SessionStart", source)
   }
 })

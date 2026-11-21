@@ -492,6 +492,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   async function onStart(request, link) {
+    // A start, whatever its source (resume, clear, compaction), is a new view of the session: the running state and the Plan Mode
+    // hint that the earlier hooks left, maybe from a turn that died, say nothing about it. It is reset as in a fresh session and
+    // the read is dropped; a local stop is not touched, since only a prompt clears it. The next hook or read sets the state again.
+    setNative(request, "unknown")
     await within(attempted, clamp(request.wait_ms, 10_000))
     if (failure) return link.send(disabledReply())
     // A start event always announces: a compaction or resume may have dropped the earlier text.

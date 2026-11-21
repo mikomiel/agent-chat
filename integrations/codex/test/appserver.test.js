@@ -80,25 +80,53 @@ test("a handshake whose accept proof is wrong, and a socket nobody listens on, a
   await assert.rejects(openAppServer(join(dir, "absent.sock")), error => ["ENOENT", "APP_SERVER_CLOSED"].includes(error.code))
 })
 
-// RFC 6455 section 4.1: the 101 answer must carry `Upgrade: websocket` and a `Connection` header with the Upgrade token, in any
-// case and in any of its repeats, and the client offered no extension and no subprotocol, so an answer that names one is refused.
+// The upgrade answer is checked whole before anything is sent: HTTP/1.1 101 (the code, then a space or the end of the line), every
+// header line `name: value` with a token for a name, the whole head within 16 KiB, terminator included, `Upgrade: websocket` and a
+// `Connection` header with the Upgrade token (any case, any repeat) as RFC 6455 section 4.1 wants, and the Accept proof. The client
+// offered no extension and no subprotocol, so an answer that names one is refused. A refusal writes no `initialize`.
+// `sized` builds the header lines that make the whole head exactly `total` bytes, as the fake server writes it.
+const sized = total => lines => {
+  const base = ["HTTP/1.1 101 Switching Protocols", ...lines, "X-Pad: ", "", ""].join("\r\n").length
+  return [...lines, `X-Pad: ${"a".repeat(total - base)}`]
+}
 const dropping = prefix => lines => lines.filter(line => !line.toLowerCase().startsWith(prefix))
 const replacing = (prefix, ...added) => lines => [...dropping(prefix)(lines), ...added]
-for (const [label, headers, accepted] of [
-  ["the headers the client expects", lines => lines, true],
-  ["Upgrade and Connection in another case", lines => [...dropping("upgrade:")(dropping("connection:")(lines)), "UPGRADE: WebSocket", "connection: UPGRADE"], true],
-  ["Connection with the Upgrade token among others", replacing("connection:", "Connection: keep-alive, Upgrade"), true],
-  ["Connection repeated, the Upgrade token in the second", replacing("connection:", "Connection: keep-alive", "Connection: Upgrade"), true],
-  ["no Upgrade header", dropping("upgrade:"), false],
-  ["Upgrade naming another protocol", replacing("upgrade:", "Upgrade: h2c"), false],
-  ["Upgrade naming websocket among others", replacing("upgrade:", "Upgrade: websocket, h2c"), false],
-  ["no Connection header", dropping("connection:"), false],
-  ["Connection without the Upgrade token", replacing("connection:", "Connection: keep-alive"), false],
-  ["Connection naming the token only as part of another", replacing("connection:", "Connection: upgrade-insecure"), false],
-  ["an extension in the answer", lines => [...lines, "Sec-WebSocket-Extensions: permessage-deflate"], false],
-  ["an empty extensions header", lines => [...lines, "Sec-WebSocket-Extensions:"], false],
-  ["a subprotocol in the answer", lines => [...lines, "Sec-WebSocket-Protocol: chat"], false],
-  ["an empty subprotocol header", lines => [...lines, "Sec-WebSocket-Protocol:"], false],
+for (const [label, options, accepted] of [
+  ["the headers the client expects", { headers: lines => lines }, true],
+  ["Upgrade and Connection in another case", { headers: lines => [...dropping("upgrade:")(dropping("connection:")(lines)), "UPGRADE: WebSocket", "connection: UPGRADE"] }, true],
+  ["Connection with the Upgrade token among others", { headers: replacing("connection:", "Connection: keep-alive, Upgrade") }, true],
+  ["Connection repeated, the Upgrade token in the second", { headers: replacing("connection:", "Connection: keep-alive", "Connection: Upgrade") }, true],
+  ["no Upgrade header", { headers: dropping("upgrade:") }, false],
+  ["Upgrade naming another protocol", { headers: replacing("upgrade:", "Upgrade: h2c") }, false],
+  ["Upgrade naming websocket among others", { headers: replacing("upgrade:", "Upgrade: websocket, h2c") }, false],
+  ["no Connection header", { headers: dropping("connection:") }, false],
+  ["Connection without the Upgrade token", { headers: replacing("connection:", "Connection: keep-alive") }, false],
+  ["Connection naming the token only as part of another", { headers: replacing("connection:", "Connection: upgrade-insecure") }, false],
+  ["an extension in the answer", { headers: lines => [...lines, "Sec-WebSocket-Extensions: permessage-deflate"] }, false],
+  ["an empty extensions header", { headers: lines => [...lines, "Sec-WebSocket-Extensions:"] }, false],
+  ["a subprotocol in the answer", { headers: lines => [...lines, "Sec-WebSocket-Protocol: chat"] }, false],
+  ["an empty subprotocol header", { headers: lines => [...lines, "Sec-WebSocket-Protocol:"] }, false],
+  ["a header with token characters in its name and colons in its value", { headers: lines => [...lines, "X-A_b.c~1!#$%&'*+^`|: 12:30:45"] }, true],
+  ["no space after the colon", { headers: replacing("upgrade:", "Upgrade:websocket") }, true],
+  ["a status line that is only 101", { status: "HTTP/1.1 101" }, true],
+  ["a head of exactly 16 KiB, terminator included", { headers: sized(16 * 1024) }, true],
+  ["a head one byte over 16 KiB, terminator in the same piece", { headers: sized(16 * 1024 + 1) }, false],
+  ["a line with no colon", { headers: lines => [...lines, "X-Broken"] }, false],
+  ["a malformed line before the upgrade headers", { headers: lines => ["X-Broken", ...lines] }, false],
+  ["a name with a space in it", { headers: lines => [...lines, "X Bad: 1"] }, false],
+  ["an empty name", { headers: lines => [...lines, ": value"] }, false],
+  ["a continuation line", { headers: lines => [...lines, " continued"] }, false],
+  ["a name with a character that is not a token character", { headers: lines => [...lines, "X(Bad): 1"] }, false],
+  ["a line break that is only LF", { headers: lines => [...lines, "X-A: 1\nX-B: 2"] }, false],
+  ["a bare CR in a line", { headers: lines => [...lines, "X-A: 1\rX-B: 2"] }, false],
+  ["101 followed by a hyphen", { status: "HTTP/1.1 101-x" }, false],
+  ["101 followed by a tab", { status: "HTTP/1.1 101\tx" }, false],
+  ["a status code of 1010", { status: "HTTP/1.1 1010 x" }, false],
+  ["a status of 100", { status: "HTTP/1.1 100 Continue" }, false],
+  ["HTTP/1.0", { status: "HTTP/1.0 101 Switching Protocols" }, false],
+  ["a lower case protocol name", { status: "http/1.1 101 Switching Protocols" }, false],
+  ["two spaces before the code", { status: "HTTP/1.1  101 x" }, false],
+  ["a space before the protocol name", { status: " HTTP/1.1 101 x" }, false],
 ]) {
   test(`the upgrade answer is ${accepted ? "accepted" : "refused as APP_SERVER_PROTOCOL"} with ${label}`, async () => {
     await withServer(main(), async (path, server) => {
@@ -108,9 +136,9 @@ for (const [label, headers, accepted] of [
         link.close()
       } else {
         await assert.rejects(openAppServer(path), { code: "APP_SERVER_PROTOCOL" })
-        assert.equal(server.log.length, 0, "nothing was sent after the refused answer")
+        assert.equal(server.log.length + server.state.initialized, 0, "no initialize and nothing else was sent after the refused answer")
       }
-    }, { headers })
+    }, options)
   })
 }
 

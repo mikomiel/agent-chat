@@ -21,6 +21,11 @@ import { trustedSocket } from "./trust.js"
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 const MAX_HEAD = 16 * 1024
+// The status line of the upgrade answer: exactly 101, so 1010 and 101-x are not it. The reason phrase is free.
+const STATUS_LINE = /^HTTP\/1\.1 101(?: |$)/
+// A header field line: a token for a name (the characters of RFC 9110 section 5.6.2), a colon, and a value. A line with no colon, a name
+// with a space in it, a continuation line and a bare CR or LF in a line do not match.
+const FIELD = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*(.*?)[ \t]*$/
 const MAX_FRAME = 4 * 1024 * 1024
 const REQUEST_MS = 3_000
 const CONNECT_MS = 2_000
@@ -232,15 +237,19 @@ export function openAppServer(path, { createConnection = net.createConnection, c
       buffer = Buffer.concat([buffer, chunk])
       if (!upgraded) {
         const end = buffer.indexOf("\r\n\r\n")
-        if (end < 0) { if (buffer.length > MAX_HEAD) fail("APP_SERVER_PROTOCOL"); return }
+        // The limit is on the whole head, terminator included, whether or not the terminator has come yet.
+        if ((end < 0 ? buffer.length : end + 4) > MAX_HEAD) return fail("APP_SERVER_PROTOCOL")
+        if (end < 0) return
         const head = buffer.subarray(0, end).toString("latin1").split("\r\n")
         buffer = buffer.subarray(end + 4)
-        // Every header of that name, as a list: a list-valued header may repeat.
-        const values = name => head.slice(1).filter(line => line.toLowerCase().startsWith(`${name}:`)).map(line => line.slice(name.length + 1).trim())
+        // Every line after the status line must be `name: value` with a token for a name (RFC 9110 sections 5.1 and 5.6.2), or the
+        // answer is not an HTTP response this client reads. A header may repeat, so a name has a list of values.
+        const fields = head.slice(1).map(line => FIELD.exec(line))
+        const values = name => fields.filter(field => field?.[1].toLowerCase() === name).map(field => field[2])
         // RFC 6455 section 4.1: the answer must name the protocol and the connection. Nothing was offered, so an extension or
         // a subprotocol in it is a protocol failure.
         const tokens = values("connection").flatMap(value => value.toLowerCase().split(",").map(token => token.trim()))
-        if (!/^HTTP\/1\.1 101\b/.test(head[0]) || values("sec-websocket-accept").join(",") !== accept
+        if (!STATUS_LINE.test(head[0]) || fields.includes(null) || values("sec-websocket-accept").join(",") !== accept
           || values("upgrade").join(",").toLowerCase() !== "websocket" || !tokens.includes("upgrade")
           || values("sec-websocket-extensions").length > 0 || values("sec-websocket-protocol").length > 0) return fail("APP_SERVER_PROTOCOL")
         upgraded = true
@@ -269,10 +278,16 @@ const childSource = source => source === "exec" ||
 export const isChildThread = thread =>
   thread.parentThreadId != null || thread.agentRole != null || thread.ephemeral === true || childSource(thread.source)
 
+// An origin shows as a non-empty string ("cli", "vscode") or as an object (a sub-agent's is `{ subAgent }`). An empty string, an
+// array, a number or nothing is no origin.
+const hasOrigin = source => (typeof source === "string" && source !== "") || (source !== null && typeof source === "object" && !Array.isArray(source))
+
 // Whether a thread record can show that the thread is a main one. Not being a child is not enough: a record without
 // its origin (`source`) or its `ephemeral` flag says nothing about either, so it proves nothing.
-const isCompleteRecord = thread =>
-  typeof thread.ephemeral === "boolean" && (typeof thread.source === "string" || (thread.source !== null && typeof thread.source === "object"))
+const isCompleteRecord = thread => typeof thread.ephemeral === "boolean" && hasOrigin(thread.source)
+
+// The statuses that a loaded thread documents. A bind accepts these and nothing else: no status, or one that is not known, proves nothing.
+const LOADED_STATUS = new Set(["idle", "active", "systemError"])
 
 const STATUS = Object.assign(Object.create(null), { idle: "idle", active: "busy", notLoaded: "offline" }) // no prototype: `constructor` is not a status
 // The status a record shows, in this package's words: "unknown" for anything that is not a known status. The type must be a
@@ -398,8 +413,9 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
       return info.isSocket() && info.uid === process.geteuid() && (info.dev !== probed.dev || info.ino !== probed.ino)
     },
 
-    // Check the thread before the receiver joins: it must be loaded, its record must be complete, it must not be a
-    // child, and it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in
+    // Check the thread before the receiver joins: it must be loaded with a documented status (idle, active or systemError),
+    // its record must be complete (a documented origin, the `ephemeral` flag, a model provider), it must not be a child, and
+    // it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in
     // "bound", "unprobed" and "stale_binding"; nothing recorded by an earlier call counts.
     // status: "bound" | "unprobed" | "child" | "unloaded" | "stale_binding" | "unavailable" | "untrusted"
     //   unprobed - a main thread, but the queue probe did not finish: the route stays undecided and the next bind probes again.
@@ -420,7 +436,7 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
           if (expired()) return { status: "unavailable" }
           if (isChildThread(thread)) return { status: "child" }
           if (thread.status?.type === "notLoaded") return { status: "unloaded" }
-          if (!isCompleteRecord(thread)) return { status: "unavailable" }
+          if (!isCompleteRecord(thread) || !LOADED_STATUS.has(thread.status?.type)) return { status: "unavailable" }
           if (typeof thread.modelProvider !== "string" || !thread.modelProvider) return { status: "unavailable" }
           if (provider !== null && provider !== thread.modelProvider) return { status: "stale_binding" }
           onRead?.()

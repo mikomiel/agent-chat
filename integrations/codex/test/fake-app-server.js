@@ -30,9 +30,9 @@ function clientFrame(buffer) {
   return { opcode: buffer[0] & 0x0f, masked, payload, size: offset + length }
 }
 
-// handler(message, connection) returns { result } or { error } to reply, or nothing to stay silent. `headers` rewrites the
-// header lines of the 101 answer (a list of "Name: value" strings) before they are sent.
-export async function fakeAppServer(path, handler, { accept = true, initialize = true, headers = lines => lines } = {}) {
+// handler(message, connection) returns { result } or { error } to reply, or nothing to stay silent. `status` replaces the status
+// line of the upgrade answer, and `headers` rewrites its header lines (a list of "Name: value" strings) before they are sent.
+export async function fakeAppServer(path, handler, { accept = true, initialize = true, status = "HTTP/1.1 101 Switching Protocols", headers = lines => lines } = {}) {
   const log = []
   const heads = []
   const state = { connections: 0, open: 0, closes: 0, unmasked: 0, initialized: 0, pongs: [], replies: [], current: null }
@@ -55,7 +55,7 @@ export async function fakeAppServer(path, handler, { accept = true, initialize =
         heads.push(text)
         const key = /sec-websocket-key:\s*(\S+)/i.exec(text)?.[1]
         const proof = createHash("sha1").update(`${key}${GUID}`).digest("base64")
-        socket.write(["HTTP/1.1 101 Switching Protocols", ...headers(["Upgrade: websocket", "Connection: Upgrade",
+        socket.write([status, ...headers(["Upgrade: websocket", "Connection: Upgrade",
           `Sec-WebSocket-Accept: ${accept ? proof : "wrong"}`]), "", ""].join("\r\n"))
         upgraded = true
       }
