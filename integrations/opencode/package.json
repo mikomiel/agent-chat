@@ -1,0 +1,20 @@
+{
+  "name": "agent-chat-opencode",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenCode plugin for Agent Chat: native join, busy-session delivery and bounded rejoin over the product's worker protocol.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "keywords": ["opencode-plugin", "agent-chat"],
+  "main": "./plugin/agent-chat.js",
+  "exports": {
+    ".": "./plugin/agent-chat.js",
+    "./plugin/agent-chat.js": "./plugin/agent-chat.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}

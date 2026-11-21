@@ -13,9 +13,10 @@ supplies native eligibility, delivery, binding context and wake behavior.
 | Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
 | Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
+| OpenCode | [`opencode/`](opencode/) | Source present; live run pending |
 | Codex | — | Planned; follows the same pattern |
 
-OpenCode and Vibe are outside the initial admission set.
+Vibe is outside the initial admission set.
 
 ## Compatibility
 
@@ -27,6 +28,7 @@ implied by a nearby version.
 |---|---|---|---|
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
+| `agent-chat-opencode` 0.1.0 | OpenCode server plugin: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.synthetic` (`delivery: "steer"`, `resume: false`), `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.execution.*`, `session.inbox.*`, `session.agent.selected`, `session.compaction.*`, `session.created`/`deleted`/`forked` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
@@ -99,5 +101,10 @@ node --test
 
 ```sh
 cd integrations/claude-code
+node --test
+```
+
+```sh
+cd integrations/opencode
 node --test
 ```

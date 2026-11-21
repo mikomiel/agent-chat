@@ -1,0 +1,168 @@
+// One manager per OpenCode server process: it turns the plugin event stream into one delivery object and one
+// lifecycle per root session.
+//
+// ROOT SESSIONS ONLY. A session joins only when `session.get` shows no `parentID` and no `fork`. A subagent runs
+// only in a child session and a child has a `parentID`. Whether a fork sets `parentID` is not confirmed, so a fork
+// is refused too: when in doubt a session stays out. A parent pointer is not trusted as a root test either way.
+//
+// ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
+// rejection there disables chat for that session only. A session that faulted or was deleted never rejoins in this
+// process, so a worker that is still ending is never raced by a second join.
+import { describeFailure } from "./worker.js"
+
+// The events the manager reads. Session events of other kinds, such as every tool call, are never subscribed to.
+export const EVENT_TYPES = Object.freeze([
+  "session.created", "session.deleted", "session.forked", "session.agent.selected",
+  "session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted",
+  "session.inbox.enqueued", "session.inbox.delivered", "session.inbox.cancelled",
+  "session.compaction.started", "session.compaction.ended", "session.compaction.failed",
+])
+
+const RETRY_LOOKUP_MS = 60_000
+const MAX_REFUSED = 1024
+
+// A root session has no parent and no fork source. Anything else, and anything unreadable, is not a root.
+export function isRootSession(info, sessionID) {
+  if (info === null || typeof info !== "object" || info.id !== sessionID) return false
+  return (info.parentID === undefined || info.parentID === null) && (info.fork === undefined || info.fork === null)
+}
+
+export function createManager(ctx, config, parts, {
+  now = Date.now,
+  notice = () => {},
+} = {}) {
+  const records = new Map() // session id -> { id, delivery, lifecycle, chain, dead, closing }
+  const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
+  let active = true
+
+  const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
+
+  function refuse(id, until) {
+    refused.delete(id)
+    refused.set(id, until)
+    while (refused.size > MAX_REFUSED) refused.delete(refused.keys().next().value)
+  }
+
+  function isRefused(id) {
+    const until = refused.get(id)
+    if (until === undefined) return false
+    if (until > now()) return true
+    refused.delete(id)
+    return false
+  }
+
+  // Ends one session's chat. The lifecycle stops first: it queues the removal of the binding entry and proves the
+  // worker's end. The delivery is disposed afterwards so a pending input settles as uncertain, never as handed.
+  function dispose(record) {
+    if (record.closing) return record.closing
+    record.dead = true
+    records.delete(record.id)
+    let ended
+    try { ended = record.lifecycle ? Promise.resolve(record.lifecycle.stop()) : Promise.resolve({ code: 0 }) }
+    catch { ended = Promise.resolve(null) }
+    try { record.delivery?.dispose() } catch { /* the object is already latched */ }
+    record.closing = ended.then(result => result?.code === 0, () => false)
+    return record.closing
+  }
+
+  // One session's fault ends that session's chat, nothing else.
+  function isolate(record, error) {
+    refuse(record.id, Infinity)
+    notice(`chat disabled for one session (${describeFailure(error)})`)
+    void dispose(record)
+  }
+
+  async function start(record, first) {
+    if (!active || record.dead) return
+    if (first?.type === "session.created" && first.data?.parentID !== undefined && first.data?.parentID !== null) {
+      refuse(record.id, Infinity)
+      records.delete(record.id)
+      record.dead = true
+      return
+    }
+    let info
+    try { info = await ctx.session.get({ sessionID: record.id }) }
+    catch {
+      // A lookup that fails is not proof of a child: ask again later, not on every event.
+      refuse(record.id, now() + RETRY_LOOKUP_MS)
+      records.delete(record.id)
+      record.dead = true
+      return
+    }
+    if (!active || record.dead) return
+    if (!isRootSession(info, record.id)) {
+      refuse(record.id, Infinity)
+      records.delete(record.id)
+      record.dead = true
+      return
+    }
+    const handlers = new Map()
+    const bus = { on(name, fn) { handlers.set(name, [...(handlers.get(name) ?? []), fn]) } }
+    record.fire = (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload) }
+    record.delivery = parts.createDelivery(ctx, record.id)
+    record.delivery.seed(info)
+    record.lifecycle = parts.createLifecycle(bus, record.delivery, config, {
+      startProcess: parts.startProcess,
+      notice: text => notice(String(text)),
+    })
+    record.fire("session_start", { nativeSessionId: record.id })
+  }
+
+  function handle(record, event) {
+    if (!active || record.dead || !record.delivery) return
+    if (event.type === "session.deleted") {
+      refuse(record.id, Infinity)
+      void dispose(record)
+      return
+    }
+    if (event.type === "session.forked") {
+      // This session is a fork: never a root, even if it was looked up as one before the event arrived.
+      refuse(record.id, Infinity)
+      void dispose(record)
+      return
+    }
+    if (record.delivery.observe(event)) record.fire("state_changed", {})
+    if (event.type === "session.compaction.ended") {
+      // A compaction may drop the entry. Put it back or turn this session's chat off: no entry, no chat.
+      record.delivery.verifyContext().catch(error => {
+        try { void record.lifecycle.disable(describeFailure(error)) } catch { /* already latched */ }
+      })
+    }
+  }
+
+  function feed(event) {
+    if (!active) return
+    const id = sessionOf(event)
+    if (id === null || isRefused(id)) return
+    let record = records.get(id)
+    if (!record) {
+      record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
+      records.set(id, record)
+      const first = event
+      record.chain = record.chain.then(() => start(record, first)).catch(error => isolate(record, error))
+    }
+    const current = record
+    current.chain = current.chain.then(() => handle(current, event)).catch(error => isolate(current, error))
+  }
+
+  // The event stream broke or restarted: events may be missing, so every observation is stale.
+  function reset() {
+    for (const record of [...records.values()]) {
+      record.chain = record.chain.then(() => {
+        if (record.dead || !record.delivery) return
+        record.delivery.reset()
+        record.fire("state_changed", {})
+      }).catch(error => isolate(record, error))
+    }
+  }
+
+  // Ends every session. Resolves true only when every worker end is proved.
+  async function stop() {
+    active = false
+    const pending = [...records.values()].map(record => record.chain.then(() => dispose(record), () => dispose(record)))
+    const results = await Promise.all(pending)
+    return results.every(proved => proved === true)
+  }
+
+  return { feed, reset, stop, sessions: () => [...records.keys()] }
+}
