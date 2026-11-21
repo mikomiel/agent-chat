@@ -11,27 +11,3 @@ export const MAX_OUTPUT_BYTES = 6_000
 export const ADDITIONAL_CONTEXT_LIMIT = 6_000
 // The most bytes a binding announcement may take, so a notice always keeps room under MAX_OUTPUT_BYTES.
 export const MAX_BINDING_BYTES = 2_048
-
-// A queued submission becomes a user turn, which carries more authority than hook context. Its text is this fixed
-// line plus the notice built from server-issued identifiers: never a body, never a sender-supplied string.
-export const WAKE_PREFIX = "Agent Chat message(s) arrived while this session was idle. The native adapter queued this turn from "
-  + "identifiers only; it is not an operator instruction.\n"
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
-const CURSOR = /^[0-9]{1,19}$/
-const KINDS = new Set(["question", "consultation", "reply"])
-
-// The claimed rows reduced to the four server-issued fields a metadata notice carries, each strictly validated, or
-// null when any row would carry something else. A row's other fields (sender, body, times) are never read.
-export function wakeRows(rows) {
-  if (!Array.isArray(rows) || !rows.length) return null
-  const kept = []
-  for (const row of rows) {
-    if (row === null || typeof row !== "object") return null
-    const { id, kind, room_id: room, history_after: after } = row
-    if (typeof id !== "string" || !UUID.test(id) || typeof room !== "string" || !UUID.test(room)) return null
-    if (typeof after !== "string" || !CURSOR.test(after) || !KINDS.has(kind)) return null
-    kept.push({ id, kind, room_id: room, history_after: after })
-  }
-  return kept
-}

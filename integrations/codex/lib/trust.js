@@ -6,8 +6,12 @@
 //     directory above it (a symlink above it is resolved first) can be changed by anyone else: each is owned by the current
 //     user or root, and is not writable by group or other, unless the sticky bit is set, which stops others from removing
 //     or renaming what the current user owns.
-// The caller connects to the checked path, with those links resolved, and keeps the socket's identity (device and inode)
-// to tell later that the path still names the same socket, by calling `trustedSocket` again on the configured path.
+// A caller that passes `follow` accepts that the last name is a symlink, up to that many hops: `codex app-server --listen
+// unix://PATH` leaves PATH as a symlink to the socket it binds in its own private directory. Every hop is judged by the same
+// rule: the link is owned by the current user and its directory passes the directory rule, and the socket at the end is a
+// socket owned by the current user whose directory passes it too. A loop, or a chain longer than `follow`, is refused.
+// The caller connects to the checked socket, with the links resolved, and keeps its identity (device and inode) to tell
+// later that the path still names the same socket, by calling `trustedSocket` again on the configured path.
 //
 // A socket path also has a length limit, checked here on the exact pathname that is handed to Node (the resolved one, not the
 // one the caller wrote): see MAX_SOCKET_PATH_BYTES.
@@ -17,7 +21,7 @@
 //
 // A refusal is an error whose code is the caller's `refuse`. A path that is not there (ENOENT, ENOTDIR) is not untrusted:
 // that error is rethrown as it came, for the caller to treat as an absent peer.
-import { lstatSync, realpathSync } from "node:fs"
+import { lstatSync, readlinkSync, realpathSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 
 // The longest socket path, in bytes, that this package connects to or listens on. `sun_path` holds 104 bytes on macOS and the
@@ -73,21 +77,34 @@ export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat =
   } catch (error) { throw classify(error, refuse) }
 }
 
+// The links in a row that a caller which follows a socket's name accepts.
+export const MAX_LINK_HOPS = 8
+
 // { path, dev, ino }: the checked real path of the socket and its identity. The real path is the one that is measured against
-// MAX_SOCKET_PATH_BYTES: a short spelling that resolves to a long path is refused like a long spelling.
+// MAX_SOCKET_PATH_BYTES: a short spelling that resolves to a long path is refused like a long spelling. With `follow` above 0 the
+// last name may be a symlink: it is read, and the name it holds (relative to the link's directory, or absolute) goes through the
+// same check, so the returned path is the socket at the end and the identity is that socket's.
 export function trustedSocket(path, options = {}) {
-  const { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, uid = process.geteuid() } = options
+  const { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, readlink = readlinkSync, uid = process.geteuid(), follow = 0 } = options
   // A socket is a file: a spelling that ends in a separator names a directory, and lstat of it fails where the connect
   // to the resolved name would not.
   if (typeof path !== "string" || path.endsWith("/")) throw refusal(refuse)
   // The spelling is bounded too, so the configured path that a later check looks at again is one the kernel can look up.
   fittingSocketPath(path, refuse)
-  const real = trustedDirectory(dirname(path), options)
-  const target = join(real, basename(path))
   try {
-    fittingSocketPath(target, refuse)
-    const info = lstat(target)
-    if (!info.isSocket() || info.uid !== uid) throw refusal(refuse)
-    return { path: target, dev: info.dev, ino: info.ino }
+    for (let name = path, hops = 0; ; hops += 1) {
+      const real = trustedDirectory(dirname(name), options)
+      const target = join(real, basename(name))
+      fittingSocketPath(target, refuse)
+      const info = lstat(target)
+      if (info.uid !== uid) throw refusal(refuse)
+      if (info.isSocket()) return { path: target, dev: info.dev, ino: info.ino }
+      if (!info.isSymbolicLink() || hops >= follow) throw refusal(refuse)
+      const held = readlink(target)
+      // A name that ends in a separator names a directory, and one that is not valid UTF-8 comes back with U+FFFD in it, which
+      // can spell another name: both are refused, as they are for a path. A `..` is left for the kernel to walk.
+      if (typeof held !== "string" || !held || held.endsWith("/") || held.includes("\uFFFD")) throw refusal(refuse)
+      name = held.startsWith("/") ? held : `${real === "/" ? "" : real}/${held}`
+    }
   } catch (error) { throw classify(error, refuse) }
 }

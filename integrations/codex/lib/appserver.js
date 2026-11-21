@@ -1,31 +1,34 @@
-// The receiver's view of one Codex thread through the app-server control socket, and the idle wake.
+// The receiver's view of one Codex thread through the app-server control socket.
 //
 // The app-server speaks JSON-RPC over a WebSocket. A control socket is a Unix socket, so this is a minimal RFC 6455
-// client over node:net: one HTTP Upgrade, which the answer must complete (101, Upgrade: websocket, a Connection header with the
-// Upgrade token, the Accept proof, and no extension or subprotocol, none being offered), masked client text frames, and server
-// frames that are whole and unfragmented (text, close, ping, pong) without reserved bits (no extension is negotiated), with the
-// shortest form of the length, UTF-8 text and control frames of at most 125 bytes; ping is answered with pong. It owns the wire,
-// the thread reads and the add-then-delete fence. It owns no chat policy: the receiver decides when to read and what a
-// refusal means, and settles the claim.
+// client over node:net: one HTTP Upgrade, which the answer must complete (a 101 status line, header lines of the form
+// `name: value`, Upgrade: websocket, a Connection header with the Upgrade token, the Accept proof, and no extension or
+// subprotocol, none being offered), masked client text frames, and server frames that are whole and unfragmented (text,
+// close, ping, pong) without reserved bits (no extension is negotiated), with the shortest form of the length, UTF-8 text
+// and control frames of at most 125 bytes; ping is answered with pong. It owns the wire and the thread reads. It owns no
+// chat policy: the receiver decides when to read and what a refusal means.
 //
-// Every operation opens its own connection and closes it. A connection that called thread/resume is subscribed to
-// the thread's events, so it must not outlive the read. The wake is the one operation with two: one for the add, one for
-// the reading before it. Methods named here are the documented ones: thread/read,
-// thread/loaded/list, thread/turns/list, thread/items/list, thread/resume with excludeTurns, and the experimental
-// thread/queue/add and thread/queue/delete, which need capabilities.experimentalApi at initialize.
-import { createHash, randomBytes, randomUUID } from "node:crypto"
+// Every operation opens its own connection and closes it. A connection that called thread/resume is subscribed to the
+// thread's events, so it must not outlive the read. Methods named here are thread/loaded/list, thread/read,
+// thread/resume with excludeTurns (for the collaboration mode) and thread/turns/list; the thread/* methods are
+// experimental, so `initialize` declares capabilities.experimentalApi. Nothing here sends a turn or changes the thread.
+import { createHash, randomBytes } from "node:crypto"
 import { lstatSync, readFileSync } from "node:fs"
 import net from "node:net"
 import { performance } from "node:perf_hooks"
-import { trustedSocket } from "./trust.js"
+import { MAX_LINK_HOPS, trustedSocket } from "./trust.js"
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 const MAX_HEAD = 16 * 1024
-// The status line of the upgrade answer: exactly 101, so 1010 and 101-x are not it. The reason phrase is free.
-const STATUS_LINE = /^HTTP\/1\.1 101(?: |$)/
-// A header field line: a token for a name (the characters of RFC 9110 section 5.6.2), a colon, and a value. A line with no colon, a name
-// with a space in it, a continuation line and a bare CR or LF in a line do not match.
-const FIELD = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*(.*?)[ \t]*$/
+// The whole status line of the upgrade answer: HTTP/1.1 and exactly 101, then nothing, or a space and a reason phrase of visible
+// ASCII, spaces and tabs. So 1010, 101-x, a tab after the code and a control byte anywhere in the line are not it.
+const STATUS_LINE = /^HTTP\/1\.1 101(?: [\t\x20-\x7e]*)?$/
+// A header field line: a token for a name (the characters of RFC 9110 section 5.6.2), a colon, optional spaces and tabs, a value,
+// optional spaces and tabs. The value holds tabs, visible ASCII, spaces and bytes from 0x80 up (RFC 9110 section 5.5), and no
+// control byte: NUL, the rest of C0 (a bare CR or LF included) and DEL are refused. A line with no colon, a name with a space in
+// it and a continuation line do not match. Only SP and HTAB are ever trimmed, never what String.trim would take.
+const FIELD = /^([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([\t\x20-\x7e\x80-\xff]*?)[ \t]*$/
+const trimOws = text => text.replace(/^[ \t]+|[ \t]+$/g, "")
 const MAX_FRAME = 4 * 1024 * 1024
 const REQUEST_MS = 3_000
 const CONNECT_MS = 2_000
@@ -33,26 +36,11 @@ const CONNECT_MS = 2_000
 // in the release tarball), so release-please moving the package version moves this one too.
 const { version: PACKAGE_VERSION } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
 const CLIENT = { name: "agent-chat-codex", title: "Agent Chat", version: PACKAGE_VERSION }
-// The queue id prefix: the wake's client message id is this plus the attempt id.
-export const CLIENT_ID_PREFIX = "agent-chat:"
-// A wake is not started with less than this left of its reservation, after the settlement margin is taken off.
-export const MIN_ADD_MS = 500
-// The end of the reservation is for recording the result. Every request of a wake ends this long before it, so a slow
-// fence leaves the receiver time to settle `deferred` or `uncertain` instead of letting the claim expire.
-export const SETTLE_MS = 1_000
-// The queue probe is the last step of a bind, after the thread read. The receiver's time for the read ends when the bind
-// reports it done; the probe then has this long of its own. A probe that does not answer in time leaves the route
-// undecided and the bind `unprobed`: it never fails a bind whose read came in on time.
-const PROBE_MS = 1_000
-const CONFIRM_MS = 250
-const CONFIRM_MARGIN_MS = 300
-const PAGE = 20
 
 const failure = (code, extra = {}) => Object.assign(new Error(code), { code, ...extra })
 
-// The default clock of the receiver and of its thread. A reservation and the deadlines of a wake are durations, so an
-// adjustable wall clock must not move them: a step back would let a wake start after its reservation ran out. What is
-// compared with a file's mtime (lib/ipc.js) stays on `Date.now`.
+// The default clock of the receiver. A claim's reservation and the rejoin policy's waits are durations, so an adjustable
+// wall clock must not move them. What is compared with a file's mtime (lib/ipc.js) stays on `Date.now`.
 export const monotonic = () => performance.now()
 
 function encode(opcode, payload) {
@@ -112,28 +100,25 @@ function decode(buffer) {
   return { opcode, payload, text, size: offset + length }
 }
 
-// The control socket is the peer of every read and of the wake, so it passes the trust check of lib/trust.js before each
+// The control socket is the peer of every read, so it passes the trust check of lib/trust.js before each
 // connect, or the connect is refused with CHAT_APPSERVER_UNTRUSTED. A socket that is not there is not untrusted: that is the
-// closed app-server (`APP_SERVER_CLOSED`), and nothing is connected to.
+// closed app-server (`APP_SERVER_CLOSED`), and nothing is connected to. The configured path may be a symlink, as `codex
+// app-server --listen unix://PATH` leaves it (to a socket in its own private directory): the check follows it, and the connection
+// goes to the socket at the end.
 const UNTRUSTED = "CHAT_APPSERVER_UNTRUSTED"
 function trusted(path, lstat) {
-  try { return trustedSocket(path, { refuse: UNTRUSTED, lstat }) } catch (error) {
+  try { return trustedSocket(path, { refuse: UNTRUSTED, lstat, follow: MAX_LINK_HOPS }) } catch (error) {
     throw error?.code === "ENOENT" || error?.code === "ENOTDIR" ? failure("APP_SERVER_CLOSED") : error
   }
 }
 
 // A connected, upgraded and initialized app-server connection. `request` resolves with the JSON-RPC result and
-// rejects with { code: "APP_SERVER_ERROR", rpc } for an error reply, or a fixed local code.
-// `identity` is the checked socket the connection was made to (real path, dev, ino). `same()` says whether the configured
-// path still names it: the path is resolved again from its first name through the whole trust check, so a link in it that has
-// moved since, a replaced socket and any failure of the check all answer false, whatever the real path of the connection
-// still holds. `expect` is the identity of another connection that this one must reach too: a socket that has been
-// replaced since is refused as untrusted, before anything is connected to. `lstat` replaces the file system, for tests.
-export function openAppServer(path, { createConnection = net.createConnection, connectMs = CONNECT_MS, lstat = lstatSync, expect = null } = {}) {
+// rejects with { code: "APP_SERVER_ERROR", rpc } for an error reply, or a fixed local code. `lstat` replaces the file system
+// that the trust check looks at, for tests.
+export function openAppServer(path, { createConnection = net.createConnection, connectMs = CONNECT_MS, lstat = lstatSync } = {}) {
   return new Promise((resolve, reject) => {
     let identity
     try { identity = trusted(path, lstat) } catch (error) { return reject(error) }
-    if (expect !== null && (identity.dev !== expect.dev || identity.ino !== expect.ino)) return reject(failure(UNTRUSTED))
     const socket = createConnection(identity.path)
     const key = randomBytes(16).toString("base64")
     const accept = createHash("sha1").update(key + GUID).digest("base64")
@@ -212,13 +197,6 @@ export function openAppServer(path, { createConnection = net.createConnection, c
     }
 
     const client = {
-      identity,
-      same: () => {
-        try {
-          const now = trusted(path, lstat)
-          return now.dev === identity.dev && now.ino === identity.ino
-        } catch { return false }
-      },
       request,
       notify: (method, params) => write(0x1, Buffer.from(JSON.stringify(params === undefined ? { method } : { method, params }))),
       close() {
@@ -248,7 +226,7 @@ export function openAppServer(path, { createConnection = net.createConnection, c
         const values = name => fields.filter(field => field?.[1].toLowerCase() === name).map(field => field[2])
         // RFC 6455 section 4.1: the answer must name the protocol and the connection. Nothing was offered, so an extension or
         // a subprotocol in it is a protocol failure.
-        const tokens = values("connection").flatMap(value => value.toLowerCase().split(",").map(token => token.trim()))
+        const tokens = values("connection").flatMap(value => value.toLowerCase().split(",").map(trimOws))
         if (!STATUS_LINE.test(head[0]) || fields.includes(null) || values("sec-websocket-accept").join(",") !== accept
           || values("upgrade").join(",").toLowerCase() !== "websocket" || !tokens.includes("upgrade")
           || values("sec-websocket-extensions").length > 0 || values("sec-websocket-protocol").length > 0) return fail("APP_SERVER_PROTOCOL")
@@ -294,27 +272,18 @@ const STATUS = Object.assign(Object.create(null), { idle: "idle", active: "busy"
 // string before it is looked up, because a table lookup turns its key into text: `["idle"]` would find `idle`.
 const statusOf = record => (typeof record.status?.type === "string" ? STATUS[record.status.type] : undefined) ?? "unknown"
 
-// The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket, and `lstat` is the
-// file system that `replaced` looks at, for tests.
-export function createThread({ path, threadId, open = openAppServer, now = monotonic, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), lstat = lstatSync }) {
+// The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket.
+export function createThread({ path, threadId, open = openAppServer }) {
   let provider = null // the provider of the bound thread: what each later record is compared with, whatever socket it comes from
-  // What the queue probe answered, and on which socket: { route, dev, ino }. `route` is true when the documented answer came
-  // back and false when it did not. A probe says what the app-server behind one socket does, so it counts only for the socket
-  // it was taken on: another device or inode (a replaced socket, another app-server) has not been probed.
-  let probed = null
-  const probedOn = identity => (probed !== null && probed.dev === identity.dev && probed.ino === identity.ino ? probed.route : null)
 
-  async function withConnection(task, options) {
-    const link = await open(path, options)
+  async function withConnection(task) {
+    const link = await open(path)
     try { return await task(link) } finally { link.close() }
   }
 
-  // The time one request may take: the usual limit, or what is left before `deadline` when there is one.
-  const allowed = deadline => Math.max(1, Math.min(REQUEST_MS, deadline - now()))
-
-  async function loaded(link, deadline = Infinity) {
+  async function loaded(link) {
     for (let cursor = null, page = 0; page < 10; page += 1) {
-      const answer = await link.request("thread/loaded/list", cursor ? { cursor } : {}, allowed(deadline))
+      const answer = await link.request("thread/loaded/list", cursor ? { cursor } : {})
       if (!Array.isArray(answer.data)) throw failure("APP_SERVER_PROTOCOL")
       if (answer.data.includes(threadId)) return true
       if (typeof answer.nextCursor !== "string") return false
@@ -323,26 +292,14 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     return false
   }
 
-  async function read(link, deadline = Infinity) {
-    const answer = await link.request("thread/read", { threadId }, allowed(deadline))
+  async function read(link) {
+    const answer = await link.request("thread/read", { threadId })
     const thread = answer.thread
     if (thread === null || typeof thread !== "object" || thread.id !== threadId) throw failure("APP_SERVER_PROTOCOL")
     return thread
   }
 
-  // A thread that was never queued answers the delete with { deleted: false }. Any other answer, an error included,
-  // is not the documented one, and the route stays off.
-  async function probe(link, ms = PROBE_MS) {
-    try {
-      const answer = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: randomUUID() }, ms)
-      return answer.deleted === false
-    } catch (error) {
-      if (error?.code === "APP_SERVER_ERROR") return false
-      throw error
-    }
-  }
-
-  // Why a thread record refuses a wake whatever its state: a child, or a provider that is no longer the bound one.
+  // Why a thread record is no longer the one that was bound: a child, or a provider that is not the bound one.
   const refusing = record => {
     if (isChildThread(record)) return "child"
     return provider !== null && record.modelProvider !== provider ? "stale_binding" : null
@@ -351,26 +308,25 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
   // A record that can show what the thread is: the origin, the `ephemeral` flag and a model provider, next to the id and a status.
   const complete = record => isCompleteRecord(record) && typeof record.modelProvider === "string" && record.modelProvider !== ""
 
-  // The thread as the app-server shows it now, for the wake or the heartbeat: loaded, read, then the `thread/resume`
-  // answer, which is a record of its own and newer than the read, and last the newest turn. The resume answer must be a
-  // complete record that shows the thread idle, in default mode, and agree with the read and the bound provider; an answer
-  // that does not is no basis for a wake. The newest-turn check is last because an interruption is the one change that
-  // the other answers cannot show: the thread is idle after it too. The order is a trade: the status and the mode come from
-  // an answer that is one request older than the last, so a turn that starts or a Plan Mode switch has that request's round
-  // trip as well as the add's to land in, where an interruption has only the add's. The newest turn must be `completed`;
-  // see the end of this function for the rest. Every request ends by `deadline`.
+  // The thread as the app-server shows it now, for the heartbeat: loaded, read, then the `thread/resume` answer, which
+  // is a record of its own and carries the collaboration mode, and last the newest turn. The resume record must be
+  // complete and agree with the read and the bound provider, or the answer says nothing. The mode decides Plan Mode:
+  // "default" is not, "plan" is, and no answer or another mode is unknown (`plan: null`); a resume that the app-server
+  // refuses (before the first user message codex-cli 0.171.0 answers -32600 "no rollout found") is unknown too.
+  // The newest-turn read is last because an interruption is the one change that the other answers cannot show: the
+  // thread is idle after it too. Nothing is written to the thread.
   // observed: { status, stopped, plan }; `reason` is null only when the thread is clear.
-  async function evaluate(link, deadline) {
+  async function evaluate(link) {
     const observed = { status: "unknown", stopped: false, plan: null }
-    if (!(await loaded(link, deadline))) return { reason: "offline", observed: { ...observed, status: "offline" } }
-    const thread = await read(link, deadline)
+    if (!(await loaded(link))) return { reason: "offline", observed: { ...observed, status: "offline" } }
+    const thread = await read(link)
     const refusal = refusing(thread)
     if (refusal) return { reason: refusal, observed }
     observed.status = statusOf(thread)
     if (observed.status !== "idle") return { reason: observed.status, observed }
     // thread/resume subscribes this connection; the connection closes as soon as the reading ends.
     let resumed = null
-    try { resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(deadline)) } catch (error) { if (error?.code !== "APP_SERVER_ERROR") throw error }
+    try { resumed = await link.request("thread/resume", { threadId, excludeTurns: true }) } catch (error) { if (error?.code !== "APP_SERVER_ERROR") throw error }
     const record = resumed?.thread
     if (record === null || typeof record !== "object" || record.id !== threadId || typeof record.status?.type !== "string") {
       return { reason: "unknown", observed } // no record of its own: nothing newer than the read, and nothing to check it against
@@ -383,10 +339,10 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     const mode = resumed.collaborationMode?.mode
     observed.plan = mode === "default" ? false : mode === "plan" ? true : null
     if (observed.plan !== false) return { reason: observed.plan === true ? "plan" : "unknown", observed }
-    const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline))
+    const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" })
     if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
     // Only a newest turn that is known to be finished clears the thread. A turn that is running is busy; an interrupted one is
-    // stopped; no turn, a turn without a status and a status that is not known say nothing, and an unknown state never wakes.
+    // stopped; no turn, a turn without a status and a status that is not known say nothing, and an unknown state is not idle.
     const newest = turns.data[0]?.status
     if (newest === "interrupted") { observed.stopped = true; return { reason: "stopped", observed } }
     if (newest === "inProgress") { observed.status = "busy"; return { reason: "busy", observed } }
@@ -396,38 +352,19 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
 
   return {
     get provider() { return provider },
-    // The answer of the newest probe that finished, whichever socket it was taken on; `wake` probes again when the socket it
-    // reaches is another one.
-    get route() { return probed === null ? null : probed.route },
-    // Whether the path now names another socket than the one of the newest probe: one `lstat` of the path, decided on that
-    // one result, and no connection. True only for a socket of the current user whose device and inode are not the probe's.
-    // False before any probe has finished, and false for anything else the path gives: no socket at all (the app-server
-    // is down, or any error of the `lstat`, `ENOTDIR` and `EACCES` included), a path that is not a socket, a socket of
-    // another user. There is no other socket to probe then, and the heartbeat's read keeps reporting offline. A probe says
-    // what the app-server behind one socket does, so a route that is off was decided on one socket and nothing would look
-    // at another: the receiver asks this of such a route and binds again when it is true, which probes the socket that is there.
-    replaced() {
-      if (probed === null) return false
-      let info
-      try { info = lstat(path) } catch { return false }
-      return info.isSocket() && info.uid === process.geteuid() && (info.dev !== probed.dev || info.ino !== probed.ino)
-    },
 
     // Check the thread before the receiver joins: it must be loaded with a documented status (idle, active or systemError),
     // its record must be complete (a documented origin, the `ephemeral` flag, a model provider), it must not be a child, and
-    // it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in
-    // "bound", "unprobed" and "stale_binding"; nothing recorded by an earlier call counts.
-    // status: "bound" | "unprobed" | "child" | "unloaded" | "stale_binding" | "unavailable" | "untrusted"
-    //   unprobed - a main thread, but the queue probe did not finish: the route stays undecided and the next bind probes again.
+    // it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in "bound" and
+    // "stale_binding"; nothing recorded by an earlier call counts.
+    // status: "bound" | "child" | "unloaded" | "stale_binding" | "unavailable" | "untrusted"
     //   unloaded - not in the loaded list, or listed but read as `notLoaded` (it unloaded between the two requests).
     //
-    // `signal` belongs to this one call: once the caller aborts it (its time ran out), the call records nothing, neither
-    // the provider nor the route, and its answer is "unavailable". `owns` is the same for a caller that stopped being
-    // the owner of the answer (the worker it binds for was retired): asked at every check, it must stay true. What the
-    // call learns is held in locals and committed together at the end, after the last check of both, in the same turn.
-    // `onRead` is called once the thread read has passed, before the queue probe: the caller's read deadline ends there,
-    // and the probe has PROBE_MS. A socket that cannot be trusted (see `trustedSocket`) answers "untrusted".
-    async bind({ signal, onRead, owns } = {}) {
+    // `signal` belongs to this one call: once the caller aborts it (its time ran out), the call records nothing, and its
+    // answer is "unavailable". `owns` is the same for a caller that stopped being the owner of the answer (the worker it
+    // binds for was retired): asked at the check, it must stay true. What the call learns is committed after that check, in
+    // the same turn. A socket that cannot be trusted (see `trustedSocket`) answers "untrusted".
+    async bind({ signal, owns } = {}) {
       const expired = () => signal?.aborted === true || owns?.() === false
       try {
         return await withConnection(async link => {
@@ -439,103 +376,19 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
           if (!isCompleteRecord(thread) || !LOADED_STATUS.has(thread.status?.type)) return { status: "unavailable" }
           if (typeof thread.modelProvider !== "string" || !thread.modelProvider) return { status: "unavailable" }
           if (provider !== null && provider !== thread.modelProvider) return { status: "stale_binding" }
-          onRead?.()
-          let route = probedOn(link.identity)
-          if (route === null) {
-            try { route = await probe(link) } catch {
-              if (expired()) return { status: "unavailable" }
-              provider = thread.modelProvider // a main thread was read; only the probe did not finish
-              return { status: "unprobed" }
-            }
-          }
-          if (expired()) return { status: "unavailable" }
           provider = thread.modelProvider
-          probed = { route, dev: link.identity.dev, ino: link.identity.ino }
-          return { status: "bound", route }
+          return { status: "bound" }
         })
       } catch (error) { return { status: error?.code === "CHAT_APPSERVER_UNTRUSTED" ? "untrusted" : "unavailable" } }
     },
 
-    // What the thread is now, from reads only. `reason` is the delivery refusal a wake would give, or null.
+    // What the thread is now, from reads only. `reason` is why the thread is not clear (a child, a changed provider, busy,
+    // Plan Mode, stopped, offline or unknown), or null.
     // observed: { status: "idle"|"busy"|"offline"|"unknown", stopped, plan: true|false|null }
     async observe() {
       try {
-        return await withConnection(link => evaluate(link, Infinity))
+        return await withConnection(link => evaluate(link))
       } catch { return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } } }
-    },
-
-    // Queue `text` as one user turn and fence it. Resolves { outcome, reason } for the settle call. Three things prove
-    // something, and everything else is uncertain:
-    //   deleted:true                       - the delete removed it before it dispatched: deferred (busy).
-    //   a userMessage with its client id   - it dispatched: handed.
-    //   anything else is uncertain: `deleted:false` says only that it is no longer queued (it may have dispatched or been
-    //   dropped), so without the matching userMessage by the settlement deadline (`limit`, SETTLE_MS before the end of the
-    //   reservation) it is uncertain; so is a lost add reply, a
-    //   reply without a submission id, and a delete that fails or is not answered, which prove neither removal nor dispatch.
-    // A failure before the add frame is written is failed; any failure after it is uncertain. Nothing retries.
-    // The wake reads the thread again (`evaluate`: the same four reads as `observe`, the newest turn last), and
-    // `proceed` is asked once with that reading, right before the add frame is written, with nothing awaited in between:
-    // the add goes out with no request between the last answer and itself. What remains is the round trip of that answer (the
-    // newest turn, for the status and the mode) and the add's: see the README. `thread/resume` subscribes the connection that asks, so the
-    // reading is taken on a second connection that is closed first, and the connection for the add, the fence and the
-    // confirmation is opened before it and never asks. Both connections must reach the same checked socket (the same
-    // device and inode): the second is refused when the path names another one, and the first is asked, in the turn before
-    // the add, whether the configured path, resolved again through the whole trust check, still names its own (a link in the
-    // path that has moved is not seen by the real path of the connection). Either mismatch, and any failure of that check,
-    // sends nothing and settles `failed`. The queue has no condition of its own (see the README).
-    // `proceed` returns null to go on, or the `deferred` reason that the reading and the receiver's state now give: nothing
-    // is sent then. Without one, the reading alone decides. `until` is the end of the reservation, and every request
-    // stops SETTLE_MS before it.
-    async wake({ text, attemptId, until, proceed = fresh => (fresh.reason === "child" ? "offline" : fresh.reason) }) {
-      const clientUserMessageId = `${CLIENT_ID_PREFIX}${attemptId}`
-      const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
-      const limit = until - SETTLE_MS
-      let link
-      // The connection, the upgrade and `initialize` end by the limit too: nothing has been sent yet when they fail.
-      try { link = await open(path, { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())) }) } catch { return { outcome: "failed", reason: "native_unavailable" } }
-      try {
-        if (limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
-        // The probe says what the app-server behind one socket does, so only a positive answer taken on this very socket (its
-        // device and inode) counts. Without one, because no bind has probed, the socket is another one or the answer was negative,
-        // the wake probes it now, on the connection that will carry the add, and adds only on a positive answer. This is the one
-        // request before the reading. (The receiver wakes a thread only when its bind probed positive, so this is a second guard.)
-        if (probedOn(link.identity) !== true) {
-          let route
-          try { route = await probe(link, Math.max(1, Math.min(PROBE_MS, limit - now()))) } catch { return { outcome: "failed", reason: "native_unavailable" } }
-          probed = { route, dev: link.identity.dev, ino: link.identity.ino }
-          if (!route) return { outcome: "failed", reason: "native_unavailable" }
-        }
-        let fresh
-        try {
-          fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })
-        } catch { return { outcome: "failed", reason: "native_unavailable" } }
-        // The path is checked first and the time after it: the check makes synchronous file system calls that can stall.
-        if (!link.same() || limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
-        const stale = proceed(fresh)
-        if (stale !== null) return { outcome: "deferred", reason: stale }
-        let added
-        try {
-          added = await link.request("thread/queue/add", {
-            threadId, clientUserMessageId, input: [{ type: "text", text, text_elements: [] }],
-          }, limit - now())
-        } catch (error) { return error?.sent === false ? { outcome: "failed", reason: "native_unavailable" } : UNCERTAIN }
-        const id = added.queuedSubmission?.id
-        if (typeof id !== "string" || !id) return UNCERTAIN
-        let fence
-        try { fence = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: id }, limit - now()) }
-        catch { return UNCERTAIN }
-        if (fence.deleted === true) return { outcome: "deferred", reason: "busy" }
-        if (fence.deleted !== false) return UNCERTAIN
-        while (now() < limit - CONFIRM_MARGIN_MS) {
-          try {
-            const page = await link.request("thread/items/list", { threadId, limit: PAGE, sortDirection: "desc" }, limit - now())
-            const seen = Array.isArray(page.data) && page.data.some(entry => entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId)
-            if (seen) return { outcome: "handed", reason: null }
-          } catch { return UNCERTAIN }
-          await sleep(CONFIRM_MS)
-        }
-        return UNCERTAIN
-      } finally { link.close() }
     },
   }
 }

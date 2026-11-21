@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { fittingSocketPath, MAX_SOCKET_PATH_BYTES, trustedDirectory, trustedSocket } from "../lib/trust.js"
+import { fittingSocketPath, MAX_LINK_HOPS, MAX_SOCKET_PATH_BYTES, trustedDirectory, trustedSocket } from "../lib/trust.js"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs"
 import net from "node:net"
 import { tmpdir } from "node:os"
@@ -290,4 +290,82 @@ test("the root is a directory of its own: `/`, `//`, `///` and `/.` are looked u
     assert.equal(trustedDirectory(spelled, { ...fs, lstat: path => { names.push(path); return fs.lstat(path) }, realpath: () => "/" }), "/", spelled)
     assert.equal(names[0], "/", spelled)
   }
+})
+
+// ---- a socket name that is a symlink --------------------------------------------------------------------------------------
+// `codex app-server --listen unix://PATH` leaves PATH as a symlink to the socket it binds in a private directory of its own. A
+// caller that passes `follow` accepts that, and every hop goes through the rule above: the link is the current user's and its
+// directory passes the directory rule, and the socket at the end is the current user's with a directory that passes it too.
+const DAEMON = "/tmp/codex-daemon-1000"
+const BOUND = `${DAEMON}/0123abcd`
+const link = to => ({ kind: "link", uid: ME, mode: 0o777, to })
+const linked = (over = {}) => {
+  const entries = {
+    "/": { kind: "dir", uid: 0, mode: 0o755 }, "/run": { kind: "dir", uid: 0, mode: 0o755 }, "/run/user": { kind: "dir", uid: 0, mode: 0o755 },
+    "/run/user/app": { kind: "dir", uid: ME, mode: 0o700 }, [SOCKET]: link(BOUND),
+    "/tmp": { kind: "dir", uid: 0, mode: 0o1777 }, [DAEMON]: { kind: "dir", uid: ME, mode: 0o700 },
+    [BOUND]: { kind: "socket", uid: ME, mode: 0o600, dev: 9, ino: 77 }, ...over,
+  }
+  return { ...table(entries), readlink: path => entries[path].to, follow: MAX_LINK_HOPS }
+}
+
+test("with follow, a name that is a symlink to a socket in a private directory is trusted, and the socket at the end is what comes back", () => {
+  assert.equal(MAX_LINK_HOPS, 8)
+  assert.deepEqual(trustedSocket(SOCKET, linked()), { path: BOUND, dev: 9, ino: 77 }, "the identity is the socket's, not the link's")
+  const relative = linked({ [SOCKET]: link("peer.sock"), "/run/user/app/peer.sock": { kind: "socket", uid: ME, mode: 0o600, dev: 5, ino: 6 } })
+  assert.deepEqual(trustedSocket(SOCKET, relative), { path: "/run/user/app/peer.sock", dev: 5, ino: 6 }, "a relative name is relative to the link's directory")
+  assert.equal(trustedSocket(SOCKET, linked({ "/run/user/app/mid": link(BOUND), [SOCKET]: link("/run/user/app/mid") })).path, BOUND, "a link to a link")
+  assert.equal(trustedSocket(BOUND, linked()).path, BOUND, "a socket that is not a link is trusted as before")
+})
+
+test("following a link is opt-in: without follow the same link is refused, as a receiver's own socket must be a socket", () => {
+  assert.throws(() => trustedSocket(SOCKET, { ...linked(), follow: undefined }), untrusted)
+  assert.throws(() => trustedSocket(SOCKET, { ...linked(), follow: 0 }), untrusted)
+})
+
+for (const [label, over] of [
+  ["a link that another user owns", { [SOCKET]: { kind: "link", uid: OTHER, mode: 0o777, to: BOUND } }],
+  ["a link in a directory that its group can write", { "/run/user/app": { kind: "dir", uid: ME, mode: 0o770 } }],
+  ["a link in a directory that another user owns", { "/run/user/app": { kind: "dir", uid: OTHER, mode: 0o700 } }],
+  ["a socket that another user owns at the end of the link", { [BOUND]: { kind: "socket", uid: OTHER, mode: 0o600 } }],
+  ["a regular file at the end of the link", { [BOUND]: { kind: "file", uid: ME, mode: 0o600 } }],
+  ["a directory at the end of the link", { [SOCKET]: link(DAEMON) }],
+  ["a target in a directory that its group can write", { [DAEMON]: { kind: "dir", uid: ME, mode: 0o770 } }],
+  ["a target in a directory that others can write", { [DAEMON]: { kind: "dir", uid: ME, mode: 0o707 } }],
+  ["a target in a directory that another user owns", { [DAEMON]: { kind: "dir", uid: OTHER, mode: 0o700 } }],
+  ["a target in a directory that is a symlink", { [DAEMON]: link("/elsewhere") }],
+  ["a target below a directory that others can write, with no sticky bit", { "/tmp": { kind: "dir", uid: 0, mode: 0o777 } }],
+  ["a target below a directory that another user owns", { "/tmp": { kind: "dir", uid: OTHER, mode: 0o755 } }],
+  ["a link whose name ends in a separator", { [SOCKET]: link(`${BOUND}/`) }],
+  ["a link with an empty name", { [SOCKET]: link("") }],
+  ["a link whose name holds U+FFFD", { [SOCKET]: link(`${DAEMON}/\uFFFD`) }],
+  ["a link to itself", { [SOCKET]: link(SOCKET) }],
+  ["a loop of two links", { [SOCKET]: link("/run/user/app/b"), "/run/user/app/b": link(SOCKET) }],
+]) {
+  test(`with follow, ${label} is refused with the caller's code`, () => {
+    assert.throws(() => trustedSocket(SOCKET, linked(over)), untrusted)
+  })
+}
+
+// SOCKET is the first of `count` links in a row, and the last one names the socket.
+const chainOf = count => {
+  const names = [SOCKET, ...Array.from({ length: count - 1 }, (_, index) => `/run/user/app/c${index + 2}`)]
+  return Object.fromEntries(names.map((name, index) => [name, link(names[index + 1] ?? BOUND)]))
+}
+
+test("a chain of links is followed up to 8 hops, and a ninth is refused", () => {
+  assert.equal(trustedSocket(SOCKET, linked(chainOf(8))).path, BOUND)
+  assert.throws(() => trustedSocket(SOCKET, linked(chainOf(9))), untrusted)
+})
+
+test("a link whose target is not there is absent, not refused: the app-server that made it is gone", () => {
+  assert.throws(() => trustedSocket(SOCKET, linked({ [BOUND]: undefined })), { code: "ENOENT" })
+  assert.throws(() => trustedSocket(SOCKET, linked({ [DAEMON]: undefined, [BOUND]: undefined })), { code: "ENOENT" })
+})
+
+test("the 103-byte limit is on the socket at the end of the link", () => {
+  const behind = ({ directory, socket }) => linked({ ...roomy(directory, socket), [SOCKET]: link(socket) })
+  const fits = socketOfBytes(103)
+  assert.equal(trustedSocket(SOCKET, behind(fits)).path, fits.socket)
+  assert.throws(() => trustedSocket(SOCKET, behind(socketOfBytes(104))), untrusted)
 })

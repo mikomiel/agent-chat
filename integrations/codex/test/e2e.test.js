@@ -5,14 +5,14 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
-import { CHAT_PREFIX, WAKE_PREFIX } from "../lib/channel.js"
+import { CHAT_PREFIX } from "../lib/channel.js"
 import { paths } from "../lib/ipc.js"
 import { fakeAppServer } from "./fake-app-server.js"
 
 // The real hook command and the real detached receiver, over a real socket. Only
 // the product's Python worker is replaced, by a small program that answers the
 // worker protocol and logs every request, and the app-server, by a fake control
-// socket. The test can then see what was settled and what was queued.
+// socket. The test can then see what was settled and what the app-server was asked.
 const HOOK = fileURLToPath(new URL("../scripts/hook.js", import.meta.url))
 const RECEIVER = fileURLToPath(new URL("../scripts/receiver.js", import.meta.url))
 const ROOM = "33333333-3333-4333-8333-333333333333"
@@ -82,8 +82,8 @@ function hook(env, name, payload) {
 
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
 
-// Answers the reads like an idle, default-mode main thread and records the queue traffic.
-function appServerHandler(threadId, queued) {
+// Answers the reads like an idle, default-mode main thread.
+function appServerHandler(threadId) {
   const ok = result => ({ result })
   const thread = { id: threadId, parentThreadId: null, agentRole: null, ephemeral: false, source: "cli", modelProvider: "openai", status: { type: "idle" } }
   return message => {
@@ -92,12 +92,6 @@ function appServerHandler(threadId, queued) {
       case "thread/read": return ok({ thread })
       case "thread/turns/list": return ok({ data: [{ id: "t1", status: "completed" }], nextCursor: null })
       case "thread/resume": return ok({ thread, collaborationMode: { mode: "default", settings: {} } })
-      case "thread/queue/add":
-        queued.push(message.params)
-        return ok({ queuedSubmission: { id: `q${queued.length}`, input: message.params.input, clientUserMessageId: message.params.clientUserMessageId } })
-      case "thread/queue/delete": return ok({ deleted: false })
-      case "thread/items/list":
-        return ok({ data: queued.map(entry => ({ turnId: "t", item: { type: "userMessage", id: "i", clientId: entry.clientUserMessageId, content: entry.input } })), nextCursor: null })
       default: return { error: { code: -32601, message: "method not found" } }
     }
   }
@@ -154,11 +148,10 @@ function fixture(session, withAppServer, { through = false } = {}) {
   }
 }
 
-test("a session joins, receives in a turn and by queued wake, ignores a delegate, notes an interrupt and ends", { timeout: 90_000 }, async t => {
+test("a session joins, receives in a turn, ignores a delegate, notes an interrupt, is not woken when idle and ends", { timeout: 90_000 }, async t => {
   if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
   const f = fixture(SESSION, true)
-  const queued = []
-  const server = await fakeAppServer(f.control, appServerHandler(SESSION, queued))
+  const server = await fakeAppServer(f.control, appServerHandler(SESSION))
   const common = { session_id: SESSION, permission_mode: "default" }
   const socket = paths(f.state, SESSION).socket
   try {
@@ -178,7 +171,7 @@ test("a session joins, receives in a turn and by queued wake, ignores a delegate
     assert.deepEqual(joined.env, [], "the worker runs with an empty environment")
     assert.ok(existsSync(socket), "the receiver serves a socket in the state directory")
     assert.match(socket, /\/codex-[0-9a-f]{16}\.sock$/)
-    assert.deepEqual(server.methods().slice(0, 4), ["initialize", "thread/loaded/list", "thread/read", "thread/queue/delete"], "bound and probed before the join")
+    assert.deepEqual(server.methods().slice(0, 3), ["initialize", "thread/loaded/list", "thread/read"], "bound before the join")
     if (existsSync(`/proc/${joined.ppid}/environ`)) {
       const received = readFileSync(`/proc/${joined.ppid}/environ`, "utf8").split("\0").filter(Boolean)
       assert.deepEqual(received, [`AGENT_CHAT_CODEX_CONFIG=${f.file}`], "the receiver carries only the config path")
@@ -205,33 +198,29 @@ test("a session joins, receives in a turn and by queued wake, ignores a delegate
     await sleep(300)
     assert.equal(f.ops("claim").length, claims)
 
-    // An interrupt is reported as stopped, prints nothing, and holds the wake back.
+    // An interrupt is reported as stopped and prints nothing.
     const interrupted = await hook(f.env, "interrupt", { ...common, hook_event_name: "Interrupt", turn_id: "t1" })
     assert.equal(interrupted.code, 0)
     assert.equal(interrupted.stdout + interrupted.stderr, "")
     await f.until(() => f.ops("heartbeat").some(entry => entry.state.stopped === true), "a stopped heartbeat")
     const stoppedOnly = await hook(f.env, "stop", { ...common, hook_event_name: "Stop" })
     assert.equal(stoppedOnly.stdout + stoppedOnly.stderr, "")
-    await sleep(2600)
-    assert.equal(queued.length, 0, "nothing is queued while stopped")
-    assert.equal(f.ops("claim").length, claims)
 
-    // A new prompt clears the stop; after the next Stop the idle session is woken through the queue.
+    // A new prompt clears the stop and delivers in its own turn.
     f.queue(uid(2))
     const again = await hook(f.env, "prompt", { ...common, hook_event_name: "UserPromptSubmit", prompt: "again" })
     assert.equal(again.code, 0)
     await f.until(() => f.ops("settle").length === 2, "the settle after the second delivery")
+    assert.deepEqual(f.ops("settle")[1].result, { outcome: "handed", reason: null })
+
+    // After the next Stop the session is idle and is not woken: a message waits for the session's next hook.
     f.queue(uid(2), uid(3))
     await hook(f.env, "stop", { ...common, hook_event_name: "Stop" })
-    await f.until(() => queued.length === 1, "the queued wake", 20_000)
-    await f.until(() => f.ops("settle").length === 3, "the settle after the wake")
-    assert.deepEqual(f.ops("settle")[2].result, { outcome: "handed", reason: null })
-    const [wake] = queued
-    assert.match(wake.clientUserMessageId, /^agent-chat:attempt-\d+$/)
-    assert.ok(wake.input[0].text.startsWith(WAKE_PREFIX))
-    assert.match(wake.input[0].text, new RegExp(`"id":"${uid(3)}"`))
-    assert.equal(wake.input[0].text.includes("synthetic body"), false, "a wake never carries a body")
-    assert.deepEqual(server.methods().slice(-3), ["thread/queue/add", "thread/queue/delete", "thread/items/list"])
+    const settled = f.ops("claim").length
+    await sleep(2600)
+    assert.equal(f.ops("claim").length, settled, "an idle session claims nothing")
+    const reads = new Set(["initialize", "thread/loaded/list", "thread/read", "thread/resume", "thread/turns/list"])
+    assert.deepEqual(server.methods().filter(method => !reads.has(method)), [], "the app-server is only ever read")
 
     // A session end ends the worker and removes the socket.
     const ended = await hook(f.env, "session-end", { ...common, hook_event_name: "SessionEnd", reason: "other" })
@@ -248,7 +237,7 @@ test("a session joins, receives in a turn and by queued wake, ignores a delegate
 test("a delegated thread is refused before it joins, and the hooks stay silent", { timeout: 60_000 }, async t => {
   if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
   const f = fixture("e2e-child", true)
-  const handler = appServerHandler("e2e-child", [])
+  const handler = appServerHandler("e2e-child")
   const server = await fakeAppServer(f.control, message => {
     const answer = handler(message)
     return message.method === "thread/read" ? { result: { thread: { ...answer.result.thread, parentThreadId: "parent-thread" } } } : answer
@@ -258,7 +247,6 @@ test("a delegated thread is refused before it joins, and the hooks stay silent",
     assert.equal(started.code, 0)
     assert.match(JSON.parse(started.stdout).systemMessage, /CHAT_CHILD_THREAD/)
     assert.deepEqual(f.ops("join"), [], "the worker was never started")
-    assert.equal(server.methods().includes("thread/queue/delete"), false, "the queue was never probed")
   } finally {
     await server.close()
     await f.cleanup()

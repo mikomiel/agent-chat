@@ -31,7 +31,8 @@ function clientFrame(buffer) {
 }
 
 // handler(message, connection) returns { result } or { error } to reply, or nothing to stay silent. `status` replaces the status
-// line of the upgrade answer, and `headers` rewrites its header lines (a list of "Name: value" strings) before they are sent.
+// line of the upgrade answer, and `headers` rewrites its header lines (a list of "Name: value" strings) before they are sent;
+// the answer is written as Latin-1.
 export async function fakeAppServer(path, handler, { accept = true, initialize = true, status = "HTTP/1.1 101 Switching Protocols", headers = lines => lines } = {}) {
   const log = []
   const heads = []
@@ -55,8 +56,9 @@ export async function fakeAppServer(path, handler, { accept = true, initialize =
         heads.push(text)
         const key = /sec-websocket-key:\s*(\S+)/i.exec(text)?.[1]
         const proof = createHash("sha1").update(`${key}${GUID}`).digest("base64")
-        socket.write([status, ...headers(["Upgrade: websocket", "Connection: Upgrade",
-          `Sec-WebSocket-Accept: ${accept ? proof : "wrong"}`]), "", ""].join("\r\n"))
+        // Latin-1, so that one character is one byte on the wire and a test can put any single byte in a header.
+        socket.write(Buffer.from([status, ...headers(["Upgrade: websocket", "Connection: Upgrade",
+          `Sec-WebSocket-Accept: ${accept ? proof : "wrong"}`]), "", ""].join("\r\n"), "latin1"))
         upgraded = true
       }
       for (let frame = clientFrame(buffer); frame; frame = clientFrame(buffer)) {
