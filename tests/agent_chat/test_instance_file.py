@@ -179,6 +179,33 @@ def test_sweep_survives_a_failing_directory_listing_or_close(tmp_path, monkeypat
     assert instance_file.sweep_stale(tmp_path, uuid4()) == 1 and not stale.exists()
 
 
+@pytest.mark.parametrize(
+    ("error", "close_fails"),
+    [(TimeoutError("worker interrupted"), False), (OSError(errno.EROFS, "read-only"), False),
+     (TimeoutError("worker interrupted"), True)],
+)
+def test_discard_never_raises_and_always_closes(tmp_path, monkeypatch, error, close_fails):
+    boot_id = uuid4()
+    prepare_instance(tmp_path, "native", boot_id, server_origin="http://127.0.0.1:1")
+    real_close = os.close
+    closed: list[int] = []
+
+    def failing_unlink(*args, **kwargs):
+        raise error
+
+    def failing_close(fd):
+        real_close(fd)
+        closed.append(fd)
+        if close_fails:
+            raise OSError(errno.EBADF, "close failed")
+
+    monkeypatch.setattr(instance_file.os, "unlink", failing_unlink)
+    monkeypatch.setattr(instance_file.os, "close", failing_close)
+    instance_file.discard_instance(tmp_path, boot_id)  # neither the unlink failure nor the close failure is raised
+    assert len(closed) == 1
+    assert (tmp_path / f"{boot_id}.json").exists()  # a failed removal leaves the file
+
+
 def test_touch_advances_only_the_own_record_and_never_follows_a_link(tmp_path):
     first = prepare_instance(tmp_path, "a", uuid4(), server_origin="https://chat.test")
     second = prepare_instance(tmp_path, "b", uuid4(), server_origin="https://chat.test")

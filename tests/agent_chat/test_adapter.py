@@ -268,6 +268,59 @@ def test_stop_ends_the_binding_and_discards_its_record(tmp_path):
     assert not adapter.available
 
 
+@pytest.mark.parametrize("error", [ChatError("TRANSPORT_UNAVAILABLE"), OSError("unreachable")])
+def test_stop_discards_the_record_even_when_the_end_fails(tmp_path, error):
+    adapter, operations, delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    path = tmp_path / f"{adapter.joined.binding.boot_id}.json"
+
+    def failing_end(instance, *, deadline=None):
+        operations.ends += 1
+        assert not path.exists()  # the record went before the end call, so a kill during it leaves nothing usable
+        raise error
+
+    operations.end = failing_end
+    adapter.stop()
+
+    assert operations.ends == 1
+    assert not path.exists()  # the server lease ends the instance; nothing local can use it
+    assert delivery.contexts[-1] is None
+
+
+def test_stop_still_discards_and_ends_when_the_context_callback_fails(tmp_path):
+    adapter, operations, delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    path = tmp_path / f"{adapter.joined.binding.boot_id}.json"
+
+    def broken(text):
+        assert not path.exists()  # the record went before the callback, which may stall or be killed
+        raise RuntimeError("context store closed")
+
+    delivery.context = broken
+    with pytest.raises(RuntimeError):
+        adapter.stop()
+
+    assert not path.exists()
+    assert operations.ends == 1
+
+
+@pytest.mark.parametrize("error", [TimeoutError("stalled mount"), OSError("read-only")])
+def test_stop_still_withdraws_and_ends_when_the_removal_fails(tmp_path, monkeypatch, error):
+    adapter, operations, delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    path = tmp_path / f"{adapter.joined.binding.boot_id}.json"
+
+    def failing_unlink(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(instance_file.os, "unlink", failing_unlink)
+    adapter.stop()
+
+    assert path.exists()  # the removal failed and left the file
+    assert delivery.contexts[-1] is None
+    assert operations.ends == 1
+
+
 def test_four_failures_in_one_hour_fail_the_rejoin_budget(tmp_path):
     adapter, operations, _delivery = make_adapter(tmp_path)
     adapter.start("native-a")

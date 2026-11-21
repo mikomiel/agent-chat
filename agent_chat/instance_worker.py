@@ -94,10 +94,19 @@ def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
 
 
 def _end(instance: instance_client.JoinedInstance, directory: Path) -> dict[str, Any]:
-    """End this binding, then drop its record; a failed end keeps the file and the server lease is the fallback."""
-    result = instance_client.end(instance)
+    """Drop this binding's record, then end it.
+
+    The record goes first. Once its removal succeeds, a new open of its path finds nothing while the end is in
+    flight, or after an end that fails or is cut short by a kill; the instance then ends when no heartbeat renews its
+    server lease. Removal is best effort. A caller that already holds the file open or has read the credential can
+    still use it, and its heartbeats renew the lease. A removal that fails or runs out of time is not raised. The
+    worker's alarm is armed again after it, because the removal may have used it up: the end request, everything it
+    loads first and the reply that follows stay under one hard limit, like every other worker request. The end uses
+    the credential held in memory.
+    """
     instance_file.discard_instance(directory, instance.binding.boot_id)
-    return result
+    signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
+    return instance_client.end(instance)
 
 
 def _asks_bodies(request: dict[str, Any]) -> bool:
