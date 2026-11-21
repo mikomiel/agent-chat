@@ -646,12 +646,13 @@ test("a collaboration mode other than default is plan, and an unreadable one is 
 })
 
 // The resume answer is a record of its own: it must be complete (id, status, origin, ephemeral flag and model provider) and
-// agree with the read and the bound provider, or it says nothing about the thread. It ends the reading when it refuses.
+// agree with the read and the bound provider, or it says nothing about the thread, the mode included. It ends the reading
+// when it refuses. A usable record whose status is not idle still gives its mode: the mode and the status are two answers.
 const resumeWith = (body, mode = { mode: "default", settings: {} }) => ({ "thread/resume": () => ok({ ...body, collaborationMode: mode }) })
 const without = key => { const record = thread(); delete record[key]; return record }
-for (const [label, over, reason, status] of [
-  ["shows the thread active", resumeWith({ thread: thread({ status: { type: "active", activeFlags: [] } }) }), "busy", "busy"],
-  ["shows the thread in Plan Mode", resumeWith({ thread: thread() }, { mode: "plan", settings: {} }), "plan", "idle"],
+for (const [label, over, reason, status, plan = null] of [
+  ["shows the thread active", resumeWith({ thread: thread({ status: { type: "active", activeFlags: [] } }) }), "busy", "busy", false],
+  ["shows the thread active in Plan Mode", resumeWith({ thread: thread({ status: { type: "active", activeFlags: [] } }) }, { mode: "plan", settings: {} }), "busy", "busy", true],
   ["has no thread record", resumeWith({}), "unknown", "idle"],
   ["is another thread's record", resumeWith({ thread: thread({ id: "thread-2" }) }), "unknown", "idle"],
   ["has a record without a status", resumeWith({ thread: { id: THREAD } }), "unknown", "idle"],
@@ -662,15 +663,36 @@ for (const [label, over, reason, status] of [
   ["lacks the ephemeral flag", resumeWith({ thread: without("ephemeral") }), "unknown", "idle"],
   ["lacks the model provider", resumeWith({ thread: without("modelProvider") }), "unknown", "idle"],
   ["has an empty model provider", resumeWith({ thread: thread({ modelProvider: "" }) }), "unknown", "idle"],
-  ["shows a status the read did not", resumeWith({ thread: thread({ status: { type: "systemError" } }) }), "unknown", "unknown"],
+  ["shows a status the read did not", resumeWith({ thread: thread({ status: { type: "systemError" } }) }), "unknown", "unknown", false],
   ["shows another provider than the bound one", resumeWith({ thread: thread({ modelProvider: "other" }) }), "stale_binding", "idle"],
   ["shows a child", resumeWith({ thread: thread({ parentThreadId: "p" }) }), "child", "idle"],
 ]) {
   test(`a read whose resume answer ${label} refuses with ${reason}, and reads no turn`, async () => {
     const { result, methods } = await observeWith(over)
-    assert.deepEqual(result, { reason, observed: { status, stopped: false, plan: reason === "plan" ? true : null } })
+    assert.deepEqual(result, { reason, observed: { status, stopped: false, plan } })
     assert.deepEqual(methods, ["initialize", "thread/loaded/list", "thread/read", "thread/resume"], "the resume answer ends the reading")
   })
+}
+
+// The mode that the resume answer confirmed stays the answer for Plan Mode whatever the newest turn says, and the newest turn
+// stays the answer for the running state whatever the mode: a turn that failed, or no turn, is an unknown state, not idle.
+for (const [mode, plan] of [["default", false], ["plan", true]]) {
+  for (const [label, data, reason, status, stopped = false] of [
+    ["completed", [{ id: "t1", status: "completed" }], plan ? "plan" : null, "idle"],
+    ["failed", [{ id: "t1", status: "failed" }], "unknown", "unknown"],
+    ["absent", [], "unknown", "unknown"],
+    ["interrupted", [{ id: "t1", status: "interrupted" }], "stopped", "idle", true],
+    ["running", [{ id: "t1", status: "inProgress" }], "busy", "busy"],
+  ]) {
+    test(`a ${mode}-mode thread whose newest turn is ${label} reads as ${status} with plan ${plan}: the mode and the running state are two answers`, async () => {
+      const { result, methods } = await observeWith({
+        ...resumeWith({ thread: thread() }, { mode, settings: {} }),
+        "thread/turns/list": () => ok({ data, nextCursor: null }),
+      })
+      assert.deepEqual(result, { reason, observed: { status, stopped, plan } })
+      assert.deepEqual(methods, ["initialize", "thread/loaded/list", "thread/read", "thread/resume", "thread/turns/list"])
+    })
+  }
 }
 
 // The interruption is the one change that the status cannot show: the thread is idle after it too. So the newest turn is read
@@ -725,7 +747,7 @@ test("a thread status that is a property name of every object is unknown, not a 
     const viaRead = await observeWith({ "thread/read": () => ok({ thread: thread({ status: { type } }) }) })
     assert.deepEqual(viaRead.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }, `read: ${type}`)
     const viaResume = await observeWith({ "thread/resume": () => ok({ thread: thread({ status: { type } }), collaborationMode: { mode: "default", settings: {} } }) })
-    assert.deepEqual(viaResume.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }, `resume: ${type}`)
+    assert.deepEqual(viaResume.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: false } }, `resume: ${type}`)
   }
 })
 

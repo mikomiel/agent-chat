@@ -28,6 +28,9 @@ const OWNER_CHECK_MS = 30_000
 const QUIET_MS = 180_000
 const STOP_GRACE_MS = 6_000
 const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
+// Nothing reached the hook's output: the hook refused it, or it was gone, or out of time, before anything was sent to it.
+// The ledger offers the batch again; only a write whose fate is not known is uncertain.
+const NOT_WRITTEN = { outcome: "failed", reason: "native_unavailable" }
 
 // A join conflict is the previous instance's lease; the rejoin policy owns the wait.
 const REJOIN_AFTER = new Set([
@@ -105,17 +108,18 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   })
 
   // The hook says whether a turn runs and whether the operator interrupted it; the app-server read, when there is one, is the
-  // authority for Plan Mode and adds a busy, idle or interrupted answer that a hook cannot give while nothing runs. A read
-  // that could not tell the collaboration mode (`plan: null`) leaves Plan Mode to the hook's `permission_mode` hint, and
-  // an idle thread whose mode is unknown is not idle.
+  // authority for Plan Mode and adds a busy, idle or interrupted answer that a hook cannot give while nothing runs. The read's
+  // two answers stand apart: a mode it confirmed (`plan` true or false) decides Plan Mode even when the running state is
+  // unknown, and one it could not tell (`plan: null`) leaves Plan Mode to the hook's `permission_mode` hint. A read is newer
+  // than the hooks' idle, so the thread is idle only when the read shows it idle and not in Plan Mode.
   function chatState() {
     if (failure) return "offline"
     const plan = observed !== null && observed.plan !== null ? observed.plan : planHint
     if (plan) return "plan"
     if (stopped || observed?.stopped === true) return "stopped"
     if (native === "busy" || observed?.status === "busy") return "busy"
-    if (native === "idle") return observed !== null && observed.plan === null ? "unknown" : null
-    return observed?.status === "idle" && observed.plan === false ? null : "unknown"
+    if (observed !== null) return observed.status === "idle" && observed.plan === false ? null : "unknown"
+    return native === "idle" ? null : "unknown"
   }
 
   // No title: hooks carry none and this version reads none. Omitting the field preserves the stored title.
@@ -261,7 +265,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const result = await thread.observe()
     const current = epoch === before && live === record
     if (current) {
-      observed = result.observed.status === "idle" || result.observed.status === "busy" ? result.observed : null
+      // A read is kept when it answered something: a running state (idle or busy) or a confirmed mode. One that answered
+      // neither (offline, or unknown with no mode) is dropped, and the state follows the hooks.
+      const answered = result.observed.status === "idle" || result.observed.status === "busy" || result.observed.plan !== null
+      observed = answered ? result.observed : null
       if (result.reason !== null) epoch += 1
     }
     return { ...result, current }
@@ -345,24 +352,28 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   const eligible = () => chatState() === "busy"
 
   // Send `text` to the consumer, then wait for its write receipt. Handed means the
-  // hook wrote and flushed the output; it does not mean the model has read it.
-  async function hand(link, text, until, announce) {
+  // hook wrote and flushed the output; it does not mean the model has read it. A hook that is gone, or whose time (`deadline`)
+  // is up, before the text is sent has written nothing: that is not handed, and the batch can be offered again. Once the
+  // text is sent, only the receipt says what became of it.
+  async function hand(link, text, until, deadline, announce) {
     if (!eligible()) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
+    if (link.closed || deadline <= now()) return { result: NOT_WRITTEN, replied: false }
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
     if (isDone(done, "written")) {
       if (announce) announced = announce.boot
       return { result: { outcome: "handed", reason: null }, replied: true }
     }
-    if (isDone(done, "refused")) return { result: { outcome: "failed", reason: "native_unavailable" }, replied: true }
+    if (isDone(done, "refused")) return { result: NOT_WRITTEN, replied: true }
     return { result: UNCERTAIN, replied: true }
   }
 
   // One claim sequence for a hook consumer: the result goes to the hook on `link`. Resolves true when it sent a context
-  // reply on `link`.
+  // reply on `link`. `deadline` is when the hook stops waiting for its reply: a claim starts only with CLAIM_MARGIN_MS of it left.
   function deliver({ link, announce = null, deadline = Infinity }) {
     if (!live || !joined || closed || failure || delivering || inflight || !eligible()) return Promise.resolve(false)
+    if (deadline - now() < CLAIM_MARGIN_MS) return Promise.resolve(false)
     return exclusive(async () => {
       if (!live || closed) return false
       delivering = true
@@ -398,7 +409,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
               bodies, bound, admittedAt: grant.admitted_at,
             })
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, announce))
+            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, deadline, announce))
           }
         }
         if (!live) return replied
@@ -424,6 +435,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     // hint that the earlier hooks left, maybe from a turn that died, say nothing about it. It is reset as in a fresh session and
     // the read is dropped; a local stop is not touched, since only a prompt clears it. The next hook or read sets the state again.
     setNative(request, "unknown")
+    // The reset is published at once, not at the next period; the announcement below does not wait for it.
+    void report()
     await within(attempted, clamp(request.wait_ms, 10_000))
     if (failure) return link.send(disabledReply())
     // A start event always announces: a compaction or resume may have dropped the earlier text.
@@ -445,15 +458,15 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   async function onTurn(request, link) {
+    // One deadline for the whole reply, taken when the request arrives: the state report below spends it too.
+    const deadline = now() + clamp(request.patience_ms, 30_000)
     setNative(request, "busy", request.event)
     if (failure) return link.send(disabledReply())
     let replied = false
     if (inflight) void report() // a slow request never stacks up behind every tool call
     else {
       await report()
-      replied = (await guard(deliver({
-        link, announce: announcement(), deadline: now() + clamp(request.patience_ms, 30_000),
-      }))) === true
+      replied = (await guard(deliver({ link, announce: announcement(), deadline }))) === true
     }
     if (replied) return undefined
     // The state report and the delivery can each end the binding this turn began with,

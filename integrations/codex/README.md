@@ -124,7 +124,7 @@ or a stop.
 
 | Event | Command | Timeout | What it does |
 |---|---|---|---|
-| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it. A start also resets what the earlier hooks left, as a fresh session starts: the read is dropped, the running state goes back to unknown and the Plan Mode hint is set from the start's own `permission_mode` (cleared when it has none), so a turn that died cannot leave the session `busy` for the heartbeat. A local stop stays until a prompt clears it. |
+| `SessionStart` (every `source`) | `session-start` | 15 s | Starts the receiver if none runs for this `session_id`, waits up to 5 seconds for the join, and prints the binding as `hookSpecificOutput.additionalContext` plus a one-line `systemMessage`. A start always re-announces the binding, so a resume, clear or compaction that dropped it restores it. A start also resets what the earlier hooks left, as a fresh session starts: the read is dropped, the running state goes back to unknown and the Plan Mode hint is set from the start's own `permission_mode` (cleared when it has none), so a turn that died cannot leave the session `busy` for the heartbeat. The reset state goes out in a heartbeat at once, not at the next period, and the announcement does not wait for it. A local stop stays until a prompt clears it. |
 | `UserPromptSubmit` | `prompt` | 10 s | Reports the session busy, or in Plan Mode when `permission_mode` is `plan`, and clears a local stop. Then delivers a claimed batch as `additionalContext`. May start a missing receiver. |
 | `PostToolUse` | `tool` | 10 s | The same as `prompt`, between tool calls, without clearing a stop. Never starts a receiver. |
 | `Stop` | `stop` | 5 s | Reports the session idle. Prints nothing: Codex expects JSON or nothing from `Stop`, and a decision there would continue the turn. |
@@ -165,7 +165,10 @@ sends its request: it does not wait for the worker to end its instance.
   cannot tell the mode (no answer, another mode, or a refused `thread/resume`,
   which a thread with no turn yet may give) leaves Plan Mode
   to the hook's `permission_mode` hint, and the session is then not idle but
-  unknown. Any later hook event discards the read. A read that refuses (busy,
+  unknown. The mode and the running state are two answers of the read: a
+  mode it confirmed decides Plan Mode even when its running state is unknown
+  (the newest turn failed, or there is none), and the state then stays unknown,
+  not idle. Any later hook event discards the read. A read that refuses (busy,
   Plan Mode, stopped, unknown) is newer than every read that began before it,
   so an older read that lands after it is dropped. Once a hook event has
   discarded the last read, Plan Mode follows the hook's hint alone, as in the
@@ -178,16 +181,24 @@ sends its request: it does not wait for the worker to end its instance.
   control socket.
 - **Busy delivery.** A `prompt` or `tool` hook asks the receiver for a batch
   while the turn runs. The receiver claims only when the session is busy, and
-  never in Plan Mode, while stopped or in an unknown state. The reply is
-  printed as `additionalContext` and settled `handed` only after the hook
-  confirms it wrote and flushed the output.
+  never in Plan Mode, while stopped or in an unknown state. A turn hook has one
+  deadline, its own limit: the wait for the reply is what is left of it after
+  the connect (at most 7.5 seconds), and the receiver gets that wait less 1.5
+  seconds (at most 6) for the whole reply, its state report included. The
+  receiver starts a claim only with 2.5 seconds of that left, and sends the
+  notice only before it runs out. The reply is printed as `additionalContext`
+  and settled `handed` only after the hook confirms it wrote and flushed the
+  output.
 - **No idle wake yet.** The idle wake is a follow-up, tracked in #154. Until it
   lands a session is woken only by its own next hook: a message for an idle
   session waits, and a `prompt` or `tool` hook delivers it, as under Busy
   delivery. Nothing in this version queues a turn, and the join frame and the
   heartbeat carry no claim that the session can be woken.
-- **Settlement.** A refused output settles `failed`; a failed write, a missing
-  receipt or a reservation too short to write inside settles `uncertain`. The
+- **Settlement.** A refused output settles `failed`, and so does a claimed batch
+  that was never sent because the hook was gone or its time was up before the
+  write: nothing reached the output, so it is offered again. A failed write, a
+  missing receipt or a reservation too short to write inside settles
+  `uncertain`. The
   adapter never writes the same attempt twice. The ledger, not the adapter,
   offers a `failed` or `deferred` batch again as a new attempt after a backoff,
   at most three attempts in all; an `uncertain` batch is not offered again.
@@ -320,7 +331,13 @@ that a hook connects to.
   target) is owned by the current user or by root and is not writable by group or
   other. A directory that is writable by others but has the sticky bit set, such
   as `/tmp`, passes: others cannot remove or rename what the current user owns in
-  it, and the socket's owner is checked on its own;
+  it, and the socket's owner is checked on its own. The directories are judged
+  from the root down, each only once every directory above it has passed, for
+  the socket and for every link on the way to it;
+- after the socket or a link is looked at, its directory and every directory
+  above it are looked at again: the spelling must still resolve to the same
+  real path and each directory must still be the same one (device and inode),
+  so a directory swapped between the two looks is refused;
 - the connection goes to the checked path with those links resolved;
 - that real path is at most 103 bytes long: `sun_path` holds 104 bytes on macOS
   and the BSDs (108 on Linux), terminator included, and a longer path must never
@@ -394,8 +411,10 @@ rule has already excluded.
    provider, an id and a status), agree with the bound provider and show the
    thread idle, or the read is unknown; a child there ends chat as a child in
    `thread/read` does. Its `collaborationMode.mode` gives Plan Mode: `default`
-   reads on, `plan` is Plan Mode, and anything else, a refused request included,
-   is unknown and ends the read. A thread with no turn yet may refuse both
+   is not Plan Mode, `plan` is, and anything else is unknown. The mode is its
+   own answer: the newest turn is read whatever the mode, and a mode that the
+   resume confirmed is kept when the turn leaves the running state unknown. A
+   refused `thread/resume` has no record and ends the read as unknown. A thread with no turn yet may refuse both
    `thread/resume` and `thread/turns/list`: the read is unknown at the resume
    and never reaches the turns list, and chat stays on. A
    `thread/turns/list` that fails after a resume answered leaves the thread

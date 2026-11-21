@@ -10,6 +10,7 @@
 // config loader refuses it).
 import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
+import { performance } from "node:perf_hooks"
 import { fileURLToPath } from "node:url"
 import { MAX_OUTPUT_BYTES } from "./channel.js"
 import { CODEX_CHAT_CONFIG_ENV, loadConfig } from "./config.js"
@@ -21,6 +22,12 @@ export const LIMITS_MS = {
   "session-start": 13_000, prompt: 9_000, tool: 9_000, stop: 4_000, interrupt: 2_000, "session-end": 2_000,
 }
 const PATIENCE_MS = 6_000
+const REPLY_MS = 7_500 // the longest a turn hook waits for the receiver's reply
+// A turn hook's reply comes within its own limit. What the connect (and a receiver start) took comes off the wait for the
+// reply, and the receiver's patience is that wait less REPLY_MARGIN_MS, so its reply reaches the hook in time. EXIT_MS is
+// left at the end for the write, the receipt and the exit.
+const REPLY_MARGIN_MS = 1_500
+const EXIT_MS = 500
 const MAX_STDIN = 32 * 1024 * 1024
 const RECEIVER = fileURLToPath(new URL("../scripts/receiver.js", import.meta.url))
 const SHELLS = new Set(["sh", "bash", "dash", "zsh", "ash"])
@@ -64,7 +71,7 @@ async function quiet(link, request, waitMs) {
   return 0
 }
 
-async function dispatch(name, { payload, config, where, io }) {
+async function dispatch(name, { payload, config, where, io, deadline, now }) {
   const mode = typeof payload.permission_mode === "string" ? payload.permission_mode : undefined
   // Only a session start and a prompt start a missing receiver; tool, stop,
   // interrupt and end events just connect, so a receiver that cannot start costs
@@ -78,12 +85,18 @@ async function dispatch(name, { payload, config, where, io }) {
   // session resumed in a new process reattaches to the old receiver, which must
   // then watch the new one.
   const owner = io.owner()
-  const turn = event => ({ op: "turn", event, permission_mode: mode, patience_ms: PATIENCE_MS, owner_pid: owner })
+  // The hook's one deadline for a turn: the time to wait for the reply is what is left of it, and the receiver is given that
+  // less the margin, so a reply that it sends in its time is one this hook is still there to write.
+  const turn = async (event, hookEventName, link) => {
+    const waitMs = Math.max(0, Math.min(REPLY_MS, deadline - now() - EXIT_MS))
+    const request = { op: "turn", event, permission_mode: mode, patience_ms: Math.max(0, Math.min(PATIENCE_MS, waitMs - REPLY_MARGIN_MS)), owner_pid: owner }
+    return converse(link, hookEventName, request, waitMs, io)
+  }
   switch (name) {
     case "session-start":
       return converse(await open(4_000), "SessionStart", { op: "start", wait_ms: 5_000, owner_pid: owner, permission_mode: mode }, 8_000, io)
-    case "prompt": return converse(await open(2_500), "UserPromptSubmit", turn("prompt"), 7_500, io)
-    case "tool": return converse(await open(0), "PostToolUse", turn("tool"), 7_500, io)
+    case "prompt": return turn("prompt", "UserPromptSubmit", await open(2_500))
+    case "tool": return turn("tool", "PostToolUse", await open(0))
     case "stop": return quiet(await open(0), { op: "stop", permission_mode: mode }, 3_500)
     case "interrupt": return quiet(await open(0), { op: "interrupt" }, 1_500)
     default: return quiet(await open(0), { op: "end" }, 800)
@@ -104,7 +117,9 @@ export async function runHook(name, io) {
     // start lock, the socket, and the working directory of a receiver that the hook starts (`config.directory`).
     const config = { ...loaded, directory: assertPrivateDirectory(loaded.directory) }
     const where = paths(config.directory, sessionId)
-    return await Promise.race([dispatch(name, { payload, config, where, io }), io.sleep(limit).then(() => 0)])
+    const now = io.now ?? (() => performance.now())
+    const deadline = now() + limit
+    return await Promise.race([dispatch(name, { payload, config, where, io, deadline, now }), io.sleep(limit).then(() => 0)])
   } catch { return 0 }
 }
 
@@ -138,6 +153,7 @@ export function nodeIo() {
     connect,
     owner: () => ownerOf(process.ppid),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+    now: () => performance.now(),
     write: text => new Promise(resolve => {
       try { process.stdout.write(text, error => resolve(!error)) } catch { resolve(false) }
     }),

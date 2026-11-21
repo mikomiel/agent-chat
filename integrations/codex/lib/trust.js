@@ -5,7 +5,9 @@
 //   - its directory is not a symlink, however its name ends (`link/` and `link/.` are the link too), and neither it nor any
 //     directory above it (a symlink above it is resolved first) can be changed by anyone else: each is owned by the current
 //     user or root, and is not writable by group or other, unless the sticky bit is set, which stops others from removing
-//     or renaming what the current user owns.
+//     or renaming what the current user owns. The directories are judged from the root down, each only after every one
+//     above it has passed, and after the name in the last one is looked at, every directory on the way is looked at again:
+//     it must still be the same directory (device and inode), so one swapped between the two looks is refused.
 // A caller that passes `follow` accepts that the last name is a symlink, up to that many hops: `codex app-server --listen
 // unix://PATH` leaves PATH as a symlink to the socket it binds in its own private directory. Every hop is judged by the same
 // rule: the link is owned by the current user and its directory passes the directory rule, and the socket at the end is a
@@ -57,24 +59,50 @@ function unfollowed(directory) {
   return names.join("/") || (directory.startsWith("/") ? "/" : "")
 }
 
-// The real path of a directory that nobody else can change: it is not a symlink, and it and every directory above it
-// pass `guarded`. The path is resolved by realpath(3), which walks it the way the kernel does: a `..` after a symlink names
-// the parent of the link's target. `realpathSync` collapses such a `..` against the link's own directory first, so it would
-// name another directory than the one `lstat` and `connect` reach for the same string, and the rule would judge that one.
-export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, realpath = realpathSync.native, uid = process.geteuid() } = {}) {
-  try {
-    const spelled = unfollowed(directory)
-    if (lstat(spelled).isSymbolicLink()) throw refusal(refuse)
-    const real = realpath(spelled)
-    // A name that is not valid UTF-8 comes back with U+FFFD in it, and that string can name another directory that is
-    // spelled with U+FFFD. Such a path is refused rather than guessed at.
-    if (real.includes("\uFFFD")) throw refusal(refuse)
-    for (let current = real; ; current = dirname(current)) {
-      if (!guarded(lstat(current), uid)) throw refusal(refuse)
-      if (dirname(current) === current) break
-    }
-    return real
-  } catch (error) { throw classify(error, refuse) }
+const settings = ({ refuse = "CHAT_UNTRUSTED", lstat = lstatSync, realpath = realpathSync.native, uid = process.geteuid() } = {}) =>
+  ({ refuse, lstat, realpath, uid })
+
+// A directory that nobody else can change: it is not a symlink, and it and every directory above it pass `guarded`. The
+// path is resolved by realpath(3), which walks it the way the kernel does: a `..` after a symlink names the parent of the
+// link's target. `realpathSync` collapses such a `..` against the link's own directory first, so it would name another
+// directory than the one `lstat` and `connect` reach for the same string, and the rule would judge that one. The real path
+// is judged from the root down, so a directory is looked at only once every directory above it has passed, and the
+// identity (device and inode) of each is kept: { spelled, real, chain: [{ path, dev, ino }, ...] }, root first.
+function checkedChain(directory, { refuse, lstat, realpath, uid }) {
+  const spelled = unfollowed(directory)
+  if (lstat(spelled).isSymbolicLink()) throw refusal(refuse)
+  const real = realpath(spelled)
+  // A name that is not valid UTF-8 comes back with U+FFFD in it, and that string can name another directory that is
+  // spelled with U+FFFD. Such a path is refused rather than guessed at.
+  if (real.includes("\uFFFD")) throw refusal(refuse)
+  const paths = []
+  for (let current = real; ; current = dirname(current)) {
+    paths.unshift(current)
+    if (dirname(current) === current) break
+  }
+  const chain = paths.map(path => {
+    const info = lstat(path)
+    if (!guarded(info, uid)) throw refusal(refuse)
+    return { path, dev: info.dev, ino: info.ino }
+  })
+  return { spelled, real, chain }
+}
+
+// The chain that `checkedChain` judged is still the one the name reaches: the spelling still resolves to the same real path,
+// and every directory on it, root first, is still the directory (device and inode) that was judged. A directory swapped
+// between the check and a later look is refused.
+function unchanged({ spelled, real, chain }, { refuse, lstat, realpath }) {
+  if (lstat(spelled).isSymbolicLink() || realpath(spelled) !== real) throw refusal(refuse)
+  for (const { path, dev, ino } of chain) {
+    const info = lstat(path)
+    if (!info.isDirectory() || info.dev !== dev || info.ino !== ino) throw refusal(refuse)
+  }
+}
+
+// The real path of a directory that nobody else can change (see `checkedChain`).
+export function trustedDirectory(directory, options) {
+  const rule = settings(options)
+  try { return checkedChain(directory, rule).real } catch (error) { throw classify(error, rule.refuse) }
 }
 
 // The links in a row that a caller which follows a socket's name accepts.
@@ -85,7 +113,9 @@ export const MAX_LINK_HOPS = 8
 // last name may be a symlink: it is read, and the name it holds (relative to the link's directory, or absolute) goes through the
 // same check, so the returned path is the socket at the end and the identity is that socket's.
 export function trustedSocket(path, options = {}) {
-  const { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, readlink = readlinkSync, uid = process.geteuid(), follow = 0 } = options
+  const { readlink = readlinkSync, follow = 0 } = options
+  const rule = settings(options)
+  const { refuse, lstat, uid } = rule
   // A socket is a file: a spelling that ends in a separator names a directory, and lstat of it fails where the connect
   // to the resolved name would not.
   if (typeof path !== "string" || path.endsWith("/")) throw refusal(refuse)
@@ -93,10 +123,14 @@ export function trustedSocket(path, options = {}) {
   fittingSocketPath(path, refuse)
   try {
     for (let name = path, hops = 0; ; hops += 1) {
-      const real = trustedDirectory(dirname(name), options)
+      const checked = checkedChain(dirname(name), rule)
+      const { real } = checked
       const target = join(real, basename(name))
       fittingSocketPath(target, refuse)
       const info = lstat(target)
+      // What was looked at is in the directory that was judged only while that directory, and every one above it, is still
+      // the one that was judged: so the chain is looked at again after the look at the name, for a link as for a socket.
+      unchanged(checked, rule)
       if (info.uid !== uid) throw refusal(refuse)
       if (info.isSocket()) return { path: target, dev: info.dev, ino: info.ino }
       if (!info.isSymbolicLink() || hops >= follow) throw refusal(refuse)

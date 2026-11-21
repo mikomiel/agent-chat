@@ -292,6 +292,66 @@ test("the root is a directory of its own: `/`, `//`, `///` and `/.` are looked u
   }
 })
 
+// ---- the chain of directories is judged from the root down, and looked at again after the name --------------------------
+
+// The directories that the table file system is asked about, in order, after the first look at the spelled directory.
+function walk(spelled, options) {
+  const names = []
+  try { trustedSocket(spelled, { ...options, lstat: path => { names.push(path); return options.lstat(path) } }) } catch { /* refused */ }
+  return names
+}
+
+test("every directory is judged only after every directory above it has passed, for a direct socket and for every hop", () => {
+  const direct = walk(SOCKET, good())
+  assert.deepEqual(direct.slice(1, 5), ["/", "/run", "/run/user", "/run/user/app"], "root first, down to the socket's directory")
+  assert.equal(direct[5], SOCKET, "then the socket")
+  const refused = walk(SOCKET, good({ "/run": { kind: "dir", uid: 0, mode: 0o777 } }))
+  assert.deepEqual(refused.slice(1), ["/", "/run"], "a directory that others can write stops the walk before anything below it is judged")
+  const hops = walk(SOCKET, linked())
+  const second = hops.indexOf("/tmp")
+  assert.ok(second > hops.indexOf(SOCKET), "the target's directories are judged after the link")
+  assert.deepEqual(hops.slice(second - 1, second + 2), ["/", "/tmp", DAEMON], "and from the root down too")
+})
+
+// One directory of the chain: after the name has been looked at once, the directory answers as another one (another inode),
+// as a directory that was renamed away and replaced would. `realpath` stays the same, so only the identity can tell.
+const swapping = (options, swapped, after) => {
+  let seen = false
+  return {
+    ...options,
+    lstat: path => {
+      const info = options.lstat(path)
+      if (path === after) seen = true
+      return seen && path === swapped ? { ...info, isDirectory: info.isDirectory, ino: 999 } : info
+    },
+  }
+}
+
+for (const swapped of ["/", "/run", "/run/user", "/run/user/app"]) {
+  test(`a directory on the socket's chain that is another one (${swapped}) once the socket was looked at is refused`, () => {
+    assert.equal(trustedSocket(SOCKET, good()).path, SOCKET, "control: the same layout without the swap is trusted")
+    assert.throws(() => trustedSocket(SOCKET, swapping(good(), swapped, SOCKET)), untrusted)
+  })
+}
+
+test("an ancestor of the link that is swapped once the link was looked at is refused, and so is one of the target's", () => {
+  assert.equal(trustedSocket(SOCKET, linked()).path, BOUND, "control")
+  assert.throws(() => trustedSocket(SOCKET, swapping(linked(), "/run/user", SOCKET)), untrusted, "the link's chain")
+  assert.throws(() => trustedSocket(SOCKET, swapping(linked(), "/tmp", BOUND)), untrusted, "the target's chain")
+  assert.throws(() => trustedSocket(SOCKET, swapping(linked(), DAEMON, BOUND)), untrusted, "the target's own directory")
+})
+
+test("a spelling that resolves to another directory once the socket was looked at is refused", () => {
+  const fs = good({ "/other": { kind: "dir", uid: ME, mode: 0o700 } })
+  let looks = 0
+  const options = { ...fs, lstat: path => { if (path === SOCKET) looks += 1; return fs.lstat(path) }, realpath: path => (looks > 0 && path === "/run/user/app" ? "/other" : path) }
+  assert.throws(() => trustedSocket(SOCKET, options), untrusted)
+  const link = linked()
+  let reached = false
+  const linking = { ...link, lstat: path => { if (path === BOUND) reached = true; return link.lstat(path) }, realpath: path => (reached && path === DAEMON ? "/run/user/app" : path) }
+  assert.throws(() => trustedSocket(SOCKET, linking), untrusted, "the target's directory, on the hop")
+})
+
 // ---- a socket name that is a symlink --------------------------------------------------------------------------------------
 // `codex app-server --listen unix://PATH` leaves PATH as a symlink to the socket it binds in a private directory of its own. A
 // caller that passes `follow` accepts that, and every hop goes through the rule above: the link is the current user's and its

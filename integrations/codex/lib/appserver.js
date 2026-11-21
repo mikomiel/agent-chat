@@ -313,9 +313,11 @@ export function createThread({ path, threadId, open = openAppServer }) {
   // complete and agree with the read and the bound provider, or the answer says nothing. The mode decides Plan Mode:
   // "default" is not, "plan" is, and no answer or another mode is unknown (`plan: null`); a resume that the app-server
   // refuses (before the first user message codex-cli 0.171.0 answers -32600 "no rollout found") is unknown too.
-  // The newest-turn read is last because an interruption is the one change that the other answers cannot show: the
-  // thread is idle after it too. Nothing is written to the thread.
-  // observed: { status, stopped, plan }; `reason` is null only when the thread is clear.
+  // The mode and the running state are two answers: `plan` comes from the mode alone, `status` and `stopped` from the
+  // record and the newest turn, and one does not erase the other (Plan Mode with a newest turn that is not known is
+  // { status: "unknown", plan: true }). The newest-turn read is last because an interruption is the one change that the
+  // other answers cannot show: the thread is idle after it too. Nothing is written to the thread.
+  // observed: { status, stopped, plan }; `reason` is null only when the thread is clear: idle, finished and not in Plan Mode.
   async function evaluate(link) {
     const observed = { status: "unknown", stopped: false, plan: null }
     if (!(await loaded(link))) return { reason: "offline", observed: { ...observed, status: "offline" } }
@@ -334,11 +336,11 @@ export function createThread({ path, threadId, open = openAppServer }) {
     if (!isChildThread(record) && !complete(record)) return { reason: "unknown", observed } // it cannot show the origin or the provider
     const newer = refusing(record)
     if (newer) return { reason: newer, observed }
-    observed.status = statusOf(record)
-    if (observed.status !== "idle") return { reason: observed.status, observed }
     const mode = resumed.collaborationMode?.mode
     observed.plan = mode === "default" ? false : mode === "plan" ? true : null
-    if (observed.plan !== false) return { reason: observed.plan === true ? "plan" : "unknown", observed }
+    const unclear = () => (observed.plan === true ? "plan" : observed.plan === null ? "unknown" : null)
+    observed.status = statusOf(record)
+    if (observed.status !== "idle") return { reason: observed.status, observed }
     const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" })
     if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
     // Only a newest turn that is known to be finished clears the thread. A turn that is running is busy; an interrupted one is
@@ -347,7 +349,7 @@ export function createThread({ path, threadId, open = openAppServer }) {
     if (newest === "interrupted") { observed.stopped = true; return { reason: "stopped", observed } }
     if (newest === "inProgress") { observed.status = "busy"; return { reason: "busy", observed } }
     if (newest !== "completed") { observed.status = "unknown"; return { reason: "unknown", observed } }
-    return { reason: null, observed }
+    return { reason: unclear(), observed }
   }
 
   return {

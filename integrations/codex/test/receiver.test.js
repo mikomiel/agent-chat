@@ -317,6 +317,41 @@ test("a write that failed or went unconfirmed settles uncertain, never handed", 
   }
 })
 
+// The hook waits for one reply, and the state report that comes first spends the same time: the deadline is taken when the
+// request arrives, so a heartbeat that used up the hook's patience leaves no claim behind it.
+test("a slow heartbeat leaves no time for the hook, so no claim starts, and one that leaves time does not stop it", async () => {
+  for (const [took, claims] of [[5000, 0], [1000, 1]]) {
+    let skewMs = 0
+    const r = await rig({ skew: () => skewMs, handlers: { pending: () => ({ messages: ["m1"] }), heartbeat: () => { skewMs += took; return {} } } })
+    await r.begin()
+    const hook = await r.op(turn())
+    assert.equal(r.worker.ops("heartbeat").length, 1, `the turn reported its state first (${took} ms)`)
+    assert.equal(r.worker.ops("claim").length, claims, `claims after a ${took} ms heartbeat`)
+    if (!claims) {
+      assert.deepEqual(r.worker.ops("pending"), [], "not even the pending read")
+      assert.deepEqual(r.worker.ops("settle"), [], "nothing to settle")
+      assert.deepEqual(hook.sent, [{ context: null }])
+    }
+  }
+})
+
+// What happens to a batch that was claimed and then never sent: the hook was gone, or its time was up, before the write.
+// Nothing reached its output, so the batch is not handed and the ledger can offer it again (failed), never uncertain.
+test("a hook that is gone, or out of time, before the write settles failed and retryable, not uncertain", async () => {
+  const gone = hookDouble()
+  const r = await rig({ handlers: { pending: () => ({ messages: ["m1"] }), status: () => { gone.close(); return { muted: false } } } })
+  await r.begin()
+  await r.op(turn(), gone)
+  assert.deepEqual(gone.sent, [], "nothing was sent to the hook")
+  assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "failed", reason: "native_unavailable" })
+  let skewMs = 0
+  const late = await rig({ skew: () => skewMs, handlers: { pending: () => ({ messages: ["m1"] }), status: () => { skewMs += 6500; return { muted: false } } } })
+  await late.begin()
+  const hook = await late.op(turn())
+  assert.equal(hook.sent.some(frame => typeof frame.context === "string" && frame.context.includes("m1")), false, "the notice was not sent past the hook's time")
+  assert.deepEqual(late.worker.ops("settle")[0].result, { outcome: "failed", reason: "native_unavailable" })
+})
+
 test("Plan Mode is reported and nothing is claimed", async () => {
   const r = await rig({ handlers: { pending: () => ({ messages: ["m1"] }) } })
   await r.begin()
@@ -1279,6 +1314,37 @@ test("a session start after a turn that died resets the running state: the heart
   assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "idle", stopped: false, plan_mode: false })
 })
 
+// The start resets the state, and the heartbeat says so at once: a session left busy by a turn that died is not shown busy
+// until the next period. The announcement is not held back by that report.
+test("a session start after a turn that left the session busy sends a heartbeat with the reset state before the next period", async () => {
+  const r = await rig()
+  await r.begin()
+  await r.op(turn())
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.native_state, "busy")
+  r.worker.log.length = 0
+  const hook = await r.op({ op: "start", wait_ms: 5000 })
+  await settle()
+  assert.deepEqual(r.worker.ops("heartbeat").map(entry => entry.state), [{ native_state: "unknown", stopped: true, plan_mode: false }])
+  assert.equal(typeof hook.sent[0].context, "string", "the binding was announced")
+})
+
+test("a session start's announcement does not wait for its heartbeat", async () => {
+  let hold = false
+  let answer
+  const r = await rig({ handlers: { heartbeat: () => (hold ? new Promise(resolve => { answer = resolve }) : {}) } })
+  await r.begin()
+  await r.op(turn())
+  hold = true
+  r.worker.log.length = 0
+  const hook = hookDouble()
+  const started = r.receiver.handle({ op: "start", wait_ms: 5000 }, hook)
+  await settle()
+  assert.equal(r.worker.ops("heartbeat").length, 1, "the reset heartbeat is out, and has no answer yet")
+  assert.equal(typeof hook.sent[0]?.context, "string", "the binding was announced while the heartbeat was still out")
+  answer({})
+  await started
+})
+
 test("a session start that resumes in Plan Mode keeps the hint until a read or hook says otherwise", async () => {
   const r = await rig({ thread: threadDouble() })
   await r.begin()
@@ -1368,6 +1434,25 @@ test("the hook's plan hint yields to the app-server read, which is the authority
     r.worker.log.length = 0
     await r.clock.advance(30_000)
     assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, expected, `${mode} ${plan}`)
+  }
+})
+
+// The read's two answers stand apart: a mode it confirmed decides Plan Mode even when its running state is unknown (the newest
+// turn failed, or there is none), and the state stays unknown, not idle.
+test("a read that confirmed the mode but not the running state keeps its plan answer, over the hint, and stays unknown", async () => {
+  for (const [plan, hint, expected] of [
+    [false, "plan", { native_state: "unknown", stopped: true, plan_mode: false }],
+    [true, "default", { native_state: "unknown", stopped: false, plan_mode: true }],
+  ]) {
+    const thread = threadDouble({ observation: { reason: "unknown", observed: { status: "unknown", stopped: false, plan } } })
+    const r = await rig({ thread })
+    await r.begin()
+    await r.op(turn({ permission_mode: hint }))
+    await r.op({ op: "stop", permission_mode: hint })
+    r.worker.log.length = 0
+    await r.clock.advance(30_000)
+    assert.equal(r.receiver.state(), plan ? "plan" : "unknown", `plan ${plan}, hint ${hint}`)
+    assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, expected, `plan ${plan}, hint ${hint}`)
   }
 })
 

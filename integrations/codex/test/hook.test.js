@@ -38,13 +38,14 @@ function world({ parentMode } = {}) {
 // happened before what.
 async function run(name, payload, {
   env, reply = { context: null }, up = true, writeOk = true, writeDelay = 0,
-  hang = false, owner = () => 100, sleep = never,
+  hang = false, owner = () => 100, sleep = never, now, connected,
 } = {}) {
   const w = world()
-  const out = { stdout: [], started: [], calls: [], sent: [], log: [], connects: 0 }
+  const out = { stdout: [], started: [], calls: [], waits: [], sent: [], log: [], connects: 0 }
   const link = {
-    async call(request) {
+    async call(request, waitMs) {
       out.calls.push(request)
+      out.waits.push(waitMs)
       out.log.push(`call:${request.op}`)
       if (hang) await never()
       return typeof reply === "function" ? reply(request) : reply
@@ -58,6 +59,7 @@ async function run(name, payload, {
     connect: async () => {
       out.connects += 1
       if (!up && !out.started.length) throw absent()
+      connected?.()
       return link
     },
     startReceiver: (_config, sessionId) => { out.started.push(sessionId) },
@@ -68,7 +70,7 @@ async function run(name, payload, {
       out.stdout.push(text)
       return writeOk
     },
-    owner, sleep,
+    owner, sleep, ...(now ? { now } : {}),
   }
   try {
     out.code = await runHook(name, io)
@@ -133,6 +135,19 @@ test("a prompt and a tool event deliver through their own hookEventName and name
     })
     assert.deepEqual(result.calls, [{ op: "turn", event: name, permission_mode: "acceptEdits", patience_ms: 6000, owner_pid: 100 }])
     assert.deepEqual(result.sent, [{ op: "done", outcome: "written" }])
+  }
+})
+
+// A turn hook has one deadline, its own limit. What the connect took comes off the wait for the reply, and the receiver's patience
+// is that wait less the margin: a slow connect leaves the receiver less time, never more than the hook has left.
+test("a turn hook's wait and the receiver's patience come out of one deadline that the connect spends too", async () => {
+  for (const [name, spent, wait, patience] of [
+    ["prompt", 0, 7500, 6000], ["prompt", 2500, 6000, 4500], ["tool", 4000, 4500, 3000], ["prompt", 8000, 500, 0], ["tool", 9500, 0, 0],
+  ]) {
+    let clock = 0
+    const result = await run(name, base, { now: () => clock, connected: () => { clock += spent } })
+    assert.deepEqual(result.waits, [wait], `${name} after ${spent} ms`)
+    assert.equal(result.calls[0].patience_ms, patience, `${name} after ${spent} ms`)
   }
 })
 
