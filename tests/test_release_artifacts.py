@@ -4,11 +4,13 @@
 ``package.json`` at its root, and every such directory ships at the version in
 ``pyproject.toml``. These tests enumerate the directories, so a package that
 someone adds later is held to the rule without an edit here. They use no
-network, no ``npm`` and no build. Most read files or archives that the tests
-write themselves. One group runs the install block of ``integrations/README.md``
-with ``bash``, ``curl`` (over ``file://``), ``tar`` and ``sha256sum``, and is
-skipped when one of them is missing. ``scripts/check_release_artifacts.py``
-proves the built artifacts, and the release workflow runs it.
+network, no real ``npm`` and no build. Most read files or archives that the
+tests write themselves, and the packing tests run ``pack`` against a stand-in
+``npm`` that records what it was asked to pack. One group runs the install
+block of ``integrations/README.md`` with ``bash``, ``curl`` (over ``file://``),
+``tar`` and ``sha256sum``, and is skipped when one of them is missing.
+``scripts/check_release_artifacts.py`` proves the built artifacts, and the
+release workflow runs it.
 """
 
 from __future__ import annotations
@@ -449,10 +451,10 @@ def special(name: str, kind: bytes, linkname: str = "") -> Entry:
     return info, b""
 
 
-def write_alpha(release: tuple[Path, Path, list[str]], entries: list[Entry]) -> None:
+def write_alpha(release: tuple[Path, Path, list[str]], entries: list[Entry], fmt: int = tarfile.PAX_FORMAT) -> None:
     """Replace the alpha tarball with exactly these members; the tarfile module builds the bad ones."""
     _, dist, _ = release
-    with tarfile.open(dist / script.tarball_name("alpha", VERSION), "w:gz") as archive:
+    with tarfile.open(dist / script.tarball_name("alpha", VERSION), "w:gz", format=fmt) as archive:
         for info, data in entries:
             info.size = len(data) if info.isreg() else 0
             archive.addfile(info, io.BytesIO(data) if info.isreg() else None)
@@ -556,6 +558,65 @@ def test_duplicates_are_compared_on_the_normalized_path(
     assert any(f"duplicate member {second[0].name} (path package/" in error for error in problems(release))
 
 
+# tarfile strips the trailing slashes of a directory name, so these need the raw header names.
+LONG_DIRECTORY = "package/lib/" + "d" * 110 + "//"
+
+
+@pytest.mark.parametrize(
+    ("fmt", "name"),
+    [
+        pytest.param(tarfile.USTAR_FORMAT, "package/lib//", id="ustar"),
+        pytest.param(tarfile.PAX_FORMAT, "package/lib//", id="pax-header-only"),
+        pytest.param(tarfile.PAX_FORMAT, LONG_DIRECTORY, id="pax-path-record"),
+        pytest.param(tarfile.GNU_FORMAT, LONG_DIRECTORY, id="gnu-long-name"),
+        pytest.param(tarfile.USTAR_FORMAT, "package/lib///", id="three-slashes"),
+    ],
+)
+def test_a_directory_header_that_ends_in_more_than_one_slash_fails(
+    release: tuple[Path, Path, list[str]], fmt: int, name: str
+) -> None:
+    write_alpha(release, [*alpha_entries(), directory(name)], fmt)
+    # What tarfile hands over for these headers differs by format and by Python version.
+    with tarfile.open(release[1] / script.tarball_name("alpha", VERSION)) as archive:
+        assert not any(member.name.endswith("//") for member in archive.getmembers())
+    assert any(f"member {name!r} has a non-canonical path" in error for error in problems(release))
+
+
+@pytest.mark.parametrize("fmt", [tarfile.USTAR_FORMAT, tarfile.PAX_FORMAT, tarfile.GNU_FORMAT])
+def test_a_directory_header_with_one_trailing_slash_is_allowed(
+    release: tuple[Path, Path, list[str]], fmt: int
+) -> None:
+    write_alpha(release, [directory("package/lib"), *alpha_entries()], fmt)
+    assert problems(release) == []
+
+
+@pytest.mark.parametrize("fmt", [tarfile.USTAR_FORMAT, tarfile.PAX_FORMAT, tarfile.GNU_FORMAT])
+def test_long_names_read_the_same_from_the_header_as_from_tarfile(
+    release: tuple[Path, Path, list[str]], fmt: int
+) -> None:
+    """A ustar prefix, a pax path record and a GNU long name all reach the check unchanged."""
+    _, _, tracked = release
+    long_name = f"lib/{'d' * 90}/{'e' * 90}.js"
+    tracked.append(f"integrations/alpha/{long_name}")
+    write_alpha(release, [*alpha_entries(), regular(f"package/{long_name}", "export {}")], fmt)
+    assert problems(release) == []
+
+
+def test_a_tarball_whose_package_json_is_not_an_object_fails_cleanly(release: tuple[Path, Path, list[str]]) -> None:
+    entries = [entry for entry in alpha_entries() if entry[0].name != "package/package.json"]
+    write_alpha(release, [*entries, regular("package/package.json", "[]")])
+    assert any("package.json is not a JSON object" in error for error in problems(release))
+
+
+def test_an_odd_pi_field_in_package_json_does_not_crash_the_entry_point_check(
+    release: tuple[Path, Path, list[str]],
+) -> None:
+    package = {"name": "agent-chat-alpha", "version": VERSION, "main": "./lib/config.js", "pi": "not an object"}
+    entries = [entry for entry in alpha_entries() if entry[0].name != "package/package.json"]
+    write_alpha(release, [*entries, regular("package/package.json", json.dumps(package))])
+    assert problems(release) == []
+
+
 def test_a_directory_named_like_a_tracked_file_fails(release: tuple[Path, Path, list[str]]) -> None:
     entries = [entry for entry in alpha_entries() if entry[0].name != "package/README.md"]
     write_alpha(release, [*entries, directory("package/README.md"), regular("package/README.md/extra", "x")])
@@ -611,6 +672,9 @@ def alpha_digest(release: tuple[Path, Path, list[str]]) -> str:
         pytest.param("{digest}  ./{name}", id="path-in-the-name"),
         pytest.param("{digest}  {name} ", id="trailing-space"),
         pytest.param("{digest}  {name}\r", id="carriage-return"),
+        pytest.param("{digest}  {name}\0", id="nul-byte"),
+        pytest.param("{digest}  na me.tgz", id="space-in-the-name"),
+        pytest.param("{digest}  na\\me.tgz", id="backslash-in-the-name"),
         pytest.param("", id="blank-line"),
         pytest.param("not a checksum line", id="free-text"),
     ],
@@ -673,6 +737,20 @@ def test_the_sdist_must_hold_every_tracked_integration_file(tmp_path: Path) -> N
     assert script.check_sdist(tmp_path, [])
 
 
+@pytest.mark.parametrize("kind", [tarfile.DIRTYPE, tarfile.SYMTYPE])
+def test_the_sdist_needs_a_regular_file_not_a_directory_or_a_link_named_like_one(tmp_path: Path, kind: bytes) -> None:
+    tracked = tracked_files("alpha")
+    with tarfile.open(tmp_path / "sessionyard-1.2.3.tar.gz", "w:gz") as archive:
+        for name in tracked[1:]:
+            info = tarfile.TarInfo(f"sessionyard-1.2.3/{name}")
+            archive.addfile(info, io.BytesIO(b""))
+        info = tarfile.TarInfo(f"sessionyard-1.2.3/{tracked[0]}")
+        info.type = kind
+        info.linkname = "/etc/passwd" if kind == tarfile.SYMTYPE else ""
+        archive.addfile(info)
+    assert script.check_sdist(tmp_path, tracked) == [f"sessionyard-1.2.3.tar.gz: missing tracked file {tracked[0]}"]
+
+
 def test_the_wheel_must_hold_no_integration_path(tmp_path: Path) -> None:
     write_wheel(tmp_path, ["agent_chat/__init__.py", "sessionyard-1.2.3.dist-info/METADATA"])
     assert script.check_wheel(tmp_path) == []
@@ -690,6 +768,7 @@ def test_the_wheel_must_hold_no_integration_path(tmp_path: Path) -> None:
         "agent_chat/integrations/pi/package.json",
         "agent_chat/mcp/integrations/pi/package.json",
         "sessionyard/integrations",
+        "agent_chat\\integrations\\pi\\package.json",
     ],
 )
 def test_the_wheel_holds_no_integrations_segment_anywhere(tmp_path: Path, name: str) -> None:
@@ -704,12 +783,197 @@ def test_a_path_that_only_contains_the_word_integrations_is_not_an_integrations_
     assert script.check_wheel(tmp_path) == []
 
 
+def test_an_artifact_that_is_a_link_fails(release: tuple[Path, Path, list[str]], tmp_path: Path) -> None:
+    _, dist, _ = release
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    tarball = dist / script.tarball_name("alpha", VERSION)
+    tarball.rename(elsewhere / tarball.name)
+    tarball.symlink_to(elsewhere / tarball.name)
+    write_sums(dist)
+    assert any(f"{tarball.name} is not a regular file" in error for error in problems(release))
+    tarball.unlink()
+    (elsewhere / tarball.name).rename(tarball)
+    write_sums(dist)
+    sums = dist / script.SUMS
+    sums.rename(elsewhere / script.SUMS)
+    sums.symlink_to(elsewhere / script.SUMS)
+    assert any(f"{script.SUMS} is a link" in error for error in problems(release))
+    write_wheel(dist, ["agent_chat/__init__.py"])
+    wheel = next(dist.glob("*.whl"))
+    wheel.rename(elsewhere / wheel.name)
+    wheel.symlink_to(elsewhere / wheel.name)
+    assert any(f"{wheel.name} is not a regular file" in error for error in script.check_wheel(dist) if error)
+
+
 def test_a_missing_or_doubled_distribution_fails(tmp_path: Path) -> None:
     assert script.check_wheel(tmp_path)
     assert script.check_sdist(tmp_path, tracked_files("alpha"))
     write_sdist(tmp_path, tracked_files("alpha"))
     write_tarball(tmp_path / "other-1.tar.gz", {})
     assert script.check_sdist(tmp_path, tracked_files("alpha"))
+
+
+# Packing, against a stand-in for npm that records what it was asked to pack.
+
+FAKE_NPM = """#!{python}
+import os, pathlib, sys
+staged, dist = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[4])
+seen = sorted(path.relative_to(staged).as_posix() for path in staged.rglob("*"))
+log = pathlib.Path(os.environ["FAKE_NPM_LOG"]) / (staged.name + ".log")
+log.write_text("\\n".join(seen) + "\\n=== LICENSE\\n" + (staged / "LICENSE").read_text())
+(dist / f"agent-chat-{{staged.name}}-1.2.3.tgz").write_bytes(b"tarball of " + staged.name.encode())
+"""
+
+
+@pytest.fixture
+def fake_npm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    bin_dir, log = tmp_path / "bin", tmp_path / "npm-log"
+    bin_dir.mkdir()
+    log.mkdir()
+    npm = bin_dir / "npm"
+    npm.write_text(FAKE_NPM.format(python=sys.executable), encoding="utf-8")
+    npm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_NPM_LOG", str(log))
+    return log
+
+
+@pytest.fixture
+def repository(tmp_path: Path) -> Path:
+    root = tmp_path / "repo"
+    (root / "LICENSE").parent.mkdir()
+    (root / "LICENSE").write_text(LICENSE_TEXT, encoding="utf-8")
+    for harness in HARNESSES:
+        (root / "integrations" / harness / "lib").mkdir(parents=True)
+        (root / "integrations" / harness / "package.json").write_text("{}", encoding="utf-8")
+        (root / "integrations" / harness / "lib" / "config.js").write_text("export {}", encoding="utf-8")
+    return root
+
+
+def test_pack_stages_each_directory_with_the_license_and_leaves_the_source_alone(
+    repository: Path, fake_npm: Path, tmp_path: Path
+) -> None:
+    # npm install leaves links under node_modules; the copy never takes that directory.
+    (repository / "integrations" / "alpha" / "node_modules" / ".bin").mkdir(parents=True)
+    (repository / "integrations" / "alpha" / "node_modules" / ".bin" / "tool").symlink_to("../tool.js")
+    dist = tmp_path / "dist"
+    script.pack(repository, dist)
+    for harness in HARNESSES:
+        listing, _, license_text = (fake_npm / f"{harness}.log").read_text(encoding="utf-8").partition("=== LICENSE\n")
+        assert listing.split() == ["LICENSE", "lib", "lib/config.js", "package.json"]
+        assert license_text == LICENSE_TEXT
+        assert not (repository / "integrations" / harness / "LICENSE").exists(), "the source tree is never written"
+    sums = (dist / script.SUMS).read_text(encoding="utf-8").splitlines()
+    assert [line.split("  ")[1] for line in sums] == ["agent-chat-alpha-1.2.3.tgz", "agent-chat-beta-1.2.3.tgz"]
+    assert script.check_sums(dist, {path.name: path for path in dist.glob("*.tgz")}) == []
+
+
+def make_fifo(path: Path) -> None:
+    os.mkfifo(path)
+
+
+def link_license(package: Path, outside: Path) -> None:
+    (package / "LICENSE").symlink_to(outside)
+
+
+def link_other_file(package: Path, outside: Path) -> None:
+    (package / "lib" / "link.js").symlink_to(outside)
+
+
+def link_directory(package: Path, outside: Path) -> None:
+    (package / "vendored").symlink_to(outside.parent, target_is_directory=True)
+
+
+def link_dangling(package: Path, outside: Path) -> None:
+    (package / "LICENSE").symlink_to(outside.parent / "does-not-exist")
+
+
+@pytest.mark.parametrize(
+    "plant",
+    [
+        pytest.param(link_license, id="license-link"),
+        pytest.param(link_other_file, id="file-link"),
+        pytest.param(link_directory, id="directory-link"),
+        pytest.param(link_dangling, id="dangling-license-link"),
+        pytest.param(lambda package, outside: make_fifo(package / "lib" / "pipe"), id="fifo"),
+    ],
+)
+def test_pack_refuses_a_link_or_special_file_and_never_writes_through_it(
+    repository: Path, fake_npm: Path, tmp_path: Path, plant
+) -> None:
+    outside = tmp_path / "outside" / "target.txt"
+    outside.parent.mkdir()
+    outside.write_text("keep", encoding="utf-8")
+    plant(repository / "integrations" / "alpha", outside)
+    with pytest.raises(SystemExit, match="not a regular file or a directory"):
+        script.pack(repository, tmp_path / "dist")
+    assert outside.read_text(encoding="utf-8") == "keep"
+    assert sorted(path.name for path in outside.parent.iterdir()) == ["target.txt"]
+    assert list(fake_npm.iterdir()) == [], "npm never ran"
+
+
+def test_the_staged_license_is_created_exclusively(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A link that appears in the copy after the walk and the copy is still not written through."""
+    package, scratch = tmp_path / "alpha", tmp_path / "scratch"
+    (package / "lib").mkdir(parents=True)
+    scratch.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    license_file = tmp_path / "LICENSE"
+    license_file.write_text(LICENSE_TEXT, encoding="utf-8")
+    staged = script.stage_package(package, scratch, license_file)
+    assert (staged / "LICENSE").read_text(encoding="utf-8") == LICENSE_TEXT
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+    copytree, second = shutil.copytree, tmp_path / "second-scratch"
+
+    def copy_then_plant_a_link(source: Path, destination: Path, *args, **options) -> Path:
+        # copytree calls itself for each subdirectory; plant the link in the top of the copy only.
+        result = copytree(source, destination, *args, **options)
+        if Path(destination) == second / "alpha":
+            (Path(destination) / "LICENSE").symlink_to(outside)
+        return result
+
+    second.mkdir()
+    monkeypatch.setattr(script.shutil, "copytree", copy_then_plant_a_link)
+    with pytest.raises(SystemExit, match="holds no LICENSE of its own"):
+        script.stage_package(package, second, license_file)
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_pack_refuses_a_license_that_the_package_already_holds(
+    repository: Path, fake_npm: Path, tmp_path: Path
+) -> None:
+    own = repository / "integrations" / "alpha" / "LICENSE"
+    own.write_text("a second licence", encoding="utf-8")
+    with pytest.raises(SystemExit, match="holds no LICENSE of its own"):
+        script.pack(repository, tmp_path / "dist")
+    assert own.read_text(encoding="utf-8") == "a second licence"
+
+
+def test_pack_refuses_a_link_in_the_output_directory(repository: Path, fake_npm: Path, tmp_path: Path) -> None:
+    outside = tmp_path / "outside.txt"
+    outside.write_text("keep", encoding="utf-8")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / script.SUMS).symlink_to(outside)
+    with pytest.raises(SystemExit, match="is a link"):
+        script.pack(repository, dist)
+    assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_the_sums_file_is_replaced_and_never_written_through(tmp_path: Path) -> None:
+    dist, outside = tmp_path / "dist", tmp_path / "outside.txt"
+    dist.mkdir()
+    write_tarball(dist / "agent-chat-alpha-1.2.3.tgz", {"package/package.json": "{}"})
+    outside.write_text("keep", encoding="utf-8")
+    (dist / script.SUMS).symlink_to(outside)
+    script.write_sums(dist)
+    assert outside.read_text(encoding="utf-8") == "keep"
+    assert not (dist / script.SUMS).is_symlink()
+    assert (dist / script.SUMS).read_text(encoding="utf-8").endswith("  agent-chat-alpha-1.2.3.tgz\n")
+    assert [path.name for path in dist.iterdir() if path.name.startswith("SHA256SUMS.")] == []
 
 
 # The install guide, executed. A block that nobody runs drifts from the checker that guards the same file.
@@ -807,6 +1071,41 @@ def windows_line_endings(release_dir: Path) -> None:
     sums.write_bytes(sums.read_bytes().replace(b"\n", b"\r\n"))
 
 
+def append_to_sums(release_dir: Path, tail: bytes) -> None:
+    sums = release_dir / script.SUMS
+    sums.write_bytes(sums.read_bytes() + tail)
+
+
+def mixed_line_endings(release_dir: Path) -> None:
+    """One clean record for the tarball, and a second one for it that ends in CRLF."""
+    append_to_sums(release_dir, pi_line(release_dir).rstrip("\n").encode() + b"\r\n")
+
+
+def crlf_on_another_line(release_dir: Path) -> None:
+    """The record for the chosen tarball is clean; only a record for another file ends in CRLF."""
+    append_to_sums(release_dir, f"{'0' * 64}  agent-chat-other-{VERSION}.tgz\r\n".encode())
+
+
+def carriage_return_inside_a_line(release_dir: Path) -> None:
+    append_to_sums(release_dir, f"{'0' * 64}  agent-chat-ot\rher-{VERSION}.tgz\n".encode())
+
+
+def stray_text_for_another_file(release_dir: Path) -> None:
+    append_to_sums(release_dir, b"this is not a checksum line\n")
+
+
+def binary_mode_for_another_file(release_dir: Path) -> None:
+    append_to_sums(release_dir, f"{'0' * 64} *agent-chat-other-{VERSION}.tgz\n".encode())
+
+
+def blank_line(release_dir: Path) -> None:
+    append_to_sums(release_dir, b"\n")
+
+
+def nul_byte_line(release_dir: Path) -> None:
+    append_to_sums(release_dir, f"{'0' * 64}  agent-chat-other-{VERSION}.tgz\0\n".encode())
+
+
 def drop_sums(release_dir: Path) -> None:
     (release_dir / script.SUMS).unlink()
 
@@ -832,10 +1131,17 @@ def test_the_install_block_extracts_a_verified_tarball_and_cleans_up(tmp_path: P
         pytest.param(tamper, "FAILED", id="tampered-tarball"),
         pytest.param(repeat_line, "exactly one line", id="duplicate-line"),
         pytest.param(drop_line, "exactly one line", id="missing-line"),
-        pytest.param(repeat_in_binary_mode, "exactly one line", id="binary-mode-duplicate"),
-        pytest.param(only_binary_mode, "GNU text form", id="binary-mode-only"),
-        pytest.param(uppercase_digest, "GNU text form", id="uppercase-digest"),
-        pytest.param(windows_line_endings, "exactly one line", id="windows-line-endings"),
+        pytest.param(repeat_in_binary_mode, "outside the GNU text form", id="binary-mode-duplicate"),
+        pytest.param(only_binary_mode, "outside the GNU text form", id="binary-mode-only"),
+        pytest.param(uppercase_digest, "outside the GNU text form", id="uppercase-digest"),
+        pytest.param(windows_line_endings, "outside the GNU text form", id="windows-line-endings"),
+        pytest.param(mixed_line_endings, "outside the GNU text form", id="mixed-line-endings"),
+        pytest.param(crlf_on_another_line, "outside the GNU text form", id="crlf-on-another-line"),
+        pytest.param(carriage_return_inside_a_line, "outside the GNU text form", id="carriage-return-inside-a-line"),
+        pytest.param(stray_text_for_another_file, "outside the GNU text form", id="stray-text-for-another-file"),
+        pytest.param(binary_mode_for_another_file, "outside the GNU text form", id="binary-mode-for-another-file"),
+        pytest.param(blank_line, "outside the GNU text form", id="blank-line"),
+        pytest.param(nul_byte_line, "outside the GNU text form", id="nul-byte-line"),
         pytest.param(drop_sums, "curl", id="missing-sums-file"),
         pytest.param(drop_tarball, "curl", id="missing-tarball"),
     ],
@@ -857,8 +1163,23 @@ def test_the_install_block_leaves_an_existing_target_alone(tmp_path: Path) -> No
     target.mkdir(parents=True)
     (target / "keep.txt").write_text("mine", encoding="utf-8")
     result, _, _ = run_install(tmp_path, release_dir)
-    assert result.returncode != 0 and "exists already" in result.stderr
+    assert result.returncode != 0 and "must not exist yet" in result.stderr
     assert [path.name for path in target.iterdir()] == ["keep.txt"]
+
+
+@needs_install_tools
+@pytest.mark.parametrize("dangling", [False, True], ids=["link-to-a-directory", "dangling-link"])
+def test_the_install_block_will_not_extract_through_a_link(tmp_path: Path, dangling: bool) -> None:
+    release_dir = make_release(tmp_path / "release")
+    elsewhere = tmp_path / "elsewhere"
+    if not dangling:
+        elsewhere.mkdir()
+    target = tmp_path / "install" / f"agent-chat-pi-{VERSION}"
+    target.parent.mkdir()
+    target.symlink_to(elsewhere, target_is_directory=not dangling)
+    result, _, _ = run_install(tmp_path, release_dir)
+    assert result.returncode != 0 and "must not exist yet" in result.stderr
+    assert not elsewhere.exists() or list(elsewhere.iterdir()) == [], "nothing is extracted through the link"
 
 
 def test_the_install_guide_names_its_requirements_and_the_macos_route() -> None:

@@ -133,15 +133,24 @@ keeps a harness process that a session starts on purpose from joining chat.
 
 `tests/test_release_artifacts.py` pins this rule for every directory under
 `integrations/`. `scripts/check_release_artifacts.py` packs the directories and
-checks the built artifacts: the sdist holds every tracked integration file, the
-wheel holds no `integrations` path, and there is one tarball per directory with
-its entry points, the repository `LICENSE` and without `test/`. A tarball holds
-only regular files and directories under `package/`, with canonical paths and
-no duplicate. `SHA256SUMS` has one line per tarball in the GNU text form
-`<64 lowercase hex digits><two spaces><tarball name>`; the install block below
-reads that form and nothing else. The release workflow
-`release-integrations.yml` runs the script before it attaches the tarballs to
-the release.
+checks the built artifacts. The pack step refuses a link or special file in a
+package directory, and the output directory must hold no link. The checks:
+
+- The sdist holds every tracked integration file as a regular file, and the
+  wheel holds no `integrations` path.
+- There is one tarball per directory with its entry points, the repository
+  `LICENSE` and without `test/`.
+- A tarball holds only regular files and directories under `package/`. The
+  archive headers are read as written: no `.`, `..`, empty or backslash
+  segment and no duplicate.
+- `SHA256SUMS` has one line per tarball in the GNU text form
+  `<64 lowercase hex digits><two spaces><tarball name>`, with LF line endings
+  and a name of letters, digits and `._+-`. The install block below checks
+  every line of the file against that form before it selects one, and
+  accepts nothing else.
+
+The release workflow `release-integrations.yml` runs the script before it
+attaches the tarballs to the release.
 
 ## Install a pinned release
 
@@ -169,15 +178,21 @@ release.
    `PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"`.
 
    The block works in a fresh temporary directory and stops at the first
-   failure. It extracts only after both downloads succeed and `SHA256SUMS`
-   has exactly one line for the chosen file name, in the GNU text form
-   `<64 lowercase hex digits><two spaces><file name>`, and that line matches.
-   A binary-mode record, `<digest> *<file name>`, counts as a line for the
-   file, so a repeated one stops the block, and a lone one is refused. The
-   target directory is absolute, must not exist yet, and stays in place for as
-   long as the harness uses it. The tarball unpacks into a `package/`
-   directory, which the block strips. The layout must stay intact, because the
-   entry points import `../lib/`.
+   failure. It extracts only after these steps all pass:
+
+   - Both downloads succeed.
+   - Every line of `SHA256SUMS` is in the GNU text form
+     `<64 lowercase hex digits><two spaces><file name>`, with LF line endings.
+     A binary-mode record (`<digest> *<file name>`), a carriage return or any
+     other stray line stops the block, even when the line names another file.
+   - `SHA256SUMS` has exactly one line for the chosen file name, and that line
+     matches the download.
+
+   The block creates the target directory itself, so the target must be an
+   absolute path that does not exist yet, a link included, and it stays in
+   place for as long as the harness uses it. The tarball unpacks into a
+   `package/` directory, which the block strips. The layout must stay intact,
+   because the entry points import `../lib/`.
 
    ```bash
    version=<version>
@@ -192,12 +207,12 @@ release.
      cd "$work"
      curl --fail --location --remote-name "${base}/${asset}"
      curl --fail --location --remote-name "${base}/SHA256SUMS"
-     awk -v name="$asset" 'NF == 2 && ($2 == name || $2 == "*" name)' SHA256SUMS > asset.sha256
+     test "$(LC_ALL=C grep -cavEx '[0-9a-f]{64}  [A-Za-z0-9._+-]+' SHA256SUMS)" -eq 0 || { echo "SHA256SUMS holds a line outside the GNU text form (<digest>  <name>, LF endings)" >&2; exit 1; }
+     awk -v name="$asset" '$2 == name' SHA256SUMS > asset.sha256
      test "$(wc -l < asset.sha256)" -eq 1 || { echo "SHA256SUMS needs exactly one line for ${asset}" >&2; exit 1; }
-     LC_ALL=C grep -Eqx '[0-9a-f]{64}  [^* ][^ ]*' asset.sha256 || { echo "the line for ${asset} is not in the GNU text form" >&2; exit 1; }
      sha256sum --check --strict asset.sha256
-     test ! -e "$dir" || { echo "${dir} exists already" >&2; exit 1; }
-     mkdir -p "$dir"
+     mkdir -p "$(dirname "$dir")"
+     mkdir "$dir" || { echo "cannot create ${dir}: it must not exist yet" >&2; exit 1; }
      tar -xzf "$asset" -C "$dir" --strip-components=1
    )
    ```

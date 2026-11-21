@@ -12,18 +12,24 @@ directory to check the sdist and the wheel as well. Directories are enumerated,
 never listed: a new harness package is packed, and checked, when its directory
 appears. ``npm pack`` runs on a copy of each directory that also holds the
 repository ``LICENSE``, because npm packs only files inside the package
-directory; the source tree is never written.
+directory. The pack step refuses a link, device or fifo anywhere in a package
+directory and a link among the files already in ``<dist-dir>``, creates the
+copied ``LICENSE`` exclusively and replaces ``SHA256SUMS`` instead of writing
+through it, so no write can reach a file outside the directories it names.
 
 The checks:
 
-* the sdist holds every path from ``git ls-files integrations``, so a later
-  ``include`` or ``exclude`` edit cannot drop a package silently;
+* the sdist holds every path from ``git ls-files integrations`` as a regular
+  file, so a later ``include`` or ``exclude`` edit cannot drop a package
+  silently;
 * the wheel holds no path with an ``integrations`` segment anywhere, because a
   Node package inside the Python import tree is never a harness install
   source;
-* there is exactly one ``agent-chat-<harness>-<version>.tgz`` per directory;
+* there is exactly one ``agent-chat-<harness>-<version>.tgz`` per directory,
+  and every artifact is a regular file, not a link;
 * ``SHA256SUMS`` has one line per tarball in the GNU text form
-  ``<64 lowercase hex digits><two spaces><tarball name>``. A malformed line, a
+  ``<64 lowercase hex digits><two spaces><tarball name>``, with LF line
+  endings and a name of letters, digits and ``._+-`` only. A malformed line, a
   binary-mode ``*name`` record or a repeated name fails, and every digest must
   match its tarball;
 * each tarball carries ``package.json`` at the product version, every declared
@@ -31,24 +37,30 @@ The checks:
   its directory except ``test/``, and nothing else;
 * each tarball member is a regular file or a directory (not a link, device or
   fifo), has a canonical path under ``package/`` (no ``.``, ``..`` or empty
-  segment, no backslash, no leading slash, no trailing slash on a file) and
-  appears once, with duplicates compared on the normalized path; a directory
-  member must be an ancestor of an expected file.
+  segment, no backslash, no leading slash, no trailing slash on a file, at most
+  one on a directory) and appears once, with duplicates compared on the
+  normalized path; a directory member must be an ancestor of an expected file.
+  The path is read from the raw archive header, because tarfile strips the
+  trailing slashes of a directory name before a check can see them.
 
 ``--integrations-only`` skips the sdist and wheel checks, for a directory that
 holds only tarballs. The script reads archive member names, the ``package.json``
-member and the ``LICENSE`` member of each tarball. It never extracts an archive.
+member and the ``LICENSE`` member of each tarball, and the raw header names. It
+never extracts an archive.
 Exit status 0 means every check passed.
 """
 
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
+import os
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -71,8 +83,12 @@ REGULAR_OR_DIRECTORY = (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE)
 # A directory of a package that its tarball leaves out, by the release rule.
 UNSHIPPED_DIRECTORY = "test/"
 # One SHA256SUMS line in GNU text mode: the digest, two spaces, a plain file name. A binary-mode
-# record is `<digest> *<name>`, and a name that starts with `*` would read like one.
-SUMS_LINE = re.compile(r"(?P<digest>[0-9a-f]{64})  (?P<name>[^\s/\\*][^\s/\\]*)")
+# record is `<digest> *<name>`. The install guide in integrations/README.md checks every line of the
+# file against this same pattern before it selects one, so change the two together.
+SUMS_LINE = re.compile(r"(?P<digest>[0-9a-f]{64})  (?P<name>[A-Za-z0-9._+-]+)")
+BLOCK = 512
+# Member types after which tarfile reads no data block: link, symlink, device, directory, fifo.
+HEADER_ONLY = (b"1", b"2", b"3", b"4", b"5", b"6")
 
 
 def project_version(root: Path) -> str:
@@ -101,6 +117,52 @@ def tarball_name(harness: str, version: str) -> str:
     return f"agent-chat-{harness}-{version}.tgz"
 
 
+def refuse_special_files(directory: Path) -> None:
+    """Stop unless ``directory`` holds only regular files and directories.
+
+    A symbolic link, device, fifo or socket anywhere in it stops the pack. ``node_modules`` is
+    skipped because the copy never takes it.
+    """
+
+    def check(path: Path) -> None:
+        mode = os.lstat(path).st_mode
+        if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+            raise SystemExit(f"{path} is not a regular file or a directory; a package directory holds only those")
+
+    check(directory)
+    for current, names, files in os.walk(directory):
+        names[:] = [name for name in names if name != "node_modules"]
+        for name in (*names, *files):
+            check(Path(current, name))
+
+
+def stage_package(directory: Path, scratch: Path, license_file: Path) -> Path:
+    """Copy one package directory into ``scratch`` and add the repository ``LICENSE`` to the copy.
+
+    Nothing is followed or preserved: a link anywhere in the directory stops the pack before the
+    copy, and the ``LICENSE`` is created exclusively (``O_CREAT | O_EXCL`` never opens an existing
+    path or link), so a ``LICENSE`` that the directory already holds stops it too.
+    """
+    refuse_special_files(directory)
+    staged = scratch / directory.name
+    shutil.copytree(directory, staged, ignore=shutil.ignore_patterns("node_modules"))
+    try:
+        with (staged / LICENSE).open("xb") as handle:
+            handle.write(license_file.read_bytes())
+    except FileExistsError:
+        raise SystemExit(f"{directory / LICENSE} exists; a package directory holds no LICENSE of its own") from None
+    return staged
+
+
+def write_sums(dist: Path) -> None:
+    """Write ``SHA256SUMS`` over the tarballs by replacing it, never by writing through a link."""
+    lines = [f"{sha256(path)}  {path.name}\n" for path in sorted(dist.glob("*.tgz"))]
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dist, prefix=f"{SUMS}.", delete=False) as handle:
+        handle.write("".join(lines))
+    os.chmod(handle.name, 0o644)
+    os.replace(handle.name, dist / SUMS)
+
+
 def pack(root: Path, dist: Path) -> None:
     """Run ``npm pack`` on every package directory, then write ``SHA256SUMS`` over the tarballs.
 
@@ -115,18 +177,18 @@ def pack(root: Path, dist: Path) -> None:
     if not license_file.is_file():
         raise SystemExit(f"{license_file} is missing; every tarball ships it")
     dist.mkdir(parents=True, exist_ok=True)
+    for child in dist.iterdir():
+        if child.is_symlink():
+            raise SystemExit(f"{child} is a link; npm pack and the sums file would write through it")
     with tempfile.TemporaryDirectory(prefix="agent-chat-pack-") as scratch:
         for directory in package_directories(root):
-            staged = Path(scratch) / directory.name
-            shutil.copytree(directory, staged, symlinks=True, ignore=shutil.ignore_patterns("node_modules"))
-            shutil.copyfile(license_file, staged / LICENSE)
+            staged = stage_package(directory, Path(scratch), license_file)
             subprocess.run(
                 [npm, "pack", str(staged), "--pack-destination", str(dist), "--silent"],
                 check=True,
                 timeout=120,
             )
-    lines = [f"{sha256(path)}  {path.name}\n" for path in sorted(dist.glob("*.tgz"))]
-    (dist / SUMS).write_text("".join(lines), encoding="utf-8")
+    write_sums(dist)
 
 
 def sha256(path: Path) -> str:
@@ -137,10 +199,18 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def regular_file(path: Path) -> bool:
+    """A regular file and not a link: a link in the artifact directory can point anywhere."""
+    return path.is_file() and not path.is_symlink()
+
+
 def only_one(dist: Path, pattern: str, errors: list[str]) -> Path | None:
     found = sorted(dist.glob(pattern))
     if len(found) != 1:
         errors.append(f"{dist}: expected exactly one {pattern}, found {[path.name for path in found]}")
+        return None
+    if not regular_file(found[0]):
+        errors.append(f"{dist}: {found[0].name} is not a regular file")
         return None
     return found[0]
 
@@ -154,8 +224,13 @@ def check_sdist(dist: Path, tracked: Sequence[str]) -> list[str]:
         return errors
     try:
         with tarfile.open(sdist, "r:gz") as archive:
-            # The first component is the sdist's own top directory, `<name>-<version>/`.
-            names = {name.split("/", 1)[1] for name in archive.getnames() if "/" in name}
+            # The first component is the sdist's own top directory, `<name>-<version>/`. Only a
+            # regular file counts: a directory or a link named like a tracked file holds nothing.
+            names = {
+                member.name.split("/", 1)[1]
+                for member in archive.getmembers()
+                if member.isfile() and "/" in member.name
+            }
     except UNREADABLE as error:
         return [f"{sdist.name}: cannot read the archive: {error}"]
     errors.extend(f"{sdist.name}: missing tracked file {path}" for path in tracked if path not in names)
@@ -174,8 +249,11 @@ def check_wheel(dist: Path) -> list[str]:
         return [f"{wheel.name}: cannot read the archive: {error}"]
     if not any(name.startswith("agent_chat/") for name in names):
         errors.append(f"{wheel.name}: holds no agent_chat/ path, so the integrations check would prove nothing")
-    # Any segment: `agent_chat/integrations/pi/package.json` is as wrong as a top-level path.
-    errors.extend(f"{wheel.name}: holds {name}" for name in names if INTEGRATIONS in name.split("/"))
+    # Any segment, with a backslash read as a separator: `agent_chat/integrations/pi/package.json`
+    # is as wrong as a top-level path.
+    errors.extend(
+        f"{wheel.name}: holds {name}" for name in names if INTEGRATIONS in name.replace("\\", "/").split("/")
+    )
     return errors
 
 
@@ -192,11 +270,12 @@ def entry_points(package: dict) -> Iterator[str]:
             for item in value.values():
                 yield from strings(item)
 
+    pi = package.get("pi")
     declared = [
         package.get("main"),
         package.get("exports"),
         package.get("bin"),
-        (package.get("pi") or {}).get("extensions"),
+        pi.get("extensions") if isinstance(pi, dict) else None,
     ]
     for value in declared:
         for text in strings(value):
@@ -217,6 +296,83 @@ def is_canonical(name: str) -> bool:
     return "\\" not in name and all(segment not in ("", ".", "..") for segment in name.split("/"))
 
 
+def read_exactly(stream: gzip.GzipFile, size: int) -> bytes:
+    data = stream.read(size)
+    if len(data) != size:
+        raise ValueError("the archive ends inside a member")
+    return data
+
+
+def skip(stream: gzip.GzipFile, size: int) -> None:
+    while size > 0:
+        chunk = stream.read(min(size, 1 << 20))
+        if not chunk:
+            raise ValueError("the archive ends inside a member")
+        size -= len(chunk)
+
+
+def header_text(field: bytes) -> str:
+    return field.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+
+
+def header_size(block: bytes) -> int:
+    field = block[124:136]
+    if field[0] == 0o200:
+        return int.from_bytes(field[1:], "big")
+    return int(field.split(b"\0", 1)[0].strip() or b"0", 8)
+
+
+def pax_path(data: bytes) -> str | None:
+    """The ``path`` record of a pax extended header, as the header spells it."""
+    found = None
+    position = 0
+    while position < len(data):
+        space = data.index(b" ", position)
+        length = int(data[position:space])
+        if length <= space - position + 1:
+            raise ValueError("a pax record has an impossible length")
+        key, _, value = data[space + 1 : position + length].removesuffix(b"\n").partition(b"=")
+        if key == b"path":
+            found = value.decode("utf-8", "surrogateescape")
+        position += length
+    return found
+
+
+def header_names(path: Path) -> list[str]:
+    """Every member name, spelled as its archive header spells it.
+
+    tarfile strips the trailing slashes of a directory name before it returns the member, so a
+    check on ``member.name`` cannot see ``package/lib//``. This reads the header blocks itself:
+    the ustar name and prefix, a GNU long name or a pax ``path`` record. The caller compares the
+    result with tarfile's members and stops on any disagreement, so a misread cannot pass.
+    """
+    names: list[str] = []
+    override: str | None = None
+    with gzip.open(path, "rb") as stream:
+        while block := stream.read(BLOCK):
+            if len(block) < BLOCK:
+                raise ValueError("the archive ends inside a header")
+            if block == bytes(BLOCK):
+                break
+            kind, size = block[156:157], header_size(block)
+            if kind in (b"x", b"g", b"L", b"K"):
+                data = read_exactly(stream, size)
+                skip(stream, -size % BLOCK)
+                if kind == b"x":
+                    override = pax_path(data) or override
+                elif kind == b"L":
+                    override = header_text(data)
+                elif kind == b"g" and pax_path(data) is not None:
+                    raise ValueError("a global pax header that sets a path is not supported")
+                continue
+            prefix, name = header_text(block[345:500]), header_text(block[0:100])
+            names.append(override if override is not None else f"{prefix}/{name}" if prefix else name)
+            override = None
+            if kind not in HEADER_ONLY:
+                skip(stream, size + -size % BLOCK)
+    return names
+
+
 def read_tarball(path: Path, errors: list[str]) -> Contents:
     """The members under ``package/``, the parsed ``package.json`` and the ``LICENSE`` bytes of one tarball."""
     files: set[str] = set()
@@ -224,23 +380,31 @@ def read_tarball(path: Path, errors: list[str]) -> Contents:
     seen: set[str] = set()
     wanted: dict[str, tarfile.TarInfo] = {}
     with tarfile.open(path, "r:gz") as archive:
-        for member in archive.getmembers():
+        members = archive.getmembers()
+        raw_names = header_names(path)
+        if len(raw_names) != len(members):
+            raise ValueError(f"the headers hold {len(raw_names)} members and tarfile reads {len(members)}")
+        for member, raw in zip(members, raw_names, strict=True):
+            if raw.rstrip("/") != member.name.rstrip("/"):
+                raise ValueError(f"member {member.name!r} has the header name {raw!r}")
+            # A directory header may end in one slash, as GNU tar writes it. Nothing else may.
+            spelled = raw.removesuffix("/") if member.isdir() else raw
             # Two spellings of one path (`package/lib`, `package/./lib`) are one member twice.
-            normalized = posixpath.normpath(member.name)
+            normalized = posixpath.normpath(spelled)
             if normalized in seen:
-                errors.append(f"{path.name}: duplicate member {member.name} (path {normalized})")
+                errors.append(f"{path.name}: duplicate member {spelled} (path {normalized})")
             seen.add(normalized)
             # A link, device or fifo never belongs in a package that a user extracts.
             if member.type not in REGULAR_OR_DIRECTORY:
                 errors.append(f"{path.name}: member {member.name} is not a regular file or directory")
-            elif not is_canonical(member.name):
-                errors.append(f"{path.name}: member {member.name!r} has a non-canonical path")
-            elif member.isdir() and member.name == TARBALL_PREFIX.rstrip("/"):
+            elif not is_canonical(spelled):
+                errors.append(f"{path.name}: member {raw!r} has a non-canonical path")
+            elif member.isdir() and spelled == TARBALL_PREFIX.rstrip("/"):
                 continue
-            elif not member.name.startswith(TARBALL_PREFIX):
-                errors.append(f"{path.name}: member {member.name} is outside {TARBALL_PREFIX}")
+            elif not spelled.startswith(TARBALL_PREFIX):
+                errors.append(f"{path.name}: member {spelled} is outside {TARBALL_PREFIX}")
             else:
-                relative = member.name[len(TARBALL_PREFIX) :]
+                relative = spelled[len(TARBALL_PREFIX) :]
                 (directories if member.isdir() else files).add(relative)
                 if member.isfile():
                     wanted.setdefault(relative, member)
@@ -253,7 +417,10 @@ def read_tarball(path: Path, errors: list[str]) -> Contents:
     if manifest is None:
         errors.append(f"{path.name}: no package.json at the package root")
         return Contents(files, directories, {}, license_text)
-    return Contents(files, directories, json.loads(manifest.decode("utf-8")), license_text)
+    package = json.loads(manifest.decode("utf-8"))
+    if not isinstance(package, dict):
+        raise ValueError("package.json is not a JSON object")
+    return Contents(files, directories, package, license_text)
 
 
 def check_tarball(path: Path, harness: str, version: str, tracked: Sequence[str], license_text: bytes) -> list[str]:
@@ -298,7 +465,12 @@ def check_tarballs(root: Path, dist: Path, version: str, tracked: Sequence[str])
         else:
             harnesses.append(directory.name)
     expected = {tarball_name(harness, version): harness for harness in harnesses}
-    found = {path.name: path for path in dist.glob("*.tgz")}
+    found: dict[str, Path] = {}
+    for path in sorted(dist.glob("*.tgz")):
+        if regular_file(path):
+            found[path.name] = path
+        else:
+            errors.append(f"{dist}: {path.name} is not a regular file")
     errors.extend(f"{dist}: no tarball {name}" for name in sorted(expected.keys() - found.keys()))
     errors.extend(f"{dist}: unexpected tarball {name}" for name in sorted(found.keys() - expected.keys()))
     license_file = root / LICENSE
@@ -317,6 +489,8 @@ def check_sums(dist: Path, found: dict[str, Path]) -> list[str]:
     sums = dist / SUMS
     if not sums.is_file():
         return [f"{dist}: no {SUMS}"]
+    if sums.is_symlink():
+        return [f"{dist}: {SUMS} is a link, not a regular file"]
     try:
         # Bytes, not read_text: universal newlines would turn a CRLF file into a clean one.
         text = sums.read_bytes().decode("utf-8")
