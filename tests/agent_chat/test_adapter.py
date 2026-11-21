@@ -304,17 +304,19 @@ def test_stop_still_discards_and_ends_when_the_context_callback_fails(tmp_path):
     assert operations.ends == 1
 
 
-@pytest.mark.parametrize("error", [TimeoutError("stalled mount"), OSError("bad descriptor")])
+@pytest.mark.parametrize("error", [TimeoutError("stalled mount"), OSError("read-only")])
 def test_stop_still_withdraws_and_ends_when_the_removal_fails(tmp_path, monkeypatch, error):
     adapter, operations, delivery = make_adapter(tmp_path)
     adapter.start("native-a")
+    path = tmp_path / f"{adapter.joined.binding.boot_id}.json"
 
-    def failing_discard(directory, boot_id):
+    def failing_unlink(*args, **kwargs):
         raise error
 
-    monkeypatch.setattr(instance_file, "discard_instance", failing_discard)
+    monkeypatch.setattr(instance_file.os, "unlink", failing_unlink)
     adapter.stop()
 
+    assert path.exists()  # the removal failed and left the file
     assert delivery.contexts[-1] is None
     assert operations.ends == 1
 

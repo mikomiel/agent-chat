@@ -99,11 +99,12 @@ def _end(instance: instance_client.JoinedInstance, directory: Path) -> dict[str,
     The record goes first. Once its removal succeeds, a new open of its path finds nothing while the end is in
     flight, or after an end that fails or is cut short by a kill; the instance then ends when no heartbeat renews its
     server lease. Removal is best effort. A caller that already holds the file open or has read the credential can
-    still use it, and its heartbeats renew the lease. A deadline that expires during the removal propagates, so the
-    caller's fallback end runs under a fresh deadline. The end uses the credential held in memory.
+    still use it, and its heartbeats renew the lease. A removal that fails or runs out of time is not raised, and the
+    end request then gets its own deadline, so it is still sent and still bounded even if the worker's alarm already
+    fired during the removal. The end uses the credential held in memory.
     """
     instance_file.discard_instance(directory, instance.binding.boot_id)
-    return instance_client.end(instance)
+    return instance_client.end(instance, deadline=monotonic() + REQUEST_SECONDS)
 
 
 def _asks_bodies(request: dict[str, Any]) -> bool:
