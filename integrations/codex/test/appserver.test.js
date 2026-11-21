@@ -919,6 +919,77 @@ test("a socket that is the same for the add connection, the reading and the add 
   assert.deepEqual(result, { outcome: "handed", reason: null })
 })
 
+// ---- the configured path is checked again before the add ---------------------------------------------------------------
+
+// The check before the add resolves the configured path again, from its first name, through the whole trust rule. It is not
+// enough that the canonical path of the add connection still holds the same socket: a link in the configured path may have
+// moved, and the path then selects another listener while the old socket is still there.
+// `<base>/current/app/control.sock` goes through the link `current`, which names `a`; `b` holds another app-server. Both answer a
+// wake the same way, and confirm its add.
+async function throughLink() {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "acr-")))
+  const handler = queueServer({ "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) })
+  const listen = async name => {
+    for (const path of [join(base, name), join(base, name, "app")]) {
+      mkdirSync(path, { mode: 0o700 })
+      chmodSync(path, 0o700)
+    }
+    return fakeAppServer(join(base, name, "app", "control.sock"), handler)
+  }
+  const old = await listen("a")
+  const next = await listen("b")
+  symlinkSync(join(base, "a"), join(base, "current"))
+  return {
+    base, old, next, path: join(base, "current", "app", "control.sock"),
+    // A new link renamed over the old one, as an operator switches `current`.
+    retarget() {
+      symlinkSync(join(base, "b"), join(base, "current.new"))
+      renameSync(join(base, "current.new"), join(base, "current"))
+    },
+    async close() { await old.close(); await next.close(); rmSync(base, { recursive: true, force: true }) },
+  }
+}
+
+// An `open` for `createThread` that calls `after` once the connection with this number (counted from 0) has closed. A wake opens
+// the connection for the add first and the reading's second, and closes the reading's before it checks the path and adds.
+function afterClose(number, after) {
+  let opened = 0
+  return async (target, options) => {
+    const link = await openAppServer(target, options)
+    const mine = opened++
+    return { identity: link.identity, same: link.same, request: link.request, close() { link.close(); if (mine === number) after() } }
+  }
+}
+const addsTo = server => server.methods().filter(method => method === "thread/queue/add").length
+
+test("a link in the configured path that moves after the reading sends no add, though the socket that was reached is still there", async () => {
+  const w = await throughLink()
+  try {
+    const wake = async moved => {
+      let asked = 0
+      const bound = createThread({ path: w.path, threadId: THREAD, open: afterClose(1, moved) })
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000, proceed: () => { asked += 1; return null } })
+      return { result, asked }
+    }
+    assert.deepEqual(await wake(() => {}), { result: { outcome: "handed", reason: null }, asked: 1 }, "control: with the link where it was, the same wake is handed")
+    assert.equal(addsTo(w.old), 1)
+    w.old.log.length = 0
+    assert.deepEqual(await wake(() => w.retarget()), { result: { outcome: "failed", reason: "native_unavailable" }, asked: 0 }, "the reading's connection closed, then the link moved")
+    assert.equal(addsTo(w.old), 0, "the old socket, which is still there, was sent nothing")
+    assert.equal(w.next.state.connections, 0, "and the new one was never connected to")
+  } finally { await w.close() }
+})
+
+test("the configured path must still pass the whole trust rule before the add: a directory that others can write by then sends no add", async () => {
+  const w = await throughLink()
+  try {
+    const bound = createThread({ path: w.path, threadId: THREAD, open: afterClose(1, () => chmodSync(join(w.base, "a", "app"), 0o777)) })
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 })
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.equal(addsTo(w.old), 0, "the socket is the same one, but its directory is no longer one that nobody else can change")
+  } finally { await w.close() }
+})
+
 // ---- the probe belongs to the socket it was taken on -----------------------------------------------------------------
 
 const handedItems = { "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) }
@@ -1019,6 +1090,91 @@ test("the thread tells whether its path still names the socket of its newest pro
     assert.equal(bound.replaced(), false, "the replacement was probed: it is the socket that counts now")
     renameSync(path, `${path}.gone`)
     assert.equal(bound.replaced(), false, "a path that names nothing has no other socket to probe")
+  } finally { await first.close(); await second?.close() }
+})
+
+// Only another socket of the current user is a replacement. Whatever else the path names or fails to name (a regular file, a
+// directory that became a file, an unreadable path, another user's socket), there is nothing to probe: the receiver does not
+// bind again, and the heartbeat's ordinary read goes on and reports the thread offline.
+// A thread that has probed a live socket in a directory of its own, for the task to change what the path names.
+async function probedAt(task, options = {}) {
+  const base = mkdtempSync(join(dir, "r-"))
+  const parent = join(base, "d")
+  mkdirSync(parent, { mode: 0o700 })
+  chmodSync(parent, 0o700)
+  const path = join(parent, "s.sock")
+  const server = await fakeAppServer(path, queueServer(handedItems))
+  try {
+    const bound = createThread({ path, threadId: THREAD, ...options })
+    assert.deepEqual(await bound.bind(), { status: "bound", route: true })
+    return await task({ bound, path, parent })
+  } finally { await server.close() }
+}
+
+test("replaced() is false when a regular file took the path: it is not a socket, so there is nothing to probe", async () => {
+  await probedAt(async ({ bound, path }) => {
+    assert.equal(bound.replaced(), false, "control: the probed socket is still there")
+    renameSync(path, `${path}.moved`)
+    writeFileSync(path, "")
+    assert.equal(bound.replaced(), false)
+  })
+})
+
+test("replaced() is false when a directory above the socket became a file (ENOTDIR)", async () => {
+  await probedAt(async ({ bound, path, parent }) => {
+    renameSync(parent, `${parent}.moved`)
+    writeFileSync(parent, "")
+    assert.throws(() => lstatSync(path), { code: "ENOTDIR" }, "control: this is what the path gives")
+    assert.equal(bound.replaced(), false)
+  })
+})
+
+test("replaced() is false whatever else the lstat fails with, not only ENOENT: a loop of links (ELOOP), EACCES, an error with no code", async () => {
+  await probedAt(async ({ bound, path, parent }) => {
+    renameSync(parent, `${parent}.moved`)
+    symlinkSync(parent, parent) // the name of the directory is a link to itself
+    assert.throws(() => lstatSync(path), { code: "ELOOP" }, "control: this is what the path gives")
+    assert.equal(bound.replaced(), false)
+  })
+  for (const code of ["EACCES", "ENAMETOOLONG", undefined]) {
+    const failing = () => { throw Object.assign(new Error("lstat failed"), code === undefined ? {} : { code }) }
+    await probedAt(async ({ bound }) => assert.equal(bound.replaced(), false, String(code)), { lstat: failing })
+  }
+})
+
+test("replaced() is true only for another socket of the current user: another user's socket is refused at a bind, not probed", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  let second
+  try {
+    let owner = process.geteuid() + 1
+    const bound = createThread({ path, threadId: THREAD, lstat: target => Object.create(lstatSync(target), { uid: { value: owner } }) })
+    await bound.bind()
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.replaced(), false, "another socket took the path, but another user owns it")
+    owner = process.geteuid()
+    assert.equal(bound.replaced(), true, "control: seen as the current user's, the same socket is a replacement")
+  } finally { await first.close(); await second?.close() }
+})
+
+test("replaced() takes one lstat of the path, whatever it finds, and none at all before a probe has finished", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  let calls = 0
+  const bound = createThread({ path, threadId: THREAD, lstat: target => { calls += 1; return lstatSync(target) } })
+  let second
+  try {
+    assert.equal(bound.replaced(), false)
+    assert.equal(calls, 0, "no probe has finished: the path is not looked at")
+    await bound.bind()
+    assert.equal(bound.replaced(), false)
+    assert.equal(calls, 1, "the socket that was probed, unchanged")
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.replaced(), true)
+    assert.equal(calls, 2, "another socket")
+    renameSync(path, `${path}.gone`)
+    assert.equal(bound.replaced(), false)
+    assert.equal(calls, 3, "no socket")
   } finally { await first.close(); await second?.close() }
 })
 

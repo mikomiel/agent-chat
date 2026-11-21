@@ -1,7 +1,8 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { fittingSocketPath, MAX_SOCKET_PATH_BYTES, sameSocket, trustedDirectory, trustedSocket } from "../lib/trust.js"
+import { fittingSocketPath, MAX_SOCKET_PATH_BYTES, trustedDirectory, trustedSocket } from "../lib/trust.js"
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
+import net from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -76,15 +77,10 @@ test("a directory is trusted by the same rule: not a symlink, and no directory f
   assert.equal(trustedDirectory("/run/user/app", good({ "/run": { kind: "dir", uid: 0, mode: 0o1777 } })), "/run/user/app", "a sticky ancestor, as /tmp is")
 })
 
-test("the identity of a socket is its device and inode: the same socket is the same, a replacement is not", () => {
-  const identity = trustedSocket(SOCKET, good())
-  const view = over => ({ lstat: good(over).lstat, uid: ME })
-  assert.equal(sameSocket(identity, view()), true)
-  assert.equal(sameSocket(identity, view({ [SOCKET]: { kind: "socket", uid: ME, mode: 0o600, dev: 7, ino: 43 } })), false, "another inode")
-  assert.equal(sameSocket(identity, view({ [SOCKET]: { kind: "socket", uid: ME, mode: 0o600, dev: 8, ino: 42 } })), false, "another device")
-  assert.equal(sameSocket(identity, view({ [SOCKET]: { kind: "socket", uid: OTHER, mode: 0o600, dev: 7, ino: 42 } })), false, "another owner")
-  assert.equal(sameSocket(identity, view({ [SOCKET]: { kind: "file", uid: ME, mode: 0o600, dev: 7, ino: 42 } })), false, "no longer a socket")
-  assert.equal(sameSocket(identity, view({ [SOCKET]: undefined })), false, "gone")
+test("a socket path that ends in a separator is refused, never resolved to the socket it would connect to", () => {
+  assert.equal(trustedSocket(SOCKET, good()).path, SOCKET)
+  assert.throws(() => trustedSocket(`${SOCKET}/`, good()), untrusted)
+  assert.throws(() => trustedSocket(`${SOCKET}//`, good()), untrusted)
 })
 
 // The length limit is on the exact pathname handed to Node: the real path of the socket, in bytes.
@@ -161,4 +157,78 @@ test("with the real file system: the trust decision is taken on the directory th
     assert.throws(() => trustedDirectory(w.named), { code: "CHAT_UNTRUSTED" })
     assert.equal(trustedDirectory(w.lexical), w.lexical, "control: the lexical twin passes by itself")
   } finally { rmSync(w.root, { recursive: true, force: true }) }
+})
+
+// ---- how the directory is spelled ------------------------------------------------------------------------------------------
+
+// A symlinked directory is refused by `lstat`, and `lstat` looks through a link when the name ends in a separator or in a `.`
+// name: `lstat("link/")` and `lstat("link/.")` describe the link's target. So the check is made on the name without those
+// endings. A `..` is left alone, as above. `dirname("link//s.sock")` is `link/`, so a socket path with a doubled separator
+// reaches the same check. A real socket sits behind the link, so a path that is let through shows as an accepted socket and
+// not as an error.
+async function behindLink() {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "act-")))
+  const make = name => {
+    const path = join(root, name)
+    mkdirSync(path, { mode: 0o700 })
+    chmodSync(path, 0o700)
+    return path
+  }
+  const real = make("real")
+  const dotted = make("dotted.") // a name that only ends in a dot is a name
+  symlinkSync(real, join(root, "link"))
+  const server = net.createServer()
+  await new Promise(resolve => server.listen(join(real, "s.sock"), resolve))
+  return { root, real, dotted, close() { server.close(); rmSync(root, { recursive: true, force: true }) } }
+}
+
+test("with the real file system: a symlinked directory is refused however its name ends, and a real one is trusted however its name ends", async () => {
+  const w = await behindLink()
+  try {
+    for (const spelled of ["link", "link/", "link//", "link///", "link/.", "link/./", "link/./."]) {
+      assert.throws(() => trustedDirectory(`${w.root}/${spelled}`), { code: "CHAT_UNTRUSTED" }, spelled)
+    }
+    for (const spelled of ["real", "real/", "real//", "real/.", "real/./"]) {
+      assert.equal(trustedDirectory(`${w.root}/${spelled}`), w.real, `${spelled} is the directory itself`)
+    }
+    assert.equal(trustedDirectory(`${w.root}/dotted.`), w.dotted, "a name that ends in a dot is not a `.` name")
+    assert.equal(trustedDirectory(`${w.root}/link/..`), w.root, "a `..` is not dropped: after a link it is the parent of the link's target")
+  } finally { w.close() }
+})
+
+test("with the real file system: a socket below a symlinked directory is refused however the separator before its name is spelled", async () => {
+  const w = await behindLink()
+  try {
+    for (const spelled of ["link/s.sock", "link//s.sock", "link///s.sock", "link/./s.sock"]) {
+      assert.throws(() => trustedSocket(`${w.root}/${spelled}`), { code: "CHAT_UNTRUSTED" }, spelled)
+    }
+    for (const spelled of ["real/s.sock", "real//s.sock", "real///s.sock", "real/./s.sock"]) {
+      assert.equal(trustedSocket(`${w.root}/${spelled}`).path, join(w.real, "s.sock"), `${spelled} is the socket itself`)
+    }
+  } finally { w.close() }
+})
+
+// The names that the table file system is asked about, in order.
+function looked(spelled) {
+  const names = []
+  const fs = good()
+  trustedSocket(spelled, { ...fs, lstat: path => { names.push(path); return fs.lstat(path) } })
+  return names
+}
+
+test("repeated separators change nothing that is checked: `dir//s.sock` and `dir///s.sock` look at the names that `dir/s.sock` does", () => {
+  const expected = looked(SOCKET)
+  assert.ok(expected.includes("/run/user/app"), "control: the directory is looked at")
+  assert.deepEqual(looked("/run/user/app//s.sock"), expected)
+  assert.deepEqual(looked("/run/user/app///s.sock"), expected)
+  assert.deepEqual(looked("/run/user/app/./s.sock"), expected)
+})
+
+test("the root is a directory of its own: `/`, `//`, `///` and `/.` are looked up as `/`, never as an empty name", () => {
+  for (const spelled of ["/", "//", "///", "/.", "/./"]) {
+    const names = []
+    const fs = good()
+    assert.equal(trustedDirectory(spelled, { ...fs, lstat: path => { names.push(path); return fs.lstat(path) }, realpath: () => "/" }), "/", spelled)
+    assert.equal(names[0], "/", spelled)
+  }
 })

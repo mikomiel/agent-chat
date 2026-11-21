@@ -2,11 +2,12 @@
 // receiver's own socket, which a hook prints the answer of (lib/ipc.js). A socket's peer is whoever owns its path, and a
 // WebSocket upgrade or a JSON line proves nothing about who that is. So the path is checked before each connect:
 //   - the socket is a socket (not a symlink) owned by the current user;
-//   - its directory is not a symlink, and neither it nor any directory above it (a symlink above it is resolved first)
-//     can be changed by anyone else: each is owned by the current user or root, and is not writable by group or other,
-//     unless the sticky bit is set, which stops others from removing or renaming what the current user owns.
+//   - its directory is not a symlink, however its name ends (`link/` and `link/.` are the link too), and neither it nor any
+//     directory above it (a symlink above it is resolved first) can be changed by anyone else: each is owned by the current
+//     user or root, and is not writable by group or other, unless the sticky bit is set, which stops others from removing
+//     or renaming what the current user owns.
 // The caller connects to the checked path, with those links resolved, and keeps the socket's identity (device and inode)
-// to tell later that the path still names the same socket (`sameSocket`).
+// to tell later that the path still names the same socket, by calling `trustedSocket` again on the configured path.
 //
 // A socket path also has a length limit, checked here on the exact pathname that is handed to Node (the resolved one, not the
 // one the caller wrote): see MAX_SOCKET_PATH_BYTES.
@@ -41,14 +42,26 @@ function classify(error, refuse) {
   return refusal(refuse)
 }
 
+// `directory` as the symlink check must be given it. `lstat` looks through a link when the name ends in a separator or in a `.`
+// name: `lstat("link/")` and `lstat("link/.")` describe the link's target, so a link would pass as the directory it names.
+// Those endings are dropped (the root, "/", stays) and nothing else is rewritten. A `..` is not dropped: after a link it names
+// the parent of the link's target, which only the kernel can walk (see `trustedDirectory`). `dirname("link//s.sock")` is
+// `link/`, so a socket path with a doubled separator reaches this too.
+function unfollowed(directory) {
+  const names = directory.split("/")
+  while (names.length > 1 && ["", "."].includes(names.at(-1))) names.pop()
+  return names.join("/") || (directory.startsWith("/") ? "/" : "")
+}
+
 // The real path of a directory that nobody else can change: it is not a symlink, and it and every directory above it
 // pass `guarded`. The path is resolved by realpath(3), which walks it the way the kernel does: a `..` after a symlink names
 // the parent of the link's target. `realpathSync` collapses such a `..` against the link's own directory first, so it would
 // name another directory than the one `lstat` and `connect` reach for the same string, and the rule would judge that one.
 export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, realpath = realpathSync.native, uid = process.geteuid() } = {}) {
   try {
-    if (lstat(directory).isSymbolicLink()) throw refusal(refuse)
-    const real = realpath(directory)
+    const spelled = unfollowed(directory)
+    if (lstat(spelled).isSymbolicLink()) throw refusal(refuse)
+    const real = realpath(spelled)
     for (let current = real; ; current = dirname(current)) {
       if (!guarded(lstat(current), uid)) throw refusal(refuse)
       if (dirname(current) === current) break
@@ -61,6 +74,9 @@ export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat =
 // MAX_SOCKET_PATH_BYTES: a short spelling that resolves to a long path is refused like a long spelling.
 export function trustedSocket(path, options = {}) {
   const { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, uid = process.geteuid() } = options
+  // A socket is a file: a spelling that ends in a separator names a directory, and lstat of it fails where the connect
+  // to the resolved name would not.
+  if (typeof path !== "string" || path.endsWith("/")) throw refusal(refuse)
   const real = trustedDirectory(dirname(path), options)
   const target = join(real, basename(path))
   try {
@@ -69,13 +85,4 @@ export function trustedSocket(path, options = {}) {
     if (!info.isSocket() || info.uid !== uid) throw refusal(refuse)
     return { path: target, dev: info.dev, ino: info.ino }
   } catch (error) { throw classify(error, refuse) }
-}
-
-// Whether the checked path still names the same socket: the same device and inode, still a socket of the current user.
-// Synchronous, so a caller can ask it in the turn before it sends.
-export function sameSocket(identity, { lstat = lstatSync, uid = process.geteuid() } = {}) {
-  try {
-    const info = lstat(identity.path)
-    return info.isSocket() && info.uid === uid && info.dev === identity.dev && info.ino === identity.ino
-  } catch { return false }
 }

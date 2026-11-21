@@ -13,7 +13,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { lstatSync, readFileSync } from "node:fs"
 import net from "node:net"
-import { sameSocket, trustedSocket } from "./trust.js"
+import { trustedSocket } from "./trust.js"
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 const MAX_HEAD = 16 * 1024
@@ -88,8 +88,10 @@ function trusted(path, lstat) {
 
 // A connected, upgraded and initialized app-server connection. `request` resolves with the JSON-RPC result and
 // rejects with { code: "APP_SERVER_ERROR", rpc } for an error reply, or a fixed local code.
-// `identity` is the checked socket the connection was made to (real path, dev, ino), and `same()` says whether the path
-// still names it. `expect` is the identity of another connection that this one must reach too: a socket that has been
+// `identity` is the checked socket the connection was made to (real path, dev, ino). `same()` says whether the configured
+// path still names it: the path is resolved again from its first name through the whole trust check, so a link in it that has
+// moved since, a replaced socket and any failure of the check all answer false, whatever the real path of the connection
+// still holds. `expect` is the identity of another connection that this one must reach too: a socket that has been
 // replaced since is refused as untrusted, before anything is connected to. `lstat` replaces the file system, for tests.
 export function openAppServer(path, { createConnection = net.createConnection, connectMs = CONNECT_MS, lstat = lstatSync, expect = null } = {}) {
   return new Promise((resolve, reject) => {
@@ -176,7 +178,12 @@ export function openAppServer(path, { createConnection = net.createConnection, c
 
     const client = {
       identity,
-      same: () => sameSocket(identity, { lstat }),
+      same: () => {
+        try {
+          const now = trusted(path, lstat)
+          return now.dev === identity.dev && now.ino === identity.ino
+        } catch { return false }
+      },
       request,
       notify: (method, params) => write(0x1, Buffer.from(JSON.stringify(params === undefined ? { method } : { method, params }))),
       close() {
@@ -236,8 +243,9 @@ const STATUS = Object.assign(Object.create(null), { idle: "idle", active: "busy"
 // string before it is looked up, because a table lookup turns its key into text: `["idle"]` would find `idle`.
 const statusOf = record => (typeof record.status?.type === "string" ? STATUS[record.status.type] : undefined) ?? "unknown"
 
-// The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket.
-export function createThread({ path, threadId, open = openAppServer, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+// The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket, and `lstat` is the
+// file system that `replaced` looks at, for tests.
+export function createThread({ path, threadId, open = openAppServer, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), lstat = lstatSync }) {
   let provider = null // the provider of the bound thread: what each later record is compared with, whatever socket it comes from
   // What the queue probe answered, and on which socket: { route, dev, ino }. `route` is true when the documented answer came
   // back and false when it did not. A probe says what the app-server behind one socket does, so it counts only for the socket
@@ -340,15 +348,18 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     // The answer of the newest probe that finished, whichever socket it was taken on; `wake` probes again when the socket it
     // reaches is another one.
     get route() { return probed === null ? null : probed.route },
-    // Whether the path now names another socket than the one of the newest probe: an `lstat` of the path, and no connection.
-    // False before any probe has finished, and false while the path names nothing (the app-server is down): there is no
-    // other socket to probe, and the heartbeat's read keeps reporting offline. A probe says what the app-server behind one
-    // socket does, so a route that is off was decided on one socket and nothing would look at another: the receiver asks
-    // this of such a route and binds again when it is true, which probes the socket that is there.
+    // Whether the path now names another socket than the one of the newest probe: one `lstat` of the path, decided on that
+    // one result, and no connection. True only for a socket of the current user whose device and inode are not the probe's.
+    // False before any probe has finished, and false for anything else the path gives: no socket at all (the app-server
+    // is down, or any error of the `lstat`, `ENOTDIR` and `EACCES` included), a path that is not a socket, a socket of
+    // another user. There is no other socket to probe then, and the heartbeat's read keeps reporting offline. A probe says
+    // what the app-server behind one socket does, so a route that is off was decided on one socket and nothing would look
+    // at another: the receiver asks this of such a route and binds again when it is true, which probes the socket that is there.
     replaced() {
       if (probed === null) return false
-      try { lstatSync(path) } catch (error) { if (error?.code === "ENOENT") return false }
-      return !sameSocket({ path, dev: probed.dev, ino: probed.ino })
+      let info
+      try { info = lstat(path) } catch { return false }
+      return info.isSocket() && info.uid === process.geteuid() && (info.dev !== probed.dev || info.ino !== probed.ino)
     },
 
     // Check the thread before the receiver joins: it must be loaded, its record must be complete, it must not be a
@@ -417,8 +428,9 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     // reading is taken on a second connection that is closed first, and the connection for the add, the fence and the
     // confirmation is opened before it and never asks. Both connections must reach the same checked socket (the same
     // device and inode): the second is refused when the path names another one, and the first is asked, in the turn before
-    // the add, whether the path still names its own. Either mismatch sends nothing and settles `failed`. The queue has no
-    // condition of its own (see the README).
+    // the add, whether the configured path, resolved again through the whole trust check, still names its own (a link in the
+    // path that has moved is not seen by the real path of the connection). Either mismatch, and any failure of that check,
+    // sends nothing and settles `failed`. The queue has no condition of its own (see the README).
     // `proceed` returns null to go on, or the `deferred` reason that the reading and the receiver's state now give: nothing
     // is sent then. Without one, the reading alone decides. `until` is the end of the reservation, and every request
     // stops SETTLE_MS before it.

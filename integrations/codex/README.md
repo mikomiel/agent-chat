@@ -269,14 +269,18 @@ The path is trusted before every connection, or the connection is refused: with
 and the wake alike) and with `CHAT_SOCKET_UNTRUSTED` for the receiver's socket
 that a hook connects to.
 
-- the socket is itself a socket, not a symlink, owned by the current user;
-- its directory is not a symlink, and the directory and every directory above it
-  (links above it resolved first, the way the kernel walks a path: a `..` after a
-  link names the parent of the link's target) is owned by the current user or by
-  root and is not writable by group or other. A directory that is writable by
-  others but has the sticky bit set, such as `/tmp`, passes: others cannot remove
-  or rename what the current user owns in it, and the socket's owner is checked
-  on its own;
+- the socket is itself a socket, not a symlink, owned by the current user, and
+  its path does not end in a separator (`control.sock/` is refused);
+- its directory is not a symlink, however its name ends: a trailing separator or
+  a `.` name makes the kernel look through a link, so `link/`, `link//` and
+  `link/.` are refused as `link` is (the name is checked without those endings,
+  so `link//control.sock` has the directory `link`);
+- the directory and every directory above it (links above it resolved first, the
+  way the kernel walks a path: a `..` after a link names the parent of the link's
+  target) is owned by the current user or by root and is not writable by group or
+  other. A directory that is writable by others but has the sticky bit set, such
+  as `/tmp`, passes: others cannot remove or rename what the current user owns in
+  it, and the socket's owner is checked on its own;
 - the connection goes to the checked path with those links resolved;
 - that real path is at most 103 bytes long: `sun_path` holds 104 bytes on macOS
   and the BSDs (108 on Linux), terminator included, and a longer path must never
@@ -311,9 +315,12 @@ that socket.
 The wake adds one more check, because it uses two connections (step 5): the
 connection that carries the add is checked first and its socket's identity (device
 and inode) is kept. The connection for the reading must reach the same identity,
-checked right before it connects, and the path is `lstat`-ed once more in the turn
-before the add frame. A socket that was replaced in between sends nothing and the
-attempt settles `failed`.
+checked right before it connects. In the turn before the add frame the configured
+path is resolved again from its first name, through the whole rule above, and must
+still name that identity, so a link in the configured path that moved after the
+connections opened is seen even while the socket they reached is still there. A
+socket that was replaced in between, a link that moved, and any failure of that
+second check send nothing and the attempt settles `failed`.
 
 The simplest safe choice is a socket in a directory of its own, mode `0700`. A
 control socket that is not there is the closed app-server, not an untrusted one.
@@ -358,12 +365,19 @@ already excluded.
    second leaves it undecided until the next bind. The answer belongs to the
    socket it was taken on (its device and inode): it says what the app-server
    behind that socket does. A bind on another socket probes again. While the
-   route is off (the newest bind's probe answered no), each heartbeat `lstat`s the
-   path once, and connects to nothing unless the path names a socket other than
-   the one that probe was taken on (a restarted app-server, another one, or none
-   for the moment): the receiver then binds again, which probes the socket that
-   is there, so a route that was off on the old socket is decided again without a
-   restart. A positive route is not checked this way: a wake probes the socket it
+   route is off (the newest bind's probe answered no), each heartbeat makes one
+   `lstat` of the configured path, decides on that one result and connects to
+   nothing. Only a socket of the current user whose device and inode differ from
+   the ones that probe was taken on is a replacement (a restarted app-server, or
+   another one): the receiver then binds again, which probes the socket that is
+   there, so a route that was off on the old socket is decided again without a
+   restart. Anything else is not a replacement: a path that names nothing (the
+   app-server is down for the moment), a path that is not a socket, a socket of
+   another user, and a path whose `lstat` fails for any other reason (`ENOTDIR`,
+   `EACCES`, a loop of links). There is no other socket to probe then, so nothing
+   is bound, and the heartbeat's read of the thread, which has to open the same
+   path, keeps reporting `offline` while the socket cannot be reached.
+   A positive route is not checked this way: a wake probes the socket it
    reaches. A wake that reaches another socket than the probed one, or one probed
    with a negative answer, probes it first, on the connection that will carry the
    add, and sends the add only after a positive answer; a wake that cannot finish
@@ -562,7 +576,8 @@ exercised live.
   sticky bit is accepted only while the socket is the current user's. The check
   and the connect are two steps; between them only an owner of a trusted
   directory could replace the socket, and the wake compares the socket's device
-  and inode across its two connections and again before the add. The identity is
+  and inode across its two connections and again before the add, where it
+  resolves the configured path afresh through the whole rule. The identity is
   that of the path at those moments, not of the peer behind an open connection,
   and a device and inode can be reused once the old socket is gone, so it shows
   that the path names the same file, not that the same listener has been there the
@@ -718,10 +733,10 @@ node --test
 
 The suite covers config refusal, the worker join frame, frame validation and request deadline,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
-the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included), the hook and the client against a real receiver socket
+the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included, and a directory named with doubled or trailing separators or a `.` name), the hook and the client against a real receiver socket
 on trusted and untrusted paths, the state directory resolved once behind a link and handed to the receiver, which refuses a directory that resolves differently, the WebSocket client against a
 fake control socket on a real Unix socket (the wake's own reading before the add on a second connection, the
-socket identity across its two connections, the probe that belongs to one socket, the newest-turn statuses and thread statuses that are not strings, the bind's commit fence for a retired worker, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery,
+socket identity across its two connections and again before the add, over a link in the configured path that moves after the reading, the probe that belongs to one socket, the check for a replaced socket (one `lstat`, tripped only by another socket of the current user), the newest-turn statuses and thread statuses that are not strings, the bind's commit fence for a retired worker, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery,
 wake (a route probed negative on a socket that is later replaced included), settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
 hint), the plugin shape that Codex reads, and runs of the real hook and

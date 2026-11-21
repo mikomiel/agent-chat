@@ -50,6 +50,22 @@ test("only a private directory owned by this user may hold the socket", () => {
   } finally { cleanup(dir) }
 })
 
+// `lstat` looks through a link when the name ends in a separator or in a `.` name, so a symlinked state directory is refused on
+// the name without those endings: the config's `directory` spelled `link/` is the same link as `link`.
+test("a symlinked state directory is refused however its name ends: `link/`, `link//` and `link/.` are the link too", () => {
+  const dir = realpathSync(privateDirectory())
+  try {
+    const real = join(dir, "real")
+    mkdirSync(real, { mode: 0o700 })
+    chmodSync(real, 0o700)
+    symlinkSync(real, join(dir, "link"))
+    for (const spelled of ["real", "real/", "real//"]) assert.equal(assertPrivateDirectory(`${dir}/${spelled}`), real, `${spelled} is the directory itself`)
+    for (const spelled of ["link", "link/", "link//", "link/."]) {
+      assert.throws(() => assertPrivateDirectory(`${dir}/${spelled}`), { code: "CHAT_SOCKET_DIRECTORY" }, spelled)
+    }
+  } finally { cleanup(dir) }
+})
+
 test("a socket serves one request per connection and is owner-only", async () => {
   const dir = privateDirectory()
   const { socket } = paths(dir, "session-1")
