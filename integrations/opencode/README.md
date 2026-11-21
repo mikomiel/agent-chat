@@ -121,24 +121,34 @@ The service and its host-token provisioning are documented in the product
   server can run several plugin instances. Every instance joins one
   process-wide registry. The first instance owns the joins. Every instance
   reads its own event stream and forwards events to the owner. The registry
-  accepts a session's events from one stream only, the instance that delivered
-  that session first, and drops another instance's copy of them. It keeps no
-  event-id memory: the published plugin and client types document no order for
-  event ids, so a bounded memory forgets an old id, and one that outlives a
-  handoff drops a replayed event as already seen. Within one stream a repeat
-  only follows a reconnect, which is a reset. A `session.forked` or
-  `session.deleted` event is the exception: it is recorded and passed on from
-  any stream. A session is released when its stream is reset or its instance
-  leaves, and the next stream that delivers it takes it over and applies what
-  it delivers in full and in order, a run end included. The registry keeps one
-  entry per held session and removes it on deletion or release. When the
-  owner's instance is torn down, the next one takes over only after the old owner's workers
-  and the removal of its binding entries have ended. A session that is still in
-  its `session.get` lookup has no worker and no entry, so it does not delay the
-  takeover, and a lookup that answers late starts nothing. A session then
-  rejoins at its next event. An instance that leaves without owning is a gap for the
-  owner too: its stream may have carried events no other stream did, so the
-  owner treats it as a lost event stream.
+  orders a session's events by the host's own sequence number, `durable.seq`,
+  and keeps one process-wide high-water mark per session: the highest `seq` it
+  has passed on. An event is passed on only when its `seq` is above the mark,
+  and it raises the mark. A copy from another stream, a lagging stream's replay
+  after a handoff and a delayed duplicate are therefore dropped, whatever id
+  they carry, and a run that starts right after another one ended is applied.
+  One exception: the registry also keeps the `seq` of each session's open run
+  (its latest passed-on `session.execution.started` that no run end has
+  closed). A run end (`succeeded`, `failed` or `interrupted`) at or below the
+  mark is still passed on when its `seq` is above that start, so a run end that
+  one stream delivers late, after another stream moved the mark past it, ends
+  the run. It closes the run and does not move the mark. An end below a
+  successor's start, an end that was already passed on, and an end with no
+  open run are dropped, so a stale end never ends a newer run. The marks and
+  the open runs outlive an owner change and a stream reset. An event without a
+  valid `durable` envelope (missing, another session's `aggregateID`, or a
+  `seq` that is not a non-negative integer) is dropped. A `session.forked` or
+  `session.deleted` event is not ordered at all: it is recorded and passed on
+  from any stream, in any order, and a session with that evidence is refused by
+  the owner. The registry keeps one mark and one open-run entry at most per
+  session it has seen, and drops both on a fork or a deletion. When the
+  owner's instance is torn down, the next one takes over only after the old
+  owner's workers and the removal of its binding entries have ended. A session
+  that is still in its `session.get` lookup has no worker and no entry, so it
+  does not delay the takeover, and a lookup that answers late starts nothing. A
+  session then rejoins at its next event. An instance that leaves without
+  owning is a gap for the owner too: its stream may have carried events no
+  other stream did, so the owner treats it as a lost event stream.
 - **One lifecycle per root session, one fault boundary each.** A session
   joins at the first event the owner sees for it. `session.get` must show no
   `parentID` and no `fork`. A subagent runs only in a child session, so it
@@ -320,22 +330,50 @@ unverified, inferred, or a deliberate choice.
   would race for the same sessions.
 - **Locations.** Whether the owner's context can read and drive a session that
   belongs to another location. If it cannot, that session never joins.
-- **Streams and event order.** The published plugin and client types (`2.3.2`)
-  do not say whether one session's events can arrive on more than one
-  instance's stream, and they document no order of event ids or of
-  `durable.seq`. The registry assumes that a stream delivers a session's events
-  in order, and takes each session from the first stream that delivered it.
-  This fails open in one case. If the stream that holds a session stops
-  carrying it while another stream still delivers it, the owner keeps the last
-  state it saw, and a session last seen running stays eligible. That happens if
-  two streams each carry only some of one session's events, or if a session
-  moves to another location (`session.moved`, which the plugin does not
-  subscribe to). A reset of the holding stream or the departure of its instance
-  releases the session, and a quiet stream does not. After a release the next
-  stream that delivers the session takes it, including a lagging stream whose
-  first event is an old one. The registry applies that stream's events in full
-  and in order and keeps no event-id memory, so a replay can move a session to
-  an older state until the stream catches up.
+- **Streams and event order.** The registry relies on the host's event
+  sequence. Evidence: the published `@opencode/*` `2.3.2` types and the
+  upstream source at tag `v2.3.2` (`anomalyco/opencode`, commit `c0ad18b4`).
+  Every session event the plugin subscribes to is durable and carries
+  `durable = { aggregateID, seq, version }`, where `aggregateID` is the
+  session id. The host assigns `seq` from 0 per session, in the commit
+  transaction under a per-session lock, so commit, publish and delivery order
+  agree within one subscription. `seq` has gaps, because internal events use
+  numbers too, so the registry compares with "above the mark" and never asks
+  for `last + 1`. Event ids and timestamps are not an order. The host never
+  replays: a new subscription sees only later events. Whether one session's
+  events can arrive on more than one instance's stream is not documented.
+  Two cases fail closed. After an owner change or a stream reset, a session
+  stays unknown until its next new event, because a replayed older event is
+  dropped. An event with no valid envelope is dropped, which would leave a
+  session unknown if the host ever sent a state event without one.
+  One kind of loss remains, and only for a non-terminal event. The mark drops
+  every event at or below it, and a run end is the one exception (see
+  above). If one stream delivers a higher `seq` of a session before another
+  stream delivers a lower event that no stream had delivered yet, that lower
+  event is lost. This needs two streams that each carry only part of a session
+  (a location move, which the plugin does not subscribe to), or a stream that
+  lags behind a newer one, such as a plugin instance that attaches while an
+  older stream still has a backlog. Per lost event type: an
+  `execution.started` can only make the session look idle or unknown, never
+  running, so it is never eligible; a user `inbox.enqueued` leaves the stop
+  latch set; an `inbox.delivered` or `inbox.cancelled` settles a pending
+  notice uncertain at its deadline; a compaction `ended` or `failed` leaves
+  the gate closed until the next compaction event; losing both compaction
+  events leaves a binding entry that the compaction removed unrepaired until
+  the next gap. All of those fail closed or lose only function. Two cases fail
+  open. An `agent.selected` that switches the session to Plan Mode leaves the
+  owner with the older agent, so the session stays eligible until its next
+  `agent.selected`. A lost compaction `started` leaves the gate open from the
+  compaction's start until its `ended` arrives, which then owes the binding
+  read-back. Losing a run's start and its end both below the mark is a double
+  loss: the owner never saw the run, so it stays ineligible, but an operator
+  interrupt in that run does not set the stop latch. The excepted run end is
+  applied after the newer events that moved the mark, so a late operator
+  interrupt sets the stop latch again after a newer user prompt cleared it,
+  and the session stays stopped until the next user prompt, which fails
+  closed. A deletion clears the host's counter for
+  that session, so a reused id would restart at 0; the registry keeps the
+  deletion tombstone and refuses that id for good.
 - **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
   after each put, each compaction and each gap. After a crash an entry can remain with a

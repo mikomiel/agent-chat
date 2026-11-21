@@ -107,7 +107,14 @@ async function realParts(startProcess) {
   return { createLifecycle, createDelivery, startProcess, createMember: owner.createMember, registry: owner.globalRegistry }
 }
 
-const ev = (type, sessionID, data = {}) => ({ id: `${type}-${sessionID}-${Math.random()}`, type, data: { sessionID, ...data } })
+// Every session event carries the host's `durable` envelope, and the registry orders by its `seq`, which only rises per
+// session. Each test builds its own registry, so one counter for the whole file is enough.
+const nextSeq = new Map()
+const ev = (type, sessionID, data = {}) => {
+  const seq = nextSeq.get(sessionID) ?? 0
+  nextSeq.set(sessionID, seq + 1)
+  return { id: `${type}-${sessionID}-${Math.random()}`, type, data: { sessionID, ...data }, durable: { aggregateID: sessionID, seq, version: 1 } }
+}
 
 test("the default export has the shape OpenCode's loader checks: an id and a setup function, nothing else", () => {
   assert.deepEqual(Object.keys(plugin).sort(), ["id", "setup"])
