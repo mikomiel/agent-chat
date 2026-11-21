@@ -166,12 +166,19 @@ def require_regular(path: Path) -> None:
 
 
 def refuse_unsafe_artifacts(dist: Path) -> None:
-    """Stop unless ``dist`` holds no link and every ``*.tgz`` and ``SHA256SUMS`` is a regular file."""
+    """Stop unless ``dist`` holds no link and every ``*.tgz`` and ``SHA256SUMS`` is a regular file.
+
+    npm pack overwrites an existing tarball in place, so a tarball with a second hard link is
+    refused too: repacking would silently change the other copy. ``SHA256SUMS`` is replaced, never
+    written in place, so a hard link to it is harmless.
+    """
     for child in dist.iterdir():
         if child.is_symlink():
             raise SystemExit(f"{child} is a link; npm pack and the sums file would write through it")
         if child.name.endswith(".tgz") or child.name == SUMS:
             require_regular(child)
+        if child.name.endswith(".tgz") and os.lstat(child).st_nlink > 1:
+            raise SystemExit(f"{child} has another hard link; npm pack would overwrite that copy too")
 
 
 def write_sums(dist: Path) -> None:

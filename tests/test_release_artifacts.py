@@ -1037,6 +1037,17 @@ def test_pack_refuses_a_fifo_named_like_an_artifact_without_opening_it(
     assert list(fake_npm.iterdir()) == [], "refused before npm ran or anything was staged"
 
 
+def test_pack_refuses_a_tarball_with_another_hard_link(repository: Path, fake_npm: Path, tmp_path: Path) -> None:
+    dist, backup = tmp_path / "dist", tmp_path / "backup.tgz"
+    dist.mkdir()
+    backup.write_bytes(b"released bytes")
+    os.link(backup, dist / "agent-chat-pi-0.8.0.tgz")
+    with pytest.raises(SystemExit, match="has another hard link"):
+        script.pack(repository, dist)
+    assert backup.read_bytes() == b"released bytes"
+    assert list(fake_npm.iterdir()) == [], "npm never ran"
+
+
 def test_write_sums_refuses_a_tarball_that_is_not_a_regular_file(tmp_path: Path) -> None:
     dist = tmp_path / "dist"
     (dist / "agent-chat-x-0.8.0.tgz").mkdir(parents=True)
