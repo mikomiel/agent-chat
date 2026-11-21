@@ -563,7 +563,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // A session resumed in a new Codex process reattaches here before any cleanup,
-  // and its start and turn requests name that process. Following the dead one would
+  // and its start and turn requests name that process (see handle for when each moves the watch). Following the dead one would
   // end the live session's instance after the quiet window. A hint that is not a
   // running process id never displaces the owner already followed.
   function adoptOwner(pid) {
@@ -590,7 +590,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (lateEnd(first)) return link.send({ ok: true })
     contact = now()
     if (closed) return link.send({ disabled: true })
-    if (first.op !== "end") adoptOwner(first.owner_pid) // an end never moves the owner watch
+    // A start moves the owner watch: a session resumed in a new process names it. Any other hook only recovers a receiver whose
+    // owner is gone (a start that was missed), so a superseded process that still runs never takes it back. An end never does.
+    if (first.op === "start" || (first.op !== "end" && !ownerRunning())) adoptOwner(first.owner_pid)
     switch (first.op) {
       case "start": return onStart(first, link)
       case "turn": return onTurn(first, link)

@@ -83,7 +83,8 @@ async function dispatch(name, { payload, config, where, io, deadline, now }) {
     : io.connect(where.socket))
   // A start and a turn name the process that runs this hook's command, Codex. A
   // session resumed in a new process reattaches to the old receiver, which must
-  // then watch the new one. An end names it only when /proc proved it, so a late end
+  // then watch the new one: a start moves the watch, a turn only when the watched
+  // process is gone. An end names it only when /proc proved it, so a late end
   // from the old process does not end the receiver that the new one adopted, and an end
   // whose owner is a guess falls under the receiver's rule for an end with no owner.
   const owner = io.owner()

@@ -319,8 +319,10 @@ sends its request: it does not wait for the worker to end its instance.
   process is identified by its pid and its start time, so another process that
   reuses the pid does not keep a dead owner's receiver alive. A hook command
   may run through a shell, so the owner hint skips up to two shell ancestors.
-  A start and a turn move the owner watch to the process they name; an end
-  never does. A `SessionEnd` ends the receiver only when it names the owner
+  A start moves the owner watch to the process it names. A turn moves it only
+  when the watched process is gone (a start that was missed), so a process
+  that a resume replaced and that still runs never takes it back; an end never
+  moves it. A `SessionEnd` ends the receiver only when it names the owner
   that is watched now, so a late end from a process that a resume replaced
   changes nothing, and does not count as contact for the three minutes. The
   end names its owner only when `/proc` showed a process that is not a shell;

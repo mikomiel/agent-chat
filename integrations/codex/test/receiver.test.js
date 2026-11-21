@@ -1008,6 +1008,41 @@ test("a session resumed by a new Codex process hands the owner watch to it", asy
   assert.equal(r.exitCode, 0, "once the new owner is gone and quiet, the receiver still ends itself")
 })
 
+// A start moves the owner watch; a turn from the process it replaced, which still runs, does not take it back. So that
+// process's end, when it exits, is late and leaves the receiver to the new owner.
+test("a turn from a superseded live process does not take the owner watch back, so its end leaves the receiver up", async () => {
+  const r = await rig()
+  await r.op({ op: "start", wait_ms: 5000, owner_pid: 4242, permission_mode: "default" })
+  await r.op({ op: "start", wait_ms: 0, owner_pid: 5151, permission_mode: "default" }) // the resume in a new process
+  await r.op(turn({ event: "tool", owner_pid: 4242 })) // the old process is still running a tool call
+  const late = await r.op({ op: "end", owner_pid: 4242 })
+  await settle()
+  assert.deepEqual(late.sent, [{ ok: true }])
+  assert.equal(r.exitCode, undefined, "the old process's end does not end the receiver")
+  assert.equal(r.worker.state.stops, 0)
+  const tool = await r.op(turn({ event: "tool", owner_pid: 5151 }))
+  assert.equal(tool.sent.length, 1)
+  assert.notEqual(tool.sent[0].disabled, true, "the new owner's hook is still served")
+  const end = await r.op({ op: "end", owner_pid: 5151 })
+  await settle()
+  assert.equal(r.exitCode, 0, "the new owner's end ends it")
+})
+
+// A turn still recovers a receiver whose watched owner is gone (its start was missed): the live process it names is followed.
+test("a turn adopts its process when the watched owner is gone", async () => {
+  const running = new Set([4242, 6000])
+  const r = await rig({ alive: pid => running.has(pid) })
+  await r.begin()
+  running.delete(4242) // the watched owner exits; the session goes on in 6000, whose start was missed
+  await r.op(turn({ owner_pid: 6000 }))
+  await r.clock.advance(1_200_000) // one long tool call: twenty minutes with no hook contact
+  assert.equal(r.exitCode, undefined, "the live process the turn named keeps the receiver up")
+  running.delete(6000)
+  await r.op({ op: "stop", permission_mode: "default" })
+  await r.clock.advance(210_000)
+  assert.equal(r.exitCode, 0, "once it is gone and quiet, the receiver ends itself")
+})
+
 test("an owner hint that is not a live process never displaces the owner being watched", async () => {
   const r = await rig({ alive: pid => pid === 4242 })
   await r.begin()
