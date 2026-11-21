@@ -16,6 +16,8 @@ const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "pyth
 const OPTIONAL = ["noticeBodies", "appServer"]
 
 // The app-server control socket named as unix://PATH: an absolute path and no other scheme. Null when it is not.
+// This only parses the path. `trustedSocket` in appserver.js decides before every connection whether the socket and its
+// directories can be trusted (CHAT_APPSERVER_UNTRUSTED), so a path that anyone else could replace is never connected to.
 export function appServerPath(value) {
   if (typeof value !== "string" || !value.startsWith("unix://")) return null
   const path = value.slice("unix://".length)

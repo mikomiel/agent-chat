@@ -242,15 +242,17 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   //
   // The time allowed, READ_MS, is for the thread read. The bind says when the read is done and then runs the queue
   // probe on a limit of its own, so a slow probe cannot veto a read that came in on time. A bind that runs out of time
-  // is aborted: its late answer neither joins nor changes what the thread has recorded.
-  async function bindThread() {
+  // is aborted: its late answer neither joins nor changes what the thread has recorded. `owns` says whether the caller
+  // still owns the answer (a tick whose worker was retired does not): the thread checks it in the turn that commits the
+  // provider and the route, so a retired caller's bind commits neither. A connect's own bind owns it until the receiver ends.
+  async function bindThread(owns = () => !closed && !failure) {
     const attempt = new AbortController()
     let timer
     const expired = new Promise(resolve => {
       timer = setTimeoutImpl(() => { attempt.abort(); resolve({ status: "unavailable" }) }, READ_MS)
     })
     const result = await Promise.race([
-      thread.bind({ signal: attempt.signal, onRead: () => clearTimeoutImpl(timer) }),
+      thread.bind({ signal: attempt.signal, onRead: () => clearTimeoutImpl(timer), owns }),
       expired,
     ])
     clearTimeoutImpl(timer)
@@ -259,14 +261,15 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return { refusal: null, verified: MAIN_THREAD.has(result.status), bound: result.status === "bound" }
   }
 
-  // Replace the observed state with a fresh read, unless a hook event arrived while it ran.
+  // Replace the observed state with a fresh read, unless a hook event arrived while it ran, or the worker it was read
+  // for (`record`) was retired meanwhile: a retired worker's read changes nothing the replacement owns.
   // A read that refuses a wake (any reason: busy, stopped, plan, unknown, offline, stale_binding) is a generation of its
   // own, and the epoch moves with it: a wake cleared before it must not go out, whatever the hooks say. A child read
   // disables the session in the caller, which settles every wake as offline.
-  async function refine() {
+  async function refine(record) {
     const before = epoch
     const result = await thread.observe()
-    const current = epoch === before
+    const current = epoch === before && live === record
     if (current) {
       observed = result.observed.status === "idle" || result.observed.status === "busy" ? result.observed : null
       if (result.reason !== null) { newestRefusal = result.reason; epoch += 1 }
@@ -327,13 +330,13 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // whose worker is gone drops what it learned and sends nothing; the replacement binds and reads for itself.
   async function tick(record) {
     if (thread && !threadBound) {
-      const check = await bindThread()
+      const check = await bindThread(() => live === record)
       if (live !== record) return
       if (check.refusal) return disable(check.refusal)
       threadBound = check.bound
     }
     if (thread && threadBound && !stopped && native !== "busy") {
-      const result = await refine()
+      const result = await refine(record)
       if (live !== record) return
       if (result.reason === "child") return disable("CHAT_CHILD_THREAD")
     }
@@ -360,24 +363,33 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // The reads that must pass before a wake claims anything: a refusal here spends no attempt.
-  async function clearToWake() {
+  async function clearToWake(record) {
     if (!thread || thread.route !== true || !threadBound || now() < wakeAfter) return false
-    const result = await refine()
-    if (!live) return false
+    const result = await refine(record)
+    if (live !== record) return false
     if (result.reason === "child") { disable("CHAT_CHILD_THREAD"); return false }
     if (result.reason !== null || !result.current || chatState() !== null) { wakeAfter = now() + WAKE_RETRY_MS; return false }
     return true
   }
 
   // The answer to "may the add still go out": null while the state that cleared the wake still holds, else the ledger
-  // reason that refuses it. A hook event, an interrupt or an app-server refusal since `cleared` (the generation that was
-  // read) is newer than the clearing read. A refusal gives its own reason; a hook event that leaves nothing refusing
-  // it means the session just ran or just stopped, so busy.
-  function wakeStale(cleared) {
+  // reason that refuses it. It is asked by the wake, in the turn before the add frame, with `fresh`: the reading the wake
+  // took of the thread on its own connection a moment before. A hook event, an interrupt or an app-server refusal since
+  // `cleared` (the generation that was read) is newer than the clearing read, and the receiver's state says so: a refusal
+  // gives its own reason, and a hook event that leaves nothing refusing it means the session just ran or just stopped,
+  // so busy. Otherwise nothing newer than the clearing read arrived, and the fresh reading is the newest word on the
+  // thread: a refusing one decides, and the state adopts it, as a read of its own would.
+  function wakeStale(cleared, fresh) {
     if (!live || closed || failure) return "offline"
     const state = chatState()
     if (state !== null) return state
-    return epoch === cleared ? null : (newestRefusal ?? "busy")
+    if (epoch !== cleared) return newestRefusal ?? "busy"
+    if (fresh.reason === "child") return "offline" // the next read ends the session; this one only declines to wake it
+    observed = fresh.observed.status === "idle" || fresh.observed.status === "busy" ? fresh.observed : null
+    if (fresh.reason === null) return null
+    newestRefusal = fresh.reason
+    epoch += 1
+    return fresh.reason
   }
 
   // One claim sequence. `wake` queues a user turn through the app-server and needs no hook; otherwise the result
@@ -386,6 +398,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (!live || !joined || closed || failure || delivering || inflight || !eligible(wake)) return Promise.resolve(false)
     return exclusive(async () => {
       if (!live || closed) return false
+      const record = live
       delivering = true
       try {
         // A wake never carries bodies, whatever the config says: a queued submission is a user turn.
@@ -397,7 +410,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (!live || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link?.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
-        if (wake && !(await clearToWake())) return false
+        if (wake && !(await clearToWake(record))) return false
         const cleared = epoch // the hook-state generation the wake was cleared at
         // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
         const claimIds = bodies
@@ -426,7 +439,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             else if (wake) {
               // The claim and the status call took time: the add is sent only if nothing newer than the clearing read arrived.
               result = await thread.wake({
-                text: WAKE_PREFIX + notice, attemptId: grant.attempt_id, until: started + reservation, proceed: () => wakeStale(cleared),
+                text: WAKE_PREFIX + notice, attemptId: grant.attempt_id, until: started + reservation, proceed: fresh => wakeStale(cleared, fresh),
               })
               wakeAfter = now() + (result.outcome === "handed" ? 0 : WAKE_RETRY_MS)
               // A hook event since the clearing read is newer than the confirmation, so its state stays. Otherwise the

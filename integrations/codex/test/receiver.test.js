@@ -795,7 +795,8 @@ test("an unknown operation is refused without touching the worker", async () => 
 const IDLE = { reason: null, observed: { status: "idle", stopped: false, plan: false } }
 // `adds` holds the wakes that got as far as the add frame: lib/appserver.js asks `proceed` right before writing it and
 // ends the wake as deferred, with the reason it was given, when it answers one.
-function threadDouble({ bind = { status: "bound" }, route = true, observation = IDLE, wake = { outcome: "handed", reason: null } } = {}) {
+// `fresh` is the reading the wake takes on its own connection right before the add and hands to `proceed`.
+function threadDouble({ bind = { status: "bound" }, route = true, observation = IDLE, wake = { outcome: "handed", reason: null }, fresh = IDLE } = {}) {
   const thread = {
     opened: [], calls: [], wakes: [], adds: [], route,
     async bind(options) { thread.calls.push("bind"); return typeof bind === "function" ? bind(options) : bind },
@@ -803,7 +804,7 @@ function threadDouble({ bind = { status: "bound" }, route = true, observation = 
     async wake(request) {
       thread.wakes.push(request)
       thread.calls.push("wake")
-      const stale = request.proceed?.() ?? null
+      const stale = request.proceed?.(typeof fresh === "function" ? fresh() : fresh) ?? null
       if (stale !== null) return { outcome: "deferred", reason: stale }
       thread.adds.push(request)
       return typeof wake === "function" ? wake(request) : wake
@@ -1447,3 +1448,197 @@ test("an app-server that cannot be read leaves the hooks' state in place", async
   assert.equal(r.receiver.state(), null)
   assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "idle", stopped: false, plan_mode: false })
 })
+
+// ---- the wake acts on the reading it takes right before the add ------------------------------------------------
+
+// The cached state cleared the wake, but the wake's own reading of the thread, taken on its connection a moment before
+// the add, is newer. When nothing newer than the clearing read arrived, that reading decides, and the state adopts it.
+const reading = (reason, observed) => ({ reason, observed: { status: "idle", stopped: false, plan: false, ...observed } })
+for (const [label, fresh, reason, state] of [
+  ["the thread active", reading("busy", { status: "busy", plan: null }), "busy", "busy"],
+  ["the thread in Plan Mode", reading("plan", { plan: true }), "plan", "plan"],
+  ["the last turn interrupted", reading("stopped", { stopped: true, plan: null }), "stopped", "stopped"],
+  ["the reading incomplete", reading("unknown", { plan: null }), "unknown", "unknown"],
+  ["the thread gone from the loaded list", reading("offline", { status: "offline", plan: null }), "offline", null],
+  ["the provider changed", reading("stale_binding", {}), "stale_binding", null],
+  ["the thread a child", reading("child", { status: "unknown", plan: null }), "offline", null],
+]) {
+  test(`a wake whose own reading before the add shows ${label} sends no add, settles deferred as ${reason}, and the state adopts it`, async () => {
+    const thread = threadDouble({ fresh })
+    const r = await rig({ handlers: wakeHandlers(), thread })
+    await idleSession(r)
+    await r.clock.advance(2000)
+    assert.equal(thread.wakes.length, 1, "the wake went as far as its own reading")
+    assert.deepEqual(thread.adds, [], "no add frame was written")
+    const [settled] = r.worker.ops("settle")
+    assert.deepEqual(settled.result, { outcome: "deferred", reason })
+    assert.ok(settleVocabulary(settled.result))
+    assert.equal(r.receiver.state(), state)
+    assert.notEqual(r.receiver.state(), "offline", "the session is not ended by a reading that only declines a wake")
+  })
+}
+
+test("the reading before the add is the newest word only while nothing newer reached the receiver: a refusal that arrived first keeps its own reason", async () => {
+  const thread = threadDouble({ fresh: reading("busy", { status: "busy", plan: null }) })
+  let armed = false
+  let r = null
+  r = await rig({ thread, handlers: wakeHandlers({ status: () => {
+    if (armed) { armed = false; void r.receiver.handle({ op: "interrupt" }, hookDouble()) }
+    return { muted: false }
+  } }) })
+  await idleSession(r)
+  armed = true
+  await r.clock.advance(2000)
+  assert.deepEqual(thread.adds, [])
+  assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "deferred", reason: "stopped" }, "the hook event is newer than the clearing read, and says what it says")
+})
+
+// ---- a retired worker's tick commits nothing -----------------------------------------------------------------------
+
+const STOPPED = reading("stopped", { stopped: true, plan: null })
+
+// The old worker's tick is reading the thread when the worker is retired by a wake poll's refused pending read (no hook
+// event, so the read is still current when it comes back). The replacement's join is held open.
+async function retiredTick() {
+  let release
+  let reads = 0
+  let refuse = false
+  let open
+  const second = { promise: new Promise(resolve => { open = resolve }) }
+  const thread = threadDouble({ observation: () => (++reads === 1 ? new Promise(resolve => { release = () => resolve(STOPPED) }) : IDLE) })
+  const r = await rig({ thread, gate: boot => (boot === 2 ? second : undefined), handlers: wakeHandlers({ pending: () => (refuse ? { refused: "STALE_INSTANCE" } : { messages: [] }) }) })
+  await idleSession(r)
+  await r.clock.advance(30_000) // the tick starts and waits on its read
+  assert.equal(reads, 1)
+  refuse = true
+  await r.clock.advance(2000) // a wake poll finds the lease gone: the worker is retired
+  assert.equal(r.worker.state.stops, 1)
+  refuse = false
+  await r.clock.advance(3750) // the rejoin starts, and its join stays open
+  assert.equal(r.worker.bootIds.length, 2)
+  return { r, release: () => release(), open: () => open(), reads: () => reads }
+}
+const lastBeat = r => r.worker.ops("heartbeat").at(-1).state
+const CLEAR_BEAT = { native_state: "idle", stopped: false, plan_mode: false }
+
+test("a retired tick's read that comes back before the replacement has read anything leaves the state it found", async () => {
+  const { r, release, open } = await retiredTick()
+  release()
+  await settle()
+  assert.equal(r.receiver.state(), null, "the old read's stopped is not the replacement's state")
+  open()
+  await settle()
+  assert.deepEqual(lastBeat(r), CLEAR_BEAT, "the replacement's first heartbeat does not carry it")
+  await r.clock.advance(30_000)
+  assert.equal(r.receiver.state(), null)
+  assert.deepEqual(lastBeat(r), CLEAR_BEAT)
+})
+
+test("a retired tick's read that comes back after the replacement has read leaves the replacement's reading", async () => {
+  const { r, release, open, reads } = await retiredTick()
+  open()
+  await settle()
+  await r.clock.advance(30_000) // the replacement's own tick reads, and finds the thread clear
+  assert.equal(reads(), 2)
+  assert.equal(r.receiver.state(), null)
+  release() // the old read lands last
+  await settle()
+  assert.equal(r.receiver.state(), null, "it overwrote nothing: no stopped, no refusal, no new generation")
+  await r.clock.advance(30_000)
+  assert.deepEqual(lastBeat(r), CLEAR_BEAT)
+})
+
+// The bind commits the provider and the route, and it is the thread's own state, not the worker's. A retired worker's bind
+// that lands after the replacement's must not put its own answer over the replacement's. This one runs the product's thread
+// over a fake app-server socket; the receiver's timers stay virtual, the socket's are real.
+test("a retired tick's bind whose negative probe lands after the replacement's positive probe leaves the route true and threadBound true", async () => {
+  const waitFor = async (check, what) => {
+    for (let waited = 0; !check() && waited < 3000; waited += 5) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(check(), `${what} never happened`)
+  }
+  const dir = mkdtempSync(join(tmpdir(), "acr-"))
+  const probes = { count: 0, free: null }
+  const record = { id: "session-1", parentThreadId: null, agentRole: null, ephemeral: false, source: "cli", modelProvider: "openai", status: { type: "idle" } }
+  const handler = (message, connection) => {
+    switch (message.method) {
+      case "thread/loaded/list": return { result: { data: ["session-1"], nextCursor: null } }
+      case "thread/read": return { result: { thread: record } }
+      case "thread/turns/list": return { result: { data: [{ id: "t1", status: "completed" }], nextCursor: null } }
+      case "thread/resume": return { result: { thread: record, collaborationMode: { mode: "default", settings: {} } } }
+      case "thread/queue/delete": {
+        probes.count += 1
+        if (probes.count === 1) { connection.socket.destroy(); return undefined } // the first bind never learns the answer: hook-only
+        if (probes.count === 2) return new Promise(resolve => { probes.free = () => resolve({ result: { deleted: true } }) }) // the old tick's probe: held, then negative
+        return { result: { deleted: false } } // the replacement's probe: positive
+      }
+      default: return { error: { code: -32601, message: "no" } }
+    }
+  }
+  const path = join(dir, "s.sock")
+  const server = await fakeAppServer(path, handler)
+  try {
+    const real = createThread({ path, threadId: "session-1" })
+    const thread = Object.assign(Object.create(real), { opened: [] })
+    let refuse = false
+    const r = await rig({ thread, handlers: { heartbeat: () => (refuse ? { refused: "STALE_INSTANCE" } : {}) } })
+    await waitFor(() => r.worker.bootIds.length === 1, "the first join")
+    assert.equal(thread.route, null, "the first bind left the route undecided")
+    await r.begin()
+    await r.clock.advance(30_000) // the tick binds again: its probe is held
+    await waitFor(() => probes.count === 2, "the old tick's probe")
+    refuse = true
+    await r.op(turn()) // the lease is gone: the worker is retired
+    assert.equal(r.worker.state.stops, 1)
+    refuse = false
+    await r.clock.advance(3750) // the rejoin binds: its probe answers
+    await waitFor(() => r.worker.bootIds.length === 2, "the rejoin")
+    assert.equal(thread.route, true, "the replacement decided the route")
+    await waitFor(() => server.state.open === 1, "the replacement's connection to close, leaving only the held one")
+    probes.free() // the old tick's negative answer arrives last
+    await waitFor(() => server.state.open === 0, "the old bind to finish and close its connection")
+    await settle()
+    assert.equal(thread.route, true, "the retired bind's answer is not the thread's route")
+    assert.equal(thread.provider, "openai")
+    // threadBound follows the route: the replacement's tick reads the thread (it never binds again), which the wire shows.
+    await r.op({ op: "stop", permission_mode: "default" }) // the turn ended: nothing is known to run, so the tick reads
+    const before = server.methods().filter(method => method === "thread/resume").length
+    await r.clock.advance(30_000)
+    await waitFor(() => server.methods().filter(method => method === "thread/resume").length > before, "the replacement's own read")
+    assert.equal(probes.count, 3, "nothing probed again")
+  } finally {
+    await server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---- a control socket that cannot be trusted ---------------------------------------------------------------------------
+
+test("a control socket that cannot be trusted is no positive check: no join, chat is not latched off, and the join follows once it can be", async () => {
+  let answer = { status: "untrusted" }
+  const thread = threadDouble({ bind: () => answer })
+  const r = await rig({ handlers: wakeHandlers(), thread })
+  assert.equal(r.worker.bootIds.length, 0, "an untrusted socket verifies nothing, so no join")
+  const hook = await r.op({ op: "start", wait_ms: 5000 })
+  assert.deepEqual(hook.sent, [{ context: null }], "no refusal text: the receiver is not disabled, it is waiting")
+  for (let period = 0; period < 4; period += 1) await r.clock.advance(30_000)
+  assert.equal(r.worker.bootIds.length, 0)
+  assert.ok(thread.calls.filter(call => call === "bind").length >= 5, "it keeps looking every heartbeat period")
+  answer = { status: "bound" }
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.bootIds.length, 1, "the path is fixed: the join follows the next look")
+})
+
+test("a bind that finds the socket untrusted after the join does not end chat, and hook delivery is unchanged", async () => {
+  let answer = { status: "unprobed" }
+  const thread = threadDouble({ bind: () => answer, route: null })
+  const r = await rig({ handlers: wakeHandlers(), thread })
+  assert.equal(r.worker.bootIds.length, 1, "the join came with a main thread whose probe did not finish")
+  await idleSession(r)
+  answer = { status: "untrusted" }
+  await r.clock.advance(30_000) // the tick binds again and the socket is refused
+  assert.notEqual(r.receiver.state(), "offline", "chat is not latched off")
+  assert.deepEqual(thread.wakes, [], "the route is not decided, so no wake")
+  const busy = await r.op(turn())
+  assert.match(busy.sent[0].context, /"id":/, "busy delivery through the hook is unchanged")
+})
+

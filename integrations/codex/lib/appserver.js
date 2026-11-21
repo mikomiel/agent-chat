@@ -10,8 +10,9 @@
 // thread/loaded/list, thread/turns/list, thread/items/list, thread/resume with excludeTurns, and the experimental
 // thread/queue/add and thread/queue/delete, which need capabilities.experimentalApi at initialize.
 import { createHash, randomBytes, randomUUID } from "node:crypto"
-import { readFileSync } from "node:fs"
+import { lstatSync, readFileSync, realpathSync } from "node:fs"
 import net from "node:net"
+import { basename, dirname, join } from "node:path"
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 const MAX_HEAD = 16 * 1024
@@ -74,11 +75,43 @@ function decode(buffer) {
   return { fin: (buffer[0] & 0x80) !== 0, opcode: buffer[0] & 0x0f, payload: buffer.subarray(offset, offset + length), size: offset + length }
 }
 
+// The control socket is the peer of every read and of the wake, and a WebSocket upgrade proves nothing about who answers it.
+// So the path is trusted before each connect, or the connect is refused with CHAT_APPSERVER_UNTRUSTED. The rule:
+//   - the socket is a socket (not a symlink) owned by the current user;
+//   - its directory is not a symlink, and neither it nor any directory above it (a symlink above it is resolved first)
+//     can be changed by anyone else: each is owned by the current user or root, and is not writable by group or other,
+//     unless the sticky bit is set, which stops others from removing or renaming what the current user owns.
+// The connection goes to the path that was checked, with those links resolved. A socket that is not there is not untrusted:
+// that is the closed app-server (`APP_SERVER_CLOSED`), and nothing is connected to.
+const untrusted = () => failure("CHAT_APPSERVER_UNTRUSTED")
+const guarded = (info, uid) => info.isDirectory() && (info.uid === uid || info.uid === 0) && ((info.mode & 0o022) === 0 || (info.mode & 0o1000) !== 0)
+
+export function trustedSocket(path, { lstat = lstatSync, realpath = realpathSync, uid = process.geteuid() } = {}) {
+  try {
+    const parent = dirname(path)
+    if (lstat(parent).isSymbolicLink()) throw untrusted()
+    const real = realpath(parent)
+    for (let directory = real; ; directory = dirname(directory)) {
+      if (!guarded(lstat(directory), uid)) throw untrusted()
+      if (dirname(directory) === directory) break
+    }
+    const target = join(real, basename(path))
+    const info = lstat(target)
+    if (!info.isSocket() || info.uid !== uid) throw untrusted()
+    return target
+  } catch (error) {
+    if (error?.code === "CHAT_APPSERVER_UNTRUSTED") throw error
+    throw error?.code === "ENOENT" || error?.code === "ENOTDIR" ? failure("APP_SERVER_CLOSED") : untrusted()
+  }
+}
+
 // A connected, upgraded and initialized app-server connection. `request` resolves with the JSON-RPC result and
 // rejects with { code: "APP_SERVER_ERROR", rpc } for an error reply, or a fixed local code.
-export function openAppServer(path, { createConnection = net.createConnection, connectMs = CONNECT_MS } = {}) {
+export function openAppServer(path, { createConnection = net.createConnection, connectMs = CONNECT_MS, trust = trustedSocket } = {}) {
   return new Promise((resolve, reject) => {
-    const socket = createConnection(path)
+    let target
+    try { target = trust(path) } catch (error) { return reject(error) }
+    const socket = createConnection(target)
     const key = randomBytes(16).toString("base64")
     const accept = createHash("sha1").update(key + GUID).digest("base64")
     const calls = new Map()
@@ -218,14 +251,17 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
   let provider = null
   let queue = null // null: not probed, true: the documented answer came back, false: it did not
 
-  async function withConnection(task) {
-    const link = await open(path)
+  async function withConnection(task, options) {
+    const link = await open(path, options)
     try { return await task(link) } finally { link.close() }
   }
 
-  async function loaded(link) {
+  // The time one request may take: the usual limit, or what is left before `deadline` when there is one.
+  const allowed = deadline => Math.max(1, Math.min(REQUEST_MS, deadline - now()))
+
+  async function loaded(link, deadline = Infinity) {
     for (let cursor = null, page = 0; page < 10; page += 1) {
-      const answer = await link.request("thread/loaded/list", cursor ? { cursor } : {})
+      const answer = await link.request("thread/loaded/list", cursor ? { cursor } : {}, allowed(deadline))
       if (!Array.isArray(answer.data)) throw failure("APP_SERVER_PROTOCOL")
       if (answer.data.includes(threadId)) return true
       if (typeof answer.nextCursor !== "string") return false
@@ -234,8 +270,8 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     return false
   }
 
-  async function read(link) {
-    const answer = await link.request("thread/read", { threadId })
+  async function read(link, deadline = Infinity) {
+    const answer = await link.request("thread/read", { threadId }, allowed(deadline))
     const thread = answer.thread
     if (thread === null || typeof thread !== "object" || thread.id !== threadId) throw failure("APP_SERVER_PROTOCOL")
     return thread
@@ -253,6 +289,44 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     }
   }
 
+  // Why a thread record refuses a wake whatever its state: a child, or a provider that is no longer the bound one.
+  const refusing = (record, checkProvider = true) => {
+    if (isChildThread(record)) return "child"
+    return checkProvider && provider !== null && record.modelProvider !== provider ? "stale_binding" : null
+  }
+
+  // The thread as the app-server shows it now, for the wake or the heartbeat: loaded, read, its newest turn, and last the
+  // `thread/resume` answer, which is a record of its own and the newest of the four. It must show the thread idle, in
+  // default mode, and agree with the read; an answer that does not is no basis for a wake. Every request ends by
+  // `deadline`. observed: { status, stopped, plan }; `reason` is null only when the thread is clear.
+  async function evaluate(link, deadline) {
+    const observed = { status: "unknown", stopped: false, plan: null }
+    if (!(await loaded(link, deadline))) return { reason: "offline", observed: { ...observed, status: "offline" } }
+    const thread = await read(link, deadline)
+    const refusal = refusing(thread)
+    if (refusal) return { reason: refusal, observed }
+    observed.status = STATUS[thread.status?.type] ?? "unknown"
+    if (observed.status !== "idle") return { reason: observed.status, observed }
+    const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline))
+    if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
+    observed.stopped = turns.data[0]?.status === "interrupted"
+    if (observed.stopped) return { reason: "stopped", observed }
+    // thread/resume subscribes this connection; the connection closes as soon as the answer is read.
+    let resumed = null
+    try { resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(deadline)) } catch (error) { if (error?.code !== "APP_SERVER_ERROR") throw error }
+    const record = resumed?.thread
+    if (record === null || typeof record !== "object" || record.id !== threadId || typeof record.status?.type !== "string") {
+      return { reason: "unknown", observed } // no record of its own: nothing newer than the read, and nothing to check it against
+    }
+    const newer = refusing(record, typeof record.modelProvider === "string") // the provider is checked when the record carries one
+    if (newer) return { reason: newer, observed }
+    observed.status = STATUS[record.status.type] ?? "unknown"
+    if (observed.status !== "idle") return { reason: observed.status, observed }
+    const mode = resumed.collaborationMode?.mode
+    observed.plan = mode === "default" ? false : mode === "plan" ? true : null
+    return { reason: observed.plan === false ? null : observed.plan === true ? "plan" : "unknown", observed }
+  }
+
   return {
     get provider() { return provider },
     get route() { return queue },
@@ -260,16 +334,18 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     // Check the thread before the receiver joins: it must be loaded, its record must be complete, it must not be a
     // child, and it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in
     // "bound", "unprobed" and "stale_binding"; nothing recorded by an earlier call counts.
-    // status: "bound" | "unprobed" | "child" | "unloaded" | "stale_binding" | "unavailable"
+    // status: "bound" | "unprobed" | "child" | "unloaded" | "stale_binding" | "unavailable" | "untrusted"
     //   unprobed - a main thread, but the queue probe did not finish: the route stays undecided and the next bind probes again.
     //   unloaded - not in the loaded list, or listed but read as `notLoaded` (it unloaded between the two requests).
     //
     // `signal` belongs to this one call: once the caller aborts it (its time ran out), the call records nothing, neither
-    // the provider nor the route, and its answer is "unavailable". What the call learns is held in locals and committed
-    // together at the end, after the last check of the signal. `onRead` is called once the thread read has passed,
-    // before the queue probe: the caller's read deadline ends there, and the probe has PROBE_MS.
-    async bind({ signal, onRead } = {}) {
-      const expired = () => signal?.aborted === true
+    // the provider nor the route, and its answer is "unavailable". `owns` is the same for a caller that stopped being
+    // the owner of the answer (the worker it binds for was retired): asked at every check, it must stay true. What the
+    // call learns is held in locals and committed together at the end, after the last check of both, in the same turn.
+    // `onRead` is called once the thread read has passed, before the queue probe: the caller's read deadline ends there,
+    // and the probe has PROBE_MS. A socket that cannot be trusted (see `trustedSocket`) answers "untrusted".
+    async bind({ signal, onRead, owns } = {}) {
+      const expired = () => signal?.aborted === true || owns?.() === false
       try {
         return await withConnection(async link => {
           if (!(await loaded(link))) return { status: "unloaded" }
@@ -294,45 +370,30 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
           queue = route
           return { status: "bound", route }
         })
-      } catch { return { status: "unavailable" } }
+      } catch (error) { return { status: error?.code === "CHAT_APPSERVER_UNTRUSTED" ? "untrusted" : "unavailable" } }
     },
 
     // What the thread is now, from reads only. `reason` is the delivery refusal a wake would give, or null.
     // observed: { status: "idle"|"busy"|"offline"|"unknown", stopped, plan: true|false|null }
     async observe() {
-      const observed = { status: "unknown", stopped: false, plan: null }
       try {
-        return await withConnection(async link => {
-          if (!(await loaded(link))) return { reason: "offline", observed: { ...observed, status: "offline" } }
-          const thread = await read(link)
-          if (isChildThread(thread)) return { reason: "child", observed }
-          if (provider !== null && thread.modelProvider !== provider) return { reason: "stale_binding", observed }
-          const status = STATUS[thread.status?.type] ?? "unknown"
-          observed.status = status
-          if (status !== "idle") return { reason: status === "unknown" ? "unknown" : status, observed }
-          const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" })
-          if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
-          observed.stopped = turns.data[0]?.status === "interrupted"
-          if (observed.stopped) return { reason: "stopped", observed }
-          // thread/resume subscribes this connection; the connection closes as soon as the answer is read.
-          try {
-            const resumed = await link.request("thread/resume", { threadId, excludeTurns: true })
-            const mode = resumed.collaborationMode?.mode
-            observed.plan = mode === "default" ? false : mode === "plan" ? true : null
-          } catch (error) { if (error?.code !== "APP_SERVER_ERROR") throw error }
-          return { reason: observed.plan === false ? null : observed.plan === true ? "plan" : "unknown", observed }
-        })
-      } catch { return { reason: "offline", observed: { ...observed, status: "offline" } } }
+        return await withConnection(link => evaluate(link, Infinity))
+      } catch { return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } } }
     },
 
     // Queue `text` as one user turn and fence it. Resolves { outcome, reason } for the settle call.
     //   deleted:true  - it never dispatched: deferred.
     //   deleted:false - it dispatched: handed once a userMessage with its client id shows, else uncertain.
     // A failure before the add frame is written is failed; any failure after it is uncertain. Nothing retries.
-    // `proceed` is asked once, right before the add frame is written, with nothing awaited in between. It returns
-    // null to go on, or the `deferred` reason that the receiver's state now gives: nothing is sent then.
-    // `until` is the end of the reservation, and every request stops SETTLE_MS before it.
-    async wake({ text, attemptId, until, proceed = () => null }) {
+    // The wake reads the thread again (`evaluate`: the same four reads as `observe`, the `thread/resume` answer last), and
+    // `proceed` is asked once with that reading, right before the add frame is written, with nothing awaited in between:
+    // the add goes out in the same turn as the last answer. `thread/resume` subscribes the connection that asks, so the
+    // reading is taken on a second connection that is closed first, and the connection for the add, the fence and the
+    // confirmation is opened before it and never asks. The queue has no condition of its own (see the README), so what
+    // remains is the add's own round trip. `proceed` returns null to go on, or the
+    // `deferred` reason that the reading and the receiver's state now give: nothing is sent then. Without one, the
+    // reading alone decides. `until` is the end of the reservation, and every request stops SETTLE_MS before it.
+    async wake({ text, attemptId, until, proceed = fresh => (fresh.reason === "child" ? "offline" : fresh.reason) }) {
       const clientUserMessageId = `${CLIENT_ID_PREFIX}${attemptId}`
       const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
       const limit = until - SETTLE_MS
@@ -341,7 +402,12 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
       try { link = await open(path, { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())) }) } catch { return { outcome: "failed", reason: "native_unavailable" } }
       try {
         if (limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
-        const stale = proceed()
+        let fresh
+        try {
+          fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())) })
+        } catch { return { outcome: "failed", reason: "native_unavailable" } }
+        if (limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
+        const stale = proceed(fresh)
         if (stale !== null) return { outcome: "deferred", reason: stale }
         let added
         try {
