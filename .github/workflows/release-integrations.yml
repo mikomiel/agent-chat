@@ -1,0 +1,89 @@
+# Attaches one tarball per harness integration, and SHA256SUMS over them, to a
+# GitHub Release when it is published. A consumer who knows only the release
+# tag can then install any one integration at that exact version. The packages
+# are released at the product version: release-please bumps every
+# `integrations/*/package.json` with the project version, and the tag check
+# below refuses a release whose tag is not `v` plus that version.
+#
+# This is its own workflow, not a job in publish.yml: that workflow's trust is
+# bound to one file name and the `pypi` environment, and its `build` job is
+# deliberately read-only. For the same reason this one splits like it does:
+# `pack` runs repository code (npm and the check script) with a read-only
+# token, and `upload` holds the only write grant but runs no repository code
+# and checks nothing out. Nothing is published to npm: the packages stay
+# `private`.
+#
+# release-please creates the release with a personal access token, so the
+# `release` event does start this workflow; a release created with the default
+# GITHUB_TOKEN would not.
+name: release-integrations
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  pack:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The commit the release event names, never a ref resolved again
+          # by name: a branch named like the tag, or a moved tag, would
+          # otherwise change what is packed.
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - name: Release tag matches the project version
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$RELEASE_TAG" != "v${version}" ]; then
+            echo "The release tag must be v${version}, the version in pyproject.toml." >&2
+            exit 1
+          fi
+      # Packs every integrations/*/ directory, found by listing, and fails
+      # unless there is one tarball per directory, each at the project
+      # version, with its entry points and the repository LICENSE and without
+      # its tests, and SHA256SUMS is in the GNU text form that the install
+      # block reads.
+      - name: Pack and check the integrations
+        run: python scripts/check_release_artifacts.py --pack --integrations-only assets
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: integration-assets
+          path: assets/
+          if-no-files-found: error
+
+  upload:
+    needs: pack
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: integration-assets
+          path: assets/
+      # --clobber makes a re-run after a partial upload finish the set. A re-run
+      # packs again and uploads a SHA256SUMS that matches its own tarballs. The
+      # install steps verify each download against SHA256SUMS, so a tarball that
+      # does not match it is refused.
+      - name: Attach the assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        # Only the checked set: the tarballs (each one checked, an unexpected one
+        # fails the pack job) and SHA256SUMS. Any other file left in assets/ is
+        # not uploaded.
+        run: gh release upload "$RELEASE_TAG" assets/*.tgz assets/SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
