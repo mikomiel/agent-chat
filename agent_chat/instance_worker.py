@@ -101,13 +101,12 @@ def _end(instance: instance_client.JoinedInstance, directory: Path) -> dict[str,
     server lease. Removal is best effort. A caller that already holds the file open or has read the credential can
     still use it, and its heartbeats renew the lease. A removal that fails or runs out of time is not raised. The
     worker's alarm is armed again after it, because the removal may have used it up: the end request, everything it
-    loads first and the reply that follows stay under one hard limit. The request also takes a client deadline, which
-    bounds name resolution: native resolver code can hold off the alarm's handler. The end uses the credential held
-    in memory.
+    loads first and the reply that follows stay under one hard limit, like every other worker request. The end uses
+    the credential held in memory.
     """
     instance_file.discard_instance(directory, instance.binding.boot_id)
     signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
-    return instance_client.end(instance, deadline=monotonic() + REQUEST_SECONDS)
+    return instance_client.end(instance)
 
 
 def _asks_bodies(request: dict[str, Any]) -> bool:

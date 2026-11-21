@@ -180,8 +180,7 @@ def test_a_stalled_end_is_interrupted_after_a_removal_that_used_up_the_alarm(mon
         with pytest.raises(TimeoutError):
             instance_worker._end(instance, Path("/nonexistent"))
         assert time.monotonic() - started < 2  # the alarm armed again after the removal interrupted the end
-        # The client deadline, measured after the removal, bounds what the alarm cannot interrupt, such as resolution.
-        assert len(deadlines) == 1 and deadlines[0] is not None and deadlines[0] - started > 0.2
+        assert deadlines == [None]  # under the alarm, like every other worker request
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
