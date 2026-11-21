@@ -111,7 +111,9 @@ function checkedChain(directory, { refuse, lstat, realpath, readlink, uid }) {
     judge(next, info)
     current = next
   }
-  if (realpath(spelled) !== current) throw refusal(refuse)
+  // A spelling or a real path with U+FFFD in it is refused even when the walk and realpath(3) agree: a name that was not
+  // UTF-8 (in the environment, say) comes back with U+FFFD, and that string names the directory a literal U+FFFD spells.
+  if (spelled.includes("\uFFFD") || current.includes("\uFFFD") || realpath(spelled) !== current) throw refusal(refuse)
   return { spelled, real: current, chain: [...judged.values()] }
 }
 

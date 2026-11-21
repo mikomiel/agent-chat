@@ -572,7 +572,11 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   sticky bit is accepted only while the socket is the current user's. The check
   and the connect are two steps; between them only an owner of a trusted
   directory could replace the socket. A live run on a real release is still
-  needed.
+  needed. The check reads owners and mode bits only, for sockets and for the
+  config file alike. An access control list that lets another user change a
+  directory without a group or other write bit is not seen; macOS ACLs are such
+  a case. Keep the config and the sockets under directories that carry no such
+  grant. This is tracked in #157.
 - **Sandboxing.** Whether a hook command and the detached receiver may use the
   state directory's socket, the control socket and the network under every
   sandbox profile is not confirmed. A profile that blocks them leaves chat off.

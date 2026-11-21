@@ -133,6 +133,18 @@ test("with the real file system: a real path that comes back with U+FFFD is refu
   return undefined
 })
 
+test("with the real file system: a spelling through a literal U+FFFD directory is refused though the walk and realpath agree", t => {
+  const bad = lossy(Buffer.from([0xff]))
+  if (bad === null) return t.skip("the file system refuses a name that is not UTF-8")
+  try {
+    const literal = `${bad.root}/\uFFFD/state`
+    assert.equal(realpathSync.native(literal), literal, "control: the literal directory exists and is its own real path")
+    assert.throws(() => trustedDirectory(literal), { code: "CHAT_UNTRUSTED" })
+    assert.throws(() => trustedSocket(`${literal}/s.sock`), { code: "CHAT_UNTRUSTED" })
+  } finally { bad.close() }
+  return undefined
+})
+
 test("the configured spelling of a socket path is bounded like its real path", () => {
   const padded = `/run/user/app${"/".repeat(MAX_SOCKET_PATH_BYTES)}s.sock` // resolves to SOCKET, spelled past the limit
   assert.throws(() => trustedSocket(padded, good()), untrusted)
