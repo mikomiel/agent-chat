@@ -1058,6 +1058,19 @@ def test_the_sums_file_is_replaced_and_never_written_through(tmp_path: Path) -> 
     assert [path.name for path in dist.iterdir() if path.name.startswith("SHA256SUMS.")] == []
 
 
+@pytest.mark.parametrize(("umask", "mode"), [(0o022, 0o644), (0o077, 0o600)])
+def test_the_sums_file_takes_its_mode_from_the_umask(tmp_path: Path, umask: int, mode: int) -> None:
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    write_tarball(dist / "agent-chat-alpha-1.2.3.tgz", {"package/package.json": "{}"})
+    previous = os.umask(umask)
+    try:
+        script.write_sums(dist)
+    finally:
+        os.umask(previous)
+    assert (dist / script.SUMS).stat().st_mode & 0o777 == mode
+
+
 # The install guide, executed. A block that nobody runs drifts from the checker that guards the same file.
 
 INSTALL_TOOLS = ("bash", "curl", "tar", "sha256sum")

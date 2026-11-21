@@ -182,7 +182,9 @@ def write_sums(dist: Path) -> None:
     lines = [f"{sha256(path)}  {path.name}\n" for path in tarballs]
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dist, prefix=f"{SUMS}.", delete=False) as handle:
         handle.write("".join(lines))
-    os.chmod(handle.name, 0o644)
+    umask = os.umask(0)  # read the umask; a temporary file is created 0600
+    os.umask(umask)
+    os.chmod(handle.name, 0o666 & ~umask)  # the mode open() would have given
     os.replace(handle.name, dist / SUMS)
 
 
