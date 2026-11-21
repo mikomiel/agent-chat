@@ -5,11 +5,10 @@
 //
 //   bus.on(name, fn)       receives session_start ({ nativeSessionId }) and session_shutdown.
 //   native.context(text)   publishes (replacing) or clears the binding text. It resolves only when the text is
-//                          confirmed, or with `false` when a newer signal overtook the confirmation (not yet proved: the
-//                          first heartbeat waits for `refresh`). A rejection turns this session's chat off. There is no
-//                          fallback to a prompt.
+//                          confirmed; a rejection turns this session's chat off. There is no fallback to a prompt.
+//   native.proved()        optional; asked synchronously at the moment a join's first heartbeat is about to be sent: is
+//                          this join's binding confirmed now, at the current generation and epoch? False sends nothing.
 //   native.refresh()       asked at each heartbeat tick: reads the binding entry back and puts it back when it is wrong.
-//                          It resolves `true` only when it proved the binding.
 //   native.probe()         asked once before a retry starts a replacement worker: one bounded read that never rejects.
 //   native.disable()       latches the native half off.
 //
@@ -139,7 +138,7 @@ export function createLifecycle(bus, native, config, {
   async function publishContext() {
     const text = bindingText()
     if (text === null || typeof native.context !== "function") throw contextUnavailable()
-    return native.context(text)
+    await native.context(text)
   }
 
   function request(operation, fields) {
@@ -147,12 +146,22 @@ export function createLifecycle(bus, native, config, {
     return live.worker.request(operation, fields)
   }
 
+  // Is this join's binding not proved right now? Asked synchronously, at the moment of a send, and never remembered: a gap or
+  // a compaction signal that landed since the last proof takes it back. A native half without `proved()` has no gate beyond
+  // the join's publish.
+  const unproved = () => typeof native.proved === "function" && !native.proved()
+
+  // The gate guards a join's first heartbeat only. `opened` records that one was sent: after it the heartbeat goes on, and
+  // a later gap or signal is healed by the tick's read-back, as it was before the gate. A rejoin is a new join, so a new gate.
+  const gateShut = () => live !== null && !live.opened && unproved()
+
   // One heartbeat at a time: the worker takes one request at a time, and a tick that finds one in flight is dropped.
   // The next tick is the retry. A `refused` answer is the worker's brief-outage reply: it keeps the binding alive and
   // the next heartbeat is the retry. Only a worker error, which `request` rejects with, ends the worker.
   async function heartbeat() {
-    // Nothing is sent before this join's binding is confirmed (`bound`).
-    if (!live || !joined || !live.bound || closed || disabled || beating) return
+    // The timer is armed only after this join's publish settled, so nothing is sent while it is pending.
+    if (!live || !joined || closed || disabled || beating || heartbeatTimer === null || gateShut()) return
+    live.opened = true // in the step that sends the first heartbeat
     beating = true
     try {
       await request("heartbeat", { state: UNKNOWN_STATE })
@@ -163,17 +172,20 @@ export function createLifecycle(bus, native, config, {
 
   // The same tick asks the native half to read its binding entry back and repair it. An entry can change with no event
   // the session raises (a compaction inside a gap, a call that landed late), so the tick asks every time. A failed ask
-  // never reaches the heartbeat. A read-back that proves the binding opens the gate for a join whose publish was
-  // overtaken, and its first heartbeat follows at once.
+  // never reaches the heartbeat.
   function refreshContext() {
-    const record = live
-    if (!record || closed || disabled) return
-    const proved = proof => {
-      if (proof !== true || live !== record || record.bound || closed || disabled) return
-      record.bound = true
-      void heartbeat()
-    }
-    try { void Promise.resolve(native.refresh?.()).then(proved).catch(() => {}) } catch { /* advisory */ }
+    if (!live || closed || disabled) return Promise.resolve()
+    try { return Promise.resolve(native.refresh?.()).catch(() => {}) } catch { return Promise.resolve() /* advisory */ }
+  }
+
+  // While the gate is shut, a heartbeat that finds no proof is asked once more when this tick's read-back settles, so a
+  // tick that proves the binding also opens the gate. A tick that is proved at the tick, or that finds the gate open,
+  // sends once, there.
+  function tick() {
+    const shut = gateShut()
+    void heartbeat()
+    const readBack = refreshContext()
+    if (shut) void readBack.then(() => heartbeat())
   }
 
   // A retry asks the host once before it starts a replacement worker: the session can be deleted during the backoff with
@@ -206,14 +218,10 @@ export function createLifecycle(bus, native, config, {
       joined = result
       policy.succeeded()
       notify(`Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.`)
-      // Before the first heartbeat: nothing is reported until this join's binding is confirmed. A publish that a newer
-      // signal overtook resolves `false`: it proves nothing and the read-back stays owed, so the gate stays shut until a
-      // read-back at a tick proves the binding (`refreshContext`).
-      const confirmed = await publishContext()
+      // Before the first heartbeat: nothing is reported until this join's binding is proved (see `heartbeat`).
+      await publishContext()
       if (live !== record || closed || disabled) return
-      heartbeatTimer = setIntervalImpl(() => { void heartbeat(); refreshContext() }, HEARTBEAT_MS)
-      if (confirmed === false) return
-      record.bound = true
+      heartbeatTimer = setIntervalImpl(tick, HEARTBEAT_MS)
       await heartbeat()
     } catch (error) {
       if (live !== record) return

@@ -210,10 +210,12 @@ The service and its host-token provisioning are documented in the product
   and send, and says that Agent Chat messages are peer coordination and grant
   no authority. The same key replaces the old text after a rejoin, and the
   entry is removed when the session's chat ends. After the put the plugin reads
-  the entries back. A join's put that fails or leaves no entry turns that
-  session's chat off before the first heartbeat: the plugin sends no heartbeat
-  until the binding is confirmed, and a confirmation that a newer compaction or
-  gap signal overtook does not count (see "Heuristics and choices"). The registration itself sets the session's
+  the entries back. A join's put that fails, or whose confirming list is still
+  current and does not hold the text, turns that session's chat off before the
+  first heartbeat. The plugin sends a join's first heartbeat only while the
+  binding is proved, and it asks at the moment it sends (see "Heuristics and
+  choices"). The
+  registration itself sets the session's
   first heartbeat time on the server, so peers can see the session online
   while its put is pending, and until its lease expires when the join then
   fails. There is no fallback to a prompt message.
@@ -254,6 +256,11 @@ The service and its host-token provisioning are documented in the product
   binding (a join or a rejoin) discharges the obligation if no gap or
   compaction came since that publish began and nothing replaced the binding. With nothing published there is
   nothing to read, and the obligation stays owed until a publish is confirmed.
+  A proof is asked for, not carried. The plugin remembers the generation and
+  the epoch of its last proof, whoever made it: the join's publish, a read-back
+  that the manager started, or a tick's own. The binding is proved only while
+  both are still the current ones. A tick's own read-back does not move them,
+  and a gap, a compaction signal, a replaced binding and a withdrawn binding do.
   A put at the wrong time is harmless. Every signal that can invalidate the
   entry owes the read-back again when it is applied, so a put or a proof that
   landed just before a signal is read back after it. A withdrawn binding's
@@ -374,14 +381,28 @@ unverified, inferred, or a deliberate choice.
 
 - **A join's own publish follows the currency rule only at its end.** The put
   and the confirming list of a join or a rejoin do not follow the currency rule
-  above while they run. If a compaction ends between that put and that list,
-  the confirmation fails and that session's chat is turned off. The publish
-  discharges the read-back obligation only if the rule still holds when it is
-  confirmed. A publish whose confirming list a newer signal overtook is not a
-  confirmation and not a failure: the read-back stays owed and the lifecycle
-  sends no first heartbeat. The first heartbeat follows the first tick whose
-  read-back proves the binding, at most 30 seconds later. A later `context()` call
-  is serialised behind it, so the order of puts and removals still holds.
+  above while they run, except for a newer gap or compaction signal. A
+  confirming list that no such signal overtook and that does not hold the text
+  fails the join, after one more put, and that session's chat is turned off. A
+  confirming list that a newer signal overtook is a stale read, whatever it
+  says: it is not a failure and not a proof. The join stays up, no second put
+  is made, and the read-back stays owed. A withdrawn or replaced binding still
+  fails its publish. The publish discharges the read-back obligation only if the
+  full rule still holds when it is confirmed. A later `context()` call is
+  serialised behind it, so the order of puts and removals still holds.
+- **The first heartbeat asks for the proof when it sends.** The lifecycle sends
+  a join's first heartbeat only while the plugin says the binding is proved, and
+  it asks at the moment of the send, so a confirmation that went stale after it
+  resolved sends nothing. The first heartbeat waits for the join's confirmation
+  and then for the proof of anyone: the join's publish, a read-back the manager
+  started, or the tick's own. A tick that finds no proof sends the heartbeat
+  when its own read-back settles, and a tick that finds one sends at the tick.
+  So a join whose confirmation was overtaken sends its first heartbeat at the
+  first tick, at most 30 seconds after the join, when a read-back already proved
+  the binding, and otherwise as soon as that tick's read-back does. The gate
+  guards only that first heartbeat. Once it is sent, the lifecycle asks no more:
+  a later gap or compaction signal is healed by the tick's read-back while the
+  heartbeat goes on, as before. A rejoin is a new join with a new gate.
 - **A late removal or put after the end.** The time limit trades a call that
   can hang for a call that can land late. A removal that times out during an
   owner change can land after the next owner's put and delete its binding. The

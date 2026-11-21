@@ -1207,10 +1207,10 @@ test("probe: it does not wait behind a removal that is still pending", async () 
   assert.equal(done, true) // not queued behind it
   held.settle.resolve()
 })
-
-// Review 6006147517, finding 2: `context()` resolves undefined only for a confirmation that is still current. A publish
-// whose confirming list a newer signal or a newer binding overtook resolves `false`: it is not a failure, so the chat
-// stays on, and it is not a proof, so the obligation stays owed and the caller keeps its gate shut.
+// Review 6006216828: the proof is asked, never carried as a value. `context()` resolves undefined, and `proved()` says
+// whether this binding is confirmed now, at the generation and epoch it is asked in. A publish whose confirming list a
+// newer signal or a newer binding overtook is not a failure, so the chat stays on, and it is not a proof, so the
+// obligation stays owed until a read-back proves it.
 for (const [name, overtake] of [
   ["a gap", context => gap(context)],
   ["a compaction signal", context => compacted(context)],
@@ -1219,7 +1219,7 @@ for (const [name, overtake] of [
     context.observe(event("session.compaction.failed", { reason: "auto" }))
   }],
 ]) {
-  test(`a publish whose confirming list ${name} overtook resolves false and leaves the obligation owed`, async () => {
+  test(`a publish whose confirming list ${name} overtook resolves, proves nothing, and leaves the obligation owed`, async () => {
     const { ctx, context } = make()
     const held = holdFirst(ctx.session.instructions.entry, "list")
     const publish = context.context("binding")
@@ -1227,12 +1227,71 @@ for (const [name, overtake] of [
     assert.equal(held.entered, true)
     overtake(context)
     held.settle.resolve()
-    assert.equal(await publish, false)
+    assert.equal(await publish, undefined)
+    assert.equal(context.proved(), false)
     assert.equal(context.owed(), true)
     assert.equal(await context.repair(), true) // the repair attempt is still there
     assert.equal(context.owed(), false)
+    assert.equal(context.proved(), true)
+  })
+
+  // The same overtaking when the confirming list answers negatively: a stale negative read is not a failed join.
+  test(`a negative confirming list that ${name} overtook is a stale read: the join resolves, the repair stays owed and heals it`, async () => {
+    const { ctx, context } = make()
+    const held = holdFirst(ctx.session.instructions.entry, "list")
+    const publish = context.context("binding")
+    await flush()
+    assert.equal(held.entered, true)
+    ctx.entries.clear() // the list will answer without the entry
+    overtake(context)
+    held.settle.resolve()
+    assert.equal(await publish, undefined) // not CHAT_CONTEXT_UNAVAILABLE
+    assert.equal(context.proved(), false)
+    assert.equal(context.owed(), true)
+    assert.equal(ctx.calls.put.length, 1) // no second put on a read that proves nothing
+    assert.equal(await context.repair(), true) // the repair puts it back
+    assert.equal(ctx.entries.get(BINDING_KEY), "binding")
+    assert.equal(context.proved(), true)
   })
 }
+
+// A negative confirmation that nothing overtook is still the failure that turns the chat off. The host never has the entry.
+test("a negative confirming list that nothing overtook still rejects, after one more put", async () => {
+  const { ctx, context } = make(fakeCtx({ listLies: true }))
+  await assert.rejects(context.context("binding"), { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  assert.equal(ctx.calls.put.length, 2)
+  assert.equal(context.proved(), false)
+})
+
+// The second confirming list is the one a signal overtook: it is a stale read too, so it ends the publish without a verdict.
+test("a second negative confirming list that a signal overtook is a stale read, not a failed join", async () => {
+  const { ctx, context } = make(fakeCtx({ listLies: true }))
+  const entry = ctx.session.instructions.entry
+  const original = entry.list
+  let lists = 0
+  let release = null
+  entry.list = async (...args) => {
+    lists += 1
+    if (lists !== 2) return original(...args)
+    await new Promise(resolve => { release = resolve })
+    return original(...args)
+  }
+  const publish = context.context("binding")
+  await flush()
+  assert.equal(lists, 2) // the first list answered negatively, one more put was made, and the second list is pending
+  compacted(context)
+  release()
+  assert.equal(await publish, undefined) // not CHAT_CONTEXT_UNAVAILABLE
+  assert.equal(context.proved(), false)
+  assert.equal(context.owed(), true)
+})
+
+test("a negative confirming list after a gap that came before the publish still rejects", async () => {
+  const { context } = make(fakeCtx({ listLies: true }))
+  gap(context) // the epoch moved before this publish began, so the publish is current at its own start
+  await assert.rejects(context.context("binding"), { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  assert.equal(context.proved(), false)
+})
 
 test("a publish whose confirming list nothing overtook resolves undefined", async () => {
   const { context } = make()
@@ -1240,13 +1299,81 @@ test("a publish whose confirming list nothing overtook resolves undefined", asyn
   assert.equal(context.owed(), false)
 })
 
-test("a publish that a newer binding replaced while its confirming list was pending resolves false", async () => {
+test("a publish whose confirming list nothing overtook proves the binding, and a context that is closed or off proves nothing", async () => {
+  for (const end of ["disable", "dispose"]) {
+    const { context } = make()
+    assert.equal(context.proved(), false) // nothing published yet
+    await context.context("binding")
+    assert.equal(context.proved(), true, end)
+    context[end]()
+    assert.equal(context.proved(), false, end)
+  }
+})
+
+test("a proof by a read-back counts, whoever started it", async () => {
+  const { ctx, context } = make()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const publish = context.context("binding")
+  await flush()
+  compacted(context) // the publish's confirmation is overtaken
+  const repair = context.repair() // the manager's own ask at that event, queued behind the publish
+  held.settle.resolve()
+  await publish
+  assert.equal(context.proved(), false)
+  assert.equal(await repair, true)
+  assert.equal(context.proved(), true)
+})
+
+test("a tick's own refresh does not take the proof back, and a signal does", async () => {
+  const { context } = make()
+  await context.context("binding")
+  const refresh = context.refresh()
+  assert.equal(context.proved(), true) // the epoch did not move: a read-back in flight is no change
+  await refresh
+  assert.equal(context.proved(), true)
+  compacted(context)
+  assert.equal(context.proved(), false)
+})
+
+test("a binding that was replaced or withdrawn is not proved until its own publish confirms", async () => {
+  const { ctx, context } = make()
+  await context.context("binding one")
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const second = context.context("binding two")
+  assert.equal(context.proved(), false) // the old proof was for the earlier binding
+  await flush()
+  held.settle.resolve()
+  await second
+  assert.equal(context.proved(), true)
+  await context.context(null)
+  assert.equal(context.proved(), false)
+})
+
+test("a publish that a newer binding replaced while its confirming list was pending resolves and proves nothing", async () => {
   const { ctx, context } = make()
   const held = holdFirst(ctx.session.instructions.entry, "list")
   const first = context.context("binding one")
   await flush()
   const second = context.context("binding two") // queued behind the first, and it replaces its binding
   held.settle.resolve()
-  assert.equal(await first, false)
+  assert.equal(await first, undefined)
+  assert.equal(context.proved(), false) // the first confirmation is for a binding that is gone
   assert.equal(await second, undefined)
+  assert.equal(context.proved(), true)
+})
+
+// A replaced binding fails its publish even when the list it was waiting for is negative: that is not a stale read.
+test("a replaced binding whose confirming list answers negatively still fails its publish", async () => {
+  const { ctx, context } = make()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const first = context.context("binding one")
+  const failed = assert.rejects(first, { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  await flush()
+  assert.equal(held.entered, true)
+  const second = context.context("binding two") // the first binding is replaced, and nothing else has moved
+  ctx.entries.clear() // the list answers without the entry
+  held.settle.resolve()
+  await failed // a withdrawn binding is a failure, not a stale read
+  assert.equal(await second, undefined)
+  assert.equal(context.proved(), true)
 })

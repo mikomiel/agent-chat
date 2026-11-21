@@ -15,8 +15,15 @@
 // compaction that ends inside a stream gap, after a put; a removal or put that lands after its time limit, after this
 // context closed; a host that answers again after a failed check. A tick owes the read-back again, without moving the
 // epoch, so whatever happened to the entry gets a repair attempt at the next tick. It costs one list per tick, and a put
-// only when the entry is wrong. Only the join's own publish (`context()`)
-// rejects, and its caller decides what a failed join means.
+// only when the entry is wrong. Only the join's own publish (`context()`) rejects, and its caller decides what a failed
+// join means. It rejects for a put that fails, a binding that was withdrawn or replaced, and a confirming list that is
+// still current and does not hold the text. A confirming list that a newer gap or compaction signal overtook is a stale
+// read: the publish ends without proof, the repair stays owed, and the join is not a failure.
+//
+// A BINDING IS PROVED, OR NOT, AT THE MOMENT SOMEONE ASKS (`proved()`). A confirmed publish and a completed read-back
+// each prove the binding at the generation and epoch they began in, whoever started them. Any later signal, gap, or new
+// or withdrawn binding takes the proof back. The lifecycle asks it synchronously when it is about to send a join's first
+// heartbeat.
 //
 // A SESSION THAT IS GONE IS REPORTED, NOT REPAIRED. Every instruction-entry call first reads the session, so the tick's
 // read-back of a deleted session fails with `Session.NotFoundError`. A call that answers with it tells `onMissing`, and
@@ -28,10 +35,8 @@
 // and on, no newer gap or compaction signal has been applied, and no `context()` call has withdrawn or replaced the
 // binding. It asks that after every host call it awaits and before the next one, and before it proves. Before its first
 // host call it also asks that the obligation is still owed: a check queued behind a publish that discharged it makes no
-// call. A confirmed `context()` publish discharges the obligation under the same rule, and only a publish that is still
-// current counts as confirmed: one that a newer signal overtook resolves `false`, so the caller does not treat the binding
-// as proved, and the obligation stays owed. With nothing published there is nothing to read, so the obligation stays
-// owed until a publish is confirmed.
+// call. A confirmed `context()` publish discharges the obligation under the same rule. With nothing published there is
+// nothing to read, so the obligation stays owed until a publish is confirmed.
 //
 // EVERY HOST CALL HAS A TIME LIMIT (`CALL_TIMEOUT_MS`). A call that never answers would hold the serial queue for ever,
 // and with it every later publish, repair and removal. A call that runs out of time counts as a failed call: a check
@@ -77,6 +82,7 @@ export function createContext(ctx, sessionID, {
   let asks = 0 // heartbeat ticks so far: a check that a tick overlapped after its reads began asks once more
   let generation = 0 // `context()` calls so far: a read-back made for an earlier call is for a binding that is gone
   let published = null // the binding text the entry should hold now
+  let proven = null // { binding, epoch } of the binding that a confirmed publish or a read-back last proved
   let contextQueue = Promise.resolve()
 
   // The entry may have changed behind any earlier proof. The read-back is owed, and the epoch moves so that a check
@@ -134,7 +140,8 @@ export function createContext(ctx, sessionID, {
   // the first included: a publish queued behind a slow removal may start after its binding was torn down, and a retired
   // context must not write. `current` false ends a repair with false, and `wanted` false (the binding was withdrawn,
   // replaced or torn down) fails a join's publish, so a stale binding is never written over a newer one.
-  // `current` is also asked after the put and before the confirming list: false stops there, and the result is false.
+  // `current` is also asked after the put and after a negative confirming list: false stops there, and the result is
+  // false. A signal that overtook the read makes that answer stale, so it is not a failure and proves nothing.
   // A put that left no entry throws: the caller decides what that means.
   // A put of an earlier owner that ran out of time can land between this put and its confirming list, so a confirmation
   // that finds other text puts once more before it fails.
@@ -146,15 +153,14 @@ export function createContext(ctx, sessionID, {
       if (!current()) return false
       // The surface is experimental.
       if (await holds(text)) return true
+      if (!current()) return false
       if (attempt >= 1) throw contextFailure()
     }
   }
 
   // Publish the binding text, replacing any earlier one under the same key; null removes it. Rejects when the
-  // entry cannot be confirmed: the caller then turns this session's chat off. Resolves `false`, not undefined, when the
-  // entry was read back but a newer signal overtook that read: not a confirmation, and not a failure either. A removal
-  // that fails is not an error: a stale entry names an instance file that is no longer valid, and the next publish
-  // replaces it.
+  // entry cannot be confirmed: the caller then turns this session's chat off. A removal that fails is not an error:
+  // a stale entry names an instance file that is no longer valid, and the next publish replaces it.
   function context(text) {
     if (closed) return Promise.resolve()
     if (text === null) {
@@ -167,13 +173,17 @@ export function createContext(ctx, sessionID, {
     generation += 1
     const binding = generation
     return queued(async () => {
-      const current = currentAt(compactions, binding) // from the start of this publish to its confirmation
+      const mark = compactions
+      const current = currentAt(mark, binding) // from the start of this publish to its confirmation
       const wanted = () => !closed && !disabled && generation === binding
-      try { await publish(text, { wanted }) } catch { throw contextFailure() }
-      // A confirmed put is a read-back of this binding, when nothing has overlapped it. A confirmation that a newer
-      // signal or a newer binding overtook proves nothing now: the read-back stays owed, and the caller is told `false`.
-      if (!current()) return false
-      unverified = false
+      // Only the epoch ends it early, with false: a confirming list that a newer signal overtook is not a failure, and the
+      // full rule below then fails too, so the repair stays owed.
+      try { await publish(text, { current: () => compactions === mark, wanted }) } catch { throw contextFailure() }
+      // A confirmed put is a read-back of this binding, when nothing has overlapped it.
+      if (current()) {
+        unverified = false
+        proven = { binding, epoch: mark }
+      }
     })
   }
 
@@ -193,6 +203,12 @@ export function createContext(ctx, sessionID, {
   // entry since. It reads state only and starts nothing.
   const owed = () => unverified && !closed && !disabled
 
+  // Is this binding proved now? A confirmed publish or a read-back proved it at this generation and epoch, and nothing has
+  // moved since: no signal, no gap, no new or withdrawn binding. The lifecycle asks it at the moment it sends a join's
+  // first heartbeat.
+  // It reads state only and starts nothing; a tick's own refresh does not take the proof back.
+  const proved = () => !closed && !disabled && proven !== null && proven.binding === generation && proven.epoch === compactions
+
   // May a read-back start now? Never with nothing published, and one at a time per obligation.
   const askable = () => owed() && published !== null && verifying !== compactions
 
@@ -203,12 +219,13 @@ export function createContext(ctx, sessionID, {
   function repair() {
     if (!askable()) return Promise.resolve(false)
     const mark = compactions
-    const current = currentAt(mark, generation)
+    const binding = generation
+    const current = currentAt(mark, binding)
     const text = published
     verifying = mark // one check per obligation at a time
-    const done = proved => {
+    const done = ok => {
       if (verifying === mark) verifying = null // ended: when still owed, the next ask repeats it
-      return proved
+      return ok
     }
     let asked = null
     return queued(async () => {
@@ -222,9 +239,10 @@ export function createContext(ctx, sessionID, {
         return done(false) // a failed call proves nothing either way; only `onMissing`, told in `call`, can end the session
       }
       if (!current()) return done(false) // the last host call proves nothing about a binding that has since changed
+      proven = { binding, epoch: mark }
       if (asks === asked) unverified = false // a tick that came after the reads began is not answered by them
       return done(true)
-    }).then(proved => (asked !== null && asks !== asked && askable() ? repair() : proved))
+    }).then(ok => (asked !== null && asks !== asked && askable() ? repair() : ok))
   }
 
   // The heartbeat tick: owe the read-back again and ask for it. The epoch does not move, so a publish in flight still
@@ -255,5 +273,5 @@ export function createContext(ctx, sessionID, {
     closed = true
   }
 
-  return { context, observe, reset, repair, refresh, probe, owed, disable, dispose }
+  return { context, observe, reset, repair, refresh, probe, owed, proved, disable, dispose }
 }
