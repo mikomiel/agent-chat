@@ -293,6 +293,7 @@ def test_stop_still_discards_and_ends_when_the_context_callback_fails(tmp_path):
     path = tmp_path / f"{adapter.joined.binding.boot_id}.json"
 
     def broken(text):
+        assert not path.exists()  # the record went before the callback, which may stall or be killed
         raise RuntimeError("context store closed")
 
     delivery.context = broken

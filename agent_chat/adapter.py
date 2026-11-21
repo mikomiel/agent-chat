@@ -179,13 +179,14 @@ class Adapter:
         self._clear_schedule()
         joined = self.joined
         self.joined = None
+        # The record goes before anything that can stall or fail: the harness callback or the end request. A new
+        # open of the path then finds nothing, even if the harness is killed during shutdown.
+        if joined is not None:
+            instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
         try:
             self.delivery.context(None)
         finally:
-            # The cleanup does not depend on the harness callback. The record goes first, so nothing local can open the
-            # binding while the end is in flight or after it fails.
             if joined is not None:
-                instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
                 try:
                     self.operations.end(joined, deadline=self._request_deadline())
                 except (ChatError, OSError):
