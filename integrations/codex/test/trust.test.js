@@ -77,6 +77,16 @@ test("a directory is trusted by the same rule: not a symlink, and no directory f
   assert.equal(trustedDirectory("/run/user/app", good({ "/run": { kind: "dir", uid: 0, mode: 0o1777 } })), "/run/user/app", "a sticky ancestor, as /tmp is")
 })
 
+test("a real path that comes back with U+FFFD is refused: a name that is not UTF-8 could stand for another directory", () => {
+  const options = { ...good(), realpath: () => "/run/user/\uFFFD" }
+  assert.throws(() => trustedDirectory("/run/user/app", options), untrusted)
+})
+
+test("the configured spelling of a socket path is bounded like its real path", () => {
+  const padded = `/run/user/app${"/".repeat(MAX_SOCKET_PATH_BYTES)}s.sock` // resolves to SOCKET, spelled past the limit
+  assert.throws(() => trustedSocket(padded, good()), untrusted)
+})
+
 test("a socket path that ends in a separator is refused, never resolved to the socket it would connect to", () => {
   assert.equal(trustedSocket(SOCKET, good()).path, SOCKET)
   assert.throws(() => trustedSocket(`${SOCKET}/`, good()), untrusted)

@@ -288,7 +288,10 @@ that a hook connects to.
   socket other than the one that was checked (reported for older Node, not
   reproduced on the release this was written on, which refuses it). The limit
   is on the resolved pathname, so a short spelling that resolves to a long path
-  is refused. Once its directory has resolved, a path that is too long is refused
+  is refused. The configured spelling is held to the same limit, so a later
+  check of that spelling is never refused by the kernel as too long. A resolved
+  path that contains U+FFFD is refused: a name that is not valid UTF-8 comes
+  back with it and could stand for another directory. Once its directory has resolved, a path that is too long is refused
   rather than reported as absent, whether or not a socket is there; a directory
   that is missing is reported as absent first, before the length is looked at.
   The receiver measures the public socket path and the private name it binds

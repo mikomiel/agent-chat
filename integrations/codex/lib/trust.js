@@ -62,6 +62,9 @@ export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat =
     const spelled = unfollowed(directory)
     if (lstat(spelled).isSymbolicLink()) throw refusal(refuse)
     const real = realpath(spelled)
+    // A name that is not valid UTF-8 comes back with U+FFFD in it, and that string can name another directory that is
+    // spelled with U+FFFD. Such a path is refused rather than guessed at.
+    if (real.includes("\uFFFD")) throw refusal(refuse)
     for (let current = real; ; current = dirname(current)) {
       if (!guarded(lstat(current), uid)) throw refusal(refuse)
       if (dirname(current) === current) break
@@ -77,6 +80,8 @@ export function trustedSocket(path, options = {}) {
   // A socket is a file: a spelling that ends in a separator names a directory, and lstat of it fails where the connect
   // to the resolved name would not.
   if (typeof path !== "string" || path.endsWith("/")) throw refusal(refuse)
+  // The spelling is bounded too, so the configured path that a later check looks at again is one the kernel can look up.
+  fittingSocketPath(path, refuse)
   const real = trustedDirectory(dirname(path), options)
   const target = join(real, basename(path))
   try {

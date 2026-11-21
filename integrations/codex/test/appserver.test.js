@@ -540,6 +540,26 @@ async function wakeWith(over, { reservation = 5000, text = "queued text", procee
   })
 }
 
+test("a path check that stalls past the settlement cutoff sends no add: the time is read after the check", async () => {
+  const gate = armed({})
+  await withServer(gate.handler, async (path, server) => {
+    const ticks = clock()
+    let stalled = false
+    const lstat = name => { // once the reading is over, the next look at the path takes the whole reservation
+      if (!stalled && server.log.some(entry => entry.method === "thread/turns/list")) { stalled = true; ticks.time.now += 10_000 }
+      return lstatSync(name)
+    }
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, open: (name, options) => openAppServer(name, { ...options, lstat }) })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    const result = await bound.wake({ text: "queued text", attemptId: "attempt-9", until: ticks.now() + 5000 })
+    assert.equal(stalled, true)
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.equal(server.methods().includes("thread/queue/add"), false)
+  })
+})
+
 test("the add carries the client id and the text, then the fence deletes by the submission id", async () => {
   const seen = []
   const { log, methods } = await wakeWith({

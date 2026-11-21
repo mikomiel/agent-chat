@@ -457,7 +457,8 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
         try {
           fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })
         } catch { return { outcome: "failed", reason: "native_unavailable" } }
-        if (limit - now() < MIN_ADD_MS || !link.same()) return { outcome: "failed", reason: "native_unavailable" }
+        // The path is checked first and the time after it: the check makes synchronous file system calls that can stall.
+        if (!link.same() || limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
         const stale = proceed(fresh)
         if (stale !== null) return { outcome: "deferred", reason: stale }
         let added
