@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { execFileSync } from "node:child_process"
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { appServerPath, CODEX_CHAT_CONFIG_ENV, HARNESS, loadConfig } from "../lib/config.js"
@@ -135,4 +135,104 @@ test("a FIFO is refused without blocking the hook", () => {
     assert.equal(loadConfig({ [ENV]: fifo }), null)
     assert.ok(Date.now() - started < 1000)
   } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+// The way to the record is checked as the socket directories are (lib/trust.js): every directory on it is owned by the user or
+// root, and nobody else can write to it unless it is sticky. Otherwise another user could replace an entry on the way and point
+// the lookup at another private record of this user. The record's own name, and its directory's, are not followed; a link
+// further up is resolved and the directories it reaches are judged.
+function nested(mode = 0o700) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "agent-chat-config-")))
+  const dir = join(root, "d")
+  mkdirSync(dir)
+  chmodSync(dir, mode)
+  const file = join(dir, "chat.json")
+  writeFileSync(file, JSON.stringify(base))
+  chmodSync(file, 0o600)
+  return { root, dir, file }
+}
+
+test("a record in a private directory below private and sticky ones loads", () => {
+  const { root, file } = nested()
+  try { assert.deepEqual(loadConfig({ [ENV]: file }), base) }
+  finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test("a record below a group- or world-writable directory that is not sticky is refused", () => {
+  for (const mode of [0o770, 0o707, 0o777]) {
+    const { root, file } = nested(mode)
+    try { assert.equal(loadConfig({ [ENV]: file }), null, mode.toString(8)) }
+    finally { rmSync(root, { recursive: true, force: true }) }
+  }
+  const { root, file } = nested(0o1777) // sticky: others cannot rename or remove what the user owns there, as for sockets
+  try { assert.deepEqual(loadConfig({ [ENV]: file }), base) }
+  finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test("a record below a directory that another user owns is refused", () => {
+  const { root, dir, file } = nested()
+  const other = process.geteuid() + 1
+  const lstat = path => { const info = lstatSync(path); return path === dir ? Object.create(info, { uid: { value: other } }) : info }
+  try {
+    assert.equal(loadConfig({ [ENV]: file }, ENV, { lstat }), null)
+    assert.deepEqual(loadConfig({ [ENV]: file }, ENV, { lstat: lstatSync }), base, "control: the same record through the real lstat")
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test("a record whose directory is a symlink is refused; a link further up is resolved and judged", () => {
+  const { root, dir, file } = nested()
+  try {
+    symlinkSync(dir, join(root, "via"))
+    assert.equal(loadConfig({ [ENV]: join(root, "via", "chat.json") }), null, "the record's own directory is a link")
+    mkdirSync(join(dir, "inner"), { mode: 0o700 })
+    chmodSync(join(dir, "inner"), 0o700)
+    writeFileSync(join(dir, "inner", "chat.json"), JSON.stringify(base))
+    chmodSync(join(dir, "inner", "chat.json"), 0o600)
+    assert.deepEqual(loadConfig({ [ENV]: join(root, "via", "inner", "chat.json") }), base, "a link above it is resolved")
+    chmodSync(dir, 0o777)
+    assert.equal(loadConfig({ [ENV]: join(root, "via", "inner", "chat.json") }), null, "and the directory it reaches is judged")
+    assert.equal(loadConfig({ [ENV]: file }), null)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test("a record swapped for another private record between the check and the open is refused", () => {
+  const { root, dir, file } = nested()
+  const decoy = join(dir, "decoy.json")
+  writeFileSync(decoy, JSON.stringify({ ...base, hostToken: "decoy-token" }))
+  chmodSync(decoy, 0o600)
+  let swapped = false
+  const lstat = path => {
+    const info = lstatSync(path)
+    if (path === file && !swapped) { swapped = true; renameSync(decoy, file) } // right after the record was looked at
+    return info
+  }
+  try {
+    assert.equal(loadConfig({ [ENV]: file }, ENV, { lstat }), null)
+    assert.equal(swapped, true)
+    assert.equal(loadConfig({ [ENV]: file }).hostToken, "decoy-token", "control: the swapped-in record itself is a valid one")
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test("a directory swapped between the check of the way and the look at the record is refused", () => {
+  const { root, dir, file } = nested()
+  let swapped = false
+  let looks = 0
+  const lstat = path => {
+    const info = lstatSync(path)
+    // The directory is looked at twice before the record: as a name (is it a link?), then in the walk from the root. The
+    // swap comes right after the walk judged it.
+    if (path === dir && ++looks === 2) {
+      swapped = true
+      renameSync(dir, join(root, "old"))
+      mkdirSync(dir, { mode: 0o700 })
+      writeFileSync(file, JSON.stringify({ ...base, hostToken: "decoy-token" }))
+      chmodSync(file, 0o600)
+    }
+    return info
+  }
+  try {
+    assert.equal(loadConfig({ [ENV]: file }, ENV, { lstat }), null)
+    assert.equal(swapped, true)
+    assert.equal(loadConfig({ [ENV]: file }).hostToken, "decoy-token", "control: the swapped-in record itself is a valid one")
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })

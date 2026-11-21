@@ -6,6 +6,7 @@
 // line. A delegated child never joins, even when it inherits the variable.
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs"
 import { isAbsolute } from "node:path"
+import { trustedFile } from "./trust.js"
 
 // The harness this package joins as. The join frame and the socket name prefix both read it, so the code that
 // was copied from another package carries no harness name of its own.
@@ -24,18 +25,26 @@ export function appServerPath(value) {
   return path && !path.includes("\0") && isAbsolute(path) ? path : null
 }
 
-export function loadConfig(env = process.env, name = CODEX_CHAT_CONFIG_ENV) {
+// `trust` is for tests: the file-system seams of trust.js (lstat, realpath, uid).
+export function loadConfig(env = process.env, name = CODEX_CHAT_CONFIG_ENV, trust = {}) {
   const raw = env[name]
   if (typeof raw !== "string" || !raw || env.AGENT_CHAT_DELEGATED_CHILD === "1" || !isAbsolute(raw)) return null
+  // The way to the file is checked first, by the rule for the socket directories (trust.js): every directory on it is owned
+  // by the user or root and nobody else can change it, so no entry on the way can be replaced to point at another file. The
+  // file's own name is not followed. Its refusal (CHAT_CONFIG_UNTRUSTED) is a null like every other failure here.
+  let checked
   let descriptor
   try {
+    checked = trustedFile(raw, { ...trust, refuse: "CHAT_CONFIG_UNTRUSTED" })
     // O_NONBLOCK keeps a FIFO from blocking the hook before fstat can refuse
     // it; the regular-file check below is still the gate.
-    descriptor = openSync(raw, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    descriptor = openSync(checked.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   } catch { return null }
   let data
   try {
     const info = fstatSync(descriptor)
+    // What was opened must be the file that was checked: one swapped in between has another identity.
+    if (info.dev !== checked.dev || info.ino !== checked.ino) return null
     if (!info.isFile() || info.uid !== process.geteuid() || (info.mode & 0o077) !== 0 || info.size > MAX_BYTES) return null
     const buffer = Buffer.alloc(MAX_BYTES)
     const length = readSync(descriptor, buffer, 0, MAX_BYTES, 0)

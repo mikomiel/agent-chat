@@ -108,7 +108,15 @@ Name the file in the environment of the Codex process:
 
 The loader refuses a relative path, a symlink, a file that is not owned by the
 current user, a file with any group or world permission bit, a file larger than
-16 KiB, an unknown field and a delegated child. A hook also refuses a state
+16 KiB, an unknown field and a delegated child. The way to the file is checked
+first, by the rule for the socket directories (see
+[App-server control socket](#app-server-control-socket)): the file's directory
+is not a symlink, and every directory on the way is owned by the current user or
+root and is not writable by group or other unless it is sticky, so no entry on
+the way can be replaced to point the lookup at another private file. A link
+further up is resolved and the directories it reaches are judged. The loader then
+opens the checked file and refuses it when what it opened is not that file
+(device and inode), so a file swapped in between is not read. A hook also refuses a state
 directory that is not private. Chat stays off silently on every refusal; the
 host token is never logged.
 
@@ -519,7 +527,11 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   directory and session id only. A session resumed with a different config that
   uses the same state directory reuses the running receiver and its binding
   until that receiver exits. End the session before you change the config.
-  Both are tracked in #156.
+  Two more edges need both processes alive. If the new process's start hook is
+  lost, its turns cannot move the owner watch while the old process lives, so
+  the old process's end closes the receiver. An interrupt in the old process
+  also stops delivery in the new one until its next prompt. All four are
+  tracked in #156.
 - **A delegate's hooks.** Codex gives a subagent's hooks the parent session
   id. Whether `UserPromptSubmit` and `PostToolUse` inside a subagent carry
   `agent_id` is not confirmed. Without `appServer` only `agent_id` and
@@ -629,7 +641,8 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
 ## Security boundaries
 
 - Chat is off unless a private `0600`, current-user-owned, non-symlinked file
-  named by `AGENT_CHAT_CODEX_CONFIG` opts the process in. A delegated child
+  named by `AGENT_CHAT_CODEX_CONFIG`, in a directory that nobody else can change,
+  opts the process in. A delegated child
   never joins.
 - The host token is read from that file only. It travels to the worker on
   stdin. The receiver environment is the config path alone and the worker

@@ -105,6 +105,22 @@ export function trustedDirectory(directory, options) {
   try { return checkedChain(directory, rule).real } catch (error) { throw classify(error, rule.refuse) }
 }
 
+// { path, dev, ino }: a regular file whose directory nobody else can change, by the same rule as a socket's directory (see
+// `checkedChain`), with its real path and its identity. Its own name is never followed: a symlink there is refused. The caller
+// opens the returned path and compares what it opened (fstat) with the identity, so a file swapped between the two is refused.
+export function trustedFile(path, options = {}) {
+  const rule = settings(options)
+  if (typeof path !== "string" || path.endsWith("/")) throw refusal(rule.refuse)
+  try {
+    const checked = checkedChain(dirname(path), rule)
+    const target = join(checked.real, basename(path))
+    const info = rule.lstat(target)
+    unchanged(checked, rule)
+    if (!info.isFile()) throw refusal(rule.refuse)
+    return { path: target, dev: info.dev, ino: info.ino }
+  } catch (error) { throw classify(error, rule.refuse) }
+}
+
 // The links in a row that a caller which follows a socket's name accepts.
 export const MAX_LINK_HOPS = 8
 
