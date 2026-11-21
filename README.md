@@ -51,6 +51,7 @@ Copyright (C) 2026 mikomiel/agent-chat contributors.
 | `agent_chat/retention.py` | Bounded pruning of expired history |
 | `agent_chat/cli.py`, `client.py`, `protocol.py` | Command-line client and transport |
 | `agent_chat/instance_file.py`, `instance_client.py`, `instance_worker.py`, `adapter.py` | Per-process adapter lifecycle |
+| `agent_chat/notice.py` | Reference renderer of the notice contract for peer message bodies; the JavaScript renderer in `integrations/shared/` is held to the same vectors, and nothing in the adapter imports this module |
 | `agent_chat/admin.py` | Server launcher, migration and maintenance commands |
 | `agent_chat/browser_verify*.py` | Optional one-shot viewer inspection |
 | `agent_chat/*.sql` | Ordered schema migrations |

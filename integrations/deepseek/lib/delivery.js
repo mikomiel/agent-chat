@@ -17,7 +17,7 @@
 // realm, so a plugin at the root scope sees `undefined` and would classify
 // every agent as unclassifiable.
 import { randomUUID } from "node:crypto"
-import { CHAT_PREFIX, MAX_CONTEXT_BYTES } from "./notice.js"
+import { CHAT_PREFIX, MAX_CONTEXT_BYTES } from "./channel.js"
 
 export const CHAT_SOURCE_KIND = "plugin:agent-chat"
 const HANDOFF_TIMEOUT_MS = 5000

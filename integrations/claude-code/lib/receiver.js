@@ -12,7 +12,8 @@ import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { loadConfig } from "./config.js"
 import { assertPrivateDirectory, paths, serve } from "./ipc.js"
-import { CHAT_PREFIX, MAX_OUTPUT_BYTES, renderNotice } from "./notice.js"
+import { CHAT_PREFIX, MAX_OUTPUT_BYTES } from "./channel.js"
+import { packCandidates, renderNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
 import { describeFailure, startWorker } from "./worker.js"
 
@@ -285,12 +286,20 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       if (holder) holder.delivering = true
       try {
         const bodies = config.noticeBodies === true
+        // The bytes the notice may use: the announcement and the delivery line go first. Known before the claim.
+        const prefix = (announce ? `${announce.text}\n\n` : "") + CHAT_PREFIX
+        const bound = MAX_OUTPUT_BYTES - bytes(prefix)
         const candidates = await ask("pending", bodies ? { bodies: true } : {})
         if (!live || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
+        // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply
+        // without sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
+        const claimIds = bodies
+          ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound })
+          : ids
         const started = now()
-        const grant = await ask("claim", { key: randomUUID(), messages: ids, ...(bodies ? { bodies: true } : {}) })
+        const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
         if (!live || check(grant, "claim")) return false
         if (grant.dispatch !== true || typeof grant.attempt_id !== "string") return false
         const reservation = Number(grant.reservation_ms)
@@ -304,12 +313,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
           else if (started + reservation - now() <= MIN_RESERVATION_MS) result = UNCERTAIN // the status call used the reservation
           else {
-            const prefix = announce ? `${announce.text}\n\n` : ""
             const notice = renderNotice(joined, config.python, grant.messages ?? [], {
-              bodies, budget: MAX_OUTPUT_BYTES - bytes(prefix),
+              bodies, bound, admittedAt: grant.admitted_at,
             })
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, prefix + CHAT_PREFIX + notice, started + reservation, wake, announce))
+            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, wake, announce))
           }
         }
         if (!live) return replied

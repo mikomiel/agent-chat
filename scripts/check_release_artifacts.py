@@ -100,10 +100,18 @@ def project_version(root: Path) -> str:
     return tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
 
 
+# Source that every package copies into its own lib/; it is never packed and holds no package.json.
+SOURCE_ONLY = frozenset({"shared"})
+
+
 def package_directories(root: Path) -> list[Path]:
-    """Every ``integrations/<harness>/`` directory, found by listing, never from a fixed list."""
+    """Every ``integrations/<harness>/`` directory, found by listing, never from a fixed list.
+
+    The one named exception is ``SOURCE_ONLY``: ``integrations/shared`` holds the notice renderer
+    that each package keeps a byte-identical copy of, so it ships inside each tarball, never alone.
+    """
     base = root / INTEGRATIONS
-    return sorted(path for path in base.iterdir() if path.is_dir())
+    return sorted(path for path in base.iterdir() if path.is_dir() and path.name not in SOURCE_ONLY)
 
 
 def tracked_integration_files(root: Path) -> list[str]:

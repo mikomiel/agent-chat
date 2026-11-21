@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { paths } from "../lib/ipc.js"
-import { CHAT_PREFIX } from "../lib/notice.js"
+import { CHAT_PREFIX } from "../lib/channel.js"
 
 // The real hook command and the real detached receiver, over a real socket. Only
 // the product's Python worker is replaced: a small program that answers the
