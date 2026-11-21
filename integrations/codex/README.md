@@ -187,11 +187,15 @@ sends its request: it does not wait for the worker to end its instance.
     one-shot `exec` run or a sub-agent. The first hook output says so, and
     the same check runs again on each heartbeat read taken while nothing is
     known to run.
-  - With `appServer`, the worker starts only after a positive check: a loaded
-    thread that is not a child. A thread the app-server does not list yet, a
-    read that does not answer within 3 seconds and a read that fails each mean
-    no join yet. The receiver asks again after 30 seconds, claims nothing in
-    the meantime, and a retry spends none of the rejoin budget.
+  - With `appServer`, the worker starts only after a positive check from the
+    current read: a loaded thread with a complete record (an `ephemeral` flag, a
+    `source` and a model provider) that is not a child. A thread the
+    app-server does not list yet, a read that does not answer within 3
+    seconds, a read that fails and a record that lacks one of those fields
+    each mean no join yet. An answer that arrives after the 3 seconds is
+    dropped and verifies nothing, and no earlier read counts for a later one.
+    The receiver asks again after 30 seconds, claims nothing in the meantime,
+    and a retry spends none of the rejoin budget.
 - **Rejoin.** `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE`,
   `REQUEST_UNCERTAIN` and a join `BINDING_CONFLICT` start a bounded rejoin:
   5-second base, doubling to a 120-second cap, jitter between 0.5 and 1.0, a
@@ -226,19 +230,22 @@ are experimental.
 
 1. **Bind.** Before the join the receiver finds the `session_id` among the
    loaded threads (`thread/loaded/list`) and reads it (`thread/read`). A child
-   thread refuses the session. The worker joins only once the thread is found
-   and is not a child: a thread that is not loaded yet, a read that fails and a
+   thread refuses the session. The worker joins only once this bind's own reads
+   show a loaded thread that is not a child and whose record is complete: an
+   `ephemeral` flag, a `source` and a model provider. A thread that is not
+   loaded yet, a read that fails, a record that lacks one of those fields and a
    read that does not answer within 3 seconds mean no join yet, and the
-   receiver asks again every 30 seconds. A queue probe that fails or does not
-   answer (step 2) does not stop the join: a thread that was read and found to
-   be a main thread joins hook-only, and each later heartbeat asks again until
-   the probe is decided. The thread's model provider is recorded after that
-   read; a read that later shows another provider is a `stale_binding` and
-   refuses the wake. A loaded thread that reports no model provider counts as
-   unverified.
+   receiver asks again every 30 seconds. The provider recorded by an earlier
+   bind, and an answer that arrives after the 3 seconds, never verify a later
+   bind. A queue probe that fails or does not answer within 1 second (step 2)
+   does not stop the join: a thread whose read passed joins hook-only, and each
+   later heartbeat binds again until the probe is decided. The thread's model
+   provider is recorded after that read; a read that later shows another
+   provider is a `stale_binding` and refuses the wake.
 2. **Probe.** One `thread/queue/delete` of a random id must answer
-   `{ "deleted": false }`. Any other answer, an error included, leaves the wake
-   route off.
+   `{ "deleted": false }` within 1 second. Any other answer, an error
+   included, leaves the wake route off; no answer within the second leaves it
+   undecided until the next bind.
 3. **Poll.** Every 2 seconds, when addressed messages are pending, the receiver
    reads the thread: it must be idle, not stopped (its last turn is not
    interrupted) and in `default` mode. A refusal here is retried after 10
@@ -252,10 +259,13 @@ are experimental.
 5. **Recheck, add, then delete as a fence.** The claim and the status call take
    time, so right before the add frame the receiver checks the state again: the
    session must still be idle, not stopped and not in Plan Mode, and no hook
-   event may have arrived since the read that cleared the wake. Otherwise
-   nothing is sent and the attempt settles `deferred` with the state's reason
-   (`stopped`, `plan`, `busy`, `unknown` or `offline`; a hook event that leaves
-   no refusing state, such as a `Stop`, gives `busy`). Every request of the
+   event may have arrived since the read that cleared the wake, and no newer
+   app-server read may have refused it. A read that refuses for any of the
+   reasons below is a newer state of its own, whatever the hooks say.
+   Otherwise nothing is sent and the attempt settles `deferred` with the
+   newest reason (`stopped`, `plan`, `busy`, `unknown`, `offline` or
+   `stale_binding`; a hook event that leaves no refusing state, such as a
+   `Stop`, gives `busy`). Every request of the
    wake, the connection included, ends 1 second before the reservation does, so
    a slow reply still leaves time to record the result. With less than half a
    second left after that margin, no add is sent and the attempt settles
@@ -311,6 +321,10 @@ exercised live.
   is not attached through `--remote` exposes a control socket is not
   confirmed. Without one there is no wake route: a message waits for the next
   turn.
+- **The thread record fields.** The join check needs `ephemeral` as a boolean
+  and `source` as a string or object, next to the model provider. They were
+  read from the generated protocol types, not from a live record. A release
+  that omits one of them leaves the receiver at no join, and chat stays off.
 - **Experimental queue methods.** The queue methods need `experimentalApi`.
   Their behaviour, including the documented pause of the queue after an
   interrupted turn, was read from the app-server documentation, not run.
@@ -374,7 +388,18 @@ exercised live.
   The orphan check and the owner hint assume the hook's parent process, or the
   shell above it, belongs to Codex; the contract tests cannot confirm that.
 - **Reused pids off Linux.** The start time comes from `/proc`. Where `/proc`
-  cannot be read, only the pid is checked.
+  cannot be read, only the pid is checked, both for the owner check and for the
+  holder of the bind lock.
+- **Hard links for the bind lock.** The lock is created and retired with hard
+  links, so the state directory must be on a file system that supports them.
+  Where `link` fails, the receiver does not start and chat stays off.
+- **A kill inside a lock takeover.** A receiver killed between the two steps
+  of a takeover (the second name linked, the dead owner's lock not yet
+  unlinked) leaves that second name, `<socket>.bind.retired-<hash>`, next to
+  the dead owner's lock. Every later receiver for that session then stands
+  back and chat stays off for it, until both files are removed by hand. Age is
+  not used to clear it, because an age rule is what let two receivers hold the
+  lock. The window is two system calls wide.
 - **Non-interactive runs.** `codex exec` is not exercised. With `appServer` its
   thread is refused as a child; without it nothing distinguishes it.
 - **Short state path.** A `directory` over 72 bytes disables chat, silently.
@@ -400,8 +425,14 @@ exercised live.
   that nothing listens on it; any other probe result counts as a running
   receiver. The probe, the unlink and the bind run under one lock file next to
   the socket, so two receivers that start for one session cannot unlink each
-  other's live socket. A lock left by a crashed receiver goes stale after 30
-  seconds.
+  other's live socket. The lock holds its owner as `<pid> <start time> <token>`
+  and is created whole, so no reader sees a partial one. It is taken over only
+  when that process is gone: its pid does not run, or runs with another start
+  time. A lock that cannot be read counts as held, and age is never a reason
+  to take it. To take over, a contender first gives the lock a second name that
+  only one contender can create for that owner line, and unlinks the lock only
+  if that name still holds the line it read. A contender with an old reading
+  therefore cannot remove a successor's lock, and at most one receiver binds.
 - The worker runs the configured Python interpreter with `-I` and the state
   directory as its working directory.
 - The app-server client answers a server request with a method-not-found error
@@ -432,7 +463,7 @@ node --test
 
 The suite covers config refusal, the worker join frame and frame validation,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
-the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery and its start handshake, the WebSocket client against a
+the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the WebSocket client against a
 fake control socket on a real Unix socket, the receiver's state, delivery,
 wake, settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner

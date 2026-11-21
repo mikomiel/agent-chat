@@ -208,10 +208,10 @@ test("any probe answer but the documented one turns the route off", async () => 
   }
 })
 
-test("a probe that cannot be completed leaves the route undecided and the thread unbound", async () => {
+test("a probe that cannot be completed leaves the route undecided: the read still found a main thread, as `unprobed`", async () => {
   await withServer(main({ "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }), async path => {
     const bound = createThread({ path, threadId: THREAD })
-    assert.deepEqual(await bound.bind(), { status: "unavailable" })
+    assert.deepEqual(await bound.bind(), { status: "unprobed" })
     assert.equal(bound.route, null, "a transport failure is not an answer: the probe runs again at the next bind")
   })
   const gone = createThread({ path: join(dir, "absent.sock"), threadId: THREAD })
@@ -219,11 +219,21 @@ test("a probe that cannot be completed leaves the route undecided and the thread
   assert.equal(gone.route, null)
 })
 
+test("a probe that does not answer is `unprobed` within a second, so it cannot use up the bind's time", async () => {
+  await withServer(main({ "thread/queue/delete": () => undefined }), async path => {
+    const started = Date.now()
+    const bound = createThread({ path, threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "unprobed" })
+    assert.ok(Date.now() - started < 2000, "the whole bind stays well inside the receiver's 3 seconds")
+    assert.equal(bound.route, null)
+  })
+})
+
 test("the provider is recorded only for a loaded thread that is not a child, and before the queue probe", async () => {
   // The receiver reads it as "a main thread was found": a probe that fails still leaves it recorded.
   await withServer(main({ "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }), async path => {
     const bound = createThread({ path, threadId: THREAD })
-    assert.deepEqual(await bound.bind(), { status: "unavailable" })
+    assert.deepEqual(await bound.bind(), { status: "unprobed" })
     assert.equal(bound.provider, "openai")
   })
   const cases = [
@@ -231,6 +241,7 @@ test("the provider is recorded only for a loaded thread that is not a child, and
     ["a child", main({ "thread/read": () => ok({ thread: thread({ parentThreadId: "p" }) }) })],
     ["no provider", main({ "thread/read": () => ok({ thread: thread({ modelProvider: "" }) }) })],
     ["an unreadable thread", main({ "thread/read": () => ({ error: { code: -32600, message: "x" } }) })],
+    ["an incomplete record", main({ "thread/read": () => ok({ thread: { id: THREAD, modelProvider: "openai" } }) })],
   ]
   for (const [label, handler] of cases) {
     await withServer(handler, async path => {
@@ -239,6 +250,38 @@ test("the provider is recorded only for a loaded thread that is not a child, and
       assert.equal(bound.provider, null, label)
     })
   }
+})
+
+// The receiver joins on the answer of one bind alone: a main thread is only ever `bound`, `unprobed` or `stale_binding`.
+test("a record with no origin or no ephemeral flag is not a main thread, though it is no child either", async () => {
+  const complete = thread()
+  for (const record of [
+    { id: THREAD, modelProvider: "openai" },
+    { id: THREAD, modelProvider: "openai", source: "cli" },
+    { id: THREAD, modelProvider: "openai", ephemeral: false },
+    { ...complete, source: null },
+    { ...complete, source: undefined },
+    { ...complete, ephemeral: "false" },
+  ]) {
+    assert.equal(isChildThread(record), false, JSON.stringify(record))
+    await withServer(main({ "thread/read": () => ok({ thread: record }) }), async (path, server) => {
+      assert.deepEqual(await createThread({ path, threadId: THREAD }).bind(), { status: "unavailable" }, JSON.stringify(record))
+      assert.equal(server.methods().includes("thread/queue/delete"), false, "no probe for a record that proves nothing")
+    })
+  }
+  await withServer(main({ "thread/read": () => ok({ thread: { ...complete, source: { custom: "x" } } }) }), async path => {
+    assert.equal((await createThread({ path, threadId: THREAD }).bind()).status, "bound", "an object origin is complete")
+  })
+})
+
+test("nothing from an earlier bind verifies a later one: a thread that is no longer loaded is `unloaded` again", async () => {
+  let listed = [THREAD]
+  await withServer(main({ "thread/loaded/list": () => ok({ data: listed, nextCursor: null }) }), async path => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.equal((await bound.bind()).status, "bound")
+    listed = []
+    assert.deepEqual(await bound.bind(), { status: "unloaded" })
+  })
 })
 
 // ---- observe ---------------------------------------------------------------------------------------------------

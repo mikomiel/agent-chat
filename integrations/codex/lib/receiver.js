@@ -9,14 +9,16 @@
 // queue, when the config names a control socket and the probe passed (lib/appserver.js);
 // without it a message waits for the next turn. A peer message never grants authority.
 import { randomUUID } from "node:crypto"
-import { readFileSync } from "node:fs"
 import { createThread } from "./appserver.js"
 import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES, WAKE_PREFIX, wakeRows } from "./channel.js"
 import { appServerPath, loadConfig } from "./config.js"
 import { assertPrivateDirectory, paths, serve } from "./ipc.js"
 import { packCandidates, renderNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
+import { ownerAlive, processStartTime } from "./process.js"
 import { describeFailure, startWorker } from "./worker.js"
+
+export { processStartTime } // the owner check reads start times through lib/process.js; the tests reach it here
 
 const HEARTBEAT_MS = 30_000
 const WAKE_POLL_MS = 2_000
@@ -37,29 +39,13 @@ const REJOIN_AFTER = new Set([
 // The states that refuse a wake before anything is claimed.
 const NO_WAKE = new Set(["busy", "plan", "stopped", "offline"])
 
+// The reads that find a loaded, complete, non-child thread record: only the current bind can say so.
+const MAIN_THREAD = new Set(["bound", "stale_binding", "unprobed"])
+
 const bytes = text => Buffer.byteLength(text, "utf8")
 const clamp = (value, max) => (Number.isFinite(value) ? Math.max(0, Math.min(max, value)) : 0)
 const refused = result => (result && typeof result === "object" && typeof result.refused === "string" ? result.refused : null)
 const isDone = (frame, outcome) => frame?.op === "done" && frame.outcome === outcome
-
-function ownerAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 1) return false
-  try { process.kill(pid, 0); return true } catch (error) { return error?.code === "EPERM" }
-}
-
-// The start time of a process, in clock ticks since boot: field 22 of /proc/<pid>/stat.
-// A pid says only which process holds the id now; the start time tells that process from
-// an earlier one that held it. `comm`, field 2, can hold spaces and parentheses, so the
-// fields are counted from the last ")". Null where /proc cannot be read (it does not
-// exist off Linux); the owner check then goes by pid alone.
-export function processStartTime(pid, read = path => readFileSync(path, "utf8")) {
-  if (!Number.isInteger(pid) || pid <= 1) return null
-  try {
-    const stat = read(`/proc/${pid}/stat`)
-    const field = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19] // index 0 is field 3, so field 22 is 19
-    return /^\d+$/.test(field) ? field : null
-  } catch { return null }
-}
 
 export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
@@ -87,7 +73,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let planHint = false // the last hook payload said permission_mode "plan"
   let stopped = false // an Interrupt hook ran; only the next UserPromptSubmit clears it
   let observed = null // the last app-server read: { status, stopped, plan }; any hook event discards it
-  let epoch = 0 // counts hook events, so a read that began before one is not kept
+  let epoch = 0 // counts hook events and app-server refusals, so a read or a clearance that began before one is not kept
+  let newestRefusal = null // the reason of the newest app-server read that refused a wake; a hook event discards it
   let threadBound = false // the thread was found, is not a child, and its provider is fixed
   let verified = false // the thread is a loaded main thread: with an app-server configured, only then may the worker join
   let wakeAfter = 0
@@ -231,12 +218,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     rejoinTimer = setTimeoutImpl(() => { void connect() }, delay)
   }
 
-  // Look the thread up in the app-server. A child refuses the whole session. A loaded thread that is not a child
-  // (`bound`, or `stale_binding` after a provider change) is verified, and may join. So is a thread whose provider was
-  // recorded: the app-server records it after the read that found a main thread and before the queue probe, so a probe
-  // that failed or timed out (an `unavailable` answer) still leaves a verified main thread, joined hook-only until a later
-  // heartbeat decides the route. Anything else (not loaded yet, no answer in time, an error) verifies nothing: the
-  // caller does not join on it.
+  // Look the thread up in the app-server. A child refuses the whole session. Verification is the answer of this call
+  // alone: a loaded thread whose record is complete and not a child's (`bound`, `unprobed` when only the queue probe did
+  // not finish, or `stale_binding` after a provider change). Anything else (not loaded yet, an incomplete record, no
+  // answer in the time allowed, an error) verifies nothing, and a result that comes in after the time allowed is
+  // dropped with the race: the caller does not join on it, and nothing left over from an earlier call counts.
   async function bindThread() {
     let timer
     const result = await Promise.race([
@@ -245,19 +231,24 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     ])
     clearTimeoutImpl(timer)
     if (result.status === "child") return "CHAT_CHILD_THREAD"
-    if (result.status === "bound" || result.status === "stale_binding" || thread.provider) verified = true
+    if (MAIN_THREAD.has(result.status)) verified = true
     if (result.status === "bound") threadBound = true // a changed provider leaves the thread unbound: hook-only
     return null
   }
 
   // Replace the observed state with a fresh read, unless a hook event arrived while it ran.
+  // A read that refuses a wake (any reason: busy, stopped, plan, unknown, offline, stale_binding) is a generation of its
+  // own, and the epoch moves with it: a wake cleared before it must not go out, whatever the hooks say. A child read
+  // disables the session in the caller, which settles every wake as offline.
   async function refine() {
     const before = epoch
     const result = await thread.observe()
-    if (epoch === before) {
+    const current = epoch === before
+    if (current) {
       observed = result.observed.status === "idle" || result.observed.status === "busy" ? result.observed : null
+      if (result.reason !== null) { newestRefusal = result.reason; epoch += 1 }
     }
-    return { ...result, current: epoch === before }
+    return { ...result, current }
   }
 
   async function connect() {
@@ -347,13 +338,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // The answer to "may the add still go out": null while the state that cleared the wake still holds, else the ledger
-  // reason that refuses it. A hook event or an interrupt since `cleared` (the generation that was read) is newer than
-  // the clearing read; an event that leaves nothing refusing it means the session just ran or just stopped, so busy.
+  // reason that refuses it. A hook event, an interrupt or an app-server refusal since `cleared` (the generation that was
+  // read) is newer than the clearing read. A refusal gives its own reason; a hook event that leaves nothing refusing
+  // it means the session just ran or just stopped, so busy.
   function wakeStale(cleared) {
     if (!live || closed || failure) return "offline"
     const state = chatState()
     if (state !== null) return state
-    return epoch === cleared ? null : "busy"
+    return epoch === cleared ? null : (newestRefusal ?? "busy")
   }
 
   // One claim sequence. `wake` queues a user turn through the app-server and needs no hook; otherwise the result
@@ -452,6 +444,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     planHint = mode === "plan"
     native = typeof mode === "string" && mode ? running : "unknown"
     observed = null
+    newestRefusal = null
     epoch += 1
     if (event === "prompt") stopped = false
   }

@@ -5,11 +5,12 @@
 // owned by the user with mode 0700, so the socket needs no other access control.
 // This module owns paths, framing and the connect-or-start handshake. It owns no
 // chat policy.
-import { createHash } from "node:crypto"
-import { chmodSync, closeSync, lstatSync, openSync, statSync, unlinkSync } from "node:fs"
+import { createHash, randomUUID } from "node:crypto"
+import { chmodSync, closeSync, linkSync, lstatSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import { join } from "node:path"
 import { HARNESS } from "./config.js"
+import { ownerAlive, processStartTime } from "./process.js"
 
 export const MAX_LINE = 64 * 1024
 // sun_path holds 104 bytes on macOS and 108 on Linux, including the terminator.
@@ -125,20 +126,65 @@ function takeLock(path, now) {
   return false
 }
 
+// The bind lock names its holder, `<pid> <start time, or "-"> <token>`, and is created whole: written to a private
+// temporary file and linked into place, so no reader sees a half-written one. It is taken over only when that exact
+// process is gone (the receiver's owner check: the pid is not running, or the pid now has another start time). A lock
+// whose holder line cannot be read counts as held.
+const holderLine = () => `${process.pid} ${processStartTime(process.pid) ?? "-"} ${randomUUID()}`
+
+function holderGone(line, { alive, startTime }) {
+  const [pid, start, token, ...rest] = line.split(" ")
+  const id = Number(pid)
+  if (!Number.isInteger(id) || id <= 1 || !start || !token || rest.length) return false
+  if (!alive(id)) return true
+  const current = start === "-" ? null : startTime(id)
+  return current !== null && current !== start
+}
+
+// Remove the lock that was just read, if its holder is gone. True when the caller should try to take the lock again.
+// The removal cannot hit a successor's lock: the lock is first given a second name that only the first contender to
+// retire this holder line can create, and the lock itself is unlinked only if what that name holds is the line that
+// was read. A contender with an old reading that finds a successor's lock under the lock name only adds and drops
+// its own extra name; the successor's lock never moves.
+function retire(path, deps) {
+  let seen
+  try { seen = readFileSync(path, "utf8") } catch (error) { return error.code === "ENOENT" }
+  if (!holderGone(seen, deps)) return false
+  const retired = `${path}.retired-${createHash("sha256").update(seen).digest("hex").slice(0, 16)}`
+  try { linkSync(path, retired) } catch (error) { return error.code === "ENOENT" } // taken by another contender: stand back
+  try {
+    if (readFileSync(retired, "utf8") === seen) unlinkSync(path)
+  } catch { /* the lock went with its holder */ } finally {
+    try { unlinkSync(retired) } catch { /* already gone */ }
+  }
+  return true
+}
+
+function takeBindLock(path, deps) {
+  const temporary = `${path}.${randomUUID()}`
+  writeFileSync(temporary, holderLine(), { flag: "wx", mode: 0o600 })
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try { linkSync(temporary, path); return true } catch (error) { if (error.code !== "EEXIST") throw error }
+      if (!retire(path, deps)) return false
+    }
+    return false
+  } finally { try { unlinkSync(temporary) } catch { /* already gone */ } }
+}
+
 // Serve one handler per connection. The first frame selects the request; the
 // handler may reply, then read follow-up frames from the same session. A socket
 // left by a dead receiver is removed; a live one is never taken over.
 //
 // Two receivers can start for one session (the hook's start lock is released after
 // its own wait, whether or not the child has bound). So the probe, the unlink and the
-// bind run under one lock file next to the socket, held until the listener is up: a
+// bind run under the bind lock, a file next to the socket, held until the listener is up: a
 // second receiver then finds the first one bound and stops, and cannot unlink a live
 // listener's path. The lock is not the one the hooks hold to start a receiver. A
-// receiver that cannot take it exits as a running one; a lock left by a crashed
-// receiver goes stale after LOCK_STALE_MS, like the start lock.
-export async function serve(path, handler, { connectImpl = connect } = {}) {
+// receiver that cannot take it exits as a running one.
+export async function serve(path, handler, { connectImpl = connect, alive = ownerAlive, startTime = processStartTime } = {}) {
   const gate = `${path}.bind`
-  if (!takeLock(gate, Date.now)) throw refusal("CHAT_RECEIVER_RUNNING")
+  if (!takeBindLock(gate, { alive, startTime })) throw refusal("CHAT_RECEIVER_RUNNING")
   let server
   try {
     let existing = null

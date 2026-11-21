@@ -1,11 +1,14 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { chmodSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import net from "node:net"
+import { createInterface } from "node:readline"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { assertPrivateDirectory, connect, connectOrStart, MAX_LINE, paths, serve } from "../lib/ipc.js"
+import { processStartTime } from "../lib/process.js"
 
 function privateDirectory() {
   const dir = mkdtempSync(join(tmpdir(), "acc-"))
@@ -186,23 +189,178 @@ test("only a refused connection proves the listener gone: any other probe result
   } finally { cleanup(dir) }
 })
 
-test("a fresh bind lock stops a second receiver and is left alone, a stale one is taken over", async () => {
+// ---- the bind lock ---------------------------------------------------------------------------------------------
+// The lock line is `<pid> <start time, or -> <token>`; a lock is taken over only when that exact process is gone.
+
+const age = (path, ms = 60_000) => { const old = new Date(Date.now() - ms); utimesSync(path, old, old) }
+const attempt = (socket, options) => serve(socket, async (_request, link) => { await link.send({ pid: process.pid }) }, options)
+  .then(listener => ({ listener }), error => ({ code: error.code }))
+async function deadPid() {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" })
+  await new Promise(resolve => child.once("exit", resolve))
+  return child.pid
+}
+const leftovers = dir => readdirSync(dir).filter(name => name.includes(".bind"))
+
+test("a lock whose holder line cannot be read counts as held, whatever its age", async () => {
   const dir = privateDirectory()
   const { socket } = paths(dir, "session-1")
   const gate = `${socket}.bind`
   try {
-    writeFileSync(gate, "")
-    await assert.rejects(serve(socket, async () => {}), { code: "CHAT_RECEIVER_RUNNING" })
-    assert.ok(statSync(gate).isFile(), "the other receiver's lock is not ours to remove")
-    const old = new Date(Date.now() - 60_000)
-    utimesSync(gate, old, old)
-    const listener = await serve(socket, async () => {})
+    for (const line of ["", "not a holder line", "1234", "0 - t", "abc - t", `${process.pid} - t extra`]) {
+      writeFileSync(gate, line)
+      for (const old of [false, true]) {
+        if (old) age(gate)
+        const result = await attempt(socket)
+        try { assert.equal(result.code, "CHAT_RECEIVER_RUNNING", JSON.stringify(line)) } finally { result.listener?.close() }
+        assert.equal(readFileSync(gate, "utf8"), line, "the other receiver's lock is not ours to remove")
+      }
+      unlinkSync(gate)
+    }
+  } finally { cleanup(dir) }
+})
+
+test("a lock held by a running process is never taken over, however old it is", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  const gate = `${socket}.bind`
+  try {
+    const line = `${process.pid} ${processStartTime(process.pid) ?? "-"} token`
+    writeFileSync(gate, line)
+    age(gate, 3_600_000)
+    const result = await attempt(socket)
+    try { assert.equal(result.code, "CHAT_RECEIVER_RUNNING") } finally { result.listener?.close() }
+    assert.equal(readFileSync(gate, "utf8"), line)
+  } finally { cleanup(dir) }
+})
+
+test("a lock whose holder is gone is taken over at once, and leaves nothing behind", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  const gate = `${socket}.bind`
+  try {
+    writeFileSync(gate, `${await deadPid()} - token`) // fresh: the holder's death is the proof, not the age
+    const result = await attempt(socket)
+    assert.ok(result.listener, result.code)
     try {
       const link = await connect(socket)
+      assert.deepEqual(await link.call({}, 2000), { pid: process.pid })
       link.close()
-    } finally { listener.close() }
-    assert.throws(() => statSync(gate), { code: "ENOENT" })
+    } finally { result.listener.close() }
+    assert.deepEqual(leftovers(dir), [], "no lock and no retired name is left")
   } finally { cleanup(dir) }
+})
+
+// The documented limit: a receiver killed between linking the retired name and unlinking the lock leaves both behind.
+// Age does not clear them, because an age rule is what let two receivers hold the lock.
+test("a retired name left by a killed takeover makes later receivers stand back, and nothing is removed", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  const gate = `${socket}.bind`
+  try {
+    const line = `${await deadPid()} - token`
+    const retired = `${gate}.retired-${createHash("sha256").update(line).digest("hex").slice(0, 16)}`
+    writeFileSync(gate, line)
+    writeFileSync(retired, line)
+    age(gate, 3_600_000)
+    age(retired, 3_600_000)
+    const result = await attempt(socket)
+    try { assert.equal(result.code, "CHAT_RECEIVER_RUNNING") } finally { result.listener?.close() }
+    assert.equal(readFileSync(gate, "utf8"), line)
+    assert.equal(readFileSync(retired, "utf8"), line)
+  } finally { cleanup(dir) }
+})
+
+test("a pid that now belongs to another process is not the holder: the start time tells them apart", async t => {
+  const start = processStartTime(process.pid)
+  if (start === null) return t.skip("no /proc: the holder is checked by pid alone")
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  try {
+    writeFileSync(`${socket}.bind`, `${process.pid} ${Number(start) + 1} token`)
+    const result = await attempt(socket)
+    try { assert.ok(result.listener, result.code) } finally { result.listener?.close() }
+  } finally { cleanup(dir) }
+})
+
+// The contender decides from a reading of the lock, and a successor can take over before it acts. `alive` runs between
+// the reading and the removal, so the swap happens exactly there.
+test("a contender with an old reading of the lock cannot remove its successor's lock", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  const gate = `${socket}.bind`
+  try {
+    writeFileSync(gate, `${await deadPid()} - old`)
+    const successor = `${process.pid} - successor`
+    let swapped = false
+    const alive = pid => {
+      if (!swapped) { swapped = true; unlinkSync(gate); writeFileSync(gate, successor); return false }
+      return pid === process.pid
+    }
+    const result = await attempt(socket, { alive })
+    try { assert.equal(result.code, "CHAT_RECEIVER_RUNNING") } finally { result.listener?.close() }
+    assert.ok(swapped)
+    assert.equal(readFileSync(gate, "utf8"), successor, "the successor's lock is still there, whole")
+    assert.deepEqual(leftovers(dir), [`${socket.split("/").pop()}.bind`], "and nothing else is")
+  } finally { cleanup(dir) }
+})
+
+// Real processes: the reading and the removal are separate system calls, so only real contention shows the race.
+// The contenders stay up between rounds and are told when to start, so a round costs milliseconds.
+test("receivers in separate processes that all find the same dead lock and dead socket leave exactly one live listener", async () => {
+  const script = `
+    import { createInterface } from "node:readline"
+    import { serve } from ${JSON.stringify(new URL("../lib/ipc.js", import.meta.url).href)}
+    let listener = null
+    for await (const line of createInterface({ input: process.stdin })) {
+      const [command, socket, goAt] = line.split(" ")
+      if (command === "release") { listener?.close(); listener = null; console.log("released"); continue }
+      while (Date.now() < Number(goAt)) { /* every contender leaves the gate together */ }
+      try { listener = await serve(socket, async (_request, link) => { await link.send({ pid: process.pid }) }); console.log("bound") }
+      catch (error) { console.log(error.code ?? "error") }
+    }
+  `
+  const ROUNDS = 30
+  const dir = privateDirectory()
+  const contenders = []
+  try {
+    // One killed process leaves a dead socket file for every round.
+    const sockets = Array.from({ length: ROUNDS }, (_unused, round) => join(dir, `round-${round}.sock`))
+    const killed = spawn(process.execPath, ["-e",
+      "const net = require('node:net'); const paths = process.argv.slice(1); let up = 0; for (const path of paths) net.createServer().listen(path, () => { if (++up === paths.length) console.log('up') })",
+      ...sockets], { stdio: ["ignore", "pipe", "ignore"] })
+    await new Promise(resolve => killed.stdout.once("data", resolve))
+    const exited = new Promise(resolve => killed.once("exit", resolve))
+    killed.kill("SIGKILL")
+    await exited
+    const dead = await deadPid()
+    for (let index = 0; index < 8; index += 1) {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["pipe", "pipe", "ignore"] })
+      const lines = []
+      const waiting = []
+      createInterface({ input: child.stdout }).on("line", line => { const resolve = waiting.shift(); if (resolve) resolve(line); else lines.push(line) })
+      contenders.push({ child, next: () => new Promise(resolve => { const line = lines.shift(); if (line !== undefined) resolve(line); else waiting.push(resolve) }) })
+    }
+    for (const [round, socket] of sockets.entries()) {
+      writeFileSync(`${socket}.bind`, `${dead} - token`)
+      age(`${socket}.bind`)
+      const goAt = Date.now() + 25
+      for (const { child } of contenders) child.stdin.write(`go ${socket} ${goAt}\n`)
+      const said = await Promise.all(contenders.map(({ next }) => next()))
+      const winners = contenders.filter((_contender, index) => said[index] === "bound")
+      assert.equal(winners.length, 1, `round ${round}: ${JSON.stringify(said)}`)
+      assert.ok(said.every(word => word === "bound" || word === "CHAT_RECEIVER_RUNNING"), JSON.stringify(said))
+      const link = await connect(socket)
+      assert.deepEqual(await link.call({}, 2000), { pid: winners[0].child.pid }, `round ${round}: the listener on the path is the winner's`)
+      link.close()
+      for (const { child } of contenders) child.stdin.write("release\n")
+      await Promise.all(contenders.map(({ next }) => next()))
+    }
+  } finally {
+    for (const { child } of contenders) { child.stdin.end(); child.kill("SIGKILL") }
+    await Promise.all(contenders.map(({ child }) => new Promise(resolve => (child.exitCode === null && child.signalCode === null ? child.once("exit", resolve) : resolve()))))
+    cleanup(dir)
+  }
 })
 
 test("closing the listener removes the socket so a resumed session can bind another", async () => {

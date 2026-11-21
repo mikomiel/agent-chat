@@ -657,10 +657,9 @@ test("an unknown operation is refused without touching the worker", async () => 
 const IDLE = { reason: null, observed: { status: "idle", stopped: false, plan: false } }
 // `adds` holds the wakes that got as far as the add frame: lib/appserver.js asks `proceed` right before writing it and
 // ends the wake as deferred, with the reason it was given, when it answers one.
-// `provider` is what lib/appserver.js records after the read that found a main thread, before the queue probe runs.
-function threadDouble({ bind = { status: "bound" }, route = true, provider = null, observation = IDLE, wake = { outcome: "handed", reason: null } } = {}) {
+function threadDouble({ bind = { status: "bound" }, route = true, observation = IDLE, wake = { outcome: "handed", reason: null } } = {}) {
   const thread = {
-    opened: [], calls: [], wakes: [], adds: [], route, provider,
+    opened: [], calls: [], wakes: [], adds: [], route,
     async bind() { thread.calls.push("bind"); return typeof bind === "function" ? bind() : bind },
     async observe() { thread.calls.push("observe"); return typeof observation === "function" ? observation() : observation },
     async wake(request) {
@@ -817,6 +816,36 @@ test("a hook event after the clearing read and before the add sends no add, and 
   }
 })
 
+// The heartbeat reads the thread outside the worker queue, so its answer can land while a cleared wake waits on claim.
+test("a heartbeat read that refuses after the clearing read and before the add sends no add, and settles deferred", async () => {
+  for (const reason of ["stale_binding", "offline", "unknown"]) {
+    let heartbeat = IDLE
+    const thread = threadDouble({ observation: () => heartbeat })
+    let armed = false
+    let release
+    const held = new Promise(resolve => { release = resolve })
+    const r = await rig({ thread, handlers: wakeHandlers({
+      claim: async fields => {
+        if (armed) await held
+        return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(id => validRow(id)) }
+      },
+    }) })
+    await idleSession(r)
+    armed = true
+    await r.clock.advance(2000)
+    assert.equal(r.worker.ops("claim").length, 1, `${reason}: the wake is waiting on its claim`)
+    heartbeat = { reason, observed: { status: reason === "offline" ? "offline" : "unknown", stopped: false, plan: null } }
+    await r.clock.advance(28_000) // the heartbeat tick reads the thread while the claim is out
+    assert.equal(r.receiver.state(), null, `${reason}: the hooks still say idle, so only the refusal can stop the add`)
+    release()
+    await settle()
+    assert.deepEqual(thread.adds, [], `${reason}: no add frame was written`)
+    const [settled] = r.worker.ops("settle")
+    assert.deepEqual(settled.result, { outcome: "deferred", reason }, reason)
+    assert.ok(settleVocabulary(settled.result), reason)
+  }
+})
+
 test("a handed wake confirmation does not overwrite a hook event that arrived after the clearing read", async () => {
   let r = null
   const thread = threadDouble({ wake: () => {
@@ -963,25 +992,41 @@ test("a bound thread whose queue probe was answered wrongly still joins, hook-on
   assert.equal(r.worker.bootIds.length, 1)
 })
 
-// The probe runs after the read that found a main thread, and the same bind answers `unavailable` when the probe fails.
-test("a queue probe that fails or does not answer still leaves a verified main thread: it joins hook-only and the route is decided later", async () => {
-  for (const bind of [() => ({ status: "unavailable" }), () => new Promise(() => {})]) {
-    let answer = bind
-    const thread = threadDouble({ bind: () => answer(), provider: "openai", route: null })
-    const r = await rig({ handlers: wakeHandlers(), thread })
-    await r.clock.advance(3000)
-    assert.equal(r.worker.bootIds.length, 1, "the read passed, so the join does not wait for the probe")
-    await r.op(turn())
-    await r.op({ op: "stop", permission_mode: "default" })
-    r.worker.log.length = 0
-    await r.clock.advance(10_000)
-    assert.deepEqual(r.worker.ops("claim"), [], "no route yet, so no wake")
-    answer = () => ({ status: "bound", route: true })
-    thread.route = true
-    await r.clock.advance(20_000)
-    await r.clock.advance(2000)
-    assert.equal(r.worker.ops("claim").length, 1, "the heartbeat bind decided the route, so the next poll wakes")
-  }
+// The queue probe is the last step of a bind: when it did not finish, the same bind still answers `unprobed`.
+test("a queue probe that did not finish still leaves a verified main thread: it joins hook-only and the route is decided later", async () => {
+  let answer = { status: "unprobed" }
+  const thread = threadDouble({ bind: () => answer, route: null })
+  const r = await rig({ handlers: wakeHandlers(), thread })
+  assert.equal(r.worker.bootIds.length, 1, "the read passed, so the join does not wait for the probe")
+  await r.op(turn())
+  await r.op({ op: "stop", permission_mode: "default" })
+  r.worker.log.length = 0
+  await r.clock.advance(10_000)
+  assert.deepEqual(r.worker.ops("claim"), [], "no route yet, so no wake")
+  answer = { status: "bound", route: true }
+  thread.route = true
+  await r.clock.advance(20_000)
+  await r.clock.advance(2000)
+  assert.equal(r.worker.ops("claim").length, 1, "the heartbeat bind decided the route, so the next poll wakes")
+})
+
+// A bind that is still running when the receiver stops waiting is dropped. What it learns later counts for nothing:
+// only the answer of a call that finishes inside the time allowed verifies the thread.
+test("a bind that answers after its deadline verifies nothing, and a later `unloaded` does not join on its account", async () => {
+  let late
+  let asked = 0
+  const thread = threadDouble({ bind: () => (++asked === 1
+    ? new Promise(resolve => { late = () => { thread.provider = "openai"; resolve({ status: "bound", route: true }) } }) // the real read records the provider as it goes
+    : { status: "unloaded" }) })
+  const r = await rig({ thread })
+  await r.clock.advance(3000)
+  assert.equal(r.worker.bootIds.length, 0, "the first bind missed its deadline")
+  late() // it finishes after the receiver stopped waiting
+  await settle()
+  assert.equal(r.worker.bootIds.length, 0, "the late answer is dropped")
+  await r.clock.advance(30_000)
+  assert.equal(asked, 2)
+  assert.equal(r.worker.bootIds.length, 0, "the next bind found the thread unloaded, so there is still nothing verified")
 })
 
 // ---- state mapping ---------------------------------------------------------------------------------------------

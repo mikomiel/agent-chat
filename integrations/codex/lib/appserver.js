@@ -29,6 +29,9 @@ export const MIN_ADD_MS = 500
 // The end of the reservation is for recording the result. Every request of a wake ends this long before it, so a slow
 // fence leaves the receiver time to settle `deferred` or `uncertain` instead of letting the claim expire.
 export const SETTLE_MS = 1_000
+// The queue probe is the last step of a bind, and the receiver gives the whole bind 3 seconds. A probe that does not
+// answer within this time leaves the route undecided, so it cannot use up the time the main-thread check needs.
+const PROBE_MS = 1_000
 const CONFIRM_MS = 250
 const CONFIRM_MARGIN_MS = 300
 const PAGE = 20
@@ -202,6 +205,11 @@ const childSource = source => source === "exec" ||
 export const isChildThread = thread =>
   thread.parentThreadId != null || thread.agentRole != null || thread.ephemeral === true || childSource(thread.source)
 
+// Whether a thread record can show that the thread is a main one. Not being a child is not enough: a record without
+// its origin (`source`) or its `ephemeral` flag says nothing about either, so it proves nothing.
+const isCompleteRecord = thread =>
+  typeof thread.ephemeral === "boolean" && (typeof thread.source === "string" || (thread.source !== null && typeof thread.source === "object"))
+
 const STATUS = { idle: "idle", active: "busy", notLoaded: "offline" }
 
 // The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket.
@@ -236,7 +244,7 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
   // is not the documented one, and the route stays off.
   async function probe(link) {
     try {
-      const answer = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: randomUUID() })
+      const answer = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: randomUUID() }, PROBE_MS)
       return answer.deleted === false
     } catch (error) {
       if (error?.code === "APP_SERVER_ERROR") return false
@@ -248,18 +256,24 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     get provider() { return provider },
     get route() { return queue },
 
-    // Check the thread before the receiver joins: it must be loaded, must not be a child, and fixes the provider.
-    // status: "bound" | "child" | "unloaded" | "stale_binding" | "unavailable"
+    // Check the thread before the receiver joins: it must be loaded, its record must be complete, it must not be a
+    // child, and it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in
+    // "bound", "unprobed" and "stale_binding"; nothing recorded by an earlier call counts.
+    // status: "bound" | "unprobed" | "child" | "unloaded" | "stale_binding" | "unavailable"
+    //   unprobed - a main thread, but the queue probe did not finish: the route stays undecided and the next bind probes again.
     async bind() {
       try {
         return await withConnection(async link => {
           if (!(await loaded(link))) return { status: "unloaded" }
           const thread = await read(link)
           if (isChildThread(thread)) return { status: "child" }
+          if (!isCompleteRecord(thread)) return { status: "unavailable" }
           if (typeof thread.modelProvider !== "string" || !thread.modelProvider) return { status: "unavailable" }
           if (provider !== null && provider !== thread.modelProvider) return { status: "stale_binding" }
           provider = thread.modelProvider
-          if (queue === null) queue = await probe(link)
+          if (queue === null) {
+            try { queue = await probe(link) } catch { return { status: "unprobed" } }
+          }
           return { status: "bound", route: queue }
         })
       } catch { return { status: "unavailable" } }
