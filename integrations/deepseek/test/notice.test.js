@@ -1,6 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { CHAT_PREFIX, MAX_CONTEXT_BYTES, renderNotice } from "../lib/notice.js"
+import * as notice from "../lib/notice.js"
+import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
+import { runNoticeSuite } from "../../shared/notice-suite.mjs"
+
+const { renderNotice } = notice
+
+// The vectors, the property, budget and pack tests, and the copy check are shared by every package.
+runNoticeSuite("deepseek", notice, new URL("../lib/notice.js", import.meta.url), { noticeBound: NOTICE_BOUND })
 
 const joined = {
   session_id: "11111111-1111-4111-8111-111111111111",
@@ -19,40 +26,57 @@ const row = index => ({
   sender_session_id: "peer-1",
   created_at: "2026-01-01T00:00:00Z",
 })
+// A message as `claim` returns it in bodies mode: the core's field set, a canonical id and a numeric cursor.
+const bodyRow = (index, body = "synthetic body") => ({
+  id: `aaaaaaaa-aaaa-4aaa-8aaa-${String(index).padStart(12, "0")}`,
+  kind: "question",
+  room_id: joined.room_id,
+  history_after: String(100 + index),
+  body,
+  body_truncated: false,
+  sender_session_id: "66666666-6666-4666-8666-666666666666",
+  sender_principal_id: "77777777-7777-4777-8777-777777777777",
+  created_at: "2026-01-01T00:00:00+00:00",
+  thread_id: "88888888-8888-4888-8888-888888888888",
+})
+const ADMITTED = "2026-01-01T00:00:42+00:00"
+const bodies = (rows, options = {}) =>
+  renderNotice(joined, "/usr/bin/python3", rows, { bodies: true, bound: NOTICE_BOUND, admittedAt: ADMITTED, ...options })
 
-test("metadata mode carries ids and cursors, never bodies or senders", () => {
-  const notice = renderNotice(joined, "/usr/bin/python3", [row(0)])
-  assert.ok(notice)
-  assert.match(notice, /Process every item/)
-  assert.match(notice, /"history_after":"history-cursor-0"/)
-  assert.match(notice, /"room_id":"33333333-3333-4333-8333-333333333333"/)
-  assert.doesNotMatch(notice, /synthetic body/)
-  assert.doesNotMatch(notice, /sender_session_id/)
+test("the notice bound is what the 8 KiB limit leaves after the delivery line", () => {
+  assert.equal(MAX_CONTEXT_BYTES, 8 * 1024)
+  assert.equal(NOTICE_BOUND, MAX_CONTEXT_BYTES - Buffer.byteLength(CHAT_PREFIX, "utf8"))
 })
 
-test("bodies mode carries the body and the sender field", () => {
-  const notice = renderNotice(joined, "/usr/bin/python3", [row(0)], { bodies: true })
-  assert.match(notice, /synthetic body/)
-  assert.match(notice, /"sender_session_id":"peer-1"/)
+test("metadata mode carries ids and cursors, never bodies or senders", () => {
+  const text = renderNotice(joined, "/usr/bin/python3", [row(0)], { bound: NOTICE_BOUND })
+  assert.ok(text)
+  assert.match(text, /Process every item/)
+  assert.match(text, /"history_after":"history-cursor-0"/)
+  assert.match(text, /"room_id":"33333333-3333-4333-8333-333333333333"/)
+  assert.doesNotMatch(text, /synthetic body/)
+  assert.doesNotMatch(text, /sender_session_id/)
+})
+
+test("bodies mode frames the body and names the sender in the message header", () => {
+  const text = bodies([bodyRow(1)], { nonce: "0123456789abcdef" })
+  assert.match(text, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question room 33333333-3333-4333-8333-333333333333 from session 66666666-6666-4666-8666-666666666666 /m)
+  assert.match(text, /^<<<AGENT-CHAT-BODY 0123456789abcdef\n> synthetic body\nAGENT-CHAT-BODY 0123456789abcdef>>>$/m)
+  assert.doesNotMatch(text, /sender_session_id/)
 })
 
 test("an empty batch renders nothing", () => {
-  assert.equal(renderNotice(joined, "/usr/bin/python3", []), null)
+  assert.equal(renderNotice(joined, "/usr/bin/python3", [], { bound: NOTICE_BOUND }), null)
 })
 
-test("a maximum batch falls back to metadata inside the same whole-notice budget", () => {
-  // Long cursors make the metadata alone eat the budget, so the bodies cannot
-  // share it. The fallback must still hand the batch over once.
-  const rows = Array.from({ length: 16 }, (_, index) => ({
-    ...row(index),
-    history_after: `cursor-${String(index).padStart(2, "0")}-${"c".repeat(220)}`,
-    body: "b".repeat(1200),
-  }))
-  const notice = renderNotice(joined, "/usr/bin/python3", rows, { bodies: true })
-  assert.ok(notice)
-  assert.ok(Buffer.byteLength(CHAT_PREFIX + notice, "utf8") <= MAX_CONTEXT_BYTES)
-  assert.match(notice, /"history_after":"cursor-15-/)
-  assert.doesNotMatch(notice, /bbbb/)
+test("a maximum batch has no metadata fallback: every message keeps its frame inside the same whole-notice limit", () => {
+  const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "b".repeat(1200)))
+  const text = bodies(rows)
+  assert.ok(text)
+  assert.ok(Buffer.byteLength(CHAT_PREFIX + text, "utf8") <= MAX_CONTEXT_BYTES)
+  for (const item of rows) assert.ok(text.includes(`message ${item.id} kind question`))
+  assert.doesNotMatch(text, /"history_after"/)
+  assert.match(text, /^Body cut\. Read all of it with: history --room /m)
 })
 
 test("a batch whose metadata alone does not fit renders nothing", () => {
@@ -60,5 +84,5 @@ test("a batch whose metadata alone does not fit renders nothing", () => {
     ...row(index),
     history_after: `${index}-${"c".repeat(600)}`,
   }))
-  assert.equal(renderNotice(joined, "/usr/bin/python3", rows), null)
+  assert.equal(renderNotice(joined, "/usr/bin/python3", rows, { bound: NOTICE_BOUND }), null)
 })

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Readable } from "node:stream"
 import { runHook } from "../lib/hook.js"
-import { MAX_OUTPUT_BYTES } from "../lib/notice.js"
+import { MAX_OUTPUT_BYTES } from "../lib/channel.js"
 
 const absent = () => Object.assign(new Error("absent"), { code: "ENOENT" })
 const never = () => new Promise(() => {})
