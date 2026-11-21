@@ -5,6 +5,14 @@
 // only in a child session and a child has a `parentID`. Whether a fork sets `parentID` is not confirmed, so a fork
 // is refused too: when in doubt a session stays out. A parent pointer is not trusted as a root test either way.
 //
+// A GAP IS READ BACK AT THE FIRST EVENT AFTER IT. The stream resets when it breaks, before it resumes, so a read-back
+// run at the reset would end before the gap does. A session is marked stale at the reset instead, and its entry is
+// read back at the first event it sees afterwards: the stream has resumed by then, so whatever it missed is over.
+//
+// FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
+// never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
+// answers later cannot undo it.
+//
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
 // rejection there disables chat for that session only. A session that faulted or was deleted never rejoins in this
 // process, so a worker that is still ending is never raced by a second join.
@@ -27,16 +35,20 @@ export function isRootSession(info, sessionID) {
   return (info.parentID === undefined || info.parentID === null) && (info.fork === undefined || info.fork === null)
 }
 
+const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
+
+// The id of the session a `session.forked` event describes, or null for any other event.
+export const forkedSessionOf = event => (event?.type === "session.forked" ? sessionOf(event) : null)
+
 export function createManager(ctx, config, parts, {
   now = Date.now,
   notice = () => {},
+  forked = new Set(), // fork evidence: session ids that are never roots; the registry hands every owner the same set
 } = {}) {
-  const records = new Map() // session id -> { id, delivery, lifecycle, chain, dead, closing }
+  const records = new Map() // session id -> { id, delivery, lifecycle, chain, dead, closing, stale }
   const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
   const closings = new Set() // ends still in flight, so stop() also waits for a session that ended before it was called
   let active = true
-
-  const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
 
   function refuse(id, until) {
     refused.delete(id)
@@ -45,6 +57,7 @@ export function createManager(ctx, config, parts, {
   }
 
   function isRefused(id) {
+    if (forked.has(id)) return true
     const until = refused.get(id)
     if (until === undefined) return false
     if (until > now()) return true
@@ -86,6 +99,8 @@ export function createManager(ctx, config, parts, {
     let info
     try { info = await ctx.session.get({ sessionID: record.id }) }
     catch {
+      // A record that was ended while the lookup ran (a fork, a deletion, a fault) keeps the refusal that ended it.
+      if (!active || record.dead) return
       // A lookup that fails is not proof of a child: ask again later, not on every event.
       refuse(record.id, now() + RETRY_LOOKUP_MS)
       records.delete(record.id)
@@ -119,22 +134,30 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (record.delivery.observe(event)) record.fire("state_changed", {})
-    if (event.type === "session.compaction.ended") {
-      // A compaction may drop the entry. Put it back or turn this session's chat off: no entry, no chat.
-      record.delivery.verifyContext().catch(error => {
-        try { void record.lifecycle.disable(describeFailure(error)) } catch { /* already latched */ }
-      })
+    // A compaction ended, or this is the first event since a gap: either may have dropped the binding entry.
+    if (record.stale || event.type === "session.compaction.ended") {
+      record.stale = false
+      readBack(record)
     }
+  }
+
+  // Put the binding entry back or turn this session's chat off: no entry, no chat. The delivery keeps its gate
+  // closed until this succeeds.
+  function readBack(record) {
+    record.delivery.verifyContext().catch(error => {
+      try { void record.lifecycle.disable(describeFailure(error)) } catch { /* already latched */ }
+    })
   }
 
   function feed(event) {
     if (!active) return
     const id = sessionOf(event)
     if (id === null) return
+    if (event.type === "session.deleted" && forked.delete(id)) return // the fork has ended: its evidence is spent
     if (event.type === "session.forked") {
       // This session is a fork: never a root. Recorded before any refusal check, lookup or join, so a fork is not
       // dropped during a temporary lookup refusal, and a lookup still in flight finds its record dead.
-      refuse(id, Infinity)
+      forked.add(id)
       const known = records.get(id)
       if (known) void dispose(known)
       return
@@ -142,7 +165,7 @@ export function createManager(ctx, config, parts, {
     if (isRefused(id)) return
     let record = records.get(id)
     if (!record) {
-      record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
+      record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null, stale: false }
       records.set(id, record)
       const first = event
       record.chain = record.chain.then(() => start(record, first)).catch(error => isolate(record, error))
@@ -157,6 +180,7 @@ export function createManager(ctx, config, parts, {
       record.chain = record.chain.then(() => {
         if (record.dead || !record.delivery) return
         record.delivery.reset()
+        record.stale = true // read back at the next event, once the stream has resumed
         record.fire("state_changed", {})
       }).catch(error => isolate(record, error))
     }

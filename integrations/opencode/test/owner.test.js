@@ -360,3 +360,140 @@ test("a removal that a session ended before the teardown began still holds the s
   assert.deepEqual(log, ["activate second"])
   assert.equal(entries.size, 0)
 })
+
+// Review 6003305717, finding 1: fork evidence is carried across a promotion.
+function realMember(lookups, started = []) {
+  const ctx = {
+    ...streamCtx([]),
+    session: { get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID, agent: "build" } } },
+  }
+  const parts = {
+    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createLifecycle: bus => {
+      bus.on("session_start", payload => started.push(payload.nativeSessionId))
+      return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) }
+    },
+  }
+  return createMember(ctx, {}, parts)
+}
+const forkedEvent = (id, sessionID) => ({ id, type: "session.forked", data: { sessionID, parentID: "ses_source" } })
+const startedEvent = (id, sessionID) => ({ id, type: "session.execution.started", data: { sessionID } })
+
+test("a fork that one owner observed is still refused by the next owner", async () => {
+  const registry = createRegistry()
+  const lookupsFirst = []
+  const lookupsNext = []
+  const started = []
+  const detachFirst = registry.attach(realMember(lookupsFirst))
+  registry.attach(realMember(lookupsNext, started))
+  await flush()
+  registry.dispatch(forkedEvent("e1", "ses_fork"))
+  await flush()
+  await detachFirst() // the next member becomes the owner
+  await flush()
+  registry.dispatch(startedEvent("e2", "ses_fork"))
+  await flush()
+  assert.deepEqual(lookupsNext, [])
+  assert.deepEqual(started, [])
+})
+
+test("a fork event that arrives between two owners is kept for the next one", async () => {
+  const registry = createRegistry()
+  const lookupsFirst = []
+  const lookupsNext = []
+  const started = []
+  const first = realMember(lookupsFirst)
+  let openGate
+  const gate = new Promise(resolve => { openGate = resolve })
+  const deactivate = first.deactivate
+  first.deactivate = async () => { await gate; return deactivate() } // the old owner is still ending
+  const detachFirst = registry.attach(first)
+  registry.attach(realMember(lookupsNext, started))
+  await flush()
+  const detaching = detachFirst()
+  await flush()
+  assert.equal(registry.owner(), null)
+  registry.dispatch(forkedEvent("e1", "ses_fork")) // no owner to take it
+  openGate()
+  await detaching
+  await flush()
+  registry.dispatch(startedEvent("e2", "ses_fork"))
+  await flush()
+  assert.deepEqual(lookupsNext, [])
+  assert.deepEqual(started, [])
+})
+
+// Review 6003305717, finding 2, ordering: `pump` resets when the stream breaks, before the wait and the resubscribe.
+// A compaction can still end after the break and before the stream resumes, and no event reports it.
+test("a compaction that ends after the stream broke and before it resumed is read back before delivery resumes", async () => {
+  const registry = createRegistry()
+  const entries = new Map()
+  const synthetic = []
+  let hold = false
+  let releaseList = null
+  let delivery = null
+  let rounds = 0
+  let breakStream
+  const broken = new Promise(resolve => { breakStream = resolve })
+  const ctx = {
+    event: {
+      subscribe(options) {
+        const round = ++rounds
+        return (async function* () {
+          if (round === 1) {
+            yield startedEvent("e1", "ses_a")
+            await broken
+            throw new Error("stream broke")
+          }
+          // The stream resumed with no `server.connected`: only the session's own events.
+          yield { id: "e2", type: "session.agent.selected", data: { sessionID: "ses_a", agent: "build" } }
+          yield { id: "e3", type: "session.inbox.enqueued", data: { sessionID: "ses_a", item: { type: "user" } } }
+          yield startedEvent("e4", "ses_a")
+          await new Promise(resolve => options.signal.addEventListener("abort", resolve, { once: true }))
+        })()
+      },
+    },
+    session: {
+      get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }),
+      synthetic: input => { synthetic.push(input); return Promise.resolve({ id: "msg_1" }) },
+      instructions: {
+        entry: {
+          put: async ({ key, value }) => { entries.set(key, value) },
+          list: async () => {
+            if (hold) await new Promise(resolve => { releaseList = resolve })
+            return [...entries].map(([key, value]) => ({ key, value }))
+          },
+          remove: async ({ key }) => { entries.delete(key) },
+        },
+      },
+    },
+  }
+  const noTimers = { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }
+  const parts = {
+    createDelivery: (hostCtx, id) => { delivery = createDelivery(hostCtx, id, noTimers); return delivery },
+    createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) } },
+  }
+  // The break happens first and the wait follows it. The read-back that the break triggers finishes first, and then a
+  // compaction ends during the wait, so its event is lost.
+  const sleep = async () => { await flush(); entries.clear(); hold = true }
+  registry.attach(createMember(ctx, {}, parts, { sleep }))
+  await flush()
+  await delivery.context("binding text")
+  assert.equal(entries.size, 1)
+  breakStream()
+  await flush()
+  await flush() // the wait inside `sleep` takes one flush of its own
+  assert.equal(rounds, 2) // the stream resumed
+  assert.equal(entries.size, 0) // the entry is gone, and no event said so
+  const batch = { content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }
+  let refusal = null
+  void delivery.deliver(batch, 5_000).then(result => { refusal = result })
+  await flush()
+  assert.deepEqual(refusal, { outcome: "deferred", reason: "busy" })
+  assert.equal(synthetic.length, 0)
+  hold = false
+  releaseList()
+  await flush()
+  assert.equal(entries.size, 1) // the entry is back
+  assert.equal(delivery.state(), null)
+})

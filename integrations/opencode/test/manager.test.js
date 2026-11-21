@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { EVENT_TYPES, createManager, isRootSession } from "../lib/manager.js"
+import { createDelivery } from "../lib/delivery.js"
 
 const config = { chatEnabled: true, directory: "/tmp/state", serverOrigin: "https://chat.example", hostToken: "synthetic-token", python: "/usr/bin/python3" }
 const flush = async () => { for (let index = 0; index < 8; index++) await new Promise(resolve => setImmediate(resolve)) }
@@ -327,4 +328,141 @@ test("a fork event stops a lookup that is still in flight before it can join", a
   await flush()
   assert.equal(parts.lifecycles.size, 0)
   assert.deepEqual(manager.sessions(), [])
+})
+
+// Review 6003305717, finding 1: fork evidence is permanent on every path.
+test("a lookup that rejects after a fork event does not turn the permanent refusal into a cooldown", async () => {
+  let clock = 1_000
+  let fail
+  const parts = stubParts()
+  const lookups = []
+  const ctx = { lookups, session: { get({ sessionID }) { lookups.push(sessionID); return new Promise((_resolve, reject) => { fail = reject }) } } }
+  const manager = createManager(ctx, config, parts, { now: () => clock })
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  manager.feed(event("session.forked", "ses_a", { parentID: "ses_source" }))
+  fail(new Error("unavailable"))
+  await flush()
+  clock += 61_000 // past the 60 second cooldown that a rejected lookup would set
+  ctx.session.get = async ({ sessionID }) => { lookups.push(sessionID); return root(sessionID) }
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(lookups, ["ses_a"])
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("fork evidence survives the refusal cache evicting its oldest entries", async () => {
+  const parts = stubParts()
+  const ctx = fakeCtx(id => (id === "ses_fork" ? root(id) : new Error("unavailable")))
+  const manager = createManager(ctx, config, parts, { now: () => 1_000 })
+  manager.feed(event("session.forked", "ses_fork", { parentID: "ses_source" }))
+  // Each of these lookups fails and is refused for 60 seconds. More than the cache holds pushes out its oldest entry.
+  for (let index = 0; index < 1_100; index++) manager.feed(event("session.execution.started", `ses_other_${index}`))
+  await flush()
+  manager.feed(event("session.execution.started", "ses_fork"))
+  await flush()
+  assert.equal(ctx.lookups.includes("ses_fork"), false)
+  assert.equal(parts.lifecycles.has("ses_fork"), false)
+})
+
+test("fork evidence is kept in the set the manager is given, and a deleted session drops it", async () => {
+  const forked = new Set()
+  const manager = createManager(fakeCtx(root), config, stubParts(), { forked })
+  manager.feed(event("session.forked", "ses_a", { parentID: "ses_source" }))
+  assert.equal(forked.has("ses_a"), true)
+  manager.feed(event("session.deleted", "ses_a"))
+  await flush()
+  assert.equal(forked.has("ses_a"), false) // the session has ended, so the set stays bounded by live forks
+})
+
+// Finding 2: a gap invalidates the binding proof, and the manager reads the binding back.
+test("a stream gap reads the binding back for every live session, at its first event after the gap", async () => {
+  const verified = []
+  const parts = stubParts({ verify: id => { verified.push(id); return Promise.resolve() } })
+  const manager = createManager(fakeCtx(root), config, parts)
+  manager.feed(event("session.execution.started", "ses_a"))
+  manager.feed(event("session.execution.started", "ses_b"))
+  await flush()
+  manager.reset()
+  await flush()
+  assert.deepEqual(verified, []) // the stream has not resumed yet, so a read-back now would end before the gap does
+  manager.feed(event("session.agent.selected", "ses_a", { agent: "build" }))
+  await flush()
+  assert.deepEqual(verified, ["ses_a"]) // only the session that has heard from the new stream
+  manager.feed(event("session.execution.started", "ses_b"))
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(verified.sort(), ["ses_a", "ses_b"]) // once per gap, not once per event
+})
+
+test("a read-back that fails after a gap turns that session's chat off and no other", async () => {
+  const parts = stubParts({ verify: id => (id === "ses_a" ? Promise.reject(Object.assign(new Error("x"), { code: "CHAT_CONTEXT_UNAVAILABLE" })) : Promise.resolve()) })
+  const manager = createManager(fakeCtx(root), config, parts)
+  manager.feed(event("session.execution.started", "ses_a"))
+  manager.feed(event("session.execution.started", "ses_b"))
+  await flush()
+  manager.reset()
+  manager.feed(event("session.execution.started", "ses_a"))
+  manager.feed(event("session.execution.started", "ses_b"))
+  await flush()
+  assert.equal(parts.lifecycles.get("ses_a").disables.length, 1)
+  assert.equal(parts.lifecycles.get("ses_b").disables.length, 0)
+})
+
+test("a compaction whose end is lost in a gap cannot reach synthetic before the binding is read back", async () => {
+  const entries = new Map()
+  const synthetic = []
+  let hold = false
+  let releaseList = null
+  const ctx = {
+    session: {
+      async get({ sessionID }) { return root(sessionID) },
+      synthetic(input) { synthetic.push(input); return Promise.resolve({ id: "msg_1" }) },
+      instructions: {
+        entry: {
+          async put({ key, value }) { entries.set(key, value) },
+          async list() {
+            if (hold) await new Promise(resolve => { releaseList = resolve })
+            return [...entries].map(([key, value]) => ({ key, value }))
+          },
+          async remove({ key }) { entries.delete(key) },
+        },
+      },
+    },
+  }
+  let delivery = null
+  const parts = stubParts()
+  parts.createDelivery = (hostCtx, id) => {
+    delivery = createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} })
+    return delivery
+  }
+  const manager = createManager(ctx, config, parts)
+  const send = (type, data = {}) => manager.feed(event(type, "ses_a", data))
+  send("session.execution.started")
+  await flush()
+  await delivery.context("binding text")
+  assert.equal(entries.size, 1)
+  entries.clear() // a compaction dropped the entry, and the event that ends it falls into the gap
+  hold = true // the read-back stays in flight until the test lets it finish
+  manager.reset()
+  await flush()
+  send("session.agent.selected", { agent: "build" })
+  send("session.inbox.enqueued", { item: { type: "user" } })
+  send("session.execution.started")
+  await flush()
+  const batch = { content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }
+  let refusal = null
+  void delivery.deliver(batch, 5_000).then(result => { refusal = result })
+  await flush()
+  assert.deepEqual(refusal, { outcome: "deferred", reason: "busy" })
+  assert.equal(synthetic.length, 0)
+  hold = false
+  releaseList()
+  await flush()
+  assert.equal(entries.size, 1) // the entry is back
+  assert.equal(delivery.state(), null)
+  const sent = delivery.deliver(batch, 5_000)
+  await flush()
+  assert.equal(synthetic.length, 1)
+  void sent
 })

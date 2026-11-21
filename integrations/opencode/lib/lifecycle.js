@@ -15,7 +15,7 @@
 //
 // This module never starts a model turn on its own and never treats a peer message as authorization.
 import { randomUUID } from "node:crypto"
-import { NOTICE_BOUND } from "./channel.js"
+import { NOTICE_BOUND, monotonicNow } from "./channel.js"
 import { packCandidates, renderNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
 import { describeFailure, startWorker } from "./worker.js"
@@ -42,7 +42,7 @@ const contextUnavailable = () => Object.assign(new Error("CHAT_CONTEXT_UNAVAILAB
 
 export function createLifecycle(bus, delivery, config, {
   startProcess = startWorker,
-  now = Date.now,
+  now = monotonicNow,
   random = Math.random,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
@@ -215,9 +215,9 @@ export function createLifecycle(bus, delivery, config, {
       while ((dirty || pollDue) && live && !closed && !disabled) {
         if (dirty) {
           dirty = false
-          const result = await request("heartbeat", { state: heartbeatState() })
-          const code = refused(result)
-          if (code && REJOIN_AFTER.has(code)) throw Object.assign(new Error(code), { code, operation: "heartbeat" })
+          // A `refused` answer is the worker's brief-outage reply: it keeps the binding alive and the next heartbeat
+          // is the retry. Only a worker error, which `request` rejects with, ends the worker.
+          await request("heartbeat", { state: heartbeatState() })
         }
         if (pollDue && live) {
           pollDue = false
@@ -233,11 +233,8 @@ export function createLifecycle(bus, delivery, config, {
     const bodies = config.noticeBodies === true
     const candidates = await request("pending", bodies ? { bodies: true } : {})
     if (!live) return
-    const refusalCode = refused(candidates)
-    if (refusalCode) {
-      if (REJOIN_AFTER.has(refusalCode)) throw Object.assign(new Error(refusalCode), { code: refusalCode, operation: "pending" })
-      return
-    }
+    // The same brief-outage reply: nothing was read, and the next poll is the retry.
+    if (refused(candidates)) return
     const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
     if (!ids.length) return
     // The native half is the only owner of eligibility: a session that is not proved to be running, or is stopped,

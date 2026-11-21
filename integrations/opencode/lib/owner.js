@@ -12,7 +12,7 @@
 //
 // The registry holds members and their callbacks. The config, and with it the host token, lives only in the
 // closures a member was built from; no property of the registry or of a member carries it.
-import { EVENT_TYPES, createManager } from "./manager.js"
+import { EVENT_TYPES, createManager, forkedSessionOf } from "./manager.js"
 
 const REGISTRY_KEY = Symbol.for("agent-chat.opencode.registry.v1")
 const MAX_SEEN_EVENTS = 1024
@@ -22,6 +22,7 @@ const RECONNECT_MAX_MS = 30_000
 export function createRegistry() {
   const members = []
   const seen = new Set() // event ids, newest last, bounded
+  const forks = new Set() // sessions known to be forks: every owner gets this set, so a promotion forgets none
   let owner = null
   let turn = Promise.resolve()
 
@@ -29,10 +30,13 @@ export function createRegistry() {
 
   function promote() {
     owner = members[0] ?? null
-    if (owner) owner.activate()
+    if (owner) owner.activate(forks)
   }
 
   function dispatch(event) {
+    // Recorded before the owner check: a fork event between two owners is kept for the next one.
+    const forked = forkedSessionOf(event)
+    if (forked !== null) forks.add(forked)
     if (!owner) return
     const id = event?.id
     if (typeof id === "string" && id) {
@@ -122,7 +126,7 @@ export function createMember(ctx, config, parts, { managerOptions = {}, sleep = 
       void pump(dispatch, reset).catch(() => {})
       return () => controller.abort()
     },
-    activate() { manager = createManager(ctx, config, parts, managerOptions) },
+    activate(forked) { manager = createManager(ctx, config, parts, { ...managerOptions, forked }) },
     async deactivate() {
       const ending = manager
       manager = null

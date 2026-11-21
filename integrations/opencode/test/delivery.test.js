@@ -424,10 +424,11 @@ test("a read-back that finishes after a second compaction ended does not reopen 
 })
 
 // Finding 5: after a gap both the agent and the stop latch are only what the events last showed.
-test("a stream gap makes the selected agent unknown again, so Plan Mode needs fresh evidence", () => {
+test("a stream gap makes the selected agent unknown again, so Plan Mode needs fresh evidence", async () => {
   const { delivery } = running()
   assert.equal(delivery.state(), null)
   delivery.reset()
+  await delivery.verifyContext() // a gap also needs the binding read back; nothing is published here
   delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
   delivery.observe(event("session.execution.started"))
   assert.equal(delivery.state(), "unknown") // the old `build` selection is not carried over
@@ -437,9 +438,10 @@ test("a stream gap makes the selected agent unknown again, so Plan Mode needs fr
   assert.equal(delivery.state(), null)
 })
 
-test("a stream gap latches stop again, so a missed operator interrupt cannot stay hidden", () => {
+test("a stream gap latches stop again, so a missed operator interrupt cannot stay hidden", async () => {
   const { delivery } = running()
   delivery.reset()
+  await delivery.verifyContext() // a gap also needs the binding read back; nothing is published here
   delivery.observe(event("session.agent.selected", { agent: "build" }))
   delivery.observe(event("session.execution.started"))
   assert.equal(delivery.state(), "stopped") // the cleared latch is not carried over
@@ -490,4 +492,76 @@ test("a receipt before the absolute deadline is still handed", async () => {
   current = 3_999
   delivery.observe(event("session.inbox.delivered", { inboxID: "msg_1" }))
   assert.deepEqual(await result, { outcome: "handed", reason: null })
+})
+
+// Review 6003305717, finding 2: a gap invalidates the binding proof.
+test("a stream gap closes the gate until the binding is read back, whatever fresh events follow", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  ctx.entries.clear() // a compaction removed the entry, and the event that ends it fell into the gap
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  assert.equal(delivery.state(), "busy")
+  assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "deferred", reason: "busy" })
+  assert.equal(ctx.calls.synthetic.length, 0)
+  await delivery.verifyContext()
+  assert.equal(ctx.entries.get(BINDING_KEY), "binding") // put back
+  assert.equal(delivery.state(), null)
+})
+
+test("a read-back that began before a gap does not reopen the gate", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  const releases = []
+  const list = ctx.session.instructions.entry.list
+  ctx.session.instructions.entry.list = async () => { await new Promise(resolve => releases.push(resolve)); return list() }
+  delivery.reset()
+  const first = delivery.verifyContext()
+  await flush()
+  delivery.reset() // the stream broke again while the first read-back was running
+  const second = delivery.verifyContext()
+  releases[0]()
+  await first
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  assert.equal(delivery.state(), "busy") // the second gap has not been read back yet
+  await flush()
+  releases[1]()
+  await second
+  assert.equal(delivery.state(), null)
+})
+
+test("a read-back that fails after a gap keeps the gate closed", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  ctx.entries.clear()
+  ctx.session.instructions.entry.put = async () => { throw new Error("unavailable") }
+  delivery.reset()
+  await assert.rejects(delivery.verifyContext(), { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  assert.equal(delivery.state(), "busy")
+  assert.equal(ctx.calls.synthetic.length, 0)
+})
+
+// Finding 4 (non-blocking): reservation arithmetic and receipt checks share one monotonic clock.
+test("the default clock is monotonic: a wall-clock step cannot decide whether a reservation is over", async t => {
+  const realNow = Date.now
+  Date.now = () => 0 // the wall clock reads 0, whatever the monotonic clock says
+  t.after(() => { Date.now = realNow })
+  const ctx = fakeCtx()
+  const delivery = createDelivery(ctx, SESSION)
+  delivery.seed({ agent: "build" })
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  const result = await delivery.deliver(batch(), performance.now() - 1) // already over on the monotonic clock
+  assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+  assert.equal(ctx.calls.synthetic.length, 0)
 })

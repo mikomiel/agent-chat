@@ -1,4 +1,4 @@
-import test, { mock } from "node:test"
+import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { readFileSync } from "node:fs"
@@ -735,9 +735,23 @@ const stdioChild = () => {
   return child
 }
 
+// A hand-written timer stub, so no test depends on the test runner's mock clock (Node 20.11 and later). It records each
+// `setTimeout` callback and fires the ones with a given delay on demand. `t.after` puts the originals back.
+function stubTimeouts(t) {
+  const realSet = globalThis.setTimeout
+  const realClear = globalThis.clearTimeout
+  const pending = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { const id = next++; pending.set(id, { fn, ms }); return id }
+  globalThis.clearTimeout = id => { pending.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear })
+  return {
+    fire(ms) { for (const [id, timer] of [...pending]) if (timer.ms === ms) { pending.delete(id); timer.fn() } },
+  }
+}
+
 test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
-  mock.timers.enable({ apis: ["setTimeout"] })
-  t.after(() => mock.timers.reset())
+  const clock = stubTimeouts(t)
   const children = []
   const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
   const retries = []
@@ -757,7 +771,7 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   await flush()
   children[0].stdout.write(`${JSON.stringify({ id: 0, result: joined })}\n`)
   await flush() // joined and bound; the first heartbeat is written and never answered
-  mock.timers.tick(22_000)
+  clock.fire(22_000)
   await flush()
   assert.doesNotMatch(notices.join("\n"), /stopped/, "not a permanent disable")
   assert.match(notices.join("\n"), /reconnecting/)
@@ -766,4 +780,88 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   retries[0].fn()
   await flush()
   assert.equal(children.length, 2, "a fresh worker joins after the back-off")
+})
+
+// Review 6003305717, finding 3: the worker's nonterminal refusals keep the worker and the binding.
+test("brief heartbeat and pending refusals keep the worker and the binding and spend no rejoin budget", async () => {
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  let refusal = null // the code the worker answers with, or null for a normal answer
+  const worker = fakeWorker({
+    answer: op => {
+      if (refusal && (op === "heartbeat" || op === "pending")) return { refused: refusal }
+      return op === "pending" ? { messages: [] } : {}
+    },
+  })
+  let starts = 0
+  const retries = []
+  const notices = []
+  const lifecycle = createLifecycle(bus, delivery, config, {
+    ...timers,
+    startProcess: () => { starts += 1; return worker },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    notice: text => notices.push(text),
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  const contextBefore = delivery.calls.context.length
+  // Four brief outages, one more than the hourly rejoin budget allows.
+  for (const [operation, code] of [
+    ["heartbeat", "SERVICE_UNAVAILABLE"], ["pending", "TRANSPORT_UNAVAILABLE"],
+    ["heartbeat", "REQUEST_UNCERTAIN"], ["pending", "SERVICE_UNAVAILABLE"],
+  ]) {
+    refusal = code
+    await (operation === "heartbeat" ? lifecycle.heartbeat() : lifecycle.poll())
+  }
+  assert.equal(starts, 1, "the same worker keeps serving")
+  assert.deepEqual(retries, [], "no rejoin is scheduled")
+  assert.doesNotMatch(notices.join("\n"), /reconnecting|stopped/)
+  assert.equal(delivery.calls.disable, 0)
+  assert.equal(delivery.calls.context.length, contextBefore, "the binding entry is not cleared")
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.equal(await Promise.race([worker.closed.then(() => "ended"), flush().then(() => "serving")]), "serving")
+  refusal = null // the next tick is the retry
+  const before = worker.requests.length
+  await lifecycle.heartbeat()
+  assert.equal(worker.requests.length, before + 1)
+  assert.equal(worker.requests.at(-1).op, "heartbeat")
+})
+
+test("a terminal worker error on a heartbeat still rejoins, like the core's own code", async () => {
+  const bus = fakeBus()
+  const terminal = Object.assign(new Error("CHAT_WORKER_REFUSED"), { code: "CHAT_WORKER_REFUSED", workerCode: "SERVICE_UNAVAILABLE" })
+  let failing = false
+  const worker = fakeWorker({ answer: op => { if (failing && op === "heartbeat") throw terminal; return op === "pending" ? { messages: [] } : {} } })
+  const retries = []
+  const notices = []
+  const lifecycle = createLifecycle(bus, fakeDelivery(), config, {
+    ...timers, startProcess: () => worker, now: () => 1000, random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    notice: text => notices.push(text),
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  failing = true
+  await lifecycle.heartbeat()
+  assert.match(notices.join("\n"), /reconnecting/)
+  assert.equal(retries.length, 1)
+})
+
+// Finding 4 (non-blocking): the reservation deadline the lifecycle hands to the native half is on a monotonic clock.
+test("the default clock for a reservation is monotonic", async () => {
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  const worker = fakeWorker({ answer: op => deliveryAnswer(op) })
+  const lifecycle = createLifecycle(bus, delivery, config, { ...timers, startProcess: () => worker })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  fakeDelivery.last.open()
+  const before = performance.now()
+  await lifecycle.poll()
+  const after = performance.now()
+  assert.equal(delivery.calls.deliver.length, 1)
+  const { deadline } = delivery.calls.deliver[0]
+  assert.ok(deadline >= before + 20_000 && deadline <= after + 20_000, `deadline ${deadline} is not on the monotonic clock`)
 })

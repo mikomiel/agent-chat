@@ -1,4 +1,4 @@
-import test, { mock } from "node:test"
+import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
@@ -96,14 +96,28 @@ test("a relative directory or an unexpected harness is refused before spawn", ()
   assert.equal(spawns, 0)
 })
 
+// A hand-written timer stub, so no test depends on the test runner's mock clock (Node 20.11 and later). It records each
+// `setTimeout` callback and fires the ones with a given delay on demand. `t.after` puts the originals back.
+function stubTimeouts(t) {
+  const realSet = globalThis.setTimeout
+  const realClear = globalThis.clearTimeout
+  const pending = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { const id = next++; pending.set(id, { fn, ms }); return id }
+  globalThis.clearTimeout = id => { pending.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear })
+  return {
+    fire(ms) { for (const [id, timer] of [...pending]) if (timer.ms === ms) { pending.delete(id); timer.fn() } },
+  }
+}
+
 test("a request that outlives the parent-side deadline rejects with the core's REQUEST_UNCERTAIN", async t => {
-  mock.timers.enable({ apis: ["setTimeout"] })
-  t.after(() => mock.timers.reset())
+  const clock = stubTimeouts(t)
   const { child } = harness()
   const worker = startWorker(config, identity, { spawnImpl: () => child })
   child.stdout.write(`${JSON.stringify({ id: 0, result: { session_id: "s", instance_id: "i", room_id: "r", host: "h", harness: "opencode", instance_file: "/tmp/s.json" } })}\n`)
   await worker.ready
   const heartbeat = worker.request("heartbeat", { state: { native_state: "idle", stopped: false, plan_mode: false } })
-  mock.timers.tick(22_000)
+  clock.fire(22_000)
   await assert.rejects(heartbeat, { code: "REQUEST_UNCERTAIN", operation: "heartbeat" })
 })

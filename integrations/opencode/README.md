@@ -133,16 +133,21 @@ The service and its host-token provisioning are documented in the product
   never joins. A fork is refused as well: whether a fork sets `parentID` is not
   confirmed, so a session that might be a fork stays out. A `session.forked`
   event is recorded before any lookup or join, and it is kept while lookups
-  are refused; a lookup already in flight cannot join afterwards. Events of one session
-  run in order on that session's own chain. A fault there ends that session's
+  are refused; a lookup already in flight cannot join afterwards, whether it
+  answers or fails. The record is its own set. No cache evicts it, a session
+  that is deleted drops it, and the next owner receives it, including an
+  event that arrived between two owners. Events of one session run in order on that session's own chain. A fault there ends that session's
   chat and no other. A faulted or deleted session does not rejoin in this
   process.
 - **State comes from durable events only.** `session.execution.started`
   means busy. `succeeded`, `failed` and `interrupted` mean idle. A fact no
   event has shown is `unknown`, and `unknown` never reads as idle. A lost or
   restarted event stream resets every session: the run state and the selected
-  agent become unknown and the stop latch is set again. Only fresh events clear
-  them.
+  agent become unknown, the stop latch is set again and the binding counts as
+  unverified. Only fresh events clear the first three. The fourth waits for a
+  read-back of the entry, which runs at the session's first event after the
+  gap: the stream has resumed by then, so a compaction that ended inside the
+  gap is already over.
 - **Stop and Plan Mode.** Every session starts chat-stopped. A `user` inbox
   item clears the stop. An interrupt with reason `user` sets it again. Other
   interrupt reasons do not. While the selected agent is `plan`, the session
@@ -154,11 +159,15 @@ The service and its host-token provisioning are documented in the product
   the session's chat ends. After each put the plugin reads the entries back.
   A put that fails or leaves no entry turns that session's chat off before
   anything is offered: no heartbeat, no pending read, no claim. There is no
-  fallback to a prompt message. After a compaction the plugin checks the entry
-  again and puts it back, or turns chat off. The session reads `busy` from
-  `session.compaction.ended` until that check has succeeded, so no claim and no
-  send runs in between. A compaction that ends while an earlier check is still
-  running is covered by its own check.
+  fallback to a prompt message. After a compaction, and after a lost event
+  stream, the plugin checks the entry again and puts it back, or turns that
+  session's chat off. The session reads `busy` from `session.compaction.ended`,
+  and from the gap, until that check has succeeded, so no claim and no send
+  runs in between. The check after a gap waits for the session's first event
+  after it, and a check that fails then turns that session's chat off. A
+  compaction or a gap that comes while an earlier check is
+  still running is covered by its own check. A compaction that ended inside a
+  gap is covered too, because the gap alone invalidates the proof.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input
@@ -174,7 +183,9 @@ The service and its host-token provisioning are documented in the product
 - **Hazard rule.** A run that ends (`succeeded`, `failed` or `interrupted`)
   before the delivered event settles `uncertain`. So do a call that throws or
   rejects, a missed reservation deadline, a lost event stream and a disabled or
-  disposed session. A receipt that arrives at or after the reservation
+  disposed session. The reservation arithmetic and the receipt checks read one
+  monotonic clock, so a wall-clock correction cannot extend a delivery window.
+  A receipt that arrives at or after the reservation
   deadline is late, even when the timer has not run yet: a `delivered` or
   `cancelled` event or a `synthetic` result then settles `uncertain` too. A
   later `delivered` event for a settled input is ignored,
@@ -191,6 +202,11 @@ The service and its host-token provisioning are documented in the product
   replaces the old binding. A worker request with no answer after 22 seconds
   ends that worker and rejoins as the core's own `REQUEST_UNCERTAIN` does. A
   worker that dies or breaks the protocol still turns that session's chat off.
+  A heartbeat or pending read that the worker answers with `refused` is a
+  brief outage, not a failure. The worker and the binding stay, no rejoin
+  budget is spent and the next heartbeat or poll is the retry. The worker ends
+  itself with an error once an outage lasts as long as the server lease, and
+  that error rejoins as above.
 - **No title.** Heartbeats carry no session title.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
@@ -248,7 +264,7 @@ unverified, inferred, or a deliberate choice.
   belongs to another location. If it cannot, that session never joins.
 - **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
-  after each put and each compaction. After a crash an entry can remain with a
+  after each put, each compaction and each gap. After a crash an entry can remain with a
   stale binding. The next join replaces it. An owner change waits for the old
   owner's `entry.remove`, and for any context operation queued before it, to
   settle. A call that never returns blocks the failover and the cleanup.
@@ -257,8 +273,9 @@ unverified, inferred, or a deliberate choice.
 - **Agent after a gap.** Whether the host emits `session.agent.selected` again
   without an agent switch. If it does not, a session stays out of chat after a
   lost event stream, or after an instance that did not own the joins is torn
-  down, until its agent next changes. A compaction that ends entirely inside
-  such a gap is not read back either.
+  down, until its agent next changes. Each such gap also costs a read-back of
+  the binding entry. If that read-back fails, that session's chat is turned
+  off, as it is after a compaction.
 - **Plain JavaScript plugin.** See "Install".
 - **Node built-ins.** Whether the plugin runtime allows `node:child_process`.
 - **Connection key.** How the connection-key work in issues #126 to #128

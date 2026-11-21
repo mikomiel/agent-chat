@@ -11,3 +11,7 @@ export const NOTICE_BOUND = MAX_CONTEXT_BYTES - Buffer.byteLength(CHAT_PREFIX, "
 export const BINDING_KEY = "agent-chat-binding"
 // Marks the synthetic input as this adapter's, so a reader of the session log can tell it from a peer or a user.
 export const CHAT_SOURCE = "agent-chat"
+// The one clock for reservation arithmetic and receipt deadline checks, in milliseconds. It is monotonic, so a
+// wall-clock correction can neither extend nor cut a delivery window. Lifecycle and delivery must share it: the
+// lifecycle hands the delivery an absolute deadline on this clock.
+export const monotonicNow = () => performance.now()

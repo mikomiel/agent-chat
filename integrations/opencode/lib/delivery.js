@@ -11,11 +11,12 @@
 // deadline, a throwing call and a lost event stream are all `uncertain`: the input may be parked and drain later, and
 // a later `delivered` for it is ignored. Only `session.inbox.cancelled` for the id proves that nothing ran.
 //
-// A compaction may drop the binding entry. From `session.compaction.ended` the gate stays closed until the entry has
-// been read back (`verifyContext`); a read-back that fails keeps it closed, and the manager then turns chat off.
+// A compaction may drop the binding entry, and a lost event stream may have hidden one. From `session.compaction.ended`
+// and from a stream gap the gate stays closed until the entry has been read back (`verifyContext`); a read-back that
+// fails keeps it closed, and the manager then turns chat off.
 //
 // State is read from events only. A fact the events have not shown is unknown, and unknown never reads as idle.
-import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES } from "./channel.js"
+import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES, monotonicNow } from "./channel.js"
 
 const MAX_ATTEMPTS = 128
 const MAX_SEEN = 64
@@ -26,7 +27,7 @@ const PLAN_AGENT = "plan"
 const contextFailure = () => Object.assign(new Error("CHAT_CONTEXT_UNAVAILABLE"), { code: "CHAT_CONTEXT_UNAVAILABLE" })
 
 export function createDelivery(ctx, sessionID, {
-  now = Date.now,
+  now = monotonicNow,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
 } = {}) {
@@ -35,8 +36,8 @@ export function createDelivery(ctx, sessionID, {
   let stopped = true // every session starts chat-stopped; an operator prompt clears it
   let executing = null // true, false, or null when no event has shown it
   let compacting = false
-  let unverified = false // a compaction ended and the binding entry has not been read back since
-  let compactions = 0 // compaction endings so far: a read-back that began before the latest one proves nothing
+  let unverified = false // a compaction ended, or the stream broke, and the binding entry has not been read back since
+  let compactions = 0 // compaction endings and gaps so far: a read-back that began before the latest one proves nothing
   let agent = null
   let pending = null // at most one issued input: { id, resolve, timer, deadline }
   let published = null // the binding text the entry should hold now
@@ -146,12 +147,15 @@ export function createDelivery(ctx, sessionID, {
 
   // The event stream broke or restarted: events may be missing, so every observation is stale. The selected agent
   // and the stop latch are observations too: a missed agent switch or operator interrupt must not stay hidden, so
-  // both go back to their start values and only fresh events clear them.
+  // both go back to their start values and only fresh events clear them. So is the binding proof: a compaction
+  // may have ended inside the gap, so the entry counts as unverified until the next read-back.
   function reset() {
     executing = null
     compacting = false
     agent = null
     stopped = true
+    unverified = true
+    compactions += 1
     abandon()
   }
 
