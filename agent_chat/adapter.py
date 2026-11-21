@@ -179,15 +179,19 @@ class Adapter:
         self._clear_schedule()
         joined = self.joined
         self.joined = None
-        self.delivery.context(None)
-        if joined is None:
-            return
+        # The record goes before anything that can stall or fail: the harness callback or the end request. Once it
+        # is removed, a new open of the path finds nothing, even if the harness is killed during shutdown. The removal
+        # never raises, so a failed one still lets the callback and the end run.
+        if joined is not None:
+            instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
         try:
-            self.operations.end(joined, deadline=self._request_deadline())
-        except (ChatError, OSError):
-            # A failed end keeps the record; the server lease remains the fallback.
-            return
-        instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
+            self.delivery.context(None)
+        finally:
+            if joined is not None:
+                try:
+                    self.operations.end(joined, deadline=self._request_deadline())
+                except (ChatError, OSError):
+                    pass  # The server lease ends the instance.
 
     def tick(self, now: float | None = None) -> float | None:
         """Run one due heartbeat, poll or join attempt; return the next deadline."""
