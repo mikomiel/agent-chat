@@ -3,7 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { CLIENT_ID_PREFIX, createThread, isChildThread, MIN_ADD_MS, openAppServer } from "../lib/appserver.js"
+import { CLIENT_ID_PREFIX, createThread, isChildThread, MIN_ADD_MS, openAppServer, SETTLE_MS } from "../lib/appserver.js"
 import { fakeAppServer, serverFrame } from "./fake-app-server.js"
 
 const THREAD = "thread-1"
@@ -219,6 +219,28 @@ test("a probe that cannot be completed leaves the route undecided and the thread
   assert.equal(gone.route, null)
 })
 
+test("the provider is recorded only for a loaded thread that is not a child, and before the queue probe", async () => {
+  // The receiver reads it as "a main thread was found": a probe that fails still leaves it recorded.
+  await withServer(main({ "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }), async path => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "unavailable" })
+    assert.equal(bound.provider, "openai")
+  })
+  const cases = [
+    ["not loaded", main({ "thread/loaded/list": () => ok({ data: ["other"], nextCursor: null }) })],
+    ["a child", main({ "thread/read": () => ok({ thread: thread({ parentThreadId: "p" }) }) })],
+    ["no provider", main({ "thread/read": () => ok({ thread: thread({ modelProvider: "" }) }) })],
+    ["an unreadable thread", main({ "thread/read": () => ({ error: { code: -32600, message: "x" } }) })],
+  ]
+  for (const [label, handler] of cases) {
+    await withServer(handler, async path => {
+      const bound = createThread({ path, threadId: THREAD })
+      await bound.bind()
+      assert.equal(bound.provider, null, label)
+    })
+  }
+})
+
 // ---- observe ---------------------------------------------------------------------------------------------------
 
 async function observeWith(over) {
@@ -305,11 +327,11 @@ const queueServer = (over = {}) => main({
   "thread/items/list": () => ok({ data: [], nextCursor: null }),
   ...over,
 })
-async function wakeWith(over, { reservation = 5000, text = "queued text" } = {}) {
+async function wakeWith(over, { reservation = 5000, text = "queued text", proceed } = {}) {
   return withServer(queueServer(over), async (path, server) => {
     const ticks = clock()
     const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
-    const result = await bound.wake({ text, attemptId: "attempt-9", until: ticks.now() + reservation })
+    const result = await bound.wake({ text, attemptId: "attempt-9", until: ticks.now() + reservation, ...(proceed ? { proceed } : {}) })
     return { result, log: server.log, methods: server.methods(), ticks }
   })
 }
@@ -386,21 +408,71 @@ test("an error after the add frame was written is uncertain, at every step", asy
 })
 
 test("an add that gets no answer is uncertain, and is never sent twice", async () => {
-  const { result, methods } = await wakeWith({ "thread/queue/add": () => undefined }, { reservation: 700 })
+  const { result, methods } = await wakeWith({ "thread/queue/add": () => undefined }, { reservation: SETTLE_MS + 700 })
   assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
   assert.equal(methods.filter(method => method === "thread/queue/add").length, 1)
   assert.equal(methods.includes("thread/queue/delete"), false)
 })
 
-test("a failure before the add frame is written is failed, and a reservation under half a second sends nothing", async () => {
+test("a failure before the add frame is written is failed, and under half a second left after the margin sends nothing", async () => {
   const absent = createThread({ path: join(dir, "absent.sock"), threadId: THREAD })
   assert.deepEqual(await absent.wake({ text: "t", attemptId: "a", until: Date.now() + 5000 }), { outcome: "failed", reason: "native_unavailable" })
   assert.equal(MIN_ADD_MS, 500)
-  const { result, methods } = await wakeWith({}, { reservation: MIN_ADD_MS - 1 })
+  const { result, methods } = await wakeWith({}, { reservation: SETTLE_MS + MIN_ADD_MS - 1 })
   assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
   assert.deepEqual(methods, ["initialize"], "no add frame")
-  const exactly = await wakeWith({}, { reservation: MIN_ADD_MS })
-  assert.ok(exactly.methods.includes("thread/queue/add"), "half a second left is enough")
+  const exactly = await wakeWith({}, { reservation: SETTLE_MS + MIN_ADD_MS })
+  assert.ok(exactly.methods.includes("thread/queue/add"), "half a second left after the margin is enough")
+})
+
+test("the settlement margin comes off the reservation first: with less than the margin and half a second left, nothing is sent", async () => {
+  assert.equal(SETTLE_MS, 1000)
+  for (const reservation of [MIN_ADD_MS + 200, SETTLE_MS, 0, -1]) {
+    const { result, methods } = await wakeWith({}, { reservation })
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" }, `${reservation} ms`)
+    assert.equal(methods.includes("thread/queue/add"), false, `${reservation} ms: no add frame`) // a connection that ran out of time never reached initialize
+  }
+})
+
+test("the add is not sent when the receiver says the state changed: deferred with its reason, no add frame", async () => {
+  const asked = []
+  const stale = await wakeWith({}, { proceed: () => { asked.push("asked"); return "stopped" } })
+  assert.deepEqual(stale.result, { outcome: "deferred", reason: "stopped" })
+  assert.deepEqual(stale.methods, ["initialize"], "no add frame")
+  assert.deepEqual(asked, ["asked"], "asked once, after the connection was ready")
+  const clear = await wakeWith({}, { proceed: () => null })
+  assert.deepEqual(clear.methods.slice(0, 2), ["initialize", "thread/queue/add"])
+})
+
+// A reply that comes later than the reservation allows: real time, because the point is where the wake gives up. One
+// test per step, so each shows up by name.
+const slowReplies = {
+  "thread/queue/add": message => ok({ queuedSubmission: { id: "q1", input: message.params.input, clientUserMessageId: message.params.clientUserMessageId } }),
+  "thread/queue/delete": () => ok({ deleted: false }),
+  "thread/items/list": () => ok({ data: [], nextCursor: null }),
+}
+for (const slow of Object.keys(slowReplies)) {
+  test(`a slow ${slow} reply ends the wake SETTLE_MS before the reservation, so the result can still be recorded`, async () => {
+    const handler = queueServer({ [slow]: async (...args) => { await new Promise(resolve => setTimeout(resolve, 1500)); return slowReplies[slow](...args) } })
+    await withServer(handler, async path => {
+      const until = Date.now() + SETTLE_MS + 600
+      const result = await createThread({ path, threadId: THREAD }).wake({ text: "t", attemptId: "attempt-9", until })
+      const left = until - Date.now()
+      assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+      assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
+    })
+  })
+}
+
+test("a connection that never finishes ends the wake SETTLE_MS before the reservation too, with nothing sent", async () => {
+  await withServer(() => undefined, async (path, server) => {
+    const until = Date.now() + SETTLE_MS + 600
+    const result = await createThread({ path, threadId: THREAD }).wake({ text: "t", attemptId: "attempt-9", until })
+    const left = until - Date.now()
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), ["initialize"], "nothing past initialize was sent")
+    assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
+  }, { initialize: false })
 })
 
 test("the wake connection is closed when it is done", async () => {

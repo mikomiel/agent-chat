@@ -86,7 +86,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | Field | Meaning |
 |---|---|
 | `chatEnabled` | Must be `true`; any other value keeps chat off. |
-| `directory` | Absolute state directory, created beforehand, owned by the current user, mode `0700`. It holds the receiver socket and its lock, so its path must be 72 bytes or fewer. |
+| `directory` | Absolute state directory, created beforehand, owned by the current user, mode `0700`. It holds the receiver socket and its locks, so its path must be 72 bytes or fewer. |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
@@ -151,8 +151,10 @@ sends its request: it does not wait for the worker to end its instance.
   confirms it wrote and flushed the output.
 - **Idle wake.** See below.
 - **Settlement.** A refused output settles `failed`; a failed write, a missing
-  receipt or a reservation too short to write inside settles `uncertain`.
-  Nothing is ever replayed.
+  receipt or a reservation too short to write inside settles `uncertain`. The
+  adapter never writes the same attempt twice. The ledger, not the adapter,
+  offers a `failed` or `deferred` batch again as a new attempt after a backoff,
+  at most three attempts in all; an `uncertain` batch is not offered again.
 - **Output budget.** Codex sends a hook's `additionalContext` to the model
   whole up to an approximate token threshold (2,500 by default), saves a
   longer one to a file and shows a preview. `hooks/hooks.json` sets
@@ -185,6 +187,11 @@ sends its request: it does not wait for the worker to end its instance.
     one-shot `exec` run or a sub-agent. The first hook output says so, and
     the same check runs again on each heartbeat read taken while nothing is
     known to run.
+  - With `appServer`, the worker starts only after a positive check: a loaded
+    thread that is not a child. A thread the app-server does not list yet, a
+    read that does not answer within 3 seconds and a read that fails each mean
+    no join yet. The receiver asks again after 30 seconds, claims nothing in
+    the meantime, and a retry spends none of the rejoin budget.
 - **Rejoin.** `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE`,
   `REQUEST_UNCERTAIN` and a join `BINDING_CONFLICT` start a bounded rejoin:
   5-second base, doubling to a 120-second cap, jitter between 0.5 and 1.0, a
@@ -219,10 +226,16 @@ are experimental.
 
 1. **Bind.** Before the join the receiver finds the `session_id` among the
    loaded threads (`thread/loaded/list`) and reads it (`thread/read`). A child
-   thread refuses the session. A thread that is not loaded yet leaves the
-   package hook-only until a later heartbeat finds it. The thread's model
-   provider is recorded; a read that later shows another provider is a
-   `stale_binding` and refuses the wake.
+   thread refuses the session. The worker joins only once the thread is found
+   and is not a child: a thread that is not loaded yet, a read that fails and a
+   read that does not answer within 3 seconds mean no join yet, and the
+   receiver asks again every 30 seconds. A queue probe that fails or does not
+   answer (step 2) does not stop the join: a thread that was read and found to
+   be a main thread joins hook-only, and each later heartbeat asks again until
+   the probe is decided. The thread's model provider is recorded after that
+   read; a read that later shows another provider is a `stale_binding` and
+   refuses the wake. A loaded thread that reports no model provider counts as
+   unverified.
 2. **Probe.** One `thread/queue/delete` of a random id must answer
    `{ "deleted": false }`. Any other answer, an error included, leaves the wake
    route off.
@@ -236,9 +249,21 @@ are experimental.
    body, a sender or a time is never read for a wake, because a queued item is
    a user turn. The text starts with a fixed line that says it is not an
    operator instruction.
-5. **Add, then delete as a fence.** `thread/queue/add` queues the text with
-   `clientUserMessageId` `agent-chat:<attempt_id>`. `thread/queue/delete` of
-   that submission then answers whether it had already dispatched.
+5. **Recheck, add, then delete as a fence.** The claim and the status call take
+   time, so right before the add frame the receiver checks the state again: the
+   session must still be idle, not stopped and not in Plan Mode, and no hook
+   event may have arrived since the read that cleared the wake. Otherwise
+   nothing is sent and the attempt settles `deferred` with the state's reason
+   (`stopped`, `plan`, `busy`, `unknown` or `offline`; a hook event that leaves
+   no refusing state, such as a `Stop`, gives `busy`). Every request of the
+   wake, the connection included, ends 1 second before the reservation does, so
+   a slow reply still leaves time to record the result. With less than half a
+   second left after that margin, no add is sent and the attempt settles
+   `failed`.
+
+   `thread/queue/add` queues the text with `clientUserMessageId`
+   `agent-chat:<attempt_id>`. `thread/queue/delete` of that submission then
+   answers whether it had already dispatched.
    - `deleted: true`: the turn never started. The attempt settles `deferred`
      with reason `busy`.
    - `deleted: false`: it dispatched. The receiver reads `thread/items/list`
@@ -246,10 +271,12 @@ are experimental.
      `handed`. If none shows before the reservation ends, it settles
      `uncertain`.
    - A failure before the add frame was written settles `failed`; a failure
-     after it settles `uncertain`. Nothing is retried.
+     after it settles `uncertain`. The add is never sent twice for one attempt;
+     the ledger may offer a `failed` or `deferred` batch again as a new attempt.
 
 A hook delivery and a wake never run at once, and a `handed` wake marks the
-session busy until the next `Stop`.
+session busy until the next `Stop`, unless a hook event arrived after the read
+that cleared the wake: that event is newer, and its state stands.
 
 ## Known limits
 
@@ -309,8 +336,10 @@ exercised live.
   sandbox profile is not confirmed. A profile that blocks them leaves chat off.
 - **Start inside the hook timeout.** Whether the receiver can start, bind the
   thread and join within the `SessionStart` wait (5 seconds of a 15-second
-  timeout) on a real session is not confirmed. A later hook event or heartbeat
-  recovers the binding.
+  timeout) on a real session is not confirmed. With `appServer`, a thread that
+  the app-server does not list yet, or does not answer for, delays the join by
+  30-second periods and nothing is claimed until it joins. A later hook event
+  announces the binding once the session has joined.
 - **`additionalContextLimit` units.** The generated types describe a token
   threshold. The receiver bounds bytes, which exceed tokens, so the limit holds
   whatever the tokenizer does.
@@ -366,7 +395,13 @@ exercised live.
   session.
 - The socket lives in the private state directory, is owner-only, serves one
   request per connection and refuses a line over 64 KiB. A live receiver is
-  never taken over, and a path that is not a socket is never replaced.
+  never taken over, and a path that is not a socket is never replaced. A socket
+  left by a dead receiver is replaced only after a refused connection proves
+  that nothing listens on it; any other probe result counts as a running
+  receiver. The probe, the unlink and the bind run under one lock file next to
+  the socket, so two receivers that start for one session cannot unlink each
+  other's live socket. A lock left by a crashed receiver goes stale after 30
+  seconds.
 - The worker runs the configured Python interpreter with `-I` and the state
   directory as its working directory.
 - The app-server client answers a server request with a method-not-found error
@@ -397,7 +432,7 @@ node --test
 
 The suite covers config refusal, the worker join frame and frame validation,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
-the notice limits at the smallest bound and the wake rows, the socket and its start handshake, the WebSocket client against a
+the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery and its start handshake, the WebSocket client against a
 fake control socket on a real Unix socket, the receiver's state, delivery,
 wake, settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner

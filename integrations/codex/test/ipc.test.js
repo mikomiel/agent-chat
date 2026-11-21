@@ -137,6 +137,74 @@ test("the socket left by a killed receiver is replaced", async () => {
   } finally { cleanup(dir) }
 })
 
+// A socket file with no listener behind it: what a killed receiver leaves.
+async function staleSocket(socket) {
+  const child = spawn(process.execPath, ["-e",
+    "require('node:net').createServer().listen(process.argv[1], () => console.log('up'))", socket],
+  { stdio: ["ignore", "pipe", "ignore"] })
+  await new Promise(resolve => child.stdout.once("data", resolve))
+  const exited = new Promise(resolve => child.once("exit", resolve))
+  child.kill("SIGKILL")
+  await exited
+  assert.ok(statSync(socket).isSocket(), "a killed process leaves its socket file")
+}
+
+test("two receivers recovering one stale socket at once leave exactly one live listener", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  try {
+    await staleSocket(socket)
+    const answers = ["first", "second"]
+    const attempts = await Promise.allSettled(answers.map(name => serve(socket, async (_request, link) => { await link.send({ name }) })))
+    const won = attempts.filter(attempt => attempt.status === "fulfilled")
+    const lost = attempts.filter(attempt => attempt.status === "rejected")
+    assert.equal(won.length, 1, "one receiver binds")
+    assert.equal(lost.length, 1)
+    assert.equal(lost[0].reason.code, "CHAT_RECEIVER_RUNNING", "the other stops as a running receiver")
+    try {
+      const link = await connect(socket)
+      assert.ok(answers.includes((await link.call({}, 2000)).name), "the surviving listener is the one that answers")
+      link.close()
+    } finally { for (const attempt of won) attempt.value.close() }
+    assert.throws(() => statSync(`${socket}.bind`), { code: "ENOENT" }, "the bind lock is released")
+  } finally { cleanup(dir) }
+})
+
+test("only a refused connection proves the listener gone: any other probe result is a running receiver", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  try {
+    await staleSocket(socket)
+    for (const code of ["CHAT_RECEIVER_TIMEOUT", "EAGAIN", "EACCES", "ECONNRESET"]) {
+      const inconclusive = async () => { throw Object.assign(new Error(code), { code }) }
+      await assert.rejects(serve(socket, async () => {}, { connectImpl: inconclusive }), { code: "CHAT_RECEIVER_RUNNING" }, code)
+      assert.ok(statSync(socket).isSocket(), `${code}: the path was not unlinked`)
+      assert.throws(() => statSync(`${socket}.bind`), { code: "ENOENT" }, `${code}: the bind lock is released`)
+    }
+    const listener = await serve(socket, async () => {})
+    listener.close()
+  } finally { cleanup(dir) }
+})
+
+test("a fresh bind lock stops a second receiver and is left alone, a stale one is taken over", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  const gate = `${socket}.bind`
+  try {
+    writeFileSync(gate, "")
+    await assert.rejects(serve(socket, async () => {}), { code: "CHAT_RECEIVER_RUNNING" })
+    assert.ok(statSync(gate).isFile(), "the other receiver's lock is not ours to remove")
+    const old = new Date(Date.now() - 60_000)
+    utimesSync(gate, old, old)
+    const listener = await serve(socket, async () => {})
+    try {
+      const link = await connect(socket)
+      link.close()
+    } finally { listener.close() }
+    assert.throws(() => statSync(gate), { code: "ENOENT" })
+  } finally { cleanup(dir) }
+})
+
 test("closing the listener removes the socket so a resumed session can bind another", async () => {
   const dir = privateDirectory()
   const { socket } = paths(dir, "session-1")

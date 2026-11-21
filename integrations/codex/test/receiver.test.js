@@ -655,12 +655,22 @@ test("an unknown operation is refused without touching the worker", async () => 
 
 // The app-server end of one thread, as a double. `observation` and `wake` answer what lib/appserver.js would.
 const IDLE = { reason: null, observed: { status: "idle", stopped: false, plan: false } }
-function threadDouble({ bind = { status: "bound" }, route = true, observation = IDLE, wake = { outcome: "handed", reason: null } } = {}) {
+// `adds` holds the wakes that got as far as the add frame: lib/appserver.js asks `proceed` right before writing it and
+// ends the wake as deferred, with the reason it was given, when it answers one.
+// `provider` is what lib/appserver.js records after the read that found a main thread, before the queue probe runs.
+function threadDouble({ bind = { status: "bound" }, route = true, provider = null, observation = IDLE, wake = { outcome: "handed", reason: null } } = {}) {
   const thread = {
-    opened: [], calls: [], wakes: [], route,
+    opened: [], calls: [], wakes: [], adds: [], route, provider,
     async bind() { thread.calls.push("bind"); return typeof bind === "function" ? bind() : bind },
     async observe() { thread.calls.push("observe"); return typeof observation === "function" ? observation() : observation },
-    async wake(request) { thread.wakes.push(request); thread.calls.push("wake"); return typeof wake === "function" ? wake(request) : wake },
+    async wake(request) {
+      thread.wakes.push(request)
+      thread.calls.push("wake")
+      const stale = request.proceed?.() ?? null
+      if (stale !== null) return { outcome: "deferred", reason: stale }
+      thread.adds.push(request)
+      return typeof wake === "function" ? wake(request) : wake
+    },
   }
   return thread
 }
@@ -774,6 +784,53 @@ test("a wake settles exactly what the app-server route proved, and nothing it se
   }
 })
 
+// The claim and status calls sit between the clearing read and the add, so a hook event can land there.
+test("a hook event after the clearing read and before the add sends no add, and settles deferred with the matching reason", async () => {
+  for (const { event, reason } of [
+    { event: { op: "interrupt" }, reason: "stopped" },
+    { event: turn({ permission_mode: "plan" }), reason: "plan" },
+    { event: turn(), reason: "busy" },
+    { event: { op: "stop", permission_mode: "default" }, reason: "busy" },
+    { event: null, reason: null }, // the control: nothing arrived, so the add goes out
+  ]) {
+    const label = JSON.stringify(event)
+    const thread = threadDouble()
+    let armed = false
+    let r = null
+    r = await rig({ thread, handlers: wakeHandlers({ status: () => {
+      if (armed && event) { armed = false; void r.receiver.handle(event, hookDouble()) }
+      return { muted: false }
+    } }) })
+    await idleSession(r)
+    armed = true
+    await r.clock.advance(2000)
+    assert.equal(thread.wakes.length, 1, label)
+    const [settled] = r.worker.ops("settle")
+    assert.ok(settleVocabulary(settled.result), label)
+    if (event === null) {
+      assert.equal(thread.adds.length, 1, `${label}: the add went out`)
+      assert.deepEqual(settled.result, { outcome: "handed", reason: null }, label)
+      continue
+    }
+    assert.deepEqual(thread.adds, [], `${label}: no add frame was written`)
+    assert.deepEqual(settled.result, { outcome: "deferred", reason }, label)
+  }
+})
+
+test("a handed wake confirmation does not overwrite a hook event that arrived after the clearing read", async () => {
+  let r = null
+  const thread = threadDouble({ wake: () => {
+    void r.receiver.handle({ op: "stop", permission_mode: "default" }, hookDouble()) // the turn ended while the add was confirmed
+    return { outcome: "handed", reason: null }
+  } })
+  r = await rig({ thread, handlers: wakeHandlers() })
+  await idleSession(r)
+  await r.clock.advance(2000)
+  assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "handed", reason: null }, "the ledger still records the handover")
+  assert.equal(r.receiver.state(), null, "the later Stop's idle stands")
+  assert.deepEqual(r.worker.ops("heartbeat").filter(entry => entry.state.native_state === "busy"), [], "busy was never reported")
+})
+
 test("a refusal before the claim spends no attempt, settles nothing and waits before the next read", async () => {
   for (const reason of ["offline", "busy", "stopped", "plan", "unknown", "stale_binding"]) {
     const thread = threadDouble({ observation: { reason, observed: { status: "idle", stopped: false, plan: false } } })
@@ -825,28 +882,44 @@ test("a delegated thread never joins: the thread is checked before the worker st
   assert.deepEqual((await r.op(turn())).sent, [{ disabled: true }])
 })
 
-test("a thread the app-server does not list yet joins hook-only and binds at a later heartbeat", async () => {
+test("a thread the app-server does not list yet does not join: each heartbeat period looks again, and a positive check joins", async () => {
   let answer = { status: "unloaded" }
   const thread = threadDouble({ bind: () => answer, route: true })
   const r = await rig({ handlers: wakeHandlers(), thread })
-  assert.equal(r.worker.bootIds.length, 1, "the join does not wait for a thread that is not there")
+  assert.equal(r.worker.bootIds.length, 0, "a thread that is not there verifies nothing, so no join")
+  const hook = await r.op({ op: "start", wait_ms: 5000 })
+  assert.deepEqual(hook.sent, [{ context: null }], "the start hook does not wait for a join that is not coming yet")
+  await r.clock.advance(29_000)
+  assert.equal(thread.calls.filter(call => call === "bind").length, 1, "the next look is a full heartbeat period away")
+  for (let period = 0; period < 5; period += 1) await r.clock.advance(30_000)
+  assert.equal(r.worker.bootIds.length, 0, "still nothing verified")
+  assert.ok(thread.calls.filter(call => call === "bind").length >= 6, "and it kept looking, more often than the rejoin budget allows")
+  answer = { status: "bound" }
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.bootIds.length, 1, "bound, so the join follows the next look")
   await r.op(turn())
   await r.op({ op: "stop", permission_mode: "default" })
   r.worker.log.length = 0
-  await r.clock.advance(10_000)
-  assert.deepEqual(r.worker.ops("claim"), [], "not bound, so no wake")
-  answer = { status: "bound" }
-  await r.clock.advance(20_000)
-  assert.equal(thread.calls.filter(call => call === "bind").length, 2)
   await r.clock.advance(2000)
-  assert.equal(r.worker.ops("claim").length, 1, "bound, so the next poll wakes")
+  assert.equal(r.worker.ops("claim").length, 1, "and the wake route works from then on")
 })
 
-test("a thread that turns out to be a child at a later heartbeat ends chat", async () => {
+test("a thread that turns out to be a child at a later check ends chat and never joins", async () => {
   let answer = { status: "unloaded" }
   const thread = threadDouble({ bind: () => answer })
   const r = await rig({ thread })
   answer = { status: "child" }
+  await r.clock.advance(30_000)
+  assert.equal(r.receiver.state(), "offline")
+  assert.equal(r.worker.bootIds.length, 0, "no worker, so no join")
+})
+
+test("a thread that turns out to be a child at a later heartbeat read ends chat and stops the worker", async () => {
+  let observation = IDLE
+  const thread = threadDouble({ observation: () => observation })
+  const r = await rig({ thread })
+  assert.equal(r.worker.bootIds.length, 1)
+  observation = { reason: "child", observed: { status: "unknown", stopped: false, plan: null } }
   await r.clock.advance(30_000)
   assert.equal(r.receiver.state(), "offline")
   assert.equal(r.worker.state.stops, 1)
@@ -870,12 +943,45 @@ test("a changed provider leaves the thread unbound: hook delivery continues and 
   assert.notEqual(r.receiver.state(), "offline")
 })
 
-test("a bind that does not answer in time lets the join proceed", async () => {
-  const thread = threadDouble({ bind: () => new Promise(() => {}) })
+test("a bind that does not answer in time verifies nothing: no join yet, and the next heartbeat period asks again", async () => {
+  let asked = 0
+  const thread = threadDouble({ bind: () => (++asked === 1 ? new Promise(() => {}) : { status: "bound" }) })
   const r = await rig({ thread })
   assert.equal(r.worker.bootIds.length, 0)
   await r.clock.advance(3000)
+  assert.equal(r.worker.bootIds.length, 0, "the timeout is not a positive check")
+  await r.clock.advance(29_000)
+  assert.equal(asked, 1)
+  await r.clock.advance(1000)
+  assert.equal(asked, 2)
+  assert.equal(r.worker.bootIds.length, 1, "the second look answered bound")
+})
+
+test("a bound thread whose queue probe was answered wrongly still joins, hook-only", async () => {
+  const thread = threadDouble({ bind: { status: "bound", route: false }, route: false })
+  const r = await rig({ thread })
   assert.equal(r.worker.bootIds.length, 1)
+})
+
+// The probe runs after the read that found a main thread, and the same bind answers `unavailable` when the probe fails.
+test("a queue probe that fails or does not answer still leaves a verified main thread: it joins hook-only and the route is decided later", async () => {
+  for (const bind of [() => ({ status: "unavailable" }), () => new Promise(() => {})]) {
+    let answer = bind
+    const thread = threadDouble({ bind: () => answer(), provider: "openai", route: null })
+    const r = await rig({ handlers: wakeHandlers(), thread })
+    await r.clock.advance(3000)
+    assert.equal(r.worker.bootIds.length, 1, "the read passed, so the join does not wait for the probe")
+    await r.op(turn())
+    await r.op({ op: "stop", permission_mode: "default" })
+    r.worker.log.length = 0
+    await r.clock.advance(10_000)
+    assert.deepEqual(r.worker.ops("claim"), [], "no route yet, so no wake")
+    answer = () => ({ status: "bound", route: true })
+    thread.route = true
+    await r.clock.advance(20_000)
+    await r.clock.advance(2000)
+    assert.equal(r.worker.ops("claim").length, 1, "the heartbeat bind decided the route, so the next poll wakes")
+  }
 })
 
 // ---- state mapping ---------------------------------------------------------------------------------------------

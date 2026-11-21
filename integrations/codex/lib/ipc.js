@@ -111,39 +111,6 @@ export function connect(path, { timeoutMs = 1500 } = {}) {
   })
 }
 
-// Serve one handler per connection. The first frame selects the request; the
-// handler may reply, then read follow-up frames from the same session. A socket
-// left by a dead receiver is removed; a live one is never taken over.
-export async function serve(path, handler) {
-  let existing = null
-  try { existing = lstatSync(path) } catch (error) { if (error.code !== "ENOENT") throw error }
-  if (existing) {
-    if (!existing.isSocket() || existing.uid !== process.geteuid()) throw refusal("CHAT_SOCKET_UNSAFE")
-    const live = await connect(path, { timeoutMs: 500 }).then(link => { link.close(); return true }, () => false)
-    if (live) throw refusal("CHAT_RECEIVER_RUNNING")
-    unlinkSync(path)
-  }
-  const server = net.createServer(async socket => {
-    const session = channel(socket)
-    try {
-      const first = await session.next(5000)
-      if (first) await handler(first, session)
-    } catch { /* a handler failure ends only this connection */ }
-    session.close()
-  })
-  await new Promise((resolve, reject) => {
-    server.once("error", reject)
-    server.listen(path, () => { server.off("error", reject); resolve() })
-  })
-  chmodSync(path, 0o600)
-  return {
-    close() {
-      server.close()
-      try { unlinkSync(path) } catch { /* already gone */ }
-    },
-  }
-}
-
 function takeLock(path, now) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try { closeSync(openSync(path, "wx", 0o600)); return true }
@@ -156,6 +123,56 @@ function takeLock(path, now) {
     }
   }
   return false
+}
+
+// Serve one handler per connection. The first frame selects the request; the
+// handler may reply, then read follow-up frames from the same session. A socket
+// left by a dead receiver is removed; a live one is never taken over.
+//
+// Two receivers can start for one session (the hook's start lock is released after
+// its own wait, whether or not the child has bound). So the probe, the unlink and the
+// bind run under one lock file next to the socket, held until the listener is up: a
+// second receiver then finds the first one bound and stops, and cannot unlink a live
+// listener's path. The lock is not the one the hooks hold to start a receiver. A
+// receiver that cannot take it exits as a running one; a lock left by a crashed
+// receiver goes stale after LOCK_STALE_MS, like the start lock.
+export async function serve(path, handler, { connectImpl = connect } = {}) {
+  const gate = `${path}.bind`
+  if (!takeLock(gate, Date.now)) throw refusal("CHAT_RECEIVER_RUNNING")
+  let server
+  try {
+    let existing = null
+    try { existing = lstatSync(path) } catch (error) { if (error.code !== "ENOENT") throw error }
+    if (existing) {
+      if (!existing.isSocket() || existing.uid !== process.geteuid()) throw refusal("CHAT_SOCKET_UNSAFE")
+      // Only a refused connection (or a path that vanished) proves the listener is gone. A timeout or any other
+      // error can come from a live receiver, so it is treated as one.
+      const evidence = await connectImpl(path, { timeoutMs: 500 }).then(link => { link.close(); return "live" }, error => error?.code)
+      if (!ABSENT.has(evidence)) throw refusal("CHAT_RECEIVER_RUNNING")
+      try { unlinkSync(path) } catch (error) { if (error.code !== "ENOENT") throw error }
+    }
+    server = net.createServer(async socket => {
+      const session = channel(socket)
+      try {
+        const first = await session.next(5000)
+        if (first) await handler(first, session)
+      } catch { /* a handler failure ends only this connection */ }
+      session.close()
+    })
+    await new Promise((resolve, reject) => {
+      server.once("error", reject)
+      server.listen(path, () => { server.off("error", reject); resolve() })
+    })
+    chmodSync(path, 0o600)
+  } finally {
+    try { unlinkSync(gate) } catch { /* already gone */ }
+  }
+  return {
+    close() {
+      server.close()
+      try { unlinkSync(path) } catch { /* already gone */ }
+    },
+  }
 }
 
 // Connect to the session's receiver, starting it when none answers. The lock

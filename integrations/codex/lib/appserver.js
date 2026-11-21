@@ -24,8 +24,11 @@ const { version: PACKAGE_VERSION } = JSON.parse(readFileSync(new URL("../package
 const CLIENT = { name: "agent-chat-codex", title: "Agent Chat", version: PACKAGE_VERSION }
 // The queue id prefix: the wake's client message id is this plus the attempt id.
 export const CLIENT_ID_PREFIX = "agent-chat:"
-// A wake is not started with less than this left of its reservation.
+// A wake is not started with less than this left of its reservation, after the settlement margin is taken off.
 export const MIN_ADD_MS = 500
+// The end of the reservation is for recording the result. Every request of a wake ends this long before it, so a slow
+// fence leaves the receiver time to settle `deferred` or `uncertain` instead of letting the claim expire.
+export const SETTLE_MS = 1_000
 const CONFIRM_MS = 250
 const CONFIRM_MARGIN_MS = 300
 const PAGE = 20
@@ -294,29 +297,36 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     //   deleted:true  - it never dispatched: deferred.
     //   deleted:false - it dispatched: handed once a userMessage with its client id shows, else uncertain.
     // A failure before the add frame is written is failed; any failure after it is uncertain. Nothing retries.
-    async wake({ text, attemptId, until }) {
+    // `proceed` is asked once, right before the add frame is written, with nothing awaited in between. It returns
+    // null to go on, or the `deferred` reason that the receiver's state now gives: nothing is sent then.
+    // `until` is the end of the reservation, and every request stops SETTLE_MS before it.
+    async wake({ text, attemptId, until, proceed = () => null }) {
       const clientUserMessageId = `${CLIENT_ID_PREFIX}${attemptId}`
       const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
+      const limit = until - SETTLE_MS
       let link
-      try { link = await open(path) } catch { return { outcome: "failed", reason: "native_unavailable" } }
+      // The connection, the upgrade and `initialize` end by the limit too: nothing has been sent yet when they fail.
+      try { link = await open(path, { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())) }) } catch { return { outcome: "failed", reason: "native_unavailable" } }
       try {
-        if (until - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
+        if (limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
+        const stale = proceed()
+        if (stale !== null) return { outcome: "deferred", reason: stale }
         let added
         try {
           added = await link.request("thread/queue/add", {
             threadId, clientUserMessageId, input: [{ type: "text", text, text_elements: [] }],
-          }, until - now())
+          }, limit - now())
         } catch (error) { return error?.sent === false ? { outcome: "failed", reason: "native_unavailable" } : UNCERTAIN }
         const id = added.queuedSubmission?.id
         if (typeof id !== "string" || !id) return UNCERTAIN
         let fence
-        try { fence = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: id }, Math.max(CONFIRM_MS, until - now())) }
+        try { fence = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: id }, limit - now()) }
         catch { return UNCERTAIN }
         if (fence.deleted === true) return { outcome: "deferred", reason: "busy" }
         if (fence.deleted !== false) return UNCERTAIN
-        while (now() < until - CONFIRM_MARGIN_MS) {
+        while (now() < limit - CONFIRM_MARGIN_MS) {
           try {
-            const page = await link.request("thread/items/list", { threadId, limit: PAGE, sortDirection: "desc" }, Math.max(CONFIRM_MS, until - now()))
+            const page = await link.request("thread/items/list", { threadId, limit: PAGE, sortDirection: "desc" }, limit - now())
             const seen = Array.isArray(page.data) && page.data.some(entry => entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId)
             if (seen) return { outcome: "handed", reason: null }
           } catch { return UNCERTAIN }
