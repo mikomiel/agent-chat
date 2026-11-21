@@ -29,8 +29,9 @@
 // and with it every later publish, repair and removal. A call that runs out of time counts as a failed call: a check
 // proves nothing and stays owed, a publish rejects, and a removal is not an error. The host is not told to stop the
 // call, so it may still land. While this context is open, a put or a removal that lands late owes the read-back again.
-// Once it is closed or turned off, a put that lands late is removed again, best effort, so a failed join does not leave
-// its binding in the instructions. A removal that lands after the next owner's publish deletes that binding until the
+// Once it is closed or turned off, a put that lands late is removed again, best effort, while the entry still holds its
+// own text, so a failed join does not leave its binding in the instructions and a newer owner's binding is kept. Between
+// that read and the removal a newer owner can still put its binding; its next tick puts it back. A removal that lands after the next owner's publish deletes that binding until the
 // next owner's next tick puts it back. The time limit trades a call that can hang for a call that can land late.
 //
 // WHY A PUT AT THE WRONG TIME IS HARMLESS. A put is never the last word. Every signal that can invalidate the entry
@@ -83,10 +84,12 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
       const answer = settle => value => {
         if (over) {
           if (name === "list") return
-          // A put that lands after this session's chat ended or was turned off would restore a binding that is no longer
-          // wanted: remove it again, best effort. While chat is open, the read-back is owed again instead.
+          // A put that answers after this session's chat ended or was turned off may have restored a binding that is no
+          // longer wanted: remove it again, best effort, and only while the entry still holds this put's own text, so a
+          // newer owner's binding is left alone, whether the put landed or failed. While chat is open, the read-back is
+          // owed again instead.
           if (closed || disabled) {
-            if (name === "put") new Promise(begin => begin(ctx.session.instructions.entry.remove({ sessionID, key: BINDING_KEY }))).catch(() => {})
+            if (name === "put") void removeIfStill(input.value)
             return
           }
           owe()
@@ -97,6 +100,15 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
       }
       new Promise(begin => begin(ctx.session.instructions.entry[name](input))).then(answer(resolve), answer(reject))
     })
+  }
+
+  // Best effort and outside the queue: this context is over, and nothing waits for it.
+  async function removeIfStill(text) {
+    try {
+      const entries = await ctx.session.instructions.entry.list({ sessionID })
+      if (!Array.isArray(entries) || !entries.some(entry => entry?.key === BINDING_KEY && entry.value === text)) return
+      await ctx.session.instructions.entry.remove({ sessionID, key: BINDING_KEY })
+    } catch { /* best effort */ }
   }
 
   async function holds(text) {

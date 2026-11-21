@@ -287,15 +287,25 @@ test("a refresh does not move the epoch: a publish in flight still discharges, a
 test("a tick that lands while a check's read is in flight is not answered by that read: the check runs once more", async () => {
   const { ctx, context } = make()
   await context.context("binding")
-  const listHeld = holdFirst(ctx.session.instructions.entry, "list")
+  const entry = ctx.session.instructions.entry
+  const list = entry.list
+  let release
+  entry.list = async input => { // the first list reads now and answers later: its answer predates what follows
+    entry.list = list
+    const snapshot = await list(input)
+    await new Promise(resolve => { release = resolve })
+    return snapshot
+  }
   const first = context.refresh() // its list is issued and waits
   await flush()
-  assert.equal(listHeld.entered, true)
+  assert.equal(typeof release, "function")
+  const lists = ctx.calls.list
   ctx.entries.clear() // an unseen compaction drops the entry after the list read it
   const second = context.refresh() // the next tick: the running check is not doubled now
-  listHeld.settle.resolve() // the old list answers with the entry present
+  release() // the old list answers with the entry present
   assert.equal(await second, false)
   assert.equal(await first, true) // the follow-up check found the entry gone and put it back
+  assert.equal(ctx.calls.list, lists + 2) // the follow-up's list and its put's confirmation
   assert.equal(ctx.entries.get(BINDING_KEY), "binding")
   assert.equal(context.owed(), false)
 })
@@ -902,6 +912,53 @@ for (const end of ["disable", "dispose"]) {
     assert.equal(ctx.entries.has(BINDING_KEY), false)
   })
 }
+
+test("after the end, a late put leaves a newer owner's binding alone, and a late put failure removes nothing", async () => {
+  for (const outcome of ["resolve", "reject"]) {
+    const { ctx, clock, context } = make()
+    const held = holdFirst(ctx.session.instructions.entry, "put")
+    const publish = context.context("old binding")
+    await flush()
+    armed(clock)[0].fn()
+    await assert.rejects(publish, { code: "CHAT_CONTEXT_UNAVAILABLE" })
+    context.dispose()
+    ctx.entries.set(BINDING_KEY, "new owner's binding") // the next owner publishes and confirms
+    const removals = ctx.calls.remove.length
+    if (outcome === "resolve") {
+      // the old put lands after the new one and overwrites it: it is removed, and the new owner's tick puts its own back
+      held.settle.resolve()
+      await flush()
+      await flush()
+      assert.equal(ctx.calls.remove.length, removals + 1, outcome)
+    } else {
+      held.settle.reject(new Error("unavailable")) // the old put failed: it wrote nothing
+      await flush()
+      await flush()
+      assert.equal(ctx.calls.remove.length, removals, outcome)
+      assert.equal(ctx.entries.get(BINDING_KEY), "new owner's binding", outcome)
+    }
+  }
+})
+
+test("after the end, a late put that landed under a newer owner's later put leaves that binding alone", async () => {
+  const { ctx, clock, context } = make()
+  const entry = ctx.session.instructions.entry
+  const put = entry.put
+  let land
+  entry.put = async input => { await new Promise(resolve => { land = resolve }); entry.put = put; ctx.calls.put.push(input) } // lands, but writes before the newer one
+  const publish = context.context("old binding")
+  await flush()
+  armed(clock)[0].fn()
+  await assert.rejects(publish, { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  context.disable()
+  ctx.entries.set(BINDING_KEY, "new owner's binding") // the newer owner's put came after the old one's write
+  const removals = ctx.calls.remove.length
+  land()
+  await flush()
+  await flush()
+  assert.equal(ctx.calls.remove.length, removals)
+  assert.equal(ctx.entries.get(BINDING_KEY), "new owner's binding")
+})
 
 test("a list that answers after its time limit owes nothing, because a read changes nothing", async () => {
   const { ctx, clock, context } = await gapped()

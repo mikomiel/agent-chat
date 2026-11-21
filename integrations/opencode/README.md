@@ -28,8 +28,10 @@ idle. Delivery is not part of this package; [issue
   field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token provisioned for the
   `opencode` harness. A token for another harness registers the session under
-  that harness, the plugin then refuses the reply, and the stray registration
-  stays until its lease expires.
+  that harness, and the plugin then refuses the reply as uncertain and retries
+  with a new boot id. Each retry can leave another stray registration under
+  the wrong harness, each until its lease expires, until the retry window
+  closes.
 - Node built-ins only inside the plugin: `node:child_process`, `node:crypto`,
   `node:fs` and `node:path`. Whether OpenCode's plugin runtime exposes them is
   not verified. The package tests need Node 20 or newer.
@@ -311,7 +313,8 @@ unverified, inferred, or a deliberate choice.
   owner change can land after the next owner's put and delete its binding. The
   next owner's next tick puts it back, within 30 seconds. A put that times out
   during a join can land after the removal that follows the failed join. When
-  it lands, the plugin removes the entry again, best effort. If that removal
+  it lands, the plugin removes the entry again, best effort, and only while the
+  entry still holds that put's own text, so a newer owner's binding is kept. If that removal
   fails too, the entry stays until the next join replaces it. The worker may
   still hold the instance file when its end request failed, so that entry can
   name a usable binding until the server lease expires.
