@@ -177,7 +177,8 @@ the callback and the end request; once it is removed, a new open of its path
 finds nothing. Removal is best effort. A command that already opened or read
 the record can still use the credential, and its heartbeats renew the lease.
 When the end fails, the instance ends once no heartbeat renews its server
-lease. Sender receipts are not
+lease. The removal has no time limit of its own, like the record's write at
+join, so a blocking file system delays the end. Sender receipts are not
 part of this core yet; `instance_client.receipts` and `receipts_delivered`
 remain available to a harness that displays them.
 

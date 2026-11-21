@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -141,6 +142,7 @@ def test_end_drops_the_record_before_the_end_request(monkeypatch: pytest.MonkeyP
         calls.append("discard")
 
     monkeypatch.setattr(instance_worker.instance_file, "discard_instance", discard)
+    monkeypatch.setattr(instance_worker.signal, "setitimer", lambda *args: None)  # no alarm in the test process
 
     def end(instance, *, deadline=None):
         calls.append("end")
@@ -153,23 +155,31 @@ def test_end_drops_the_record_before_the_end_request(monkeypatch: pytest.MonkeyP
     assert calls == ["discard", "end"]
 
 
-def test_the_end_gets_its_own_deadline_after_a_removal_that_ran_out_of_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    clock = [1000.0]
-    deadlines: list[float | None] = []
+def test_a_stalled_end_is_interrupted_after_a_removal_that_used_up_the_alarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(instance_worker, "REQUEST_SECONDS", 0.2)
+    previous = signal.signal(signal.SIGALRM, instance_worker._interrupt)
+    try:
+        def stalled_discard(directory, boot_id):
+            signal.setitimer(signal.ITIMER_REAL, 0.05)
+            try:
+                time.sleep(5)
+            except TimeoutError:
+                pass  # the removal swallows the worker's alarm
 
-    def stalled_discard(directory, boot_id):
-        clock[0] += 3600.0  # the removal used up the worker's alarm, which the discard swallowed
+        def stalled_end(instance):
+            time.sleep(5)  # stands for a stall before the request is sent, such as loading the trust store
+            return {"ended": True}
 
-    def end(instance, *, deadline=None):
-        deadlines.append(deadline)
-        return {"ended": True}
-
-    monkeypatch.setattr(instance_worker, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(instance_worker.instance_file, "discard_instance", stalled_discard)
-    monkeypatch.setattr(instance_worker.instance_client, "end", end)
-    instance = type("Joined", (), {"binding": type("Binding", (), {"boot_id": uuid4()})()})()
-    assert instance_worker._end(instance, Path("/nonexistent")) == {"ended": True}
-    assert deadlines == [4600.0 + instance_worker.REQUEST_SECONDS]  # sent, and bounded from after the removal
+        monkeypatch.setattr(instance_worker.instance_file, "discard_instance", stalled_discard)
+        monkeypatch.setattr(instance_worker.instance_client, "end", stalled_end)
+        instance = type("Joined", (), {"binding": type("Binding", (), {"boot_id": uuid4()})()})()
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            instance_worker._end(instance, Path("/nonexistent"))
+        assert time.monotonic() - started < 2  # the alarm armed again after the removal interrupted the end
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def test_worker_start_sweeps_only_long_untouched_records_and_never_uses_the_network(join_frame, db):

@@ -147,7 +147,7 @@ def prepare_instance(directory: Path, native_session_id: str, boot_id: UUID, *, 
 def discard_instance(directory: Path, boot_id: UUID) -> None:
     """Best effort: drop one record whose instance is over. Any failure, a timeout too, leaves the file; never raises.
 
-    A caller that sends a request after it gives that request its own deadline, because a timeout here is swallowed.
+    A caller that sends a request after it arms its deadline again, because a timeout here is swallowed.
     """
     try:
         directory_fd = _directory(directory)
