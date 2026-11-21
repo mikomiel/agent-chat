@@ -127,8 +127,10 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "deepse
     if (Buffer.byteLength(frame) > MAX_FRAME) return Promise.reject(failure("CHAT_REQUEST_INVALID", op))
     return new Promise((resolve, reject) => {
       const id = sequence - 1
+      // A request whose outcome is unknown is the core's REQUEST_UNCERTAIN, which the
+      // lifecycle rejoins. The CHAT_ code stays for a worker that stopped or died.
       pending = { id, op, resolve, reject, timer: setTimeout(() => {
-        rejectPending("CHAT_REQUEST_UNCERTAIN")
+        rejectPending("REQUEST_UNCERTAIN")
         void stop()
       }, REQUEST_MS) }
       child.stdin.write(frame)

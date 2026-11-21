@@ -161,11 +161,17 @@ The service and its host-token provisioning are documented in the product
   remote unmute never clears it.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
-- **Rejoin.** `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE`,
-  `REQUEST_UNCERTAIN` and a join `BINDING_CONFLICT` start a bounded rejoin:
+- **Rejoin.** A worker error or a request timeout that carries
+  `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or
+  `REQUEST_UNCERTAIN`, and a join `BINDING_CONFLICT`, start a bounded rejoin:
   5-second base, doubling to a 120-second cap, jitter between 0.5 and 1.0, a
   two-hour episode window and at most three completed rejoins per hour. The
   numbers are pinned to `agent_chat/models.py` by `test/policy.test.js`.
+  A `refused` reply on a heartbeat or a pending read that carries
+  `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` is the
+  core's brief-outage answer: the worker and the binding stay, no rejoin budget
+  is spent and the next heartbeat or poll is the retry. A `refused`
+  `STALE_INSTANCE` still rejoins.
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for that agent. A fault in one agent's
   lifecycle is isolated to that agent; CI and other agents are unchanged.

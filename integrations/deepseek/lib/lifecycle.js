@@ -213,7 +213,7 @@ export function createLifecycle(bus, delivery, config, {
           dirty = false
           const result = await request("heartbeat", { state: heartbeatState() })
           const code = refused(result)
-          if (code && REJOIN_AFTER.has(code)) throw Object.assign(new Error(code), { code, operation: "heartbeat" })
+          if (code && REJOIN_AFTER.has(code) && !BRIEF_OUTAGE.has(code)) throw Object.assign(new Error(code), { code, operation: "heartbeat" })
         }
         if (pollDue && live) {
           pollDue = false
@@ -231,7 +231,8 @@ export function createLifecycle(bus, delivery, config, {
     if (!live) return
     const refusalCode = refused(candidates)
     if (refusalCode) {
-      if (REJOIN_AFTER.has(refusalCode)) throw Object.assign(new Error(refusalCode), { code: refusalCode, operation: "pending" })
+      if (REJOIN_AFTER.has(refusalCode) && !BRIEF_OUTAGE.has(refusalCode))
+        throw Object.assign(new Error(refusalCode), { code: refusalCode, operation: "pending" })
       return
     }
     const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
@@ -418,3 +419,9 @@ export function createLifecycle(bus, delivery, config, {
 const REJOIN_AFTER = new Set([
   "STALE_INSTANCE", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN", "BINDING_CONFLICT",
 ])
+
+// The core's worker answers a brief outage on a heartbeat or a pending read with a non-terminal `refused` reply and
+// keeps the binding (`agent_chat/instance_worker.py`). The next tick is the retry, so the reply spends no rejoin
+// budget (#146). A refusal that proves the lease gone, a thrown worker error and the parent-side timeout still rejoin;
+// a worker that exits still turns chat off.
+const BRIEF_OUTAGE = new Set(["SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"])

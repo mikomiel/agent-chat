@@ -1,6 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
+import { PassThrough } from "node:stream"
 import { createAgentChat } from "../lib/lifecycle.js"
+import { startWorker } from "../lib/worker.js"
 import { MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
 import { renderNotice } from "../lib/notice.js"
 
@@ -481,4 +484,182 @@ test("a non-transport join refusal fails closed and latches", async () => {
   assert.equal(lifecycle.state(), "offline")
   assert.equal(globalThis[Symbol.for("agent-chat.pi.disabled")], true)
   delete globalThis[Symbol.for("agent-chat.pi.disabled")]
+})
+
+// #146: during a brief outage the core's worker answers a heartbeat or a pending read with the non-terminal
+// `{ refused: code }` and keeps the binding; the next heartbeat or poll is the retry.
+test("brief heartbeat and pending refusals keep the worker and the binding and spend no rejoin budget", async t => {
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] }) // a disable would otherwise leak into later tests
+  const { pi, emit, ctx, notices, statuses } = fakePi()
+  const answered = []
+  let refusal = null // the code the worker answers with, or null for a normal answer
+  const worker = fakeWorker({
+    answer: op => {
+      if (refusal && (op === "heartbeat" || op === "pending")) { answered.push([op, refusal]); return { refused: refusal } }
+      return op === "pending" ? { messages: [] } : {}
+    },
+  })
+  let starts = 0
+  const retries = []
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers,
+    startProcess: () => { starts += 1; return worker },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  const bindingBefore = lifecycle.binding()
+  assert.match(bindingBefore, /boot-1\.json/)
+  // Four brief outages, one more than the hourly rejoin budget allows.
+  const outages = [
+    ["heartbeat", "SERVICE_UNAVAILABLE"], ["pending", "TRANSPORT_UNAVAILABLE"],
+    ["heartbeat", "REQUEST_UNCERTAIN"], ["pending", "SERVICE_UNAVAILABLE"],
+  ]
+  for (const [operation, code] of outages) {
+    refusal = code
+    await (operation === "heartbeat" ? lifecycle.heartbeat() : lifecycle.poll())
+  }
+  assert.deepEqual(answered, outages, "each refusal reached the lifecycle")
+  assert.equal(starts, 1, "the same worker keeps serving")
+  assert.deepEqual(retries, [], "no rejoin is scheduled")
+  assert.doesNotMatch(notices.join("\n"), /reconnecting|stopped/)
+  assert.doesNotMatch(statuses.join("\n"), /reconnecting/)
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.notEqual(globalThis[Symbol.for("agent-chat.pi.disabled")], true, "chat is not disabled")
+  assert.equal(lifecycle.binding(), bindingBefore, "the binding is unchanged")
+  assert.equal(await Promise.race([worker.closed.then(() => "ended"), flush().then(() => "serving")]), "serving")
+  refusal = null // the next tick is the retry
+  const before = worker.requests.length
+  await lifecycle.heartbeat()
+  assert.equal(worker.requests.length, before + 1)
+  assert.equal(worker.requests.at(-1).op, "heartbeat")
+  assert.equal(starts, 1)
+})
+
+test("a thrown worker error on a heartbeat still rejoins, even with a code that a refused reply would not rejoin on", async t => {
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] })
+  const { pi, emit, ctx, notices } = fakePi()
+  const terminal = Object.assign(new Error("CHAT_WORKER_REFUSED"), {
+    code: "CHAT_WORKER_REFUSED", workerCode: "SERVICE_UNAVAILABLE", operation: "heartbeat",
+  })
+  let failing = false
+  let starts = 0
+  const retries = []
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers,
+    startProcess: () => {
+      starts += 1
+      return fakeWorker({ answer: op => (failing && op === "heartbeat" ? Promise.reject(terminal) : op === "pending" ? { messages: [] } : {}) })
+    },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  failing = true
+  await lifecycle.heartbeat()
+  assert.match(notices.join("\n"), /reconnecting/)
+  assert.doesNotMatch(notices.join("\n"), /stopped/)
+  assert.equal(retries.length, 1)
+  assert.equal(retries[0].ms, 2500)
+  failing = false
+  retries[0].fn()
+  await flush()
+  assert.equal(starts, 2, "a fresh worker joins after the back-off")
+})
+
+// A refusal that proves the lease gone is not a brief outage; only the three outage codes are retried on the next tick.
+for (const operation of ["heartbeat", "pending"]) {
+  test(`a refused STALE_INSTANCE on a ${operation} still rejoins`, async t => {
+    t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] })
+    const { pi, emit, ctx, notices } = fakePi()
+    let failing = false
+    const retries = []
+    const lifecycle = createAgentChat(pi, config, {
+      ...timers,
+      startProcess: () => fakeWorker({
+        answer: op => (failing && op === operation ? { refused: "STALE_INSTANCE" } : op === "pending" ? { messages: [] } : {}),
+      }),
+      now: () => 1000,
+      random: () => 0,
+      setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    })
+    emit("session_start", {}, ctx)
+    await flush()
+    failing = true
+    await (operation === "heartbeat" ? lifecycle.heartbeat() : lifecycle.poll())
+    assert.match(notices.join("\n"), /reconnecting/)
+    assert.equal(retries.length, 1)
+  })
+}
+
+// A request that outlives the parent-side deadline has an unknown outcome. The real worker reports the core's
+// own code for it, so the lifecycle rejoins instead of latching chat off.
+const stdioChild = () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.kill = () => {}
+  return child
+}
+
+// The node:test timer mock needs Node 20.11, and the package supports 20.0. This stub records each timer, fires one on demand
+// and restores the originals when the test ends, so a failing test cannot leak it.
+function stubTimeouts(t) {
+  const { setTimeout: realSetTimeout, clearTimeout: realClearTimeout } = globalThis
+  const timers = new Map()
+  let next = 1
+  globalThis.setTimeout = (fn, ms) => { timers.set(next, { fn, ms }); return next++ }
+  globalThis.clearTimeout = id => { timers.delete(id) }
+  t.after(() => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout })
+  return {
+    fire(ms) {
+      for (const [id, timer] of [...timers]) if (timer.ms === ms) { timers.delete(id); timer.fn() }
+    },
+  }
+}
+
+test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
+  const clock = stubTimeouts(t)
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] }) // a disable would otherwise leak into later tests
+  const children = []
+  const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
+  const retries = []
+  const { pi, emit, ctx, notices } = fakePi()
+  const lifecycle = createAgentChat(pi, config, {
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    now: () => 0,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    clearTimeoutImpl: () => {},
+    setIntervalImpl: () => 0,
+    clearIntervalImpl: () => {},
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  children[0].stdout.write(`${JSON.stringify({ id: 0, result: joined })}\n`)
+  await flush() // joined and bound; the first heartbeat is written and never answered
+  clock.fire(22_000)
+  await flush()
+  assert.doesNotMatch(notices.join("\n"), /stopped/, "not a permanent disable")
+  assert.match(notices.join("\n"), /reconnecting/)
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.equal(retries.length, 1)
+  assert.equal(retries[0].ms, 2500)
+  retries[0].fn()
+  await flush()
+  assert.equal(children.length, 2, "a fresh worker joins after the back-off")
+  const rejoined = {
+    ...joined, session_id: "99999999-9999-4999-8999-999999999999", instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    instance_file: "/tmp/agent-chat-state/boot-2.json",
+  }
+  children[1].stdout.write(`${JSON.stringify({ id: 0, result: rejoined })}\n`)
+  await flush()
+  assert.match(notices.join("\n"), new RegExp(`joined as ${rejoined.session_id}`))
+  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/, "the new binding is published")
+  assert.doesNotMatch(lifecycle.binding(), /boot-1\.json/)
+  assert.notEqual(lifecycle.state(), "offline")
 })
