@@ -153,37 +153,14 @@ sends its request: it does not wait for the worker to end its instance.
   clears it, `inProgress` is busy, `interrupted` is stopped, and anything else
   is unknown), and its collaboration mode (`plan` or `default`, from
   `thread/resume` with `excludeTurns`). The read, when there is one, is the authority for Plan Mode
-  and for an idle session. The two mode fields differ in what they can end. A hook's
-  `permission_mode` is only a hint: `plan` sets Plan Mode, and a later hook with another mode
-  ends a Plan Mode that a hook set, but it cannot end one that a read showed. A later hook event
-  discards the read's busy or idle answer, but not a Plan Mode that the read showed, and that
-  holds for a read that a hook event made stale while it ran: a hook says nothing about the
-  mode, so Plan Mode that a read shows is kept whenever the read was taken. It stays, whatever
-  the hook events say, until a later read shows another mode (only a read that is still
-  fresh can say so, since a stale one may be older than the switch into Plan Mode), so meanwhile the
-  receiver claims no hook delivery and the heartbeat reports Plan Mode. A read that shows no mode
-  changes nothing: a busy thread, one that is not loaded, an unreadable or untrusted socket, a
-  changed provider. A read whose `thread/resume` answer showed default mode, but whose lookup of
-  the newest turn then failed or answered in a way that is not the documented one, is unknown and
-  refuses the wake, but it keeps the mode it showed: it ends the memory. The receiver reads the
-  thread only while no turn is known to run, so after a prompt in default mode the delivery waits
-  for the next `Stop` and the first read after it.
-  Reads land in any order, so each is numbered when it starts (the wake's own reading when the
-  receiver hands the wake to the thread). A read changes nothing that a newer read has set: a Plan
-  Mode read that started before a default-mode read cannot bring the memory back by landing after
-  it, hook event or not, and a default-mode read that started before a Plan Mode read cannot end
-  it. The same holds for the busy or idle answer the receiver holds.
-  Reads are taken only on a thread whose bind decided the route (a main thread, a fixed provider
-  and a queue probe that answered). When a bind leaves the route undecided, for example because the
-  queue probe stayed silent, no read can end the memory, so it is cleared, together with the answer
-  of the last read (which carries a mode of its own), and stays clear until a later bind decides the
-  route: the state and the heartbeat follow the hooks at once, with no hook event in between, as
-  for a session without a control socket. A read that was out across such a bind changes nothing
-  when it lands, even when a later bind has decided the route again, because it started before the
-  bind that cleared what it would set; and a read that would clear a wake clears nothing then. While
-  the route is decided, the memory can still stay for as long as every read refuses before it
-  reaches the mode (the app-server gone, an unreadable thread), and hook delivery stays withheld
-  until a read shows the mode or the receiver ends.
+  and for an idle session; any later hook event discards it. Once a hook event has discarded the
+  last read, Plan Mode during a running turn follows the hook's `permission_mode` hint alone, as
+  in the Claude and Pi packages: `plan` sets it and a later hook with another mode ends it. The
+  hint can be stale, since a session put into Plan Mode while a turn runs is not seen until a hook
+  payload says so, and a hook event does not keep the Plan Mode that a read showed (authoritative
+  Plan Mode for busy delivery: #152). A bind that leaves the route undecided (a silent queue
+  probe, say) discards the last read too, and no read is adopted while the route stays undecided:
+  the state follows the hooks, as for a session without a control socket.
 - **Busy delivery.** A `prompt` or `tool` hook asks the receiver for a batch
   while the turn runs. The receiver claims only when the session is busy, and
   never in Plan Mode, while stopped or in an unknown state. The reply is
@@ -515,11 +492,13 @@ exercised live.
   review were not run. A hook that is not trusted is skipped, and chat stays
   off without a message.
 - **Plan Mode from a hook.** Whether `permission_mode` `plan` in a hook payload
-  follows the Plan collaboration mode is not confirmed. The app-server read is
-  the authority when it exists, and a hook event cannot end a Plan Mode that it
-  showed (see State); without `appServer`, or with a route that no bind has
-  decided (a silent queue probe), a session put into Plan
-  Mode while idle is seen only if a hook payload says so.
+  follows the Plan collaboration mode is not confirmed, and the hint can be stale. The app-server
+  read is the authority when it exists, but a hook event discards it: after that, Plan Mode during
+  a running turn, for busy delivery and the heartbeat, follows the hint alone (see State). Without
+  `appServer`, or with a route that no bind has decided (a silent queue probe), a session put
+  into Plan Mode is seen only if a hook payload says so. Reads are not ordered among themselves:
+  an older read that lands after a newer one can set the state it saw until the next hook event.
+  An authoritative Plan Mode for busy delivery is tracked in #152.
 - **A delegate's hooks.** Codex gives a subagent's hooks the parent session
   id. Whether `UserPromptSubmit` and `PostToolUse` inside a subagent carry
   `agent_id` is not confirmed. Without `appServer` only `agent_id` and
@@ -744,7 +723,10 @@ exercised live.
   directory, as its canonical path, as its working directory and as the
   directory it keeps the binding file in.
 - The app-server client answers a server request with a method-not-found error
-  and checks every server frame against RFC 6455 section 5 before it reads it. It
+  completes the upgrade only on a 101 answer with `Upgrade: websocket`, a `Connection`
+  header with the `Upgrade` token (any case) and the `Sec-WebSocket-Accept` proof,
+  and refuses an answer that names an extension or a subprotocol (none is offered). It
+  checks every server frame against RFC 6455 section 5 before it reads it. It
   refuses a frame with FIN=0 (fragmentation is not supported, so a continuation
   frame is refused too), an opcode that is not text, close, ping or pong (binary
   included), a control frame with FIN=0 or more than 125 bytes of payload, a text

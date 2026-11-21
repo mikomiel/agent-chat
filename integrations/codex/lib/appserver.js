@@ -1,9 +1,10 @@
 // The receiver's view of one Codex thread through the app-server control socket, and the idle wake.
 //
 // The app-server speaks JSON-RPC over a WebSocket. A control socket is a Unix socket, so this is a minimal RFC 6455
-// client over node:net: one HTTP Upgrade, masked client text frames, and server frames that are whole and unfragmented
-// (text, close, ping, pong) without reserved bits (no extension is negotiated), with the shortest form of the length, UTF-8
-// text and control frames of at most 125 bytes; ping is answered with pong. It owns the wire,
+// client over node:net: one HTTP Upgrade, which the answer must complete (101, Upgrade: websocket, a Connection header with the
+// Upgrade token, the Accept proof, and no extension or subprotocol, none being offered), masked client text frames, and server
+// frames that are whole and unfragmented (text, close, ping, pong) without reserved bits (no extension is negotiated), with the
+// shortest form of the length, UTF-8 text and control frames of at most 125 bytes; ping is answered with pong. It owns the wire,
 // the thread reads and the add-then-delete fence. It owns no chat policy: the receiver decides when to read and what a
 // refusal means, and settles the claim.
 //
@@ -234,8 +235,14 @@ export function openAppServer(path, { createConnection = net.createConnection, c
         if (end < 0) { if (buffer.length > MAX_HEAD) fail("APP_SERVER_PROTOCOL"); return }
         const head = buffer.subarray(0, end).toString("latin1").split("\r\n")
         buffer = buffer.subarray(end + 4)
-        const header = name => head.slice(1).find(line => line.toLowerCase().startsWith(`${name}:`))?.slice(name.length + 1).trim()
-        if (!/^HTTP\/1\.1 101\b/.test(head[0]) || header("sec-websocket-accept") !== accept) return fail("APP_SERVER_PROTOCOL")
+        // Every header of that name, as a list: a list-valued header may repeat.
+        const values = name => head.slice(1).filter(line => line.toLowerCase().startsWith(`${name}:`)).map(line => line.slice(name.length + 1).trim())
+        // RFC 6455 section 4.1: the answer must name the protocol and the connection. Nothing was offered, so an extension or
+        // a subprotocol in it is a protocol failure.
+        const tokens = values("connection").flatMap(value => value.toLowerCase().split(",").map(token => token.trim()))
+        if (!/^HTTP\/1\.1 101\b/.test(head[0]) || values("sec-websocket-accept").join(",") !== accept
+          || values("upgrade").join(",").toLowerCase() !== "websocket" || !tokens.includes("upgrade")
+          || values("sec-websocket-extensions").length > 0 || values("sec-websocket-protocol").length > 0) return fail("APP_SERVER_PROTOCOL")
         upgraded = true
         try {
           await request("initialize", { clientInfo: CLIENT, capabilities: { experimentalApi: true } })
@@ -361,15 +368,8 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     const mode = resumed.collaborationMode?.mode
     observed.plan = mode === "default" ? false : mode === "plan" ? true : null
     if (observed.plan !== false) return { reason: observed.plan === true ? "plan" : "unknown", observed }
-    let turns
-    try {
-      turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline))
-      if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
-    } catch (error) {
-      // The mode was validated by the answer above, and a lookup that then fails or is malformed does not take it back. The
-      // error carries what was known, so `observe` can report the mode; the status is unknown, and the wake still fails.
-      throw Object.assign(error, { observed: { ...observed, status: "unknown" } })
-    }
+    const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline))
+    if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
     // Only a newest turn that is known to be finished clears the thread. A turn that is running is busy; an interrupted one is
     // stopped; no turn, a turn without a status and a status that is not known say nothing, and an unknown state never wakes.
     const newest = turns.data[0]?.status
@@ -442,15 +442,10 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
 
     // What the thread is now, from reads only. `reason` is the delivery refusal a wake would give, or null.
     // observed: { status: "idle"|"busy"|"offline"|"unknown", stopped, plan: true|false|null }
-    // A read that fails is offline, with no mode. The one exception is a failed lookup of the newest turn, after the
-    // `thread/resume` answer had shown the mode: that is unknown, and keeps the mode, so the mode it showed still counts.
     async observe() {
       try {
         return await withConnection(link => evaluate(link, Infinity))
-      } catch (error) {
-        if (error?.observed) return { reason: "unknown", observed: error.observed }
-        return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } }
-      }
+      } catch { return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } } }
     },
 
     // Queue `text` as one user turn and fence it. Resolves { outcome, reason } for the settle call. Three things prove

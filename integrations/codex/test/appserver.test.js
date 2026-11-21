@@ -80,6 +80,40 @@ test("a handshake whose accept proof is wrong, and a socket nobody listens on, a
   await assert.rejects(openAppServer(join(dir, "absent.sock")), error => ["ENOENT", "APP_SERVER_CLOSED"].includes(error.code))
 })
 
+// RFC 6455 section 4.1: the 101 answer must carry `Upgrade: websocket` and a `Connection` header with the Upgrade token, in any
+// case and in any of its repeats, and the client offered no extension and no subprotocol, so an answer that names one is refused.
+const dropping = prefix => lines => lines.filter(line => !line.toLowerCase().startsWith(prefix))
+const replacing = (prefix, ...added) => lines => [...dropping(prefix)(lines), ...added]
+for (const [label, headers, accepted] of [
+  ["the headers the client expects", lines => lines, true],
+  ["Upgrade and Connection in another case", lines => [...dropping("upgrade:")(dropping("connection:")(lines)), "UPGRADE: WebSocket", "connection: UPGRADE"], true],
+  ["Connection with the Upgrade token among others", replacing("connection:", "Connection: keep-alive, Upgrade"), true],
+  ["Connection repeated, the Upgrade token in the second", replacing("connection:", "Connection: keep-alive", "Connection: Upgrade"), true],
+  ["no Upgrade header", dropping("upgrade:"), false],
+  ["Upgrade naming another protocol", replacing("upgrade:", "Upgrade: h2c"), false],
+  ["Upgrade naming websocket among others", replacing("upgrade:", "Upgrade: websocket, h2c"), false],
+  ["no Connection header", dropping("connection:"), false],
+  ["Connection without the Upgrade token", replacing("connection:", "Connection: keep-alive"), false],
+  ["Connection naming the token only as part of another", replacing("connection:", "Connection: upgrade-insecure"), false],
+  ["an extension in the answer", lines => [...lines, "Sec-WebSocket-Extensions: permessage-deflate"], false],
+  ["an empty extensions header", lines => [...lines, "Sec-WebSocket-Extensions:"], false],
+  ["a subprotocol in the answer", lines => [...lines, "Sec-WebSocket-Protocol: chat"], false],
+  ["an empty subprotocol header", lines => [...lines, "Sec-WebSocket-Protocol:"], false],
+]) {
+  test(`the upgrade answer is ${accepted ? "accepted" : "refused as APP_SERVER_PROTOCOL"} with ${label}`, async () => {
+    await withServer(main(), async (path, server) => {
+      if (accepted) {
+        const link = await openAppServer(path)
+        assert.equal(server.log[0].method, "initialize")
+        link.close()
+      } else {
+        await assert.rejects(openAppServer(path), { code: "APP_SERVER_PROTOCOL" })
+        assert.equal(server.log.length, 0, "nothing was sent after the refused answer")
+      }
+    }, { headers })
+  })
+}
+
 test("ping is answered with pong, a server request is refused, and a notification is ignored", async () => {
   await withServer(message => (message.method === "thread/loaded/list" ? ok({ data: [THREAD], nextCursor: null }) : undefined), async (path, server) => {
     const link = await openAppServer(path)
@@ -650,24 +684,19 @@ test("a collaboration mode other than default is plan, and an unreadable one is 
   }
 })
 
-// The mode comes from the `thread/resume` answer, and the newest turn is looked up after it. A lookup that fails, or answers in a
-// way that is not the documented one, leaves the status unknown and the wake refused, but does not take back the mode that the
-// answer before it had validated: the receiver ends a Plan Mode memory on `plan: false`, whatever came after it.
-test("a lookup of the newest turn that fails or is malformed leaves the mode that thread/resume showed, and the wake is still refused", async () => {
+// The newest turn is looked up after the mode. A lookup that fails, or answers in a way that is not the documented one, leaves
+// the thread unread, so the wake is refused and nothing is queued.
+test("a lookup of the newest turn that fails or is malformed refuses the wake and adds nothing", async () => {
   for (const [label, answer] of [
     ["an error reply", () => ({ error: { code: -32000, message: "no" } })],
     ["data that is not a list", () => ok({ data: "none", nextCursor: null })],
     ["no data", () => ok({})],
     ["a connection that drops", (message, connection) => { connection.socket.destroy(); return undefined }],
   ]) {
-    const { result } = await observeWith({ "thread/turns/list": answer })
-    assert.deepEqual(result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: false } }, label)
     const { result: woken, methods } = await wakeWith({ "thread/turns/list": answer })
     assert.deepEqual(woken, { outcome: "failed", reason: "native_unavailable" }, `${label}: the wake fails and adds nothing`)
     assert.equal(methods.includes("thread/queue/add"), false, label)
   }
-  const unseen = await observeWith({ "thread/resume": () => ({ error: { code: -32600, message: "no rollout found" } }), "thread/turns/list": () => ({ error: { code: -32000, message: "no" } }) })
-  assert.deepEqual(unseen.result, { reason: "unknown", observed: { status: "idle", stopped: false, plan: null } }, "no mode was validated, so none is reported")
 })
 
 test("a child or a changed provider found by a later read is refused by name", async () => {

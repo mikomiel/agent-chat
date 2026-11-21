@@ -80,10 +80,6 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let planHint = false // the last hook payload said permission_mode "plan"
   let stopped = false // an Interrupt hook ran; only the next UserPromptSubmit clears it
   let observed = null // the last app-server read: { status, stopped, plan }; any hook event, and a bind that leaves the route undecided, discards it
-  let planSeen = false // the newest app-server read that showed a mode showed Plan Mode; a hook event does not discard it, a bind that leaves the route undecided does
-  let reads = 0 // numbers each app-server read when it starts, and the bind that ends the memory (`routeDecided`)
-  let observedAt = 0 // the number of the read held in `observed`
-  let planSeenAt = 0 // the number of the newest read that set `planSeen`
   let epoch = 0 // counts hook events and app-server refusals, so a read or a clearance that began before one is not kept
   let newestRefusal = null // the reason of the newest app-server read that refused a wake; a hook event discards it
   let threadBound = false // the newest bind decided the route: the thread is a main thread, its provider is fixed and the queue probe answered
@@ -119,11 +115,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   })
 
   // The hook says whether a turn runs and whether the operator interrupted it; the app-server read, when there is
-  // one, is the authority for Plan Mode and adds a busy or idle answer a hook cannot give while nothing runs. A hook's
-  // `permission_mode` is only a hint, so it cannot end a Plan Mode that the app-server showed: that ends with a read.
+  // one, is the authority for Plan Mode and adds a busy or idle answer a hook cannot give while nothing runs.
   function chatState() {
     if (failure) return "offline"
-    const plan = observed !== null && observed.plan !== null ? observed.plan : planHint || planSeen
+    const plan = observed !== null && observed.plan !== null ? observed.plan : planHint
     if (plan) return "plan"
     if (stopped || observed?.stopped === true) return "stopped"
     if (native === "busy" || observed?.status === "busy") return "busy"
@@ -267,53 +262,28 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return { refusal: null, verified: MAIN_THREAD.has(result.status), bound: result.status === "bound" }
   }
 
-  // Replace the observed state with a fresh read, unless a hook event arrived while it ran, the worker it was read for
-  // (`record`) was retired meanwhile, or the route stopped being decided: a retired worker's read changes nothing the
-  // replacement owns, and with no decided route no read is kept (see `learn`).
+  // Replace the observed state with a fresh read, unless a hook event arrived while it ran, the worker it was read
+  // for (`record`) was retired meanwhile, or a bind left the route undecided: a retired worker's read changes nothing
+  // the replacement owns, and with no decided route no read clears a wake.
   // A read that refuses a wake (any reason: busy, stopped, plan, unknown, offline, stale_binding) is a generation of its
   // own, and the epoch moves with it: a wake cleared before it must not go out, whatever the hooks say. A child read
   // disables the session in the caller, which settles every wake as offline.
   async function refine(record) {
     const before = epoch
-    const number = ++reads
     const result = await thread.observe()
     const current = epoch === before && live === record && threadBound
-    learn(record, result.observed, number, current)
-    if (current && result.reason !== null) { newestRefusal = result.reason; epoch += 1 }
+    if (current) {
+      observed = result.observed.status === "idle" || result.observed.status === "busy" ? result.observed : null
+      if (result.reason !== null) { newestRefusal = result.reason; epoch += 1 }
+    }
     return { ...result, current }
   }
 
-  // What one app-server read changes, by whichever path it came: `number` is the read's, taken when it started, and `fresh` says
-  // that no hook event or refusal arrived while it ran. One rule for the observed state and for the Plan Mode memory:
-  // - A read counts only for the worker it was made for, and only while the route is decided (`threadBound`). With no
-  //   decided route no read comes, so nothing could end what this one set: the session is hook-only.
-  // - The observed state takes a fresh read, unless it holds a newer one: reads land out of the order they started in.
-  // - Plan Mode: a read that shows it is evidence about the mode whenever it was taken. A hook event makes a read stale for
-  //   the observed state and for a wake, but says nothing about the mode (`permission_mode` is only a hint). A read that
-  //   shows default mode ends the memory only while it is fresh: a stale one may be older than the switch into Plan Mode.
-  //   Either way it must be newer than the newest read that set the memory, whatever it shows: a late one is older evidence
-  //   than the memory it would change. A read that shows no mode (a busy or an unreadable thread) leaves the memory as it was.
-  // The same read may be offered twice, fresh and then not (the wake's `proceed`): that changes nothing the first did not.
-  function learn(record, read, number, fresh) {
-    if (live !== record || !threadBound) return
-    if (fresh && number > observedAt) {
-      observed = read.status === "idle" || read.status === "busy" ? read : null
-      observedAt = number
-    }
-    if (read.plan === null || number < planSeenAt) return
-    if (read.plan === true || fresh) { planSeen = read.plan; planSeenAt = number }
-  }
-
-  // A bind decides the route. A bind that leaves it undecided drops what only a read could end: the Plan Mode memory and the
-  // answer held in `observed`, so the state and the heartbeat follow the hooks at once, with no hook event in between. The
-  // drop takes a number of its own, so a read that started before it is older than it and brings nothing back, whenever
-  // it lands, a later bind that decides the route again included.
+  // A bind decides the route. One that leaves it undecided (a silent queue probe, say) drops the last read: no read comes while
+  // the route is undecided, so nothing could replace it, and the state follows the hooks as it does without a control socket.
   function routeDecided(bound) {
     threadBound = bound
-    if (bound) return
-    planSeen = false
-    observed = null
-    planSeenAt = observedAt = ++reads
+    if (!bound) observed = null
   }
 
   async function connect() {
@@ -427,14 +397,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // so busy. A route that a bind has left undecided since refuses it as unknown, whatever the reading shows. Otherwise nothing
   // newer than the clearing read arrived, and the fresh reading is the newest word on the thread: a refusing one decides, and
   // the state adopts it, as a read of its own would.
-  function wakeStale(record, cleared, fresh, number) {
+  function wakeStale(cleared, fresh) {
     if (!live || closed || failure) return "offline"
     if (!threadBound) return "unknown" // a bind left the route undecided since the wake was cleared: only a decided route wakes
     const state = chatState()
     if (state !== null) return state
     if (epoch !== cleared) return newestRefusal ?? "busy"
     if (fresh.reason === "child") return "offline" // the next read ends the session; this one only declines to wake it
-    learn(record, fresh.observed, number, true)
+    observed = fresh.observed.status === "idle" || fresh.observed.status === "busy" ? fresh.observed : null
     if (fresh.reason === null) return null
     newestRefusal = fresh.reason
     epoch += 1
@@ -487,13 +457,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
             else if (wake) {
               // The claim and the status call took time: the add is sent only if nothing newer than the clearing read arrived.
-              const number = ++reads // the wake's reading starts inside this call, so it is newer than every read that started before it
               result = await thread.wake({
-                text: WAKE_PREFIX + notice, attemptId: grant.attempt_id, until: started + reservation, proceed: fresh => {
-                  const stale = wakeStale(record, cleared, fresh, number)
-                  learn(record, fresh.observed, number, false) // the mode counts whether or not the reading is still fresh enough to adopt
-                  return stale
-                },
+                text: WAKE_PREFIX + notice, attemptId: grant.attempt_id, until: started + reservation, proceed: fresh => wakeStale(cleared, fresh),
               })
               wakeAfter = now() + (result.outcome === "handed" ? 0 : WAKE_RETRY_MS)
               // A hook event since the clearing read is newer than the confirmation, so its state stays. Otherwise the
@@ -537,8 +502,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (isDone(await link.next(2_000), "written")) announced = announce.boot
   }
 
-  // A hook event is newer than any app-server read, so it discards the read, but not the Plan Mode that the read showed
-  // (`planSeen`): the hook's mode is a hint. Only a prompt clears a local stop.
+  // A hook event is newer than any app-server read, so it discards the read. Only a prompt clears a local stop.
   function setNative(request, running, event) {
     const mode = request.permission_mode
     planHint = mode === "plan"
