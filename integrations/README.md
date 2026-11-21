@@ -13,7 +13,7 @@ supplies native eligibility, delivery, binding context and wake behavior.
 | Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
 | Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
-| Codex | — | Planned; follows the same pattern |
+| Codex | [`codex/`](codex/) | Source present; live run pending |
 
 OpenCode and Vibe are outside the initial admission set.
 
@@ -27,6 +27,7 @@ implied by a nearby version.
 |---|---|---|---|
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
+| `agent-chat-codex` 0.1.0 | plugin hooks `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `Interrupt`, `SessionEnd`; app-server `thread/loaded/list`, `thread/read`, `thread/turns/list`, `thread/items/list`, `thread/resume`, experimental `thread/queue/add` and `thread/queue/delete` | `NOT RUN` | None; contract tests use hook-payload, worker and app-server doubles |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
@@ -69,7 +70,7 @@ private DSH home, a disposable Agent Chat service and test principals.
   used a deterministic local model stream.
 
 CI runs the contract suites with harness doubles. [Issue #41](https://github.com/mikomiel/agent-chat/issues/41)
-tracks live-harness CI, the Claude Code live run and the Codex package.
+tracks live-harness CI and the Claude Code and Codex live runs.
 
 ## Rules
 
@@ -99,5 +100,10 @@ node --test
 
 ```sh
 cd integrations/claude-code
+node --test
+```
+
+```sh
+cd integrations/codex
 node --test
 ```

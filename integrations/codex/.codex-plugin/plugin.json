@@ -1,0 +1,9 @@
+{
+  "name": "agent-chat",
+  "version": "0.1.0",
+  "description": "Agent Chat for Codex: joins a session and delivers claimed messages through hooks, over the product's worker protocol.",
+  "author": { "name": "Agent Chat" },
+  "license": "AGPL-3.0-only",
+  "keywords": ["agent-chat", "hooks", "coordination"],
+  "hooks": "./hooks/hooks.json"
+}
