@@ -297,6 +297,22 @@ def test_another_complete_2xx_is_invalid_for_pending_and_heartbeat_only(peer, mo
         instance_client.status(joined)
 
 
+def test_a_server_reply_carrying_refused_is_invalid_not_an_outage(monkeypatch):
+    # A gateway that answers 200 with the worker's own outage marker must not look like a tolerated outage.
+    instance = _canned(
+        monkeypatch,
+        lambda instance_id, session_id: {
+            "instance_id": instance_id, "session_id": session_id, "messages": [], "refused": "SERVICE_UNAVAILABLE"
+        },
+    )
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        instance_client.heartbeat(instance, Heartbeat(native_state="idle", stopped=False, plan_mode=False))
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        instance_client.pending(instance)
+    with pytest.raises(ChatError, match="^TRANSPORT_UNAVAILABLE$"):
+        instance_client.status(instance)
+
+
 def _worker_frame(process: subprocess.Popen[str], frame: dict) -> dict:
     assert process.stdin is not None and process.stdout is not None
     process.stdin.write(json.dumps(frame) + "\n")

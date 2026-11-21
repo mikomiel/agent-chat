@@ -102,6 +102,10 @@ def _request(
     try:
         if not isinstance(result, dict) or _uuid(result.get("instance_id")) != instance.instance_id:
             raise ValueError("different binding in response")
+        if "refused" in result:
+            # Only the worker writes `refused`, for an outage it tolerates. The server never sends it, so one in a
+            # server reply is a protocol violation and must not pass through as that tolerated outage.
+            raise ValueError("refused in a server reply")
         if method == "GET":
             if _uuid(result.get("session_id")) != instance.session_id:
                 raise ValueError("different logical session in response")
