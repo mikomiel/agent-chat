@@ -3,8 +3,11 @@
 ``integrations/<harness>/`` is a self-contained package directory with
 ``package.json`` at its root, and every such directory ships at the version in
 ``pyproject.toml``. These tests enumerate the directories, so a package that
-someone adds later is held to the rule without an edit here. They read files
-only: no network, no ``npm`` and no build. ``scripts/check_release_artifacts.py``
+someone adds later is held to the rule without an edit here. They use no
+network, no ``npm`` and no build. Most read files or archives that the tests
+write themselves. One group runs the install block of ``integrations/README.md``
+with ``bash``, ``curl`` (over ``file://``), ``tar`` and ``sha256sum``, and is
+skipped when one of them is missing. ``scripts/check_release_artifacts.py``
 proves the built artifacts, and the release workflow runs it.
 """
 
@@ -15,9 +18,11 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
+import textwrap
 import tomllib
 import zipfile
 from pathlib import Path
@@ -153,6 +158,13 @@ def test_files_allowlist_ships_everything_but_the_tests(package: Path) -> None:
         assert name.split("/")[0] not in {"test", "tests", "node_modules"}
     top_level = {path.name for path in package.iterdir()} - {"package.json", "test", "node_modules"}
     assert top_level <= names, f"top-level paths missing from files: {sorted(top_level - names)}"
+
+
+@pytest.mark.parametrize("package", PACKAGES, ids=lambda path: path.name)
+def test_a_package_directory_holds_no_license_of_its_own(package: Path) -> None:
+    """The pack step puts the one repository LICENSE into every tarball; a second copy would be shadowed."""
+    own = [path.name for path in package.iterdir() if re.match(r"licen[cs]e", path.name, re.IGNORECASE)]
+    assert own == []
 
 
 @pytest.mark.parametrize("package", PACKAGES, ids=lambda path: path.name)
@@ -313,6 +325,7 @@ def test_the_release_tag_check_passes_only_the_exact_project_version(tmp_path: P
 
 VERSION = "1.2.3"
 HARNESSES = ("alpha", "beta")
+LICENSE_TEXT = "the repository licence\n"
 
 
 def write_tarball(path: Path, members: dict[str, str]) -> None:
@@ -336,6 +349,7 @@ def tarball_members(harness: str, version: str = VERSION) -> dict[str, str]:
         "package/package.json": json.dumps(package),
         "package/README.md": "readme",
         "package/lib/config.js": "export {}",
+        "package/LICENSE": LICENSE_TEXT,
     }
 
 
@@ -348,6 +362,8 @@ def write_sums(dist: Path) -> None:
 def release(tmp_path: Path) -> tuple[Path, Path, list[str]]:
     root, dist = tmp_path / "root", tmp_path / "dist"
     dist.mkdir()
+    root.mkdir()
+    (root / "LICENSE").write_text(LICENSE_TEXT, encoding="utf-8")
     tracked: list[str] = []
     for harness in HARNESSES:
         (root / "integrations" / harness).mkdir(parents=True)
@@ -486,12 +502,156 @@ def test_a_directory_member_is_allowed(release: tuple[Path, Path, list[str]]) ->
     assert problems(release) == []
 
 
+def test_the_package_root_directory_member_is_allowed(release: tuple[Path, Path, list[str]]) -> None:
+    root_directory = tarfile.TarInfo("package")
+    root_directory.type = tarfile.DIRTYPE
+    write_alpha(release, [(root_directory, b""), *alpha_entries()])
+    assert problems(release) == []
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param("package/lib/./extra.js", id="dot-segment"),
+        pytest.param("package/lib/../extra.js", id="dot-dot-segment"),
+        pytest.param("package//lib/extra.js", id="empty-segment"),
+        pytest.param("./package/lib/extra.js", id="leading-dot"),
+        pytest.param("/package/lib/extra.js", id="leading-slash"),
+        pytest.param("package\\lib\\extra.js", id="backslash"),
+        pytest.param("package/lib/extra.js/", id="trailing-slash-on-a-file"),
+    ],
+)
+def test_a_tarball_member_with_a_non_canonical_path_fails(release: tuple[Path, Path, list[str]], name: str) -> None:
+    write_alpha(release, [*alpha_entries(), regular(name, "x")])
+    assert any(f"member {name!r} has a non-canonical path" in error for error in problems(release))
+
+
+def test_a_non_canonical_spelling_cannot_stand_in_for_a_tracked_file(release: tuple[Path, Path, list[str]]) -> None:
+    entries = [entry for entry in alpha_entries() if entry[0].name != "package/lib/config.js"]
+    write_alpha(release, [*entries, regular("package/lib/./config.js", "export {}")])
+    errors = problems(release)
+    assert any("has a non-canonical path" in error for error in errors)
+    assert any("missing lib/config.js" in error for error in errors)
+
+
+def directory(name: str) -> Entry:
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.DIRTYPE
+    return info, b""
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        pytest.param(regular("package/lib/config.js", "a"), regular("package/lib/./config.js", "b"), id="files"),
+        pytest.param(directory("package/lib"), directory("package/./lib"), id="directories"),
+        pytest.param(directory("package/lib"), regular("package/lib/../lib", "b"), id="directory-and-file"),
+    ],
+)
+def test_duplicates_are_compared_on_the_normalized_path(
+    release: tuple[Path, Path, list[str]], first: Entry, second: Entry
+) -> None:
+    entries = [entry for entry in alpha_entries() if entry[0].name != first[0].name]
+    write_alpha(release, [first, *entries, second])
+    assert any(f"duplicate member {second[0].name} (path package/" in error for error in problems(release))
+
+
+def test_a_directory_named_like_a_tracked_file_fails(release: tuple[Path, Path, list[str]]) -> None:
+    entries = [entry for entry in alpha_entries() if entry[0].name != "package/README.md"]
+    write_alpha(release, [*entries, directory("package/README.md"), regular("package/README.md/extra", "x")])
+    errors = problems(release)
+    assert any("unexpected directory README.md" in error for error in errors)
+    assert any("unexpected README.md/extra" in error for error in errors)
+    assert any("missing README.md" in error for error in errors)
+
+
+@pytest.mark.parametrize("name", ["package/lib/empty", "package/test", "package/elsewhere"])
+def test_a_directory_member_must_be_an_ancestor_of_an_expected_file(
+    release: tuple[Path, Path, list[str]], name: str
+) -> None:
+    write_alpha(release, [*alpha_entries(), directory(name)])
+    assert any(f"unexpected directory {name.removeprefix('package/')}" in error for error in problems(release))
+
+
+def test_every_tarball_ships_the_repository_license(release: tuple[Path, Path, list[str]]) -> None:
+    entries = [entry for entry in alpha_entries() if entry[0].name != "package/LICENSE"]
+    write_alpha(release, entries)
+    assert any("missing LICENSE" in error for error in problems(release))
+    write_alpha(release, [*entries, regular("package/LICENSE", "another licence\n")])
+    assert any("LICENSE differs from the repository LICENSE" in error for error in problems(release))
+    root, _, _ = release
+    (root / "LICENSE").unlink()
+    assert any("LICENSE is missing, so the tarball LICENSE check would prove nothing" in e for e in problems(release))
+
+
 def test_the_sums_must_match_the_tarballs(release: tuple[Path, Path, list[str]]) -> None:
     _, dist, _ = release
     (dist / script.tarball_name("alpha", VERSION)).write_bytes(b"changed")
     assert any("wrong digest for agent-chat-alpha-1.2.3.tgz" in error for error in problems(release))
     (dist / script.SUMS).unlink()
     assert any(f"no {script.SUMS}" in error for error in problems(release))
+
+
+ALPHA = script.tarball_name("alpha", VERSION)
+
+
+def alpha_digest(release: tuple[Path, Path, list[str]]) -> str:
+    return script.sha256(release[1] / ALPHA)
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        pytest.param("{digest_upper}  {name}", id="uppercase-digest"),
+        pytest.param("{digest_short}  {name}", id="short-digest"),
+        pytest.param("{digest} {name}", id="one-space"),
+        pytest.param("{digest}   {name}", id="three-spaces"),
+        pytest.param("{digest} *{name}", id="binary-mode"),
+        pytest.param("{digest}  *{name}", id="star-in-the-name"),
+        pytest.param("{digest}  ./{name}", id="path-in-the-name"),
+        pytest.param("{digest}  {name} ", id="trailing-space"),
+        pytest.param("{digest}  {name}\r", id="carriage-return"),
+        pytest.param("", id="blank-line"),
+        pytest.param("not a checksum line", id="free-text"),
+    ],
+)
+def test_a_malformed_sums_line_fails(release: tuple[Path, Path, list[str]], bad_line: str) -> None:
+    _, dist, _ = release
+    digest = alpha_digest(release)
+    line = bad_line.format(digest=digest, digest_upper=digest.upper(), digest_short=digest[:-1], name=ALPHA)
+    sums = dist / script.SUMS
+    sums.write_text(sums.read_text(encoding="utf-8") + line + "\n", encoding="utf-8")
+    assert any(
+        f"{script.SUMS}: line 3 is not '<64 lowercase hex digits>  <file name>'" in e for e in problems(release)
+    )
+
+
+def test_a_sums_file_with_windows_line_endings_fails(release: tuple[Path, Path, list[str]]) -> None:
+    _, dist, _ = release
+    sums = dist / script.SUMS
+    sums.write_bytes(sums.read_bytes().replace(b"\n", b"\r\n"))
+    assert sum("is not '<64 lowercase hex digits>" in error for error in problems(release)) == 2
+
+
+@pytest.mark.parametrize("wrong_digest", [False, True])
+def test_a_repeated_sums_line_fails_and_never_overwrites_the_first(
+    release: tuple[Path, Path, list[str]], wrong_digest: bool
+) -> None:
+    _, dist, _ = release
+    digest = "0" * 64 if wrong_digest else alpha_digest(release)
+    sums = dist / script.SUMS
+    sums.write_text(sums.read_text(encoding="utf-8") + f"{digest}  {ALPHA}\n", encoding="utf-8")
+    assert any(f"{script.SUMS}: line 3 repeats {ALPHA}" in error for error in problems(release))
+
+
+def test_an_empty_or_unreadable_sums_file_fails(release: tuple[Path, Path, list[str]]) -> None:
+    _, dist, _ = release
+    (dist / script.SUMS).write_text("", encoding="utf-8")
+    errors = problems(release)
+    assert any("line 1 is not" in error for error in errors)
+    assert any(f"{script.SUMS}: no line for {ALPHA}" in error for error in errors)
+    (dist / script.SUMS).write_bytes(b"\xff\xfe")
+    assert any(f"{script.SUMS}: cannot read the file" in error for error in problems(release))
 
 
 def write_sdist(dist: Path, names: list[str]) -> None:
@@ -524,9 +684,184 @@ def test_the_wheel_must_hold_no_integration_path(tmp_path: Path) -> None:
     assert script.check_wheel(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "agent_chat/integrations/pi/package.json",
+        "agent_chat/mcp/integrations/pi/package.json",
+        "sessionyard/integrations",
+    ],
+)
+def test_the_wheel_holds_no_integrations_segment_anywhere(tmp_path: Path, name: str) -> None:
+    write_wheel(tmp_path, ["agent_chat/__init__.py", name])
+    assert script.check_wheel(tmp_path) == [f"sessionyard-1.2.3-py3-none-any.whl: holds {name}"]
+
+
+def test_a_path_that_only_contains_the_word_integrations_is_not_an_integrations_segment(tmp_path: Path) -> None:
+    write_wheel(
+        tmp_path, ["agent_chat/__init__.py", "agent_chat/integrations_notes.py", "agent_chat/myintegrations/x"]
+    )
+    assert script.check_wheel(tmp_path) == []
+
+
 def test_a_missing_or_doubled_distribution_fails(tmp_path: Path) -> None:
     assert script.check_wheel(tmp_path)
     assert script.check_sdist(tmp_path, tracked_files("alpha"))
     write_sdist(tmp_path, tracked_files("alpha"))
     write_tarball(tmp_path / "other-1.tar.gz", {})
     assert script.check_sdist(tmp_path, tracked_files("alpha"))
+
+
+# The install guide, executed. A block that nobody runs drifts from the checker that guards the same file.
+
+INSTALL_TOOLS = ("bash", "curl", "tar", "sha256sum")
+MISSING_TOOLS = [tool for tool in INSTALL_TOOLS if shutil.which(tool) is None]
+GUIDE_BASE_URL = "https://github.com/mikomiel/agent-chat/releases/download/v${version}"
+PI_ASSET = f"agent-chat-pi-{VERSION}.tgz"
+needs_install_tools = pytest.mark.skipif(bool(MISSING_TOOLS), reason=f"the install block needs {MISSING_TOOLS}")
+
+
+def install_block() -> str:
+    """The one fenced bash block of the install section, as the guide prints it."""
+    section = (INTEGRATIONS / "README.md").read_text(encoding="utf-8").split(INSTALL_SECTION, 1)[1]
+    (block,) = re.findall(r"^   ```bash\n(.*?)^   ```$", section, flags=re.DOTALL | re.MULTILINE)
+    return textwrap.dedent(block)
+
+
+def make_release(directory: Path) -> Path:
+    """A local stand-in for the release download directory: two tarballs and their SHA256SUMS."""
+    directory.mkdir()
+    write_tarball(directory / PI_ASSET, {"package/package.json": "{}", "package/lib/config.js": "export {}"})
+    write_tarball(directory / f"agent-chat-deepseek-{VERSION}.tgz", {"package/package.json": "{}"})
+    write_sums(directory)
+    return directory
+
+
+def run_install(tmp_path: Path, release_dir: Path) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    """Run the guide's block over ``file://`` and return the result, the target and the scratch directory."""
+    block = install_block()
+    assert GUIDE_BASE_URL in block, "the block no longer downloads from the release URL that this test replaces"
+    parent, scratch = tmp_path / "install", tmp_path / "scratch"
+    parent.mkdir(exist_ok=True)
+    scratch.mkdir()
+    block = (
+        block.replace(GUIDE_BASE_URL, f"file://{release_dir}")
+        .replace("<version>", VERSION)
+        .replace("<absolute-directory>", str(parent))
+    )
+    result = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", block],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        cwd=tmp_path,
+        env={**os.environ, "TMPDIR": str(scratch), "LC_ALL": "C"},
+    )
+    return result, parent / f"agent-chat-pi-{VERSION}", scratch
+
+
+def pi_line(release_dir: Path) -> str:
+    return f"{script.sha256(release_dir / PI_ASSET)}  {PI_ASSET}\n"
+
+
+def other_lines(release_dir: Path) -> str:
+    return "".join(
+        line
+        for line in (release_dir / script.SUMS).read_text(encoding="utf-8").splitlines(True)
+        if PI_ASSET not in line
+    )
+
+
+def tamper(release_dir: Path) -> None:
+    (release_dir / PI_ASSET).write_bytes(b"tampered after the sums were written")
+
+
+def repeat_line(release_dir: Path) -> None:
+    sums = release_dir / script.SUMS
+    sums.write_text(sums.read_text(encoding="utf-8") + pi_line(release_dir), encoding="utf-8")
+
+
+def drop_line(release_dir: Path) -> None:
+    (release_dir / script.SUMS).write_text(other_lines(release_dir), encoding="utf-8")
+
+
+def repeat_in_binary_mode(release_dir: Path) -> None:
+    sums = release_dir / script.SUMS
+    digest = pi_line(release_dir).split()[0]
+    sums.write_text(sums.read_text(encoding="utf-8") + f"{digest} *{PI_ASSET}\n", encoding="utf-8")
+
+
+def only_binary_mode(release_dir: Path) -> None:
+    digest = pi_line(release_dir).split()[0]
+    (release_dir / script.SUMS).write_text(other_lines(release_dir) + f"{digest} *{PI_ASSET}\n", encoding="utf-8")
+
+
+def uppercase_digest(release_dir: Path) -> None:
+    digest = pi_line(release_dir).split()[0].upper()
+    (release_dir / script.SUMS).write_text(other_lines(release_dir) + f"{digest}  {PI_ASSET}\n", encoding="utf-8")
+
+
+def windows_line_endings(release_dir: Path) -> None:
+    sums = release_dir / script.SUMS
+    sums.write_bytes(sums.read_bytes().replace(b"\n", b"\r\n"))
+
+
+def drop_sums(release_dir: Path) -> None:
+    (release_dir / script.SUMS).unlink()
+
+
+def drop_tarball(release_dir: Path) -> None:
+    (release_dir / PI_ASSET).unlink()
+
+
+@needs_install_tools
+def test_the_install_block_extracts_a_verified_tarball_and_cleans_up(tmp_path: Path) -> None:
+    release_dir = make_release(tmp_path / "release")
+    result, target, scratch = run_install(tmp_path, release_dir)
+    assert result.returncode == 0, result.stderr
+    assert (target / "package.json").is_file() and (target / "lib" / "config.js").is_file()
+    assert not (target / "package").exists(), "--strip-components=1 removes the package/ directory"
+    assert list(scratch.iterdir()) == [], "the temporary download directory is removed"
+
+
+@needs_install_tools
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        pytest.param(tamper, "FAILED", id="tampered-tarball"),
+        pytest.param(repeat_line, "exactly one line", id="duplicate-line"),
+        pytest.param(drop_line, "exactly one line", id="missing-line"),
+        pytest.param(repeat_in_binary_mode, "exactly one line", id="binary-mode-duplicate"),
+        pytest.param(only_binary_mode, "GNU text form", id="binary-mode-only"),
+        pytest.param(uppercase_digest, "GNU text form", id="uppercase-digest"),
+        pytest.param(windows_line_endings, "exactly one line", id="windows-line-endings"),
+        pytest.param(drop_sums, "curl", id="missing-sums-file"),
+        pytest.param(drop_tarball, "curl", id="missing-tarball"),
+    ],
+)
+def test_the_install_block_extracts_nothing_when_a_check_fails(tmp_path: Path, mutate, message: str) -> None:
+    release_dir = make_release(tmp_path / "release")
+    mutate(release_dir)
+    result, target, scratch = run_install(tmp_path, release_dir)
+    assert result.returncode != 0
+    assert message in result.stdout + result.stderr
+    assert not target.exists(), "nothing is extracted after a failed check"
+    assert list(scratch.iterdir()) == [], "the temporary download directory is removed"
+
+
+@needs_install_tools
+def test_the_install_block_leaves_an_existing_target_alone(tmp_path: Path) -> None:
+    release_dir = make_release(tmp_path / "release")
+    target = tmp_path / "install" / f"agent-chat-pi-{VERSION}"
+    target.mkdir(parents=True)
+    (target / "keep.txt").write_text("mine", encoding="utf-8")
+    result, _, _ = run_install(tmp_path, release_dir)
+    assert result.returncode != 0 and "exists already" in result.stderr
+    assert [path.name for path in target.iterdir()] == ["keep.txt"]
+
+
+def test_the_install_guide_names_its_requirements_and_the_macos_route() -> None:
+    section = (INTEGRATIONS / "README.md").read_text(encoding="utf-8").split(INSTALL_SECTION, 1)[1]
+    assert "bash" in section and "GNU coreutils" in section and "sha256sum" in section
+    assert "libexec/gnubin" in section

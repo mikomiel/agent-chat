@@ -53,7 +53,9 @@ jobs:
           fi
       # Packs every integrations/*/ directory, found by listing, and fails
       # unless there is one tarball per directory, each at the project
-      # version, with its entry points and without its tests.
+      # version, with its entry points and the repository LICENSE and without
+      # its tests, and SHA256SUMS is in the GNU text form that the install
+      # block reads.
       - name: Pack and check the integrations
         run: python scripts/check_release_artifacts.py --pack --integrations-only assets
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

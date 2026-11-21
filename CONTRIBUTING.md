@@ -164,10 +164,11 @@ predate the rename and carry the distribution name `agent-chat`.
 
 Publishing the GitHub Release also starts
 `.github/workflows/release-integrations.yml`, which attaches
-`agent-chat-<harness>-<version>.tgz` for every `integrations/*/` directory and
-`SHA256SUMS` to the release. It is a separate workflow so that `publish.yml`
-keeps its single trust binding. Its `pack` job runs read-only, checks the tag
-like `publish.yml` does and runs `scripts/check_release_artifacts.py --pack`.
+`agent-chat-<harness>-<version>.tgz` for every `integrations/*/` directory, each
+with the repository `LICENSE`, and `SHA256SUMS` to the release. It is a separate
+workflow so that `publish.yml` keeps its single trust binding. Its `pack` job
+runs read-only, checks the tag like `publish.yml` does and runs
+`scripts/check_release_artifacts.py --pack`.
 Its `upload` job holds `contents: write`, checks nothing out and runs no
 repository code. Nothing is published to npm. Run the script over a `uv build`
 output directory to check the sdist and the wheel as well:

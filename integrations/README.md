@@ -113,7 +113,9 @@ package is covered when its directory appears.
 - **Contents.** A `files` allowlist lists the entry points, `lib/`, `scripts/`,
   `hooks/`, `.claude-plugin/` and `README.md` that the package needs, so
   `test/` stays out of the tarball. Every other top-level path of the
-  directory belongs in `files`.
+  directory belongs in `files`. The repository `LICENSE` is in every tarball
+  too: the pack step adds it, because npm packs only files inside the package
+  directory, so a package directory holds no copy of it.
 - **Configuration.** `lib/config.js` reads the shared `AGENT_CHAT_DELEGATED_CHILD`
   opt-out and exactly one `AGENT_CHAT_<HARNESS>_CONFIG` variable, and the
   package README documents it. See the table below.
@@ -132,9 +134,14 @@ keeps a harness process that a session starts on purpose from joining chat.
 `tests/test_release_artifacts.py` pins this rule for every directory under
 `integrations/`. `scripts/check_release_artifacts.py` packs the directories and
 checks the built artifacts: the sdist holds every tracked integration file, the
-wheel holds none, and there is one tarball per directory with its entry points
-and without `test/`. The release workflow `release-integrations.yml` runs it
-before it attaches the tarballs to the release.
+wheel holds no `integrations` path, and there is one tarball per directory with
+its entry points, the repository `LICENSE` and without `test/`. A tarball holds
+only regular files and directories under `package/`, with canonical paths and
+no duplicate. `SHA256SUMS` has one line per tarball in the GNU text form
+`<64 lowercase hex digits><two spaces><tarball name>`; the install block below
+reads that form and nothing else. The release workflow
+`release-integrations.yml` runs the script before it attaches the tarballs to
+the release.
 
 ## Install a pinned release
 
@@ -155,15 +162,24 @@ release.
    that its config file names in `python`, so point `python` at an interpreter
    that has this version installed.
 2. **Download, verify and extract the tarball** of the harness (`pi`,
-   `deepseek` or `claude-code`) in one block. The block works in a fresh
-   temporary directory and stops at the first failure: it extracts only after
-   both downloads succeed and `SHA256SUMS` has exactly one line for the
-   chosen file name and that line matches. The target directory is absolute,
-   must not exist yet, and stays in place for as long as the harness uses it.
-   The tarball unpacks into a `package/` directory, which the block strips.
-   The layout must stay intact, because the entry points import `../lib/`.
+   `deepseek` or `claude-code`) in one block. The block needs `bash`, `curl`,
+   `tar` and GNU coreutils `sha256sum`. macOS has no GNU `sha256sum`: install
+   coreutils with Homebrew (`brew install coreutils`) and put its `gnubin`
+   directory first on `PATH` in the shell that runs the block:
+   `PATH="$(brew --prefix coreutils)/libexec/gnubin:$PATH"`.
 
-   ```sh
+   The block works in a fresh temporary directory and stops at the first
+   failure. It extracts only after both downloads succeed and `SHA256SUMS`
+   has exactly one line for the chosen file name, in the GNU text form
+   `<64 lowercase hex digits><two spaces><file name>`, and that line matches.
+   A binary-mode record, `<digest> *<file name>`, counts as a line for the
+   file, so a repeated one stops the block, and a lone one is refused. The
+   target directory is absolute, must not exist yet, and stays in place for as
+   long as the harness uses it. The tarball unpacks into a `package/`
+   directory, which the block strips. The layout must stay intact, because the
+   entry points import `../lib/`.
+
+   ```bash
    version=<version>
    harness=pi
    dir="<absolute-directory>/agent-chat-${harness}-${version}"
@@ -174,9 +190,11 @@ release.
      work=$(mktemp -d)
      trap 'rm -rf "$work"' EXIT
      cd "$work"
-     curl --fail --location --remote-name "${base}/${asset}" --remote-name "${base}/SHA256SUMS"
-     awk -v name="$asset" 'NF == 2 && $2 == name' SHA256SUMS > asset.sha256
+     curl --fail --location --remote-name "${base}/${asset}"
+     curl --fail --location --remote-name "${base}/SHA256SUMS"
+     awk -v name="$asset" 'NF == 2 && ($2 == name || $2 == "*" name)' SHA256SUMS > asset.sha256
      test "$(wc -l < asset.sha256)" -eq 1 || { echo "SHA256SUMS needs exactly one line for ${asset}" >&2; exit 1; }
+     LC_ALL=C grep -Eqx '[0-9a-f]{64}  [^* ][^ ]*' asset.sha256 || { echo "the line for ${asset} is not in the GNU text form" >&2; exit 1; }
      sha256sum --check --strict asset.sha256
      test ! -e "$dir" || { echo "${dir} exists already" >&2; exit 1; }
      mkdir -p "$dir"
