@@ -184,7 +184,7 @@ def write_sums(dist: Path) -> None:
         handle.write("".join(lines))
     umask = os.umask(0)  # read the umask; a temporary file is created 0600
     os.umask(umask)
-    os.chmod(handle.name, 0o666 & ~umask)  # the mode open() would have given
+    os.chmod(handle.name, 0o644 & ~umask)  # never group- or world-writable; a tighter umask wins
     os.replace(handle.name, dist / SUMS)
 
 

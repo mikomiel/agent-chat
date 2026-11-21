@@ -1058,8 +1058,8 @@ def test_the_sums_file_is_replaced_and_never_written_through(tmp_path: Path) -> 
     assert [path.name for path in dist.iterdir() if path.name.startswith("SHA256SUMS.")] == []
 
 
-@pytest.mark.parametrize(("umask", "mode"), [(0o022, 0o644), (0o077, 0o600)])
-def test_the_sums_file_takes_its_mode_from_the_umask(tmp_path: Path, umask: int, mode: int) -> None:
+@pytest.mark.parametrize(("umask", "mode"), [(0o022, 0o644), (0o002, 0o644), (0o000, 0o644), (0o077, 0o600)])
+def test_the_sums_file_is_at_most_0644_and_honours_a_tighter_umask(tmp_path: Path, umask: int, mode: int) -> None:
     dist = tmp_path / "dist"
     dist.mkdir()
     write_tarball(dist / "agent-chat-alpha-1.2.3.tgz", {"package/package.json": "{}"})
