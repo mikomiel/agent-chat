@@ -187,7 +187,7 @@ function takeBindLock(path, deps) {
 // a Node listener unlinks the name it was bound under, whatever is there by then, so with the public path as that
 // name a receiver that closed late would remove its successor's socket. With the private name, closing touches
 // nothing public: `close` removes the public path itself, only while that path is still this listener's file, and
-// while the listener is still up, so nothing can have taken the path in between.
+// only under the bind lock, so no successor can publish its socket between the check and the removal.
 export async function serve(path, handler, { connectImpl = connect, alive = ownerAlive, startTime = processStartTime } = {}) {
   const gate = `${path}.bind`
   if (!takeBindLock(gate, { alive, startTime })) throw refusal("CHAT_RECEIVER_RUNNING")
@@ -231,11 +231,21 @@ export async function serve(path, handler, { connectImpl = connect, alive = owne
     try { unlinkSync(gate) } catch { /* already gone */ }
   }
   return {
+    // The check of the path and its removal are two system calls, so they run under the bind lock, which every receiver
+    // holds while it publishes a socket: no successor can link its socket between them. A close that cannot take the
+    // lock leaves the public path alone, because a successor may be publishing; a dead socket file is what the next
+    // `serve` already recovers. The listener closes either way.
     close() {
-      try {
-        const now = lstatSync(path, { bigint: true })
-        if (now.dev === own.dev && now.ino === own.ino) unlinkSync(path)
-      } catch { /* already gone */ }
+      let held = false
+      try { held = takeBindLock(gate, { alive, startTime }) } catch { /* no lock, no unlink */ }
+      if (held) {
+        try {
+          const now = lstatSync(path, { bigint: true })
+          if (now.dev === own.dev && now.ino === own.ino) unlinkSync(path)
+        } catch { /* already gone */ } finally {
+          try { unlinkSync(gate) } catch { /* already gone */ }
+        }
+      }
       server.close()
     },
   }

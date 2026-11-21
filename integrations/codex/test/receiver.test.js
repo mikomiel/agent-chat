@@ -1,8 +1,12 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { existsSync, readFileSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { createThread } from "../lib/appserver.js"
 import { createReceiver, processStartTime } from "../lib/receiver.js"
 import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES, WAKE_PREFIX } from "../lib/channel.js"
+import { fakeAppServer } from "./fake-app-server.js"
 
 const ROOM = "33333333-3333-4333-8333-333333333333"
 const baseConfig = { python: "/usr/bin/python3", directory: "/tmp/agent-chat-state", serverOrigin: "https://chat.example", hostToken: "synthetic-host-token" }
@@ -55,11 +59,13 @@ function scheduler() {
   }
 }
 
-// The product's worker, as a double. `handlers` override one operation each.
+// The product's worker, as a double. `handlers` override one operation each. `gate` holds a join open: one gate for
+// every worker, or a function of the worker's number (1 is the first) that returns the gate of that worker, if any.
+// Like the product's worker, a worker whose join is still open refuses every other request as busy.
 function workerDouble({ events, handlers = {}, gate, joinErrors = [] } = {}) {
   const log = []
   const bootIds = []
-  const state = { stops: 0 }
+  const state = { stops: 0, busy: 0 }
   const answers = {
     heartbeat: () => ({}),
     pending: () => ({ messages: [] }),
@@ -77,9 +83,15 @@ function workerDouble({ events, handlers = {}, gate, joinErrors = [] } = {}) {
       room_id: ROOM, host: "synthetic-host", harness: "codex", instance_file: `/tmp/agent-chat-state/${identity.bootId}.json`,
     }
     const refusal = joinErrors[bootIds.length - 1]
+    const hold = typeof gate === "function" ? gate(bootIds.length) : gate
+    let joining = Boolean(hold)
     return {
-      ready: refusal ? Promise.reject(refusal) : gate ? gate.promise.then(() => joined) : Promise.resolve(joined),
+      ready: refusal ? Promise.reject(refusal) : hold ? hold.promise.then(() => { joining = false; return joined }) : Promise.resolve(joined),
       async request(op, fields = {}) {
+        if (joining) {
+          state.busy += 1
+          throw Object.assign(new Error("CHAT_WORKER_BUSY"), { code: "CHAT_WORKER_BUSY", operation: op })
+        }
         log.push({ op, ...fields })
         events?.push(op === "heartbeat" ? `heartbeat:${fields.state.native_state}` : op === "settle" ? `settle:${fields.result.outcome}` : op)
         return answers[op](fields)
@@ -119,7 +131,8 @@ function hookDouble({ events, receipt = "written", answer = true, sendOk = true 
   }
 }
 
-async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread } = {}) {
+// `skew` returns milliseconds added to the receiver's clock, so a test can move the policy's time without moving the timers.
+async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread, skew = () => 0 } = {}) {
   const clock = scheduler()
   const events = []
   const worker = workerDouble({ events, handlers, gate, joinErrors })
@@ -127,7 +140,7 @@ async function rig({ handlers, gate, joinErrors, alive = () => true, startTime =
   const receiver = createReceiver({ ...baseConfig, ...(thread ? { appServer: APP_SERVER } : {}), ...config }, { sessionId: "session-1", ownerPid: 4242 }, {
     startProcess: worker.startProcess,
     openThread: options => { thread?.opened.push(options); return thread },
-    now: clock.now,
+    now: () => clock.now() + skew(),
     random: () => 0.5,
     setTimeoutImpl: clock.setTimeoutImpl,
     clearTimeoutImpl: clock.clearTimeoutImpl,
@@ -453,6 +466,60 @@ for (const [label, answers] of [
     assert.equal(r.worker.state.stops, 1)
   })
 }
+
+// The core's worker answers a brief outage on a heartbeat or a pending read with a non-terminal `refused` reply and keeps
+// the binding: its next heartbeat is the retry. The receiver must not retire a healthy worker or spend rejoin budget on it.
+const BRIEF = ["SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"]
+
+test("a brief outage reply on a heartbeat or a pending read keeps the worker, the binding and the rejoin budget", async () => {
+  const answer = { heartbeat: null, pending: null }
+  const served = []
+  const r = await rig({ handlers: {
+    heartbeat: () => { if (answer.heartbeat) served.push(`heartbeat:${answer.heartbeat}`); return answer.heartbeat ? { refused: answer.heartbeat } : {} },
+    pending: () => { if (answer.pending) served.push(`pending:${answer.pending}`); return answer.pending ? { refused: answer.pending } : { messages: [] } },
+  } })
+  await r.begin()
+  await r.op(turn())
+  const timers = r.clock.count()
+  for (const code of BRIEF) {
+    for (const op of ["heartbeat", "pending"]) {
+      const before = served.length
+      answer[op] = code
+      // A tick sends a heartbeat; a turn asks for the pending batch.
+      const hook = op === "heartbeat" ? null : await r.op(turn())
+      if (op === "heartbeat") await r.clock.advance(30_000)
+      answer[op] = null
+      assert.deepEqual(served.slice(before), [`${op}:${code}`], `the ${code} reply to ${op} reached the receiver`)
+      if (hook) assert.deepEqual(hook.sent, [{ context: null }], "a pending read that was refused delivers nothing and disables nothing")
+      assert.equal(r.worker.bootIds.length, 1, `${op} ${code}: one worker start`)
+      assert.equal(r.worker.state.stops, 0, `${op} ${code}: the worker is not stopped`)
+      assert.equal(r.clock.count(), timers, `${op} ${code}: no retry timer is set`)
+      assert.notEqual(r.receiver.state(), "offline", `${op} ${code}: chat is not disabled`)
+      const heartbeats = r.worker.ops("heartbeat").length
+      await r.clock.advance(30_000)
+      assert.equal(r.worker.ops("heartbeat").length, heartbeats + 1, `${op} ${code}: the same worker serves the next heartbeat`)
+      assert.equal(r.worker.bootIds.length, 1)
+    }
+  }
+  assert.equal(served.length, 6)
+})
+
+// Only the reply is a no-op. A worker error frame (the core refusing the request outright) is the product's own failure
+// and still ends the worker and starts the bounded rejoin.
+test("a worker error on a heartbeat still retires the worker and rejoins", async () => {
+  let fail = false
+  const failure = Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", workerCode: "SERVICE_UNAVAILABLE", operation: "heartbeat" })
+  const r = await rig({ handlers: { heartbeat: () => { if (fail) throw failure; return {} } } })
+  await r.begin()
+  fail = true
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.state.stops, 1, "the worker that threw is stopped")
+  assert.equal(r.worker.bootIds.length, 1)
+  fail = false
+  await r.clock.advance(3750)
+  assert.equal(r.worker.bootIds.length, 2, "and the rejoin starts a new one")
+  assert.notEqual(r.receiver.state(), "offline")
+})
 
 const joinRefusal = workerCode => Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", workerCode, operation: "join" })
 
@@ -1084,6 +1151,97 @@ test("a rejoin whose thread stays unloaded ends with the rejoin episode window, 
   assert.equal(r.worker.bootIds.length, 1, "no worker ever started on the strength of the first bind")
   const hook = await r.op(turn())
   assert.match(hook.sent[0].message, /REJOIN_WINDOW/)
+})
+
+// A bind takes time, and the two-hour episode of a rejoin can end while it runs.
+test("a bind that carries a rejoin past the two-hour episode starts no worker", async () => {
+  let jump = 0
+  let asked = 0
+  // The rejoin's own bind is the second one: it takes the policy's clock to the end of the episode.
+  const thread = threadDouble({ bind: () => { if (++asked === 2) jump = 7_200_000; return { status: "bound" } } })
+  let refuse = true
+  const r = await rig({ thread, skew: () => jump, handlers: { pending: () => (refuse ? { refused: "STALE_INSTANCE" } : { messages: [] }) } })
+  await r.begin()
+  await r.op(turn()) // the lease is gone: the episode starts, and the rejoin is scheduled
+  refuse = false
+  await r.clock.advance(3750) // the rejoin fires inside the episode; its bind ends after the episode
+  assert.equal(asked, 2)
+  assert.equal(r.worker.bootIds.length, 1, "no worker starts after the episode ended")
+  assert.equal(r.receiver.state(), "offline")
+  assert.match((await r.op(turn())).sent[0].message, /REJOIN_WINDOW/)
+})
+
+// The old worker's heartbeat tick can be waiting on an app-server read when the worker is retired. When the read
+// returns during the replacement's join, the worker must not be asked anything: it answers busy, and chat would end.
+test("a heartbeat tick that was reading when its worker was retired sends nothing to the replacement and disables nothing", async () => {
+  let release
+  let reads = 0
+  const thread = threadDouble({ observation: () => (++reads === 1 ? new Promise(resolve => { release = () => resolve(IDLE) }) : IDLE) })
+  let refuse = false
+  let open
+  const second = { promise: new Promise(resolve => { open = resolve }) }
+  const r = await rig({ thread, gate: boot => (boot === 2 ? second : undefined), handlers: { heartbeat: () => (refuse ? { refused: "STALE_INSTANCE" } : {}) } })
+  await r.begin()
+  await r.clock.advance(30_000) // the tick starts and waits on its read
+  assert.equal(reads, 1)
+  refuse = true
+  await r.op(turn()) // a prompt's heartbeat finds the lease gone: the worker is retired
+  assert.equal(r.worker.state.stops, 1)
+  refuse = false
+  await r.clock.advance(3750) // the rejoin starts, and its join stays open
+  assert.equal(r.worker.bootIds.length, 2)
+  release() // the old tick's read comes back during that join
+  await settle()
+  assert.equal(r.worker.state.busy, 0, "nothing was asked of a worker whose join is in flight")
+  assert.notEqual(r.receiver.state(), "offline", "chat is not disabled")
+  const heartbeats = r.worker.ops("heartbeat").length
+  open()
+  await settle()
+  assert.notEqual(r.receiver.state(), "offline", "and the rejoin completes")
+  assert.equal(r.worker.ops("heartbeat").length, heartbeats + 1, "with the replacement's own first heartbeat, and no other")
+  assert.equal(r.worker.state.busy, 0)
+  assert.match((await r.op(turn())).sent[0].context, /Agent Chat is available/)
+})
+
+// The real thread against a fake app-server: the thread is still in the loaded list when the rejoin asks, but its read
+// says it has unloaded since. Only a worker started on a positive read may join.
+test("a rejoin whose read finds a listed thread unloaded starts no worker, and a later read that finds it loaded does", async () => {
+  const waitFor = async (check, what) => {
+    for (let waited = 0; !check() && waited < 3000; waited += 5) await new Promise(resolve => setTimeout(resolve, 5))
+    assert.ok(check(), `${what} never happened`)
+  }
+  const dir = mkdtempSync(join(tmpdir(), "acr-"))
+  let status = "idle"
+  const answers = {
+    "thread/loaded/list": () => ({ result: { data: ["session-1"], nextCursor: null } }),
+    "thread/read": () => ({ result: { thread: {
+      id: "session-1", parentThreadId: null, agentRole: null, ephemeral: false, source: "cli", modelProvider: "openai", status: { type: status },
+    } } }),
+    "thread/queue/delete": () => ({ result: { deleted: false } }),
+  }
+  const server = await fakeAppServer(join(dir, "s.sock"), message => answers[message.method]?.() ?? { error: { code: -32601, message: "no" } })
+  const reads = () => server.methods().filter(method => method === "thread/read").length
+  try {
+    const thread = Object.assign(createThread({ path: join(dir, "s.sock"), threadId: "session-1" }), { opened: [] })
+    let refuse = false
+    const r = await rig({ thread, handlers: { pending: () => (refuse ? { refused: "STALE_INSTANCE" } : { messages: [] }) } })
+    await waitFor(() => r.worker.bootIds.length === 1, "the first join")
+    await r.begin()
+    refuse = true
+    await r.op(turn()) // the lease is gone: the rejoin is scheduled
+    refuse = false
+    status = "notLoaded"
+    await r.clock.advance(3750) // the rejoin binds: listed, but read as notLoaded
+    await waitFor(() => reads() === 2, "the rejoin's read")
+    await settle()
+    assert.equal(r.worker.bootIds.length, 1, "no worker starts on a read that says notLoaded")
+    status = "idle"
+    await r.clock.advance(30_000) // the next look finds it loaded
+    await waitFor(() => r.worker.bootIds.length === 2, "the join after a positive read")
+  } finally {
+    await server.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 // The time allowed for a bind is for the thread read. When the read is in, the bind says so and the queue probe runs on

@@ -210,6 +210,38 @@ test("a receiver that closes after its successor bound the path leaves the succe
   } finally { cleanup(dir) }
 })
 
+// Removing the path takes two system calls, a check and an unlink, and a successor publishes its socket under the bind
+// lock. So the old receiver removes under that lock too, and when the lock is held it removes nothing.
+test("a close that finds the bind lock held leaves the public path and the lock alone, and still closes the listener", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  const gate = `${socket}.bind`
+  try {
+    const old = await serve(socket, async (_request, link) => { await link.send({ owner: "old" }) })
+    const line = `${process.pid} ${processStartTime(process.pid) ?? "-"} successor` // a successor is publishing: it holds the lock
+    writeFileSync(gate, line)
+    old.close()
+    assert.ok(statSync(socket).isSocket(), "the path is left for the lock holder: it may already be the successor's")
+    assert.equal(readFileSync(gate, "utf8"), line, "and the lock is not the old receiver's to remove")
+    await assert.rejects(connect(socket), { code: "ECONNREFUSED" }, "the listener itself is closed")
+    unlinkSync(gate) // the lock holder is done; the dead socket file it leaves is the next serve's to recover
+    const next = await attempt(socket)
+    try { assert.ok(next.listener, next.code) } finally { next.listener?.close() }
+  } finally { cleanup(dir) }
+})
+
+test("a close takes the bind lock only for its own check and releases it", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  try {
+    const old = await serve(socket, async (_request, link) => { await link.send({ owner: "old" }) })
+    old.close()
+    assert.deepEqual(readdirSync(dir), [], "no socket and no lock are left")
+    const next = await attempt(socket)
+    try { assert.ok(next.listener, "a successor takes the path at once") } finally { next.listener?.close() }
+  } finally { cleanup(dir) }
+})
+
 test("a listener leaves only its socket in the directory while it runs, and nothing once it is closed", async () => {
   const dir = privateDirectory()
   const { socket } = paths(dir, "session-1")

@@ -135,7 +135,12 @@ sends its request: it does not wait for the worker to end its instance.
   supersedes every earlier one, and the old `instance_file` is no longer valid.
   The binding text is capped at 2,048 bytes.
 - **Presence.** A heartbeat every 30 seconds, and one on every state change,
-  carries `native_state`, `stopped` and `plan_mode`. It carries no title.
+  carries `native_state`, `stopped` and `plan_mode`. It carries no title. A
+  heartbeat belongs to the worker that was live when its tick started. A tick
+  that was waiting for an app-server read when that worker was retired (for
+  example by `STALE_INSTANCE`) is dropped when the read returns: it sends
+  nothing to the replacement, whose join may still be in flight and would
+  refuse the request as busy.
 - **State.** Hook events give the receiver `busy` (a prompt or a tool event),
   `idle` (`Stop`) and a stop (`Interrupt`). A missing or non-string
   `permission_mode` makes the state `unknown`. With `appServer` configured the
@@ -192,20 +197,30 @@ sends its request: it does not wait for the worker to end its instance.
     loaded thread with a complete record (an `ephemeral` flag, a `source` and a
     model provider) that is not a child. A thread the app-server does not list
     yet, a read that does not answer within 3 seconds, a read that fails and a
-    record that lacks one of those fields each mean no join yet. An answer that
-    arrives after the 3 seconds is dropped and verifies nothing, and no earlier
-    read counts for a later one: a rejoin whose read finds the thread unloaded
-    starts no worker, and one that finds a child ends chat, as the first join
-    would. The receiver asks again after 30 seconds, claims nothing in the
-    meantime, and a retry spends none of the rejoin budget. A retry inside a
-    rejoin still belongs to that rejoin's episode, so the two-hour episode
-    window ends it (`REJOIN_WINDOW`); a first join has no episode, and its
-    retries have no end.
+    record that lacks one of those fields each mean no join yet, and so does a
+    complete record whose status is `notLoaded` (the thread left the loaded list
+    between the list and the read). An answer that arrives after the 3 seconds
+    is dropped and verifies nothing, and no earlier read counts for a later one:
+    a rejoin whose read finds the thread unloaded starts no worker, and one that
+    finds a child ends chat, as the first join would. The receiver asks again
+    after 30 seconds, claims nothing in the meantime, and a retry spends none of
+    the rejoin budget. A retry inside a rejoin still belongs to that rejoin's
+    episode, so the two-hour episode window ends it (`REJOIN_WINDOW`). The
+    window is checked again when the bind answers, before the worker starts, so
+    a bind that runs across the end of the window starts no worker. A first join
+    has no episode, and its retries have no end.
 - **Rejoin.** `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE`,
   `REQUEST_UNCERTAIN` and a join `BINDING_CONFLICT` start a bounded rejoin:
   5-second base, doubling to a 120-second cap, jitter between 0.5 and 1.0, a
   two-hour episode window and at most three completed rejoins per hour. The
-  numbers are pinned to `agent_chat/models.py` by `test/policy.test.js`.
+  numbers are pinned to `agent_chat/models.py` by `test/policy.test.js`. The
+  exception is a worker's `refused` reply to a heartbeat or to the pending read
+  with `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN`:
+  the core worker answers a brief outage that way and keeps its binding, so the
+  receiver does nothing, no rejoin starts, no budget is spent, and the next
+  heartbeat is the retry. The same codes in a worker error, or in a refused
+  claim, status or settle reply, start the rejoin; `STALE_INSTANCE` always does,
+  and a `BINDING_CONFLICT` after the join still ends chat.
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for that session. The receiver stays
   up and answers every hook with a refusal; the first output after the latch
@@ -238,8 +253,9 @@ are experimental.
    thread refuses the session. The worker joins only once this bind's own reads
    show a loaded thread that is not a child and whose record is complete: an
    `ephemeral` flag, a `source` and a model provider. A thread that is not
-   loaded yet, a read that fails, a record that lacks one of those fields and a
-   read that does not answer within 3 seconds mean no join yet, and the
+   loaded yet or whose read says `notLoaded`, a read that fails, a record that
+   lacks one of those fields and a read that does not answer within 3 seconds
+   mean no join yet, and the
    receiver asks again every 30 seconds. The provider recorded by an earlier
    bind, and an answer that arrives after the 3 seconds, never verify a later
    bind. The 3 seconds are for the thread read alone. Once the read is in, the
@@ -247,9 +263,12 @@ are experimental.
    read that came in on time: a probe that fails or does not answer within 1
    second does not stop the join. A thread whose read passed joins hook-only,
    and each later heartbeat binds again until the probe is decided. A bind that
-   ran out of its 3 seconds is aborted: what it reads afterwards fixes no
-   provider and decides no route. The thread's model provider is recorded after
-   that read; a read that later shows another provider is a `stale_binding` and
+   is aborted, during its read or later during its probe, records nothing:
+   neither the provider nor the route, so the next bind compares with what an
+   earlier bind recorded and not with an aborted one. The receiver aborts only
+   at the end of the 3 seconds for the read; an abort during the probe is the
+   contract of `bind` for any caller that signals one. The thread's model provider is recorded when the bind
+   completes; a read that later shows another provider is a `stale_binding` and
    refuses the wake.
 2. **Probe.** One `thread/queue/delete` of a random id must answer
    `{ "deleted": false }` within 1 second. Any other answer, an error
@@ -406,6 +425,10 @@ exercised live.
   a private name, so the state directory must be on a file system that supports
   them. Where `link` fails, the receiver does not start and chat stays off.
   Linking a socket file was checked on Linux only.
+- **A start during a close.** A closing receiver holds the bind lock for the
+  few system calls of its close. A receiver that starts inside that window
+  exits as a running one (`CHAT_RECEIVER_RUNNING`), so the hook event that
+  started it finds no receiver; the next hook event starts another.
 - **A kill between listen and link.** A receiver killed after its listener
   bound the private name and before that name was dropped leaves a socket file
   with a 12-character hexadecimal name in the state directory. Nothing reads
@@ -452,10 +475,16 @@ exercised live.
   therefore cannot remove a successor's lock, and at most one receiver binds.
 - Closing a Node listener unlinks the name it was bound under, whatever is at
   that name by then. The receiver therefore binds under a private name, links
-  it to the socket path and drops the private name. When it closes, it removes
-  the socket path only while that path is still its own file (same device and
-  inode), and does so before the listener closes. A receiver that closes after
-  its successor bound the path leaves the successor's socket alone.
+  it to the socket path and drops the private name. When it closes, it takes
+  the same bind lock, removes the socket path only while that path is still its
+  own file (same device and inode), releases the lock, and then closes the
+  listener. The check and the unlink are two system calls, and a successor
+  publishes its socket under that lock, so no successor can link its socket
+  between them. A receiver that closes after its successor bound the path leaves
+  the successor's socket alone. A receiver that cannot take the lock at close
+  leaves the socket path in place, because the holder may be publishing its own
+  socket there, and still closes its listener; a dead socket file is what the
+  next receiver's stale-socket check already replaces.
 - The worker runs the configured Python interpreter with `-I` and the state
   directory as its working directory.
 - The app-server client answers a server request with a method-not-found error
@@ -486,7 +515,7 @@ node --test
 
 The suite covers config refusal, the worker join frame and frame validation,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
-the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the WebSocket client against a
+the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the WebSocket client against a
 fake control socket on a real Unix socket, the receiver's state, delivery,
 wake, settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner

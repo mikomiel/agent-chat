@@ -229,7 +229,7 @@ test("a probe that does not answer is `unprobed` within a second, so it cannot u
   })
 })
 
-test("the provider is recorded only for a loaded thread that is not a child, and before the queue probe", async () => {
+test("the provider is recorded only for a loaded thread that is not a child, and a probe that fails still leaves it recorded", async () => {
   // The receiver reads it as "a main thread was found": a probe that fails still leaves it recorded.
   await withServer(main({ "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }), async path => {
     const bound = createThread({ path, threadId: THREAD })
@@ -348,6 +348,48 @@ test("a bind that the caller timed out while it was probing cannot record a late
     assert.equal(probes, 2, "the later bind probed instead of trusting the expired one")
   })
 })
+
+// A thread can leave the loaded list between the list request and the read. observe() already reads that as offline.
+test("a thread that is listed but reads as notLoaded is unloaded: nothing is probed or recorded, and a child is still a child", async () => {
+  await withServer(main({ "thread/read": () => ok({ thread: thread({ status: { type: "notLoaded" } }) }) }), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "unloaded" })
+    assert.equal(server.methods().includes("thread/queue/delete"), false)
+    assert.equal(bound.provider, null)
+    assert.equal(bound.route, null)
+  })
+  await withServer(main({ "thread/read": () => ok({ thread: thread({ parentThreadId: "p", status: { type: "notLoaded" } }) }) }), async path => {
+    assert.deepEqual(await createThread({ path, threadId: THREAD }).bind(), { status: "child" })
+  })
+})
+
+// What a call reads is committed once, at the end, after the last look at its signal.
+for (const [label, probe] of [
+  ["answers the documented way", async () => { await pause(300); return ok({ deleted: false }) }],
+  ["fails", async (_message, { socket }) => { await pause(300); socket.destroy() }],
+]) {
+  test(`a bind that the caller timed out while its probe ${label} records neither the provider nor the route`, async () => {
+    let reads = 0
+    let probes = 0
+    await withServer(main({
+      "thread/read": () => ok({ thread: thread({ modelProvider: ++reads === 1 ? "openai" : "other" }) }),
+      "thread/queue/delete": (message, connection) => (++probes === 1 ? probe(message, connection) : ok({ deleted: false })),
+    }), async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD })
+      const attempt = new AbortController()
+      let reported = 0
+      const first = bound.bind({ signal: attempt.signal, onRead: () => { reported += 1 } })
+      await eventually(() => server.methods().includes("thread/queue/delete"), "the probe request")
+      attempt.abort()
+      assert.deepEqual(await first, { status: "unavailable" })
+      assert.equal(reported, 1, "the read was reported done before the probe, as always")
+      assert.equal(bound.provider, null, "the aborted call fixed no provider")
+      assert.equal(bound.route, null)
+      assert.deepEqual(await bound.bind(), { status: "bound", route: true }, "so the next bind is not stale against a provider nobody committed")
+      assert.equal(bound.provider, "other")
+    })
+  })
+}
 
 // ---- observe ---------------------------------------------------------------------------------------------------
 

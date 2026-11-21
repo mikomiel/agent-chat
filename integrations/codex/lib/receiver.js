@@ -36,6 +36,11 @@ const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
 const REJOIN_AFTER = new Set([
   "STALE_INSTANCE", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN", "BINDING_CONFLICT",
 ])
+// The core's worker answers a brief outage on a heartbeat or a pending read with a non-terminal `refused` reply and keeps
+// the binding. The next tick is the retry, so that reply retires nothing and spends no rejoin budget (#146). A refusal
+// that proves the lease gone, a worker error and a worker that exits still end the worker; claim, status and settle
+// replies still go through `check` whole.
+const BRIEF_OUTAGE = new Set(["SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"])
 // The states that refuse a wake before anything is claimed.
 const NO_WAKE = new Set(["busy", "plan", "stopped", "offline"])
 
@@ -45,6 +50,7 @@ const MAIN_THREAD = new Set(["bound", "stale_binding", "unprobed"])
 const bytes = text => Buffer.byteLength(text, "utf8")
 const clamp = (value, max) => (Number.isFinite(value) ? Math.max(0, Math.min(max, value)) : 0)
 const refused = result => (result && typeof result === "object" && typeof result.refused === "string" ? result.refused : null)
+const brief = result => BRIEF_OUTAGE.has(refused(result))
 const isDone = (frame, outcome) => frame?.op === "done" && frame.outcome === outcome
 
 export function createReceiver(config, { sessionId, ownerPid }, {
@@ -173,15 +179,26 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return code
   }
 
-  async function beat() {
+  // A heartbeat belongs to the worker that was live when it was asked for. It is sent to that worker only: one that was
+  // retired meanwhile gets nothing, and neither its answer nor its failure is the replacement's business (a request to
+  // a replacement whose join is in flight would be refused as busy, and that refusal would end chat).
+  async function beat(record) {
+    if (!record || live !== record) return
     const snapshot = heartbeatState()
     reported = JSON.stringify(snapshot)
-    check(await ask("heartbeat", { state: snapshot }), "heartbeat")
+    let answer
+    try { answer = await record.worker.request("heartbeat", { state: snapshot }) } catch (error) {
+      if (live !== record) return
+      throw error
+    }
+    if (live !== record) return
+    if (!brief(answer)) check(answer, "heartbeat")
   }
 
   function report() {
     if (!live || !joined || failure || JSON.stringify(heartbeatState()) === reported) return Promise.resolve()
-    return guard(exclusive(beat))
+    const record = live
+    return guard(exclusive(() => beat(record)))
   }
 
   function stopLive() {
@@ -237,9 +254,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       expired,
     ])
     clearTimeoutImpl(timer)
-    if (result.status === "child") return { refusal: "CHAT_CHILD_THREAD", verified: false }
-    threadBound = result.status === "bound" // a changed provider or an undecided probe leaves the thread unbound: hook-only
-    return { refusal: null, verified: MAIN_THREAD.has(result.status) }
+    if (result.status === "child") return { refusal: "CHAT_CHILD_THREAD", verified: false, bound: false }
+    // `bound` is the route decided by this bind. A changed provider or an undecided probe is not bound: hook-only.
+    return { refusal: null, verified: MAIN_THREAD.has(result.status), bound: result.status === "bound" }
   }
 
   // Replace the observed state with a fresh read, unless a hook event arrived while it ran.
@@ -269,6 +286,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       const check = await bindThread()
       if (closed || failure) return
       if (check.refusal) return disable(check.refusal)
+      // The bind took time: a rejoin whose episode ran out meanwhile starts nothing.
+      try { policy.check() } catch (error) { return disable(describeFailure(error)) }
+      threadBound = check.bound
       if (!check.verified) {
         firstAttempt()
         rejoinTimer = setTimeoutImpl(() => { void connect() }, HEARTBEAT_MS)
@@ -289,8 +309,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       bootId = id
       reported = null
       policy.succeeded()
-      heartbeatTimer = setIntervalImpl(() => { void guard(tick()) }, HEARTBEAT_MS)
-      await guard(exclusive(beat))
+      heartbeatTimer = setIntervalImpl(() => { void guard(tick(record)) }, HEARTBEAT_MS)
+      await guard(exclusive(() => beat(record)))
     } catch (error) {
       if (live !== record) return
       joined = null
@@ -303,16 +323,21 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   // One heartbeat tick: bind the thread again when the join came without a decided queue route, read the thread while
   // nothing is known to run, then report. The read runs outside the worker queue so a slow app-server never holds up a delivery.
-  async function tick() {
+  // A tick belongs to the worker `record` that started it. The reads outlive a retirement, so after each one a tick
+  // whose worker is gone drops what it learned and sends nothing; the replacement binds and reads for itself.
+  async function tick(record) {
     if (thread && !threadBound) {
       const check = await bindThread()
+      if (live !== record) return
       if (check.refusal) return disable(check.refusal)
+      threadBound = check.bound
     }
     if (thread && threadBound && !stopped && native !== "busy") {
       const result = await refine()
+      if (live !== record) return
       if (result.reason === "child") return disable("CHAT_CHILD_THREAD")
     }
-    return exclusive(beat)
+    return exclusive(() => beat(record))
   }
 
   // A hook consumer delivers only to a running turn. The wake route reaches a session that is not running: anything
@@ -369,7 +394,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const prefix = wake ? WAKE_PREFIX : (announce ? `${announce.text}\n\n` : "") + CHAT_PREFIX
         const bound = MAX_OUTPUT_BYTES - bytes(prefix)
         const candidates = await ask("pending", bodies ? { bodies: true } : {})
-        if (!live || check(candidates, "pending")) return false
+        if (!live || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link?.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
         if (wake && !(await clearToWake())) return false
