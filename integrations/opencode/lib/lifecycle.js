@@ -5,8 +5,11 @@
 //
 //   bus.on(name, fn)       receives session_start ({ nativeSessionId }) and session_shutdown.
 //   native.context(text)   publishes (replacing) or clears the binding text. It resolves only when the text is
-//                          confirmed; a rejection turns this session's chat off. There is no fallback to a prompt.
+//                          confirmed, or with `false` when a newer signal overtook the confirmation (not yet proved: the
+//                          first heartbeat waits for `refresh`). A rejection turns this session's chat off. There is no
+//                          fallback to a prompt.
 //   native.refresh()       asked at each heartbeat tick: reads the binding entry back and puts it back when it is wrong.
+//                          It resolves `true` only when it proved the binding.
 //   native.probe()         asked once before a retry starts a replacement worker: one bounded read that never rejects.
 //   native.disable()       latches the native half off.
 //
@@ -136,7 +139,7 @@ export function createLifecycle(bus, native, config, {
   async function publishContext() {
     const text = bindingText()
     if (text === null || typeof native.context !== "function") throw contextUnavailable()
-    await native.context(text)
+    return native.context(text)
   }
 
   function request(operation, fields) {
@@ -160,10 +163,17 @@ export function createLifecycle(bus, native, config, {
 
   // The same tick asks the native half to read its binding entry back and repair it. An entry can change with no event
   // the session raises (a compaction inside a gap, a call that landed late), so the tick asks every time. A failed ask
-  // never reaches the heartbeat.
+  // never reaches the heartbeat. A read-back that proves the binding opens the gate for a join whose publish was
+  // overtaken, and its first heartbeat follows at once.
   function refreshContext() {
-    if (!live?.bound || closed || disabled) return
-    try { void Promise.resolve(native.refresh?.()).catch(() => {}) } catch { /* advisory */ }
+    const record = live
+    if (!record || closed || disabled) return
+    const proved = proof => {
+      if (proof !== true || live !== record || record.bound || closed || disabled) return
+      record.bound = true
+      void heartbeat()
+    }
+    try { void Promise.resolve(native.refresh?.()).then(proved).catch(() => {}) } catch { /* advisory */ }
   }
 
   // A retry asks the host once before it starts a replacement worker: the session can be deleted during the backoff with
@@ -196,11 +206,14 @@ export function createLifecycle(bus, native, config, {
       joined = result
       policy.succeeded()
       notify(`Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.`)
-      // Before the first heartbeat: nothing is reported until this join's binding is confirmed.
-      await publishContext()
+      // Before the first heartbeat: nothing is reported until this join's binding is confirmed. A publish that a newer
+      // signal overtook resolves `false`: it proves nothing and the read-back stays owed, so the gate stays shut until a
+      // read-back at a tick proves the binding (`refreshContext`).
+      const confirmed = await publishContext()
       if (live !== record || closed || disabled) return
-      record.bound = true
       heartbeatTimer = setIntervalImpl(() => { void heartbeat(); refreshContext() }, HEARTBEAT_MS)
+      if (confirmed === false) return
+      record.bound = true
       await heartbeat()
     } catch (error) {
       if (live !== record) return

@@ -185,7 +185,11 @@ The service and its host-token provisioning are documented in the product
   owner ends its own record, which can be a different owner than the one that
   asked, joined or still in its lookup. The answer counts when it lands after the
   call's 10-second limit, and after the owner that asked has ended: the limit
-  frees the queue and ends the repair attempt, and nothing more. A repair
+  frees the queue and ends the repair attempt, and nothing more. The eligibility
+  lookup is a host call of the same kind: a `session.get` that the host rejects
+  with the session's own not-found is reported the same way, in time, late or
+  after the owner ended, so it leaves a tombstone, not a 60-second refusal in
+  one owner's cache. A repair
   already in flight can defer that read past the tick, as for any repair. No
   host call is added for it. A timeout, any other error, and a session that is
   found change nothing. Events
@@ -208,7 +212,8 @@ The service and its host-token provisioning are documented in the product
   entry is removed when the session's chat ends. After the put the plugin reads
   the entries back. A join's put that fails or leaves no entry turns that
   session's chat off before the first heartbeat: the plugin sends no heartbeat
-  until the binding is confirmed. The registration itself sets the session's
+  until the binding is confirmed, and a confirmation that a newer compaction or
+  gap signal overtook does not count (see "Heuristics and choices"). The registration itself sets the session's
   first heartbeat time on the server, so peers can see the session online
   while its put is pending, and until its lease expires when the join then
   fails. There is no fallback to a prompt message.
@@ -372,7 +377,10 @@ unverified, inferred, or a deliberate choice.
   above while they run. If a compaction ends between that put and that list,
   the confirmation fails and that session's chat is turned off. The publish
   discharges the read-back obligation only if the rule still holds when it is
-  confirmed. A later `context()` call
+  confirmed. A publish whose confirming list a newer signal overtook is not a
+  confirmation and not a failure: the read-back stays owed and the lifecycle
+  sends no first heartbeat. The first heartbeat follows the first tick whose
+  read-back proves the binding, at most 30 seconds later. A later `context()` call
   is serialised behind it, so the order of puts and removals still holds.
 - **A late removal or put after the end.** The time limit trades a call that
   can hang for a call that can land late. A removal that times out during an

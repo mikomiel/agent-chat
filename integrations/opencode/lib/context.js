@@ -28,8 +28,10 @@
 // and on, no newer gap or compaction signal has been applied, and no `context()` call has withdrawn or replaced the
 // binding. It asks that after every host call it awaits and before the next one, and before it proves. Before its first
 // host call it also asks that the obligation is still owed: a check queued behind a publish that discharged it makes no
-// call. A confirmed `context()` publish discharges the obligation under the same rule. With nothing published there is
-// nothing to read, so the obligation stays owed until a publish is confirmed.
+// call. A confirmed `context()` publish discharges the obligation under the same rule, and only a publish that is still
+// current counts as confirmed: one that a newer signal overtook resolves `false`, so the caller does not treat the binding
+// as proved, and the obligation stays owed. With nothing published there is nothing to read, so the obligation stays
+// owed until a publish is confirmed.
 //
 // EVERY HOST CALL HAS A TIME LIMIT (`CALL_TIMEOUT_MS`). A call that never answers would hold the serial queue for ever,
 // and with it every later publish, repair and removal. A call that runs out of time counts as a failed call: a check
@@ -149,8 +151,10 @@ export function createContext(ctx, sessionID, {
   }
 
   // Publish the binding text, replacing any earlier one under the same key; null removes it. Rejects when the
-  // entry cannot be confirmed: the caller then turns this session's chat off. A removal that fails is not an error:
-  // a stale entry names an instance file that is no longer valid, and the next publish replaces it.
+  // entry cannot be confirmed: the caller then turns this session's chat off. Resolves `false`, not undefined, when the
+  // entry was read back but a newer signal overtook that read: not a confirmation, and not a failure either. A removal
+  // that fails is not an error: a stale entry names an instance file that is no longer valid, and the next publish
+  // replaces it.
   function context(text) {
     if (closed) return Promise.resolve()
     if (text === null) {
@@ -166,8 +170,10 @@ export function createContext(ctx, sessionID, {
       const current = currentAt(compactions, binding) // from the start of this publish to its confirmation
       const wanted = () => !closed && !disabled && generation === binding
       try { await publish(text, { wanted }) } catch { throw contextFailure() }
-      // A confirmed put is a read-back of this binding, when nothing has overlapped it.
-      if (current()) unverified = false
+      // A confirmed put is a read-back of this binding, when nothing has overlapped it. A confirmation that a newer
+      // signal or a newer binding overtook proves nothing now: the read-back stays owed, and the caller is told `false`.
+      if (!current()) return false
+      unverified = false
     })
   }
 

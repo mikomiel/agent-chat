@@ -852,3 +852,87 @@ test("a repair that failed is repeated by the next tick, with no event from the 
   await flush()
   assert.equal(entries.get(BINDING_KEY), binding)
 })
+
+// Review 6006147517, finding 2: the first heartbeat is sent only on a confirmation that is still current. The join's
+// confirming list captures the entry, a compaction signal is applied, and then the old answer arrives: that read proves
+// nothing about the binding now, so the gate stays shut until a read-back that proves it.
+function overtakenJoin() {
+  const bus = fakeBus()
+  const entries = new Map()
+  const held = { entered: false, release: null }
+  const rig = { entries, held, listFails: false, tick: null }
+  const host = {
+    session: {
+      instructions: {
+        entry: {
+          async put({ key, value }) { entries.set(key, value) },
+          async list() {
+            if (rig.listFails) throw new Error("unavailable")
+            const snapshot = [...entries].map(([key, value]) => ({ key, value })) // captured when the host answers
+            if (!held.entered) {
+              held.entered = true
+              await new Promise(resolve => { held.release = resolve })
+            }
+            return snapshot
+          },
+          async remove({ key }) { entries.delete(key) },
+        },
+      },
+    },
+  }
+  rig.worker = fakeWorker()
+  rig.context = createContext(host, "ses_synthetic0001")
+  rig.beats = () => rig.worker.requests.filter(row => row.op === "heartbeat").length
+  createLifecycle(bus, rig.context, config, {
+    ...timers, startProcess: () => rig.worker, now: () => 1000, setIntervalImpl: fn => { rig.tick = fn; return 1 },
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  return rig
+}
+
+test("a join whose confirming read a compaction signal overtook sends no first heartbeat until a read-back proves the binding", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  assert.equal(rig.held.entered, true) // the confirming list is pending
+  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
+  const repair = rig.context.repair() // the manager's own ask at that event, queued behind the publish
+  rig.held.release() // the old answer arrives
+  await flush()
+  assert.equal(rig.beats(), 0) // an overtaken confirmation does not open the gate
+  assert.equal(typeof rig.tick, "function") // the tick is armed: it carries the next read-back
+  assert.equal(await repair, true) // the existing repair ran and proved the binding
+  assert.equal(rig.beats(), 0) // the lifecycle waits for its own proof, which the next tick asks for
+  rig.tick()
+  await flush()
+  assert.equal(rig.beats(), 1) // the gate opens, and the first heartbeat follows at once
+  rig.tick()
+  await flush()
+  assert.equal(rig.beats(), 2) // and runs as any bound join does
+})
+
+test("a join whose confirming read was overtaken stays shut while the read-back fails, and opens at the first tick that proves", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
+  rig.listFails = true // the host cannot be read, so nothing is proved
+  rig.held.release()
+  await flush()
+  rig.tick()
+  await flush()
+  rig.tick()
+  await flush()
+  assert.equal(rig.beats(), 0)
+  assert.equal(rig.context.owed(), true)
+  rig.listFails = false
+  rig.tick()
+  await flush()
+  assert.equal(rig.beats(), 1)
+})
+
+test("a confirmation that nothing overtook still opens the gate at once, as before", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  rig.held.release() // no signal came
+  await flush()
+  assert.equal(rig.beats(), 1)
+})

@@ -976,6 +976,83 @@ test("the injected report of a lookup answer's evidence is called, and the manag
   assert.deepEqual(manager.sessions(), []) // this record is still refused here
 })
 
+// Review 6006147517, finding 1: the lookup is a host call like any entry call, so its own not-found is the same evidence.
+// It is a tombstone that every owner shares, not a 60-second refusal in the cache of the owner that asked.
+const lookupMissing = (sessionID = "ses_a") => Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID })
+
+test("a lookup that the host rejects with the session's not-found leaves a tombstone for the next owner, not a cooldown", async () => {
+  const sets = { deleted: new Set(), forked: new Set() }
+  const first = createManager(fakeCtx(() => lookupMissing()), config, stubParts(), sets)
+  first.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual([...sets.deleted], ["ses_a"])
+  assert.deepEqual(first.sessions(), [])
+  const parts = stubParts()
+  const ctx = fakeCtx(root) // a snapshot from before the deletion would answer root-shaped
+  const successor = createManager(ctx, config, parts, sets)
+  successor.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(ctx.lookups, [])
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("a lookup that the host rejects with not-found after its time limit is still a tombstone", async () => {
+  let reject
+  const limits = []
+  const sets = { deleted: new Set(), forked: new Set() }
+  const ctx = { session: { get: () => new Promise((_, fail) => { reject = fail }) } }
+  const first = createManager(ctx, config, stubParts(), { ...sets, setTimeoutImpl: fn => { limits.push(fn); return 0 } })
+  first.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  limits[0]() // the lookup's time limit passes: a failed lookup
+  await flush()
+  assert.deepEqual([...sets.deleted], []) // nothing is known yet
+  reject(lookupMissing()) // the host answers after the limit
+  await flush()
+  assert.deepEqual([...sets.deleted], ["ses_a"])
+  const parts = stubParts()
+  const next = fakeCtx(root)
+  const successor = createManager(next, config, parts, sets)
+  successor.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(next.lookups, [])
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("a lookup that the host rejects with not-found after stop() is reported to the injected reporter", async () => {
+  let reject
+  const reported = []
+  const sets = { deleted: new Set(), forked: new Set() }
+  const ctx = { session: { get: () => new Promise((_, fail) => { reject = fail }) } }
+  const manager = createManager(ctx, config, stubParts(), { ...sets, reportDeleted: id => reported.push(id) })
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  await manager.stop() // the old owner is torn down with its lookup still open
+  reject(lookupMissing())
+  await flush()
+  assert.deepEqual(reported, ["ses_a"])
+  assert.deepEqual([...sets.deleted], []) // the registry records it, as for any received event
+})
+
+for (const [label, error] of Object.entries({
+  "another session's not-found": lookupMissing("ses_other"),
+  "the HTTP mapping's tag": Object.assign(new Error("gone"), { _tag: "SessionNotFoundError", sessionID: "ses_a" }),
+  "another failure": new Error("unavailable"),
+})) {
+  test(`a lookup rejected with ${label} is not reported, and stays a failed lookup with a cooldown`, async () => {
+    const reported = []
+    const sets = { deleted: new Set(), forked: new Set() }
+    const ctx = fakeCtx(() => error)
+    const manager = createManager(ctx, config, stubParts(), { ...sets, reportDeleted: id => reported.push(id) })
+    manager.feed(event("session.execution.started", "ses_a"))
+    manager.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    assert.deepEqual(reported, [])
+    assert.deepEqual([...sets.deleted], [])
+    assert.deepEqual(ctx.lookups, ["ses_a"]) // the cooldown refuses the second event
+  })
+}
+
 // Review 6006011023, finding 1: a missing-session answer is reported to the owner of the process, which decides. The manager
 // ends nothing itself: the report reaches it as a received `session.deleted` event, as the registry sends it.
 test("a missing-session answer is passed to the injected report and the manager does not end the record on its own", async () => {

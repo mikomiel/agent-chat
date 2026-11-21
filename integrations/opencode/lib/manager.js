@@ -21,9 +21,9 @@
 // A lookup answer for the session that names a fork or a parent is the same evidence and is kept the same way, so the
 // next owner never asks again. An answer that is unreadable or for another session is not: it only refuses locally.
 //
-// DEFINITIVE EVIDENCE IS REPORTED WHENEVER IT LANDS. An answer that the host gives for a session, a not-found from any
-// instruction-entry call or a lookup that names a parent or a fork, is a fact about the session. It goes to
-// `reportDeleted` or `reportNotRoot`, which the registry sets to a received event, even when the answer comes after the
+// DEFINITIVE EVIDENCE IS REPORTED WHENEVER IT LANDS. A not-found from an instruction-entry call or from the eligibility
+// lookup, and a lookup answer that names a parent or a fork, are facts about the session, not about the call. Each goes
+// to `reportDeleted` or `reportNotRoot`, which the registry sets to a received event, even when the answer comes after the
 // call's time limit or after this record, context or manager ended. The time limit only releases the queue, and whether
 // this record starts a worker is still decided by its own liveness.
 //
@@ -51,7 +51,7 @@
 // rejection there disables chat for that session only. A deleted session never rejoins in this process. A session
 // that faulted stays out while its refusal is in the bounded lookup cache, so a worker that is still ending is not
 // raced by a second join until that entry is evicted.
-import { CALL_TIMEOUT_MS } from "./context.js"
+import { CALL_TIMEOUT_MS, isMissing } from "./context.js"
 import { describeFailure } from "./worker.js"
 
 // The events the manager reads. Session events of other kinds, such as every tool call, are never subscribed to.
@@ -148,8 +148,9 @@ export function createManager(ctx, config, parts, {
   // The eligibility lookup has the same time limit as one instruction-entry call: a lookup that never answers would hold
   // its session's chain, and every later event of that session, for ever. A lookup that runs out of time is a failed
   // lookup. The host is not told to stop it, and its late answer settles a promise that already ended, so it creates
-  // nothing: only `start` can create a worker, and it has moved on. An answer that names a parent or a fork is evidence
-  // about the session, not about this lookup, so it is reported whenever it lands: late, or after this manager stopped.
+  // nothing: only `start` can create a worker, and it has moved on. An answer that names a parent or a fork, and a
+  // rejection with the session's own not-found, are evidence about the session, not about this lookup, so each is
+  // reported whenever it lands: late, or after this manager stopped.
   function lookup(sessionID) {
     return new Promise((resolve, reject) => {
       const timer = setTimeoutImpl(() => reject(new Error("LOOKUP_TIMEOUT")), CALL_TIMEOUT_MS)
@@ -158,7 +159,11 @@ export function createManager(ctx, config, parts, {
       new Promise(begin => begin(ctx.session.get({ sessionID }))).then(info => {
         if (namesParent(info, sessionID)) { try { (reportNotRoot ?? markNotRoot)(sessionID) } catch { /* advisory */ } }
         answer(resolve)(info)
-      }, answer(reject))
+      }, error => {
+        // The session's own not-found is the same host evidence as at an entry call. Any other failure is a failed lookup.
+        if (isMissing(error, sessionID)) { try { (reportDeleted ?? markDeleted)(sessionID) } catch { /* advisory */ } }
+        answer(reject)(error)
+      })
     })
   }
 

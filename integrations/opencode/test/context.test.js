@@ -1207,3 +1207,46 @@ test("probe: it does not wait behind a removal that is still pending", async () 
   assert.equal(done, true) // not queued behind it
   held.settle.resolve()
 })
+
+// Review 6006147517, finding 2: `context()` resolves undefined only for a confirmation that is still current. A publish
+// whose confirming list a newer signal or a newer binding overtook resolves `false`: it is not a failure, so the chat
+// stays on, and it is not a proof, so the obligation stays owed and the caller keeps its gate shut.
+for (const [name, overtake] of [
+  ["a gap", context => gap(context)],
+  ["a compaction signal", context => compacted(context)],
+  ["a compaction that began and failed", context => {
+    context.observe(event("session.compaction.started", { reason: "auto" }))
+    context.observe(event("session.compaction.failed", { reason: "auto" }))
+  }],
+]) {
+  test(`a publish whose confirming list ${name} overtook resolves false and leaves the obligation owed`, async () => {
+    const { ctx, context } = make()
+    const held = holdFirst(ctx.session.instructions.entry, "list")
+    const publish = context.context("binding")
+    await flush()
+    assert.equal(held.entered, true)
+    overtake(context)
+    held.settle.resolve()
+    assert.equal(await publish, false)
+    assert.equal(context.owed(), true)
+    assert.equal(await context.repair(), true) // the repair attempt is still there
+    assert.equal(context.owed(), false)
+  })
+}
+
+test("a publish whose confirming list nothing overtook resolves undefined", async () => {
+  const { context } = make()
+  assert.equal(await context.context("binding"), undefined)
+  assert.equal(context.owed(), false)
+})
+
+test("a publish that a newer binding replaced while its confirming list was pending resolves false", async () => {
+  const { ctx, context } = make()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const first = context.context("binding one")
+  await flush()
+  const second = context.context("binding two") // queued behind the first, and it replaces its binding
+  held.settle.resolve()
+  assert.equal(await first, false)
+  assert.equal(await second, undefined)
+})

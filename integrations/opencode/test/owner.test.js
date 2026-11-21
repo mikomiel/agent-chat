@@ -902,3 +902,36 @@ test("a not-found that lands on the old owner's disposed context, after its limi
   await flush()
   assert.equal(host.lookups.length, asked) // and the tombstone refuses the id
 })
+
+// Review 6006147517, finding 1: the old owner's lookup is rejected with not-found after the successor started its own lookup,
+// and the successor's lookup then answers from a snapshot that was taken before the deletion. The tombstone is already in
+// the shared set, so the successor starts no worker and sends no join.
+test("a lookup that the old owner's host rejects with not-found stops the successor's lookup from joining on a pre-deletion snapshot", async () => {
+  const host = twoMembers()
+  const detachOld = host.attach("old")
+  host.attach("successor")
+  await flush()
+  host.holdLookup = true
+  host.registry.dispatch(startedEvent("e1", "ses_a")) // the old owner's lookup is pending
+  await flush()
+  const oldLookup = host.heldLookup
+  assert.equal(typeof oldLookup?.reject, "function")
+  await detachOld() // a lookup holds nothing back
+  await flush()
+  host.holdLookup = true
+  host.registry.dispatch(startedEvent("e2", "ses_a")) // the successor's own lookup is pending too
+  await flush()
+  const newLookup = host.heldLookup
+  assert.notEqual(newLookup, oldLookup)
+  oldLookup.reject(missing()) // the host: this session no longer exists
+  await flush()
+  newLookup.resolve({ id: "ses_a", agent: "build" }) // the successor's answer is from before the deletion
+  await flush()
+  assert.deepEqual(host.labels(), []) // no worker, so no join
+  assert.equal(host.entries.size, 0)
+  const asked = host.lookups.length
+  host.registry.dispatch(startedEvent("e3", "ses_a")) // a later event is refused without a new lookup
+  await flush()
+  assert.equal(host.lookups.length, asked)
+  assert.deepEqual(host.labels(), [])
+})
