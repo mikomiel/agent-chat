@@ -95,7 +95,7 @@ the same vectors in [`notice-vectors.json`](notice-vectors.json): the Python ref
 [`shared/notice.js`](shared/notice.js). A package keeps no dependency and reads nothing outside its own directory
 at run time, so each one ships a byte-identical copy as `lib/notice.js`. A test in each package fails when its copy
 differs from the shared source.
-After you edit `shared/notice.js`, copy it over all three. The normative text is the notice requirements in
+After you edit `shared/notice.js`, copy it over every package's `lib/notice.js`. The normative text is the notice requirements in
 [`openspec/specs/chat-clients/spec.md`](../openspec/specs/chat-clients/spec.md).
 
 In bodies mode, a notice has:
@@ -132,7 +132,7 @@ or a `pending` reply without `sizes`, is claimed whole, because the server refus
 A missing or invalid size counts as a full body.
 
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
-bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line
+bound, and the lifecycle makes the claim and the delivery call. `pi`, `deepseek` and `opencode` allow 8 KiB for the delivery line
 and the notice together. `claude-code` allows 10,000 bytes for its announcement, the delivery line and the notice
 together.
 
@@ -143,13 +143,13 @@ Limits that remain:
 - The packing estimate allows three bytes of notice for each byte of body (a line feed and its `> ` prefix). It does
   not bound the rendering. A body made mostly of control characters renders larger, because each one becomes a
   six-byte escape. Two pending bodies of 650 carriage returns each (3,900 bytes once escaped) are both claimed under
-  the Pi and DeepSeek bound of 8,137 bytes, and the renderer then halves the cap and cuts both. The halved cap applies
+  the Pi, DeepSeek and OpenCode bound of 8,137 bytes, and the renderer then halves the cap and cuts both. The halved cap applies
   to every body in the notice. Each cut body carries its pointer line, and the notice stays within `bound`. The
   vectors `two-bodies-of-650-carriage-returns-are-both-packed` and
   `two-bodies-of-650-carriage-returns-are-cut-by-halving-after-the-claim` pin this case.
 - A retry batch is claimed whole, up to 16 messages. At body cap 0, 16 frames and the adapter's own lines take 7,052
-  bytes in the shared suite's fixtures, and 7,685 bytes when every header field is at its widest. Both fit the Pi and
-  DeepSeek bound of 8,137 bytes, and a test in each of those packages holds the widest case to it. `claude-code` has no
+  bytes in the shared suite's fixtures, and 7,685 bytes when every header field is at its widest. Both fit the Pi,
+  DeepSeek and OpenCode bound of 8,137 bytes, and a test in each of those packages holds the widest case to it. `claude-code` has no
   fixed bound, because its announcement comes out of the same 10,000 bytes: [its README](claude-code/README.md) gives
   the room that is left.
 - The table of escaped code points is fixed. A code point that a later Unicode version makes invisible stays

@@ -96,7 +96,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
-| `noticeBodies` | Optional. `true` includes message bodies in the notice; default metadata only. |
+| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 
 Every key is fixed. The loader accepts exactly these six and refuses an
 unknown key. Point the server process at the file:
@@ -156,7 +156,11 @@ The service and its host-token provisioning are documented in the product
   The result is `handed` only when `session.inbox.delivered` arrives for the
   exact inbox id the call returned. Everything after the call is `handed` or
   `uncertain`, with one exception: `session.inbox.cancelled` for that id means
-  nothing ran and settles `deferred`.
+  nothing ran and settles `deferred`. With `noticeBodies`, the plugin reads
+  each candidate's size from `pending` and claims the longest prefix that one
+  8 KiB notice is estimated to carry; a retry batch is claimed whole. A body
+  that outgrows the estimate can still be cut after the claim; the
+  [notice contract](../README.md#notice-contract) lists the limit.
 - **Hazard rule.** A run that ends (`succeeded`, `failed` or `interrupted`)
   before the delivered event settles `uncertain`. So do a call that throws or
   rejects, a missed reservation deadline, a lost event stream and a disabled or
@@ -167,13 +171,17 @@ The service and its host-token provisioning are documented in the product
   `stopped`, `plan`, `unknown` or `busy`. A disabled or disposed session returns
   `failed` with `native_unavailable`. A session that went idle after the claim
   is `unknown`: idle is a known state, but the closed reason set has no `idle`,
-  and this release never wakes an idle session. The notice is rendered by `lib/notice.js`, which is a copy of the
-  notice renderer shared by every package.
+  and this release never wakes an idle session.
 - **Rejoin.** A lapsed instance rejoins only for the codes the core names. The
   wait, jitter, episode length and hourly budget mirror `agent_chat/models.py`,
   and `test/policy.test.js` pins the copy. Each join uses a new boot id and
   replaces the old binding.
 - **No title.** Heartbeats carry no session title.
+- **Shared renderer.** `lib/notice.js` is a byte-identical copy of
+  [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
+  over; `test/notice.test.js` fails on any difference. The
+  [notice contract](../README.md#notice-contract) lists what framing and
+  packing do not cover.
 
 ## Known limits
 
@@ -303,6 +311,7 @@ The suites use doubles of the plugin context and of the worker. They cover the
 config refusals, the delegated-child refusal, root, child and fork
 eligibility, the busy, idle, plan and unknown mapping, the binding replace and
 fail-closed context, the `handed`, `failed`, `deferred` and `uncertain` reason
-sets pinned to `agent_chat/models.py`, the pinned rejoin constants, owner
-failover, per-session fault isolation, and the hazard rule: a run that ends
-before delivery must never produce a later `handed`.
+sets pinned to `agent_chat/models.py`, the pinned rejoin constants, the shared
+notice vectors with the claim packing for bodies mode, owner failover,
+per-session fault isolation, and the hazard rule: a run that ends before
+delivery must never produce a later `handed`.
