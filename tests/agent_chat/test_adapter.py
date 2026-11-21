@@ -287,6 +287,22 @@ def test_stop_discards_the_record_even_when_the_end_fails(tmp_path, error):
     assert delivery.contexts[-1] is None
 
 
+def test_stop_still_discards_and_ends_when_the_context_callback_fails(tmp_path):
+    adapter, operations, delivery = make_adapter(tmp_path)
+    adapter.start("native-a")
+    path = tmp_path / f"{adapter.joined.binding.boot_id}.json"
+
+    def broken(text):
+        raise RuntimeError("context store closed")
+
+    delivery.context = broken
+    with pytest.raises(RuntimeError):
+        adapter.stop()
+
+    assert not path.exists()
+    assert operations.ends == 1
+
+
 def test_four_failures_in_one_hour_fail_the_rejoin_budget(tmp_path):
     adapter, operations, _delivery = make_adapter(tmp_path)
     adapter.start("native-a")

@@ -179,15 +179,17 @@ class Adapter:
         self._clear_schedule()
         joined = self.joined
         self.joined = None
-        self.delivery.context(None)
-        if joined is None:
-            return
-        # The record goes first, so nothing local can use the binding while the end is in flight or after it fails.
-        instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
         try:
-            self.operations.end(joined, deadline=self._request_deadline())
-        except (ChatError, OSError):
-            pass  # The server lease ends the instance.
+            self.delivery.context(None)
+        finally:
+            # The cleanup does not depend on the harness callback. The record goes first, so nothing local can open the
+            # binding while the end is in flight or after it fails.
+            if joined is not None:
+                instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
+                try:
+                    self.operations.end(joined, deadline=self._request_deadline())
+                except (ChatError, OSError):
+                    pass  # The server lease ends the instance.
 
     def tick(self, now: float | None = None) -> float | None:
         """Run one due heartbeat, poll or join attempt; return the next deadline."""

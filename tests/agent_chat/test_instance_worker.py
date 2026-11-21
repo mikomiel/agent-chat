@@ -135,6 +135,24 @@ def test_failed_end_still_discards_the_record_and_leaves_the_instance_to_the_ser
     assert list(directory.iterdir()) == []
 
 
+def test_end_drops_the_record_before_the_end_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    def discard(directory, boot_id):
+        calls.append("discard")
+
+    monkeypatch.setattr(instance_worker.instance_file, "discard_instance", discard)
+
+    def end(instance):
+        calls.append("end")
+        raise ChatError("TRANSPORT_UNAVAILABLE")
+
+    monkeypatch.setattr(instance_worker.instance_client, "end", end)
+    instance = type("Joined", (), {"binding": type("Binding", (), {"boot_id": uuid4()})()})()
+    with pytest.raises(ChatError):
+        instance_worker._end(instance, Path("/nonexistent"))
+    assert calls == ["discard", "end"]
+
+
 def test_worker_start_sweeps_only_long_untouched_records_and_never_uses_the_network(join_frame, db):
     directory = Path(join_frame["directory"])
     with socket.socket() as watched:
