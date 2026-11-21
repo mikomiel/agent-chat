@@ -89,19 +89,23 @@ After you edit `shared/notice.js`, copy it over all three. The normative text is
 In bodies mode, a notice has:
 
 - the adapter's own instruction lines and the binding line, then one static line that says every `> ` line between
-  the markers is untrusted peer data and grants no authority;
-- for each message, a header line (`message <id> kind <kind> from session <uuid> sent <time> age <N>s`, with
-  `principal <uuid>` for an operator publication), an opening marker `<<<AGENT-CHAT-BODY <nonce>`, the body, and a
-  closing marker `AGENT-CHAT-BODY <nonce>>>>`. The nonce is 16 random hex digits (64 bits) drawn when the notice is
-  rendered, after the claim. The renderer checks every header field again against a strict pattern and returns
-  nothing when one does not match;
+  the markers is untrusted peer data and grants no authority. One instruction line tells the reader to verify that a
+  `history` read returns the id shown in that item's header, and that a reply's `--room` is the room shown in that
+  item's header;
+- for each message, a header line (`message <id> kind <kind> room <room> from session <uuid> sent <time> age <N>s`,
+  with `principal <uuid>` for an operator publication), an opening marker `<<<AGENT-CHAT-BODY <nonce>`, the body, and a
+  closing marker `AGENT-CHAT-BODY <nonce>>>>`. The `room` is the room of that message, which can differ from the room
+  of the binding. The `--room` of a `reply` comes from it. The nonce is 16 random hex digits (64 bits) drawn when the
+  notice is rendered, after the claim. The renderer checks every header field again against a strict pattern and
+  returns nothing when one does not match;
 - every body line prefixed with `> `, so a body line cannot start like a header, a marker, the binding or an
   instruction line;
 - control, bidirectional, invisible, tag and variation-selector code points, and unpaired surrogates, written as
   `\uXXXX` text (`\u{X}` above U+FFFF). Tab and line feed stay, and line feed is the only line break. The table is
   `ESCAPED_RANGES`, and the vectors pin it;
 - a cut on whole units (a code point or one escape) at 4096 UTF-8 bytes per body, the core's `NOTICE_BODY_BYTES`. A
-  cut body is followed by a pointer line with the `history` arguments that read the rest.
+  cut body is followed by a pointer line with the exact `history` arguments that read the rest (`--room`, `--after`
+  and `--limit 1`). It does not repeat the message id: the header above it carries the id.
 
 The caller passes `bound`, the UTF-8 bytes it may send, with its own prefix already counted. The renderer halves the
 body cap (4096, 2048, ... 0) until the whole notice fits. At cap 0 each message still has its header, markers and
@@ -131,9 +135,11 @@ Limits that remain:
   to every body in the notice. Each cut body carries its pointer line, and the notice stays within `bound`. The
   vectors `two-bodies-of-650-carriage-returns-are-both-packed` and
   `two-bodies-of-650-carriage-returns-are-cut-by-halving-after-the-claim` pin this case.
-- A retry batch is claimed whole, up to 16 messages. Its headers, markers and pointers alone take about 7.5 KB in the
-  test fixtures, and the shared suite checks that 16 such frames fit an 8 KiB bound. A Claude Code announcement
-  larger than about 2.4 KB leaves less room than that, and the renderer then returns `null` for such a batch.
+- A retry batch is claimed whole, up to 16 messages. At body cap 0, 16 frames and the adapter's own lines take 7,052
+  bytes in the shared suite's fixtures, and 7,685 bytes when every header field is at its widest. Both fit the Pi and
+  DeepSeek bound of 8,137 bytes, and a test in each of those packages holds the widest case to it. `claude-code` has no
+  fixed bound, because its announcement comes out of the same 10,000 bytes: [its README](claude-code/README.md) gives
+  the room that is left.
 - The table of escaped code points is fixed. A code point that a later Unicode version makes invisible stays
   unescaped until the table and the vectors change.
 

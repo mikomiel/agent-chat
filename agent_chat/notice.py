@@ -70,7 +70,8 @@ _READ_METADATA = (
 )
 _READ_BODIES = (
     "Each item below carries its body. A cut body has a pointer line with the exact history arguments to read the "
-    "rest; verify its ID."
+    "rest. Verify that the history read returns the ID shown in that item's header. A reply's --room is the room "
+    "shown in that item's header."
 )
 _CLI = "Use exactly instance_file below as AGENT_CHAT_INSTANCE_FILE and the declared python with -I -m agent_chat.cli."
 _UNTRUSTED = (
@@ -160,8 +161,8 @@ def _check_bound(bound: object) -> int:
 class _Frame:
     """One message of a bodies notice: its checked header fields and its neutralized body."""
 
-    def __init__(self, header: str, ident: str, room: str, after: str, units: Sequence[tuple[str, int]], cut: bool):
-        self.header, self.ident, self.room, self.after = header, ident, room, after
+    def __init__(self, header: str, room: str, after: str, units: Sequence[tuple[str, int]], cut: bool):
+        self.header, self.room, self.after = header, room, after
         self.units, self.core_cut = units, cut
 
     def lines(self, nonce: str, cap: int) -> list[str]:
@@ -171,10 +172,7 @@ class _Frame:
             lines.extend(f"> {line}" for line in text.split("\n"))
         lines.append(f"AGENT-CHAT-BODY {nonce}>>>")
         if left_out or self.core_cut:
-            lines.append(
-                f"Body cut. Read all of it with: history --room {self.room} --after {self.after} --limit 1"
-                f" (verify id {self.ident})"
-            )
+            lines.append(f"Body cut. Read all of it with: history --room {self.room} --after {self.after} --limit 1")
         return lines
 
 
@@ -209,17 +207,18 @@ def _frame(row: Any, admitted: datetime) -> _Frame | None:
     units = _units(body) if isinstance(body, str) else []
     # A body that is not text counts as cut, so the pointer line shows how to read the message.
     cut = row.get("body_truncated") is True or not isinstance(body, str)
-    header = f"message {ident} kind {kind} from {sender} sent {sent} age {age}s"
-    return _Frame(header, ident, room, after, units, cut)
+    header = f"message {ident} kind {kind} room {room} from {sender} sent {sent} age {age}s"
+    return _Frame(header, room, after, units, cut)
 
 
 def _worst_frame_bytes() -> int:
     """The bytes one message adds to a notice at body cap 0, for the widest header and pointer it can have."""
     zero = "00000000-0000-0000-0000-000000000000"
     header = (
-        f"message {zero} kind consultation from principal {zero} sent 9999-12-31T23:59:59.999999+00:00 age {'9' * 12}s"
+        f"message {zero} kind consultation room {zero} from principal {zero}"
+        f" sent 9999-12-31T23:59:59.999999+00:00 age {'9' * 12}s"
     )
-    frame = _Frame(header, zero, zero, "9" * 19, [], True)
+    frame = _Frame(header, zero, "9" * 19, [], True)
     return sum(len(line.encode("utf-8")) + 1 for line in frame.lines("0" * (_NONCE_BYTES * 2), 0))
 
 

@@ -5,7 +5,7 @@ import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
 import { runNoticeSuite } from "../../shared/notice-suite.mjs"
 
 // The vectors, the property, budget and pack tests, and the copy check are shared by every package.
-runNoticeSuite("pi", notice, new URL("../lib/notice.js", import.meta.url))
+runNoticeSuite("pi", notice, new URL("../lib/notice.js", import.meta.url), { noticeBound: NOTICE_BOUND })
 
 test("the notice bound is what the 8 KiB limit leaves after the delivery line", () => {
   assert.equal(MAX_CONTEXT_BYTES, 8 * 1024)

@@ -63,7 +63,7 @@ test("metadata mode carries ids and cursors, never bodies or senders", () => {
 
 test("bodies mode frames the body and names the sender in the message header", () => {
   const text = bodies([bodyRow(1)], { nonce: "0123456789abcdef" })
-  assert.match(text, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question from session 66666666-6666-4666-8666-666666666666 /m)
+  assert.match(text, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question room 33333333-3333-4333-8333-333333333333 from session 66666666-6666-4666-8666-666666666666 /m)
   assert.match(text, /^<<<AGENT-CHAT-BODY 0123456789abcdef\n> synthetic body\nAGENT-CHAT-BODY 0123456789abcdef>>>$/m)
   assert.doesNotMatch(text, /sender_session_id/)
 })
@@ -123,5 +123,5 @@ test("a body over the per-body cap is cut and pointed at, never passed on as a f
   const text = bodies([bodyRow(0, "x".repeat(5000))])
   assert.match(text, /^> x{4096}$/m)
   assert.doesNotMatch(text, /x{4097}/)
-  assert.match(text, /^Body cut\. Read all of it with: history --room 33333333-3333-4333-8333-333333333333 --after 100 --limit 1 \(verify id aaaaaaaa-aaaa-4aaa-8aaa-000000000000\)$/m)
+  assert.match(text, /^Body cut\. Read all of it with: history --room 33333333-3333-4333-8333-333333333333 --after 100 --limit 1$/m)
 })

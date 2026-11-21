@@ -263,7 +263,7 @@ test("a tool event delivers the same way, with bodies when the config asks for t
 test("bodies mode hands the body over inside a nonce frame with its sender and age", async () => {
   const { context } = await bodiesEvent([bodyRow(1)])
   assert.ok(context.startsWith(CHAT_PREFIX))
-  assert.match(context, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question from session 66666666-6666-4666-8666-666666666666 sent 2026-01-01T00:00:00\+00:00 age 42s$/m)
+  assert.match(context, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question room 33333333-3333-4333-8333-333333333333 from session 66666666-6666-4666-8666-666666666666 sent 2026-01-01T00:00:00\+00:00 age 42s$/m)
   assert.match(context, /^<<<AGENT-CHAT-BODY ([0-9a-f]{16})\n> synthetic body\nAGENT-CHAT-BODY \1>>>$/m)
   assert.doesNotMatch(context, /"sender_session_id"/, "no per-message JSON in bodies mode")
 })

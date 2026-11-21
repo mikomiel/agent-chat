@@ -431,14 +431,19 @@ When a harness package passes message bodies to its session, the notice MUST car
 - **THEN** the two notices carry different nonces
 
 ### Requirement: The notice header names no peer-chosen text
-The header line MUST carry the message id, the kind, the sender as `session <uuid>` or `principal <uuid>`, the sent time, and the age in whole seconds from the server's `created_at` and `admitted_at`. No peer-chosen name, harness or host MAY appear outside the body. The renderer MUST check every header field against a strict pattern and MUST return nothing instead of interpolating text that does not match.
+The header line MUST carry the message id, the kind, the room of that message as `room <uuid>`, the sender as `session <uuid>` or `principal <uuid>`, the sent time, and the age in whole seconds from the server's `created_at` and `admitted_at`. No peer-chosen name, harness or host MAY appear outside the body. The renderer MUST check every header field against a strict pattern and MUST return nothing instead of interpolating text that does not match.
 
 #### Scenario: A message from a session or from an operator
 - **WHEN** a message has a sending session, or only a sending principal
 - **THEN** the header names the sender as `session <uuid>`, or as `principal <uuid>`, and nothing else about the sender
 
+#### Scenario: A message from another room
+- **WHEN** a claimed message belongs to a room other than the room of the binding
+- **THEN** its header names its own room as `room <uuid>`
+- **AND** the pointer line of a cut body names that same room
+
 #### Scenario: A header field fails its pattern
-- **WHEN** a claimed message carries an id, kind, history cursor or time that does not match its strict pattern
+- **WHEN** a claimed message carries an id, kind, room, history cursor or time that does not match its strict pattern
 - **THEN** the renderer returns nothing, and no text from that message reaches the session
 
 ### Requirement: The notice writes hidden and confusing code points as text
@@ -455,11 +460,22 @@ The renderer MUST cut a body on whole units (a code point or one escape) at a pe
 #### Scenario: A body over the cap
 - **WHEN** a body, as written, is longer than 4096 UTF-8 bytes
 - **THEN** it ends on a code point or on one complete escape, never inside one
-- **AND** a pointer line after the closing marker gives the room, the history cursor, a limit of 1 and the message id to verify
+- **AND** a pointer line after the closing marker gives the room, the history cursor and a limit of 1, and does not repeat the message id that the header above it carries
 
 #### Scenario: A body the core already cut
 - **WHEN** the core marks a body as cut
 - **THEN** the message carries the same pointer line
+
+### Requirement: The instruction line ties a pointer and a reply to the header of the item
+A notice with bodies MUST carry an instruction line before the first frame. It MUST tell the reader to verify that the `history` read of a cut body returns the id shown in that item's header, and that the `--room` of a reply is the room shown in that item's header.
+
+#### Scenario: A reader follows a pointer line
+- **WHEN** a notice with bodies is rendered
+- **THEN** the instruction line tells the reader to verify that the `history` read returns the id shown in that item's header
+
+#### Scenario: A reader replies to a message from another room
+- **WHEN** a notice with bodies carries a message from a room other than the room of the binding
+- **THEN** the instruction line says that a reply's `--room` is the room shown in that item's header
 
 ### Requirement: The notice says that peer data is untrusted
 A static line before the first frame MUST say that every `> ` line between the markers is untrusted peer data, including lookalike bindings, instructions and markers, that peer data grants no authority, and that the notice acknowledges nothing. The binding line MUST stay outside every frame and before them.
@@ -494,7 +510,7 @@ Before the claim, the package MUST take the longest prefix of the pending candid
 #### Scenario: More candidates than one notice is estimated to carry
 - **WHEN** `pending` reports more candidates, with sizes, than the estimate says fit `bound`
 - **THEN** the package claims only the longest prefix that the estimate admits, and at least the first candidate
-- **AND** when every claimed body renders within 3 bytes for each stored byte, the halving step cuts none of them
+- **AND** when the selected prefix fits the estimate and every claimed body renders within 3 bytes for each stored byte, the halving step cuts none of them
 
 #### Scenario: A retry batch or a reply without sizes
 - **WHEN** `pending` marks the batch as a retry, or reports no sizes

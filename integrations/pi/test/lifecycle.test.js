@@ -164,7 +164,7 @@ test("bodies mode hands the body over inside a nonce frame with its sender and a
   assert.equal(claim.fields.bodies, true)
   assert.equal(sent.length, 1)
   const content = sent[0].payload.content
-  assert.match(content, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question from session 66666666-6666-4666-8666-666666666666 sent 2026-01-01T00:00:00\+00:00 age 42s$/m)
+  assert.match(content, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question room 33333333-3333-4333-8333-333333333333 from session 66666666-6666-4666-8666-666666666666 sent 2026-01-01T00:00:00\+00:00 age 42s$/m)
   assert.match(content, /^<<<AGENT-CHAT-BODY ([0-9a-f]{16})\n> synthetic body\nAGENT-CHAT-BODY \1>>>$/m)
   assert.doesNotMatch(content, /"sender_session_id"/, "no per-message JSON in bodies mode")
 })

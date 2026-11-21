@@ -184,10 +184,15 @@ or a stop. Only the idle-wake waiter exits 2.
   not change delivery.
 - **No title.** `session_title` reaches hooks only for a custom-titled session
   and is not forwarded. The server keeps the stored title.
-- **Large retry batches.** A retry batch is claimed whole, up to 16 messages,
-  and its headers, markers and pointers alone take about 7.5 KB in the test
-  fixtures. An announcement larger than about 2.4 KB leaves less room than that,
-  so the renderer returns nothing and the batch is deferred.
+- **Large retry batches.** A retry batch is claimed whole, up to 16 messages.
+  At body cap 0, 16 frames and the adapter's own lines take 7,095 bytes in the
+  receiver test fixtures, and 7,719 bytes when every header field is at its
+  widest. With the notice, the delivery line and the two line feeds after the
+  announcement counted, the 10,000-byte output cap leaves 2,848 bytes for an
+  announcement in the first case and 2,224 bytes in the second. The
+  announcement is 1,016 bytes in the receiver tests and never more than 4,096.
+  An announcement larger than that room leaves less than the batch needs, so
+  the renderer returns nothing and the batch is deferred.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The

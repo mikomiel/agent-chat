@@ -7,7 +7,7 @@ import { runNoticeSuite } from "../../shared/notice-suite.mjs"
 const { renderNotice } = notice
 
 // The vectors, the property, budget and pack tests, and the copy check are shared by every package.
-runNoticeSuite("deepseek", notice, new URL("../lib/notice.js", import.meta.url))
+runNoticeSuite("deepseek", notice, new URL("../lib/notice.js", import.meta.url), { noticeBound: NOTICE_BOUND })
 
 const joined = {
   session_id: "11111111-1111-4111-8111-111111111111",
@@ -60,7 +60,7 @@ test("metadata mode carries ids and cursors, never bodies or senders", () => {
 
 test("bodies mode frames the body and names the sender in the message header", () => {
   const text = bodies([bodyRow(1)], { nonce: "0123456789abcdef" })
-  assert.match(text, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question from session 66666666-6666-4666-8666-666666666666 /m)
+  assert.match(text, /^message aaaaaaaa-aaaa-4aaa-8aaa-000000000001 kind question room 33333333-3333-4333-8333-333333333333 from session 66666666-6666-4666-8666-666666666666 /m)
   assert.match(text, /^<<<AGENT-CHAT-BODY 0123456789abcdef\n> synthetic body\nAGENT-CHAT-BODY 0123456789abcdef>>>$/m)
   assert.doesNotMatch(text, /sender_session_id/)
 })
