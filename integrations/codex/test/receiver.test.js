@@ -660,7 +660,7 @@ const IDLE = { reason: null, observed: { status: "idle", stopped: false, plan: f
 function threadDouble({ bind = { status: "bound" }, route = true, observation = IDLE, wake = { outcome: "handed", reason: null } } = {}) {
   const thread = {
     opened: [], calls: [], wakes: [], adds: [], route,
-    async bind() { thread.calls.push("bind"); return typeof bind === "function" ? bind() : bind },
+    async bind(options) { thread.calls.push("bind"); return typeof bind === "function" ? bind(options) : bind },
     async observe() { thread.calls.push("observe"); return typeof observation === "function" ? observation() : observation },
     async wake(request) {
       thread.wakes.push(request)
@@ -1027,6 +1027,102 @@ test("a bind that answers after its deadline verifies nothing, and a later `unlo
   await r.clock.advance(30_000)
   assert.equal(asked, 2)
   assert.equal(r.worker.bootIds.length, 0, "the next bind found the thread unloaded, so there is still nothing verified")
+})
+
+// Every worker start binds the thread again. What the first bind found does not carry over to a rejoin: the thread can be
+// unloaded, or turn out to be a child, while the receiver waits out its backoff.
+async function rejoining(second) {
+  let answer = { status: "bound" }
+  let refuse = true
+  const thread = threadDouble({ bind: () => answer })
+  const r = await rig({ thread, handlers: { pending: () => (refuse ? { refused: "STALE_INSTANCE" } : { messages: [] }) } })
+  await r.begin()
+  assert.equal(r.worker.bootIds.length, 1, "the first join is verified by the first bind")
+  await r.op(turn()) // the lease is gone: the worker stops and the bounded rejoin starts
+  assert.equal(r.worker.state.stops, 1)
+  answer = second
+  refuse = false
+  await r.clock.advance(3750) // the rejoin fires
+  return { r, thread, answer: next => { answer = next }, binds: () => thread.calls.filter(call => call === "bind").length }
+}
+
+test("a rejoin binds again: a thread that is no longer loaded starts no worker, and a later positive bind does", async () => {
+  const { r, answer, binds } = await rejoining({ status: "unloaded" })
+  assert.equal(binds(), 2, "the rejoin looked at the thread again")
+  assert.equal(r.worker.bootIds.length, 1, "and no worker started on the strength of the first bind")
+  await r.clock.advance(29_000)
+  assert.equal(binds(), 2, "the next look is a heartbeat period away")
+  assert.equal(r.worker.bootIds.length, 1)
+  answer({ status: "bound" })
+  await r.clock.advance(1000)
+  assert.equal(binds(), 3)
+  assert.equal(r.worker.bootIds.length, 2, "a bind that finds the thread joins it")
+})
+
+test("a rejoin binds again: a thread that has become a child ends chat the way the first join would, and starts no worker", async () => {
+  const { r, binds } = await rejoining({ status: "child" })
+  assert.equal(binds(), 2)
+  assert.equal(r.worker.bootIds.length, 1, "no new worker")
+  assert.equal(r.receiver.state(), "offline")
+  assert.deepEqual((await r.op(turn())).sent, [{
+    disabled: true, message: "Agent Chat stopped (CHAT_CHILD_THREAD); the Codex session is unchanged.",
+  }])
+  await r.clock.advance(120_000)
+  assert.equal(binds(), 2, "chat stays off: nothing looks again")
+  assert.equal(r.worker.bootIds.length, 1)
+})
+
+// A retry inside a rejoin episode belongs to that episode: it spends no budget, but the two-hour window still ends it. A
+// first join has no episode, so its retries have no end.
+test("a rejoin whose thread stays unloaded ends with the rejoin episode window, which a first join does not have", async () => {
+  const { r, binds } = await rejoining({ status: "unloaded" })
+  await r.clock.advance(7_000_000) // inside the two hours counted from the first refusal: still looking
+  assert.equal(r.receiver.state() === "offline", false)
+  assert.ok(binds() > 200)
+  await r.clock.advance(200_000)
+  assert.equal(r.receiver.state(), "offline")
+  assert.equal(r.worker.bootIds.length, 1, "no worker ever started on the strength of the first bind")
+  const hook = await r.op(turn())
+  assert.match(hook.sent[0].message, /REJOIN_WINDOW/)
+})
+
+// The time allowed for a bind is for the thread read. When the read is in, the bind says so and the queue probe runs on
+// its own limit; a probe that does not finish costs the route, never the join.
+test("a thread read that arrives at 2.5 seconds with a probe that stays silent still joins, hook-only", async () => {
+  let options
+  let finish
+  let asked = 0
+  const thread = threadDouble({ route: null, bind: given => {
+    if (++asked > 1) return { status: "unprobed" }
+    options = given
+    return new Promise(resolve => { finish = resolve })
+  } })
+  const r = await rig({ handlers: wakeHandlers(), thread })
+  await r.clock.advance(2500)
+  options?.onRead?.() // the read is in, and the probe is out
+  await r.clock.advance(1000) // 3.5 seconds: past the 3 seconds of the read
+  assert.equal(r.worker.bootIds.length, 0, "the bind is still probing")
+  assert.notEqual(options?.signal?.aborted, true, "the read deadline ended with the read: nothing aborts the probe")
+  finish({ status: "unprobed" }) // the probe gave up on its own limit
+  await settle()
+  assert.equal(r.worker.bootIds.length, 1, "joined on the read that came in on time")
+  await r.op(turn())
+  await r.op({ op: "stop", permission_mode: "default" })
+  r.worker.log.length = 0
+  await r.clock.advance(10_000)
+  assert.deepEqual(r.worker.ops("claim"), [], "hook-only: the route is undecided, so no wake")
+  assert.deepEqual(thread.wakes, [])
+})
+
+test("a bind whose read is not in after 3 seconds is aborted at once, so what it learns later is recorded nowhere", async () => {
+  const signals = []
+  const thread = threadDouble({ bind: options => { signals.push(options?.signal); return new Promise(() => {}) } })
+  const r = await rig({ thread })
+  await r.clock.advance(2999)
+  assert.equal(signals[0]?.aborted, false, "still within the read deadline")
+  await r.clock.advance(1)
+  assert.equal(signals[0]?.aborted, true, "the deadline aborts the call's own token")
+  assert.equal(r.worker.bootIds.length, 0)
 })
 
 // ---- state mapping ---------------------------------------------------------------------------------------------

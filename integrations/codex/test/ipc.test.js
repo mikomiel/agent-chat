@@ -189,6 +189,43 @@ test("only a refused connection proves the listener gone: any other probe result
   } finally { cleanup(dir) }
 })
 
+// ---- closing a listener ----------------------------------------------------------------------------------------
+// A Node listener unlinks, when it closes, the name it was bound under. The receiver binds under a private name, so
+// a receiver that closes after its successor took the path cannot remove the successor's socket.
+
+test("a receiver that closes after its successor bound the path leaves the successor's socket", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  try {
+    const old = await serve(socket, async (_request, link) => { await link.send({ owner: "old" }) })
+    unlinkSync(socket) // the old path goes (a cleaner, an operator), and a successor takes it while the old receiver still runs
+    const successor = await serve(socket, async (_request, link) => { await link.send({ owner: "successor" }) })
+    try {
+      old.close()
+      const link = await connect(socket)
+      assert.deepEqual(await link.call({}, 2000), { owner: "successor" }, "the successor's socket still exists and answers")
+      link.close()
+    } finally { successor.close() }
+    assert.deepEqual(readdirSync(dir), [], "and its own close removes it")
+  } finally { cleanup(dir) }
+})
+
+test("a listener leaves only its socket in the directory while it runs, and nothing once it is closed", async () => {
+  const dir = privateDirectory()
+  const { socket } = paths(dir, "session-1")
+  try {
+    const listener = await serve(socket, async (_request, link) => { await link.send({ ok: true }) })
+    assert.deepEqual(readdirSync(dir), [socket.split("/").pop()], "no private bind name and no lock are left")
+    assert.equal(statSync(socket).mode & 0o777, 0o600)
+    const link = await connect(socket)
+    assert.deepEqual(await link.call({}, 2000), { ok: true })
+    link.close()
+    listener.close()
+    listener.close() // closing twice is harmless, and still removes nothing that is not its own
+    assert.deepEqual(readdirSync(dir), [])
+  } finally { cleanup(dir) }
+})
+
 // ---- the bind lock ---------------------------------------------------------------------------------------------
 // The lock line is `<pid> <start time, or -> <token>`; a lock is taken over only when that exact process is gone.
 
@@ -307,6 +344,42 @@ test("a contender with an old reading of the lock cannot remove its successor's 
 
 // Real processes: the reading and the removal are separate system calls, so only real contention shows the race.
 // The contenders stay up between rounds and are told when to start, so a round costs milliseconds.
+// One long-lived child that runs `script` and answers each command line on its standard output. `next` resolves its next
+// reply, and rejects when the child has exited without one or says nothing for `waitMs`, so a contender that dies
+// fails its round instead of leaving the test to wait for the runner's timeout.
+function contender(script, waitMs = 10_000) {
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["pipe", "pipe", "ignore"] })
+  const lines = []
+  const waiting = []
+  let gone = null
+  createInterface({ input: child.stdout }).on("line", line => { const reader = waiting.shift(); if (reader) reader.resolve(line); else lines.push(line) })
+  child.once("close", (code, signal) => { // after its output was read to the end
+    gone = new Error(`contender ${child.pid} exited (${code ?? signal}) without replying`)
+    for (const reader of waiting.splice(0)) reader.reject(gone)
+  })
+  const next = () => new Promise((resolve, reject) => {
+    const line = lines.shift()
+    if (line !== undefined) return resolve(line)
+    if (gone) return reject(gone)
+    const timer = setTimeout(() => reject(new Error(`contender ${child.pid} did not reply within ${waitMs} ms`)), waitMs)
+    waiting.push({ resolve: reply => { clearTimeout(timer); resolve(reply) }, reject: error => { clearTimeout(timer); reject(error) } })
+  })
+  return { child, next }
+}
+
+test("a contender that exits without replying, or stays silent, fails its round instead of hanging", async () => {
+  const dies = contender("process.stdin.once('data', () => process.exit(3))", 2000)
+  const silent = contender("setInterval(() => {}, 1000)", 200)
+  try {
+    dies.child.stdin.write("go\n")
+    await assert.rejects(dies.next(), /exited \(3\) without replying/)
+    await assert.rejects(dies.next(), /exited \(3\) without replying/, "a later wait on the dead child fails at once too")
+    await assert.rejects(silent.next(), /did not reply within 200 ms/)
+  } finally {
+    for (const { child } of [dies, silent]) child.kill("SIGKILL")
+  }
+})
+
 test("receivers in separate processes that all find the same dead lock and dead socket leave exactly one live listener", async () => {
   const script = `
     import { createInterface } from "node:readline"
@@ -334,13 +407,7 @@ test("receivers in separate processes that all find the same dead lock and dead 
     killed.kill("SIGKILL")
     await exited
     const dead = await deadPid()
-    for (let index = 0; index < 8; index += 1) {
-      const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["pipe", "pipe", "ignore"] })
-      const lines = []
-      const waiting = []
-      createInterface({ input: child.stdout }).on("line", line => { const resolve = waiting.shift(); if (resolve) resolve(line); else lines.push(line) })
-      contenders.push({ child, next: () => new Promise(resolve => { const line = lines.shift(); if (line !== undefined) resolve(line); else waiting.push(resolve) }) })
-    }
+    for (let index = 0; index < 8; index += 1) contenders.push(contender(script))
     for (const [round, socket] of sockets.entries()) {
       writeFileSync(`${socket}.bind`, `${dead} - token`)
       age(`${socket}.bind`)

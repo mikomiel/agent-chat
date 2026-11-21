@@ -284,6 +284,71 @@ test("nothing from an earlier bind verifies a later one: a thread that is no lon
   })
 })
 
+// ---- the two deadlines of a bind and the call's own token ------------------------------------------------------
+// The caller's time is for the thread read: `onRead` says it is over, and the queue probe then has PROBE_MS of its own.
+// `signal` is the call's token: once aborted, nothing the call reads afterwards is recorded.
+
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
+async function eventually(check, what) {
+  for (let waited = 0; !check() && waited < 2000; waited += 5) await pause(5)
+  assert.ok(check(), `${what} never happened`)
+}
+
+test("the read is reported done before the probe starts, and the probe runs on its own limit, not on what the read left", async () => {
+  const events = []
+  await withServer(main({
+    "thread/read": async () => { await pause(1200); events.push("read"); return ok({ thread: thread() }) },
+    "thread/queue/delete": () => { events.push("probe") }, // silent
+  }), async path => {
+    const started = Date.now()
+    const bound = createThread({ path, threadId: THREAD })
+    let readAt = null
+    const result = await bound.bind({ onRead: () => { readAt = Date.now() - started; events.push("onRead") } })
+    const finished = Date.now() - started
+    assert.deepEqual(result, { status: "unprobed" })
+    assert.deepEqual(events, ["read", "onRead", "probe"])
+    assert.ok(readAt >= 1100, "the read took 1.2 seconds")
+    assert.ok(finished - readAt >= 900 && finished - readAt < 2000, `the probe had about its own second after the read: ${finished - readAt} ms`)
+    assert.equal(bound.provider, "openai")
+    assert.equal(bound.route, null)
+  })
+})
+
+test("a bind that the caller timed out while it was reading records nothing and probes nothing", async () => {
+  await withServer(main({
+    "thread/read": async () => { await pause(300); return ok({ thread: thread() }) },
+  }), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    const attempt = new AbortController()
+    let reads = 0
+    const first = bound.bind({ signal: attempt.signal, onRead: () => { reads += 1 } })
+    await eventually(() => server.methods().includes("thread/read"), "the read request")
+    attempt.abort() // the caller's time ran out while the read was out
+    assert.deepEqual(await first, { status: "unavailable" })
+    assert.equal(reads, 0, "the read it finished late is not reported as done")
+    assert.equal(bound.provider, null, "a late read does not fix the provider")
+    assert.equal(server.methods().includes("thread/queue/delete"), false, "and nothing is probed on its account")
+    assert.deepEqual(await bound.bind(), { status: "bound", route: true }, "the next bind starts from nothing")
+  })
+})
+
+test("a bind that the caller timed out while it was probing cannot record a late negative answer: the next bind probes again", async () => {
+  let probes = 0
+  await withServer(main({
+    "thread/queue/delete": async () => { probes += 1; await pause(300); return probes === 1 ? ok({ deleted: true }) : ok({ deleted: false }) },
+  }), async path => {
+    const bound = createThread({ path, threadId: THREAD })
+    const attempt = new AbortController()
+    const first = bound.bind({ signal: attempt.signal })
+    await eventually(() => probes === 1, "the first probe request")
+    attempt.abort() // the caller stopped waiting; the answer is still on its way, and it is not the documented one
+    assert.deepEqual(await first, { status: "unavailable" })
+    assert.equal(bound.route, null, "a late negative answer is not recorded as the route")
+    assert.deepEqual(await bound.bind(), { status: "bound", route: true })
+    assert.equal(probes, 2, "the later bind probed instead of trusting the expired one")
+  })
+})
+
 // ---- observe ---------------------------------------------------------------------------------------------------
 
 async function observeWith(over) {

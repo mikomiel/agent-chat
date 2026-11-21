@@ -5,10 +5,10 @@
 // owned by the user with mode 0700, so the socket needs no other access control.
 // This module owns paths, framing and the connect-or-start handshake. It owns no
 // chat policy.
-import { createHash, randomUUID } from "node:crypto"
+import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { chmodSync, closeSync, linkSync, lstatSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import net from "node:net"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { HARNESS } from "./config.js"
 import { ownerAlive, processStartTime } from "./process.js"
 
@@ -182,10 +182,17 @@ function takeBindLock(path, deps) {
 // second receiver then finds the first one bound and stops, and cannot unlink a live
 // listener's path. The lock is not the one the hooks hold to start a receiver. A
 // receiver that cannot take it exits as a running one.
+//
+// The listener is bound under a private name and linked to the public path, then the private name is dropped. Closing
+// a Node listener unlinks the name it was bound under, whatever is there by then, so with the public path as that
+// name a receiver that closed late would remove its successor's socket. With the private name, closing touches
+// nothing public: `close` removes the public path itself, only while that path is still this listener's file, and
+// while the listener is still up, so nothing can have taken the path in between.
 export async function serve(path, handler, { connectImpl = connect, alive = ownerAlive, startTime = processStartTime } = {}) {
   const gate = `${path}.bind`
   if (!takeBindLock(gate, { alive, startTime })) throw refusal("CHAT_RECEIVER_RUNNING")
   let server
+  let own // dev and ino of the public path as this listener linked it
   try {
     let existing = null
     try { existing = lstatSync(path) } catch (error) { if (error.code !== "ENOENT") throw error }
@@ -205,18 +212,31 @@ export async function serve(path, handler, { connectImpl = connect, alive = owne
       } catch { /* a handler failure ends only this connection */ }
       session.close()
     })
+    const bound = join(dirname(path), randomBytes(6).toString("hex"))
     await new Promise((resolve, reject) => {
       server.once("error", reject)
-      server.listen(path, () => { server.off("error", reject); resolve() })
+      server.listen(bound, () => { server.off("error", reject); resolve() })
     })
-    chmodSync(path, 0o600)
+    try {
+      chmodSync(bound, 0o600)
+      linkSync(bound, path) // EEXIST: something took the path under the lock, so a receiver is running
+      own = lstatSync(path, { bigint: true })
+    } catch (error) {
+      server.close()
+      throw error.code === "EEXIST" ? refusal("CHAT_RECEIVER_RUNNING") : error
+    } finally {
+      try { unlinkSync(bound) } catch { /* already gone */ }
+    }
   } finally {
     try { unlinkSync(gate) } catch { /* already gone */ }
   }
   return {
     close() {
+      try {
+        const now = lstatSync(path, { bigint: true })
+        if (now.dev === own.dev && now.ino === own.ino) unlinkSync(path)
+      } catch { /* already gone */ }
       server.close()
-      try { unlinkSync(path) } catch { /* already gone */ }
     },
   }
 }

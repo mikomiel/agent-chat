@@ -23,7 +23,7 @@ export { processStartTime } // the owner check reads start times through lib/pro
 const HEARTBEAT_MS = 30_000
 const WAKE_POLL_MS = 2_000
 const WAKE_RETRY_MS = 10_000 // after a refused or unsuccessful wake, before the next read
-const BIND_MS = 3_000
+const READ_MS = 3_000 // the thread read of a bind; the queue probe that may follow has its own limit in lib/appserver.js
 const HANDOFF_MS = 5_000
 const MIN_RESERVATION_MS = 500
 const CLAIM_MARGIN_MS = 2_500 // a hook consumer needs this long left to claim and answer
@@ -75,8 +75,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let observed = null // the last app-server read: { status, stopped, plan }; any hook event discards it
   let epoch = 0 // counts hook events and app-server refusals, so a read or a clearance that began before one is not kept
   let newestRefusal = null // the reason of the newest app-server read that refused a wake; a hook event discards it
-  let threadBound = false // the thread was found, is not a child, and its provider is fixed
-  let verified = false // the thread is a loaded main thread: with an app-server configured, only then may the worker join
+  let threadBound = false // the newest bind decided the route: the thread is a main thread, its provider is fixed and the queue probe answered
   let wakeAfter = 0
   let failure = null // the fail-closed latch: the reason
   let failureShown = false
@@ -219,21 +218,28 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // Look the thread up in the app-server. A child refuses the whole session. Verification is the answer of this call
-  // alone: a loaded thread whose record is complete and not a child's (`bound`, `unprobed` when only the queue probe did
-  // not finish, or `stale_binding` after a provider change). Anything else (not loaded yet, an incomplete record, no
-  // answer in the time allowed, an error) verifies nothing, and a result that comes in after the time allowed is
-  // dropped with the race: the caller does not join on it, and nothing left over from an earlier call counts.
+  // alone, and nothing is kept for the next one: every worker start, a rejoin included, binds again. A loaded thread
+  // whose record is complete and not a child's is `bound`, `unprobed` (only the queue probe did not finish) or
+  // `stale_binding` (the provider changed). Anything else (not loaded yet, an incomplete record, no answer in the
+  // time allowed, an error) verifies nothing.
+  //
+  // The time allowed, READ_MS, is for the thread read. The bind says when the read is done and then runs the queue
+  // probe on a limit of its own, so a slow probe cannot veto a read that came in on time. A bind that runs out of time
+  // is aborted: its late answer neither joins nor changes what the thread has recorded.
   async function bindThread() {
+    const attempt = new AbortController()
     let timer
+    const expired = new Promise(resolve => {
+      timer = setTimeoutImpl(() => { attempt.abort(); resolve({ status: "unavailable" }) }, READ_MS)
+    })
     const result = await Promise.race([
-      thread.bind(),
-      new Promise(resolve => { timer = setTimeoutImpl(() => resolve({ status: "unavailable" }), BIND_MS) }),
+      thread.bind({ signal: attempt.signal, onRead: () => clearTimeoutImpl(timer) }),
+      expired,
     ])
     clearTimeoutImpl(timer)
-    if (result.status === "child") return "CHAT_CHILD_THREAD"
-    if (MAIN_THREAD.has(result.status)) verified = true
-    if (result.status === "bound") threadBound = true // a changed provider leaves the thread unbound: hook-only
-    return null
+    if (result.status === "child") return { refusal: "CHAT_CHILD_THREAD", verified: false }
+    threadBound = result.status === "bound" // a changed provider or an undecided probe leaves the thread unbound: hook-only
+    return { refusal: null, verified: MAIN_THREAD.has(result.status) }
   }
 
   // Replace the observed state with a fresh read, unless a hook event arrived while it ran.
@@ -255,14 +261,15 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (closed || failure) return
     try { policy.check() } catch (error) { return disable(describeFailure(error)) }
     rejoinTimer = null
-    // A delegated thread must never join, so with an app-server configured the worker starts only after a positive
-    // main-thread check. A thread that is not loaded yet, a read that timed out and an error all mean no join yet:
-    // try again after one heartbeat period, and claim nothing meanwhile. The attempt counts as made for a waiting hook.
-    if (thread && !verified) {
-      const refusal = await bindThread()
+    // A delegated thread must never join, so with an app-server configured every worker start, the first join and each
+    // rejoin alike, waits for a positive main-thread check taken now. A thread that is not loaded yet, a read that
+    // timed out and an error all mean no join yet: try again after one heartbeat period, and claim nothing meanwhile.
+    // The attempt counts as made for a waiting hook.
+    if (thread) {
+      const check = await bindThread()
       if (closed || failure) return
-      if (refusal) return disable(refusal)
-      if (!verified) {
+      if (check.refusal) return disable(check.refusal)
+      if (!check.verified) {
         firstAttempt()
         rejoinTimer = setTimeoutImpl(() => { void connect() }, HEARTBEAT_MS)
         return
@@ -298,8 +305,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // nothing is known to run, then report. The read runs outside the worker queue so a slow app-server never holds up a delivery.
   async function tick() {
     if (thread && !threadBound) {
-      const refusal = await bindThread()
-      if (refusal) return disable(refusal)
+      const check = await bindThread()
+      if (check.refusal) return disable(check.refusal)
     }
     if (thread && threadBound && !stopped && native !== "busy") {
       const result = await refine()

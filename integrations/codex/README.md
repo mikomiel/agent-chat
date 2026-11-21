@@ -187,15 +187,20 @@ sends its request: it does not wait for the worker to end its instance.
     one-shot `exec` run or a sub-agent. The first hook output says so, and
     the same check runs again on each heartbeat read taken while nothing is
     known to run.
-  - With `appServer`, the worker starts only after a positive check from the
-    current read: a loaded thread with a complete record (an `ephemeral` flag, a
-    `source` and a model provider) that is not a child. A thread the
-    app-server does not list yet, a read that does not answer within 3
-    seconds, a read that fails and a record that lacks one of those fields
-    each mean no join yet. An answer that arrives after the 3 seconds is
-    dropped and verifies nothing, and no earlier read counts for a later one.
-    The receiver asks again after 30 seconds, claims nothing in the meantime,
-    and a retry spends none of the rejoin budget.
+  - With `appServer`, every worker start, the first join and each rejoin
+    alike, waits for a positive check from a read taken for that start: a
+    loaded thread with a complete record (an `ephemeral` flag, a `source` and a
+    model provider) that is not a child. A thread the app-server does not list
+    yet, a read that does not answer within 3 seconds, a read that fails and a
+    record that lacks one of those fields each mean no join yet. An answer that
+    arrives after the 3 seconds is dropped and verifies nothing, and no earlier
+    read counts for a later one: a rejoin whose read finds the thread unloaded
+    starts no worker, and one that finds a child ends chat, as the first join
+    would. The receiver asks again after 30 seconds, claims nothing in the
+    meantime, and a retry spends none of the rejoin budget. A retry inside a
+    rejoin still belongs to that rejoin's episode, so the two-hour episode
+    window ends it (`REJOIN_WINDOW`); a first join has no episode, and its
+    retries have no end.
 - **Rejoin.** `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE`,
   `REQUEST_UNCERTAIN` and a join `BINDING_CONFLICT` start a bounded rejoin:
   5-second base, doubling to a 120-second cap, jitter between 0.5 and 1.0, a
@@ -237,11 +242,15 @@ are experimental.
    read that does not answer within 3 seconds mean no join yet, and the
    receiver asks again every 30 seconds. The provider recorded by an earlier
    bind, and an answer that arrives after the 3 seconds, never verify a later
-   bind. A queue probe that fails or does not answer within 1 second (step 2)
-   does not stop the join: a thread whose read passed joins hook-only, and each
-   later heartbeat binds again until the probe is decided. The thread's model
-   provider is recorded after that read; a read that later shows another
-   provider is a `stale_binding` and refuses the wake.
+   bind. The 3 seconds are for the thread read alone. Once the read is in, the
+   queue probe (step 2) has a limit of its own, so a slow probe never costs a
+   read that came in on time: a probe that fails or does not answer within 1
+   second does not stop the join. A thread whose read passed joins hook-only,
+   and each later heartbeat binds again until the probe is decided. A bind that
+   ran out of its 3 seconds is aborted: what it reads afterwards fixes no
+   provider and decides no route. The thread's model provider is recorded after
+   that read; a read that later shows another provider is a `stale_binding` and
+   refuses the wake.
 2. **Probe.** One `thread/queue/delete` of a random id must answer
    `{ "deleted": false }` within 1 second. Any other answer, an error
    included, leaves the wake route off; no answer within the second leaves it
@@ -350,8 +359,10 @@ exercised live.
   sandbox profile is not confirmed. A profile that blocks them leaves chat off.
 - **Start inside the hook timeout.** Whether the receiver can start, bind the
   thread and join within the `SessionStart` wait (5 seconds of a 15-second
-  timeout) on a real session is not confirmed. With `appServer`, a thread that
-  the app-server does not list yet, or does not answer for, delays the join by
+  timeout) on a real session is not confirmed. With `appServer`, the bind alone
+  can take 4 seconds (3 for the thread read, then 1 for the queue probe), which
+  leaves one second of that wait for the worker's join. A thread that the
+  app-server does not list yet, or does not answer for, delays the join by
   30-second periods and nothing is claimed until it joins. A later hook event
   announces the binding once the session has joined.
 - **`additionalContextLimit` units.** The generated types describe a token
@@ -390,9 +401,15 @@ exercised live.
 - **Reused pids off Linux.** The start time comes from `/proc`. Where `/proc`
   cannot be read, only the pid is checked, both for the owner check and for the
   holder of the bind lock.
-- **Hard links for the bind lock.** The lock is created and retired with hard
-  links, so the state directory must be on a file system that supports them.
-  Where `link` fails, the receiver does not start and chat stays off.
+- **Hard links for the bind lock and the socket.** The lock is created and
+  retired with hard links, and the listener's socket is linked into place from
+  a private name, so the state directory must be on a file system that supports
+  them. Where `link` fails, the receiver does not start and chat stays off.
+  Linking a socket file was checked on Linux only.
+- **A kill between listen and link.** A receiver killed after its listener
+  bound the private name and before that name was dropped leaves a socket file
+  with a 12-character hexadecimal name in the state directory. Nothing reads
+  it and nothing removes it; delete it by hand.
 - **A kill inside a lock takeover.** A receiver killed between the two steps
   of a takeover (the second name linked, the dead owner's lock not yet
   unlinked) leaves that second name, `<socket>.bind.retired-<hash>`, next to
@@ -433,6 +450,12 @@ exercised live.
   only one contender can create for that owner line, and unlinks the lock only
   if that name still holds the line it read. A contender with an old reading
   therefore cannot remove a successor's lock, and at most one receiver binds.
+- Closing a Node listener unlinks the name it was bound under, whatever is at
+  that name by then. The receiver therefore binds under a private name, links
+  it to the socket path and drops the private name. When it closes, it removes
+  the socket path only while that path is still its own file (same device and
+  inode), and does so before the listener closes. A receiver that closes after
+  its successor bound the path leaves the successor's socket alone.
 - The worker runs the configured Python interpreter with `-I` and the state
   directory as its working directory.
 - The app-server client answers a server request with a method-not-found error
@@ -463,7 +486,7 @@ node --test
 
 The suite covers config refusal, the worker join frame and frame validation,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
-the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the WebSocket client against a
+the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the WebSocket client against a
 fake control socket on a real Unix socket, the receiver's state, delivery,
 wake, settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner

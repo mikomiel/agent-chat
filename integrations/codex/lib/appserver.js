@@ -29,8 +29,9 @@ export const MIN_ADD_MS = 500
 // The end of the reservation is for recording the result. Every request of a wake ends this long before it, so a slow
 // fence leaves the receiver time to settle `deferred` or `uncertain` instead of letting the claim expire.
 export const SETTLE_MS = 1_000
-// The queue probe is the last step of a bind, and the receiver gives the whole bind 3 seconds. A probe that does not
-// answer within this time leaves the route undecided, so it cannot use up the time the main-thread check needs.
+// The queue probe is the last step of a bind, after the thread read. The receiver's time for the read ends when the bind
+// reports it done; the probe then has this long of its own. A probe that does not answer in time leaves the route
+// undecided and the bind `unprobed`: it never fails a bind whose read came in on time.
 const PROBE_MS = 1_000
 const CONFIRM_MS = 250
 const CONFIRM_MARGIN_MS = 300
@@ -261,18 +262,29 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     // "bound", "unprobed" and "stale_binding"; nothing recorded by an earlier call counts.
     // status: "bound" | "unprobed" | "child" | "unloaded" | "stale_binding" | "unavailable"
     //   unprobed - a main thread, but the queue probe did not finish: the route stays undecided and the next bind probes again.
-    async bind() {
+    //
+    // `signal` belongs to this one call: once the caller aborts it (its time ran out), nothing this call reads after
+    // that is recorded, neither the provider nor the route, and its answer is "unavailable". `onRead` is called once
+    // the thread read has passed, before the queue probe: the caller's read deadline ends there, and the probe has
+    // PROBE_MS.
+    async bind({ signal, onRead } = {}) {
+      const expired = () => signal?.aborted === true
       try {
         return await withConnection(async link => {
           if (!(await loaded(link))) return { status: "unloaded" }
           const thread = await read(link)
+          if (expired()) return { status: "unavailable" }
           if (isChildThread(thread)) return { status: "child" }
           if (!isCompleteRecord(thread)) return { status: "unavailable" }
           if (typeof thread.modelProvider !== "string" || !thread.modelProvider) return { status: "unavailable" }
           if (provider !== null && provider !== thread.modelProvider) return { status: "stale_binding" }
           provider = thread.modelProvider
+          onRead?.()
           if (queue === null) {
-            try { queue = await probe(link) } catch { return { status: "unprobed" } }
+            let answer
+            try { answer = await probe(link) } catch { return { status: "unprobed" } }
+            if (expired()) return { status: "unavailable" }
+            queue = answer
           }
           return { status: "bound", route: queue }
         })
