@@ -38,6 +38,13 @@ def _uuid(value: Any) -> UUID:
     return result
 
 
+def _not_refused(result: Any) -> None:
+    # Only the worker writes `refused`, for an outage it tolerates. The server never sends it, so one in a server
+    # reply is a protocol violation and must not pass through as that tolerated outage.
+    if isinstance(result, dict) and "refused" in result:
+        raise ValueError("refused in a server reply")
+
+
 def join_instance(
     directory: Path,
     native_session_id: str,
@@ -102,6 +109,7 @@ def _request(
     try:
         if not isinstance(result, dict) or _uuid(result.get("instance_id")) != instance.instance_id:
             raise ValueError("different binding in response")
+        _not_refused(result)
         if method == "GET":
             if _uuid(result.get("session_id")) != instance.session_id:
                 raise ValueError("different logical session in response")
@@ -215,6 +223,7 @@ def claim(
         str(key),
     )
     try:
+        _not_refused(result)
         attempt = result["attempt"]
         if _uuid(attempt["instance_id"]) != instance.instance_id or type(result["dispatch"]) is not bool:
             raise ValueError("invalid grant identity")
@@ -338,6 +347,7 @@ def settle(
         request.model_dump(mode="json"),
     )
     try:
+        _not_refused(result)
         if (
             _uuid(result["instance_id"]) != instance.instance_id
             or _uuid(result["id"]) != attempt

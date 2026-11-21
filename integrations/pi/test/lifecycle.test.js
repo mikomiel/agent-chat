@@ -486,6 +486,116 @@ test("a non-transport join refusal fails closed and latches", async () => {
   delete globalThis[Symbol.for("agent-chat.pi.disabled")]
 })
 
+// #146: during a brief outage the core's worker answers a heartbeat or a pending read with the non-terminal
+// `{ refused: code }` and keeps the binding; the next heartbeat or poll is the retry.
+test("brief heartbeat and pending refusals keep the worker and the binding and spend no rejoin budget", async t => {
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] }) // a disable would otherwise leak into later tests
+  const { pi, emit, ctx, notices, statuses } = fakePi()
+  const answered = []
+  let refusal = null // the code the worker answers with, or null for a normal answer
+  const worker = fakeWorker({
+    answer: op => {
+      if (refusal && (op === "heartbeat" || op === "pending")) { answered.push([op, refusal]); return { refused: refusal } }
+      return op === "pending" ? { messages: [] } : {}
+    },
+  })
+  let starts = 0
+  const retries = []
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers,
+    startProcess: () => { starts += 1; return worker },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  const bindingBefore = lifecycle.binding()
+  assert.match(bindingBefore, /boot-1\.json/)
+  // Four brief outages, one more than the hourly rejoin budget allows.
+  const outages = [
+    ["heartbeat", "SERVICE_UNAVAILABLE"], ["pending", "TRANSPORT_UNAVAILABLE"],
+    ["heartbeat", "REQUEST_UNCERTAIN"], ["pending", "SERVICE_UNAVAILABLE"],
+  ]
+  for (const [operation, code] of outages) {
+    refusal = code
+    await (operation === "heartbeat" ? lifecycle.heartbeat() : lifecycle.poll())
+  }
+  assert.deepEqual(answered, outages, "each refusal reached the lifecycle")
+  assert.equal(starts, 1, "the same worker keeps serving")
+  assert.deepEqual(retries, [], "no rejoin is scheduled")
+  assert.doesNotMatch(notices.join("\n"), /reconnecting|stopped/)
+  assert.doesNotMatch(statuses.join("\n"), /reconnecting/)
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.notEqual(globalThis[Symbol.for("agent-chat.pi.disabled")], true, "chat is not disabled")
+  assert.equal(lifecycle.binding(), bindingBefore, "the binding is unchanged")
+  assert.equal(await Promise.race([worker.closed.then(() => "ended"), flush().then(() => "serving")]), "serving")
+  refusal = null // the next tick is the retry
+  const before = worker.requests.length
+  await lifecycle.heartbeat()
+  assert.equal(worker.requests.length, before + 1)
+  assert.equal(worker.requests.at(-1).op, "heartbeat")
+  assert.equal(starts, 1)
+})
+
+test("a thrown worker error on a heartbeat still rejoins, even with a code that a refused reply would not rejoin on", async t => {
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] })
+  const { pi, emit, ctx, notices } = fakePi()
+  const terminal = Object.assign(new Error("CHAT_WORKER_REFUSED"), {
+    code: "CHAT_WORKER_REFUSED", workerCode: "SERVICE_UNAVAILABLE", operation: "heartbeat",
+  })
+  let failing = false
+  let starts = 0
+  const retries = []
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers,
+    startProcess: () => {
+      starts += 1
+      return fakeWorker({ answer: op => (failing && op === "heartbeat" ? Promise.reject(terminal) : op === "pending" ? { messages: [] } : {}) })
+    },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  failing = true
+  await lifecycle.heartbeat()
+  assert.match(notices.join("\n"), /reconnecting/)
+  assert.doesNotMatch(notices.join("\n"), /stopped/)
+  assert.equal(retries.length, 1)
+  assert.equal(retries[0].ms, 2500)
+  failing = false
+  retries[0].fn()
+  await flush()
+  assert.equal(starts, 2, "a fresh worker joins after the back-off")
+})
+
+// A refusal that proves the lease gone is not a brief outage; only the three outage codes are retried on the next tick.
+for (const operation of ["heartbeat", "pending"]) {
+  test(`a refused STALE_INSTANCE on a ${operation} still rejoins`, async t => {
+    t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] })
+    const { pi, emit, ctx, notices } = fakePi()
+    let failing = false
+    const retries = []
+    const lifecycle = createAgentChat(pi, config, {
+      ...timers,
+      startProcess: () => fakeWorker({
+        answer: op => (failing && op === operation ? { refused: "STALE_INSTANCE" } : op === "pending" ? { messages: [] } : {}),
+      }),
+      now: () => 1000,
+      random: () => 0,
+      setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    })
+    emit("session_start", {}, ctx)
+    await flush()
+    failing = true
+    await (operation === "heartbeat" ? lifecycle.heartbeat() : lifecycle.poll())
+    assert.match(notices.join("\n"), /reconnecting/)
+    assert.equal(retries.length, 1)
+  })
+}
+
 // A request that outlives the parent-side deadline has an unknown outcome. The real worker reports the core's
 // own code for it, so the lifecycle rejoins instead of latching chat off.
 const stdioChild = () => {
