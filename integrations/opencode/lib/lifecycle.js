@@ -212,8 +212,13 @@ export function createLifecycle(bus, native, config, {
       // Watched from here, not from the first heartbeat: the publish below may wait behind a slow removal, and a worker
       // that exits meanwhile must withdraw its binding before the publish makes a put for an instance that is gone.
       worker.closed.then(() => {
-        if (live === record && !closed && !disabled)
-          failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
+        if (live !== record || closed || disabled) return
+        // A worker that ends while its join waits for the first proof (the publish settled, no heartbeat sent yet) was
+        // idle for the server lease: the instance is gone, and a rejoin is the answer, not a shutdown. Every other
+        // exit turns this session's chat off.
+        if (heartbeatTimer !== null && !record.opened)
+          return handleFailure(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "STALE_INSTANCE", operation: "end" }))
+        failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
       })
       joined = result
       policy.succeeded()

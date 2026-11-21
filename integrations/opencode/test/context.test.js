@@ -1377,3 +1377,42 @@ test("a replaced binding whose confirming list answers negatively still fails it
   assert.equal(await second, undefined)
   assert.equal(context.proved(), true)
 })
+
+// Review 6006555010, finding 1: a read of the entry that is current and does not find it withdraws the proof, before any
+// put. Only a later confirmation proves the binding again. A read that fails finds nothing, so it withdraws nothing.
+test("a current read that misses the entry withdraws the proof before the put, and a later confirmation proves again", async () => {
+  const { ctx, context } = make()
+  await context.context("binding")
+  assert.equal(context.proved(), true)
+  ctx.entries.clear() // the entry is gone, and no signal said so
+  const held = holdFirst(ctx.session.instructions.entry, "put")
+  const refresh = context.refresh()
+  await flush()
+  assert.equal(held.entered, true) // the repair's put is pending
+  assert.equal(context.proved(), false) // the miss already took the proof back
+  held.settle.resolve()
+  assert.equal(await refresh, true)
+  assert.equal(context.proved(), true)
+})
+
+test("a read that misses the entry and cannot restore it leaves the proof withdrawn", async () => {
+  const { ctx, context } = make()
+  await context.context("binding")
+  ctx.entries.clear()
+  ctx.session.instructions.entry.put = () => Promise.reject(new Error("unavailable"))
+  assert.equal(await context.refresh(), false)
+  assert.equal(context.proved(), false)
+  assert.equal(context.owed(), true)
+})
+
+test("a read that changed text withdraws the proof, and a read that fails withdraws nothing", async () => {
+  const { ctx, context } = make()
+  await context.context("binding")
+  ctx.session.instructions.entry.list = () => Promise.reject(new Error("unavailable"))
+  assert.equal(await context.refresh(), false)
+  assert.equal(context.proved(), true) // nothing was found out
+  ctx.session.instructions.entry.list = async () => [{ key: BINDING_KEY, value: "another text" }]
+  ctx.session.instructions.entry.put = () => Promise.reject(new Error("unavailable"))
+  assert.equal(await context.refresh(), false)
+  assert.equal(context.proved(), false) // the entry is there with other text: changed
+})

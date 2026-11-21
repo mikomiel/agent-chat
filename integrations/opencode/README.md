@@ -284,7 +284,12 @@ The service and its host-token provisioning are documented in the product
   worker that dies or breaks the protocol still turns that session's chat off.
   That holds from the moment the worker is ready, so a worker that exits while
   its binding waits behind a slow removal withdraws that binding, and the
-  queued publish makes no put. A spawn that fails after it returned, such as
+  queued publish makes no put. One exception: a worker that exits after its
+  join's publish settled and before its first heartbeat was sent, because the
+  binding is still unproved, ran out of its idle time. That is a lapsed instance,
+  so it rejoins as `STALE_INSTANCE` does, with the host asked first, and no
+  heartbeat was sent for the old instance. An exit after the first heartbeat
+  turns the chat off as above. A spawn that fails after it returned, such as
   `EMFILE`, leaves no pipes and also turns that session's chat off. Before a
   retry starts a replacement worker, it asks the host once for the session's
   entry list, with the same 10-second limit, because the session can be deleted
@@ -386,10 +391,14 @@ unverified, inferred, or a deliberate choice.
   fails the join, after one more put, and that session's chat is turned off. A
   confirming list that a newer signal overtook is a stale read, whatever it
   says: it is not a failure and not a proof. The join stays up, no second put
-  is made, and the read-back stays owed. A withdrawn or replaced binding still
-  fails its publish. The publish discharges the read-back obligation only if the
-  full rule still holds when it is confirmed. A later `context()` call is
-  serialised behind it, so the order of puts and removals still holds.
+  is made, and the read-back stays owed. A binding that was withdrawn or
+  replaced before its put fails its publish, and so does one whose confirming
+  list does not hold its text. A binding that was replaced while its confirming
+  list was pending, and whose list holds the old text, resolves without a
+  proof: the newer binding's own publish proves itself. The publish discharges
+  the read-back obligation only if the full rule still holds when it is
+  confirmed. A later `context()` call is serialised behind it, so the order of
+  puts and removals still holds.
 - **The first heartbeat asks for the proof when it sends.** The lifecycle sends
   a join's first heartbeat only while the plugin says the binding is proved, and
   it asks at the moment of the send, so a confirmation that went stale after it
@@ -399,10 +408,13 @@ unverified, inferred, or a deliberate choice.
   when its own read-back settles, and a tick that finds one sends at the tick.
   So a join whose confirmation was overtaken sends its first heartbeat at the
   first tick, at most 30 seconds after the join, when a read-back already proved
-  the binding, and otherwise as soon as that tick's read-back does. The gate
-  guards only that first heartbeat. Once it is sent, the lifecycle asks no more:
-  a later gap or compaction signal is healed by the tick's read-back while the
-  heartbeat goes on, as before. A rejoin is a new join with a new gate.
+  the binding, and otherwise as soon as that tick's read-back does. A read of
+  the entry that is still current and does not find it withdraws the proof
+  before any put, and only a later confirmation proves the binding again, so a
+  heartbeat that waited behind such a read sends nothing. The gate guards only
+  that first heartbeat. Once it is sent, the lifecycle asks no more: a later gap
+  or compaction signal is healed by the tick's read-back while the heartbeat
+  goes on, as before. A rejoin is a new join with a new gate.
 - **A late removal or put after the end.** The time limit trades a call that
   can hang for a call that can land late. A removal that times out during an
   owner change can land after the next owner's put and delete its binding. The

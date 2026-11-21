@@ -22,8 +22,8 @@
 //
 // A BINDING IS PROVED, OR NOT, AT THE MOMENT SOMEONE ASKS (`proved()`). A confirmed publish and a completed read-back
 // each prove the binding at the generation and epoch they began in, whoever started them. Any later signal, gap, or new
-// or withdrawn binding takes the proof back. The lifecycle asks it synchronously when it is about to send a join's first
-// heartbeat.
+// or withdrawn binding takes the proof back, and so does a read of the entry that is still current and does not find it.
+// The lifecycle asks it synchronously when it is about to send a join's first heartbeat.
 //
 // A SESSION THAT IS GONE IS REPORTED, NOT REPAIRED. Every instruction-entry call first reads the session, so the tick's
 // read-back of a deleted session fails with `Session.NotFoundError`. A call that answers with it tells `onMissing`, and
@@ -204,8 +204,8 @@ export function createContext(ctx, sessionID, {
   const owed = () => unverified && !closed && !disabled
 
   // Is this binding proved now? A confirmed publish or a read-back proved it at this generation and epoch, and nothing has
-  // moved since: no signal, no gap, no new or withdrawn binding. The lifecycle asks it at the moment it sends a join's
-  // first heartbeat.
+  // moved since: no signal, no gap, no new or withdrawn binding, and no current read that missed the entry. The lifecycle
+  // asks it at the moment it sends a join's first heartbeat.
   // It reads state only and starts nothing; a tick's own refresh does not take the proof back.
   const proved = () => !closed && !disabled && proven !== null && proven.binding === generation && proven.epoch === compactions
 
@@ -234,6 +234,7 @@ export function createContext(ctx, sessionID, {
       try {
         const found = await holds(text)
         if (!current()) return done(false) // asked before the put, which is made in the same step
+        if (!found) proven = null // a current negative read withdraws the proof, before any put; only a confirmation proves again
         if (!found && !await publish(text, { current })) return done(false)
       } catch {
         return done(false) // a failed call proves nothing either way; only `onMissing`, told in `call`, can end the session

@@ -861,19 +861,22 @@ function overtakenJoin() {
   const bus = fakeBus()
   const entries = new Map()
   const held = { entered: false, release: null }
-  const rig = { entries, held, listFails: false, negative: false, tick: null }
+  const rig = { entries, held, listFails: false, negative: false, putFails: false, gate: null, tick: null, retry: null, starts: 0, notices: [] }
   const host = {
     session: {
       instructions: {
         entry: {
-          async put({ key, value }) { entries.set(key, value) },
+          async put({ key, value }) {
+            if (rig.putFails) throw new Error("unavailable")
+            entries.set(key, value)
+          },
           async list() {
             if (rig.listFails) throw new Error("unavailable")
             const snapshot = rig.negative ? [] : [...entries].map(([key, value]) => ({ key, value })) // captured when the host answers
             if (!held.entered) {
               held.entered = true
               await new Promise(resolve => { held.release = resolve })
-            }
+            } else if (rig.gate) await rig.gate // the next list waits here, when a test set a gate
             return snapshot
           },
           async remove({ key }) { entries.delete(key) },
@@ -885,7 +888,17 @@ function overtakenJoin() {
   rig.context = createContext(host, "ses_synthetic0001")
   rig.beats = () => rig.worker.requests.filter(row => row.op === "heartbeat").length
   createLifecycle(bus, rig.context, config, {
-    ...timers, startProcess: () => rig.worker, now: () => 1000, setIntervalImpl: fn => { rig.tick = fn; return 1 },
+    ...timers,
+    startProcess: () => {
+      rig.starts += 1
+      if (rig.starts > 1) rig.worker = fakeWorker() // a rejoin starts a new worker
+      return rig.worker
+    },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: fn => { rig.retry = fn; return 1 },
+    setIntervalImpl: fn => { rig.tick = fn; return 1 },
+    notice: text => rig.notices.push(text),
   })
   bus.fire("session_start", { nativeSessionId: "native-1" })
   return rig
@@ -1052,4 +1065,72 @@ test("an overtaken negative confirmation leaves the session joined with the repa
   assert.match(rig.entries.get(BINDING_KEY), /boot-1\.json/)
   assert.equal(rig.context.owed(), false)
   assert.equal(rig.beats(), 1)
+})
+
+// Review 6006555010, finding 1: a read-back proves the binding, then a follow-up that an overlapping tick caused reads the
+// entry again, finds it missing and cannot put it back. A current read that misses the entry withdraws the proof, so the
+// first heartbeat that was deferred behind that read-back sends nothing.
+test("a follow-up read that finds the entry missing and cannot restore it withdraws the proof, so the deferred first heartbeat sends nothing", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
+  rig.held.release() // the join's confirmation was overtaken: the gate is shut
+  await flush()
+  assert.equal(rig.beats(), 0)
+  let open = null
+  rig.gate = new Promise(resolve => { open = resolve }) // the next list waits
+  rig.tick() // its read-back lists the entry, which is there, and waits
+  await flush()
+  rig.tick() // an overlapping tick: the read-back that is running is not answered by it, so it runs once more when it ends
+  await flush()
+  rig.gate = null
+  rig.negative = true // the follow-up's list finds no entry
+  rig.putFails = true // and its put cannot restore it
+  open()
+  await flush()
+  assert.equal(rig.context.proved(), false) // the first read proved the binding, and the follow-up withdrew that
+  assert.equal(rig.context.owed(), true)
+  assert.equal(rig.beats(), 0) // the first heartbeat that was deferred behind them sends nothing
+})
+
+// Review 6006555010, finding 2: the worker idles out at the server lease while the gate waits for its first proof. That is
+// a lapsed instance, so the join is retried through the rejoin path, with the host asked first. Nothing is sent meanwhile.
+test("a worker that exits while the first proof is pending rejoins, and the new join opens its gate once the host answers", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
+  rig.listFails = true // the host cannot be read, so nothing is proved
+  rig.held.release() // the join's confirmation was overtaken: the gate is shut
+  await flush()
+  rig.tick()
+  await flush()
+  rig.tick()
+  await flush()
+  const first = rig.worker
+  assert.equal(rig.beats(), 0)
+  void first.stop() // the worker ran out of time without a heartbeat
+  await flush()
+  assert.equal(typeof rig.retry, "function") // a rejoin is scheduled
+  assert.ok(rig.notices.some(text => /reconnecting \(STALE_INSTANCE\)/.test(text)), rig.notices.join(" | "))
+  assert.equal(rig.notices.some(text => /stopped/.test(text)), false, rig.notices.join(" | ")) // and chat is still on
+  assert.equal(first.requests.length, 0) // nothing was ever sent for the first instance
+  rig.listFails = false // the host answers again
+  rig.retry()
+  await flush()
+  assert.equal(rig.starts, 2)
+  assert.equal(rig.beats(), 1) // the new join confirmed its binding and opened its gate
+  assert.notEqual(rig.worker, first)
+})
+
+test("a worker that exits after the gate opened fails closed, as before", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  rig.held.release() // nothing overtook the join's confirmation: the first heartbeat is sent
+  await flush()
+  assert.equal(rig.beats(), 1)
+  void rig.worker.stop()
+  await flush()
+  assert.match(rig.notices.at(-1), /Agent Chat stopped \(end:CHAT_WORKER_EXITED\)/)
+  assert.equal(rig.retry, null)
+  assert.equal(rig.starts, 1)
 })
