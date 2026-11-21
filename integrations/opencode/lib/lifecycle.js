@@ -178,6 +178,12 @@ export function createLifecycle(bus, native, config, {
     try {
       const result = await worker.ready
       if (live !== record || closed || disabled) { void worker.stop(); return }
+      // Watched from here, not from the first heartbeat: the publish below may wait behind a slow removal, and a worker
+      // that exits meanwhile must withdraw its binding before the publish makes a put for an instance that is gone.
+      worker.closed.then(() => {
+        if (live === record && !closed && !disabled)
+          failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
+      })
       joined = result
       policy.succeeded()
       notify(`Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.`)
@@ -192,10 +198,6 @@ export function createLifecycle(bus, native, config, {
       joined = null
       handleFailure(error) // every path out of it stops the live record, which clears the binding
     }
-    worker.closed.then(() => {
-      if (live === record && !closed && !disabled)
-        failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
-    })
   }
 
   bus.on("session_start", event => {

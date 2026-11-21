@@ -162,18 +162,24 @@ The service and its host-token provisioning are documented in the product
   looked up, and a `session.forked` event that arrives after the deletion adds
   no fork record. A deleted fork drops its fork record, because the tombstone
   covers it. The tombstone set is never trimmed, so it grows with the deleted
-  sessions of one process. Events of one session run in order on that session's
-  own chain. A fault there ends that session's chat and no other. A faulted
-  session stays out while its refusal is in the bounded lookup cache, which
-  holds 1,024 entries and drops the oldest first. After an eviction a new
-  lookup can succeed and the session can rejoin while the cleanup of its old
-  worker and entry is still pending.
+  sessions of one process. A deletion event can fall into a stream gap, and no
+  later event would end that session's chat. When a gap begins or ends, the
+  owner asks `session.get` about each joined session, with the same 10-second
+  limit, and without holding the session's events. Only the host's
+  `Session.NotFoundError` for that session counts as a deletion, and it takes
+  the path above. A timeout, any other error and a session that is found
+  change nothing beyond the read-back that the gap owes. Events of one session
+  run in order on that session's own chain. A fault there ends that session's
+  chat and no other. A faulted session stays out while its refusal is in the
+  bounded lookup cache, which holds 1,024 entries and drops the oldest first.
+  After an eviction a new lookup can succeed and the session can rejoin while
+  the cleanup of its old worker and entry is still pending.
 - **Seven events, no session state.** The plugin subscribes to
   `session.created`, `session.execution.started`, `session.forked`,
   `session.deleted` and the three `session.compaction.*` events (`started`,
   `ended`, `failed`). Nothing is read as a state of the session. The first
   event for a session starts its join. A lost or restarted event stream owes the
-  binding a read-back.
+  binding a read-back and each joined session an existence check.
 - **Binding context.** The binding text is one keyed instruction entry,
   `agent-chat-binding`, written with `session.instructions.entry.put`. The text
   gives the session its instance file and the `agent_chat.cli` commands to read
@@ -241,10 +247,13 @@ The service and its host-token provisioning are documented in the product
   replaces the old binding. A worker request with no answer after 22 seconds
   ends that worker and rejoins as the core's own `REQUEST_UNCERTAIN` does. A
   worker that dies or breaks the protocol still turns that session's chat off.
-  A heartbeat that the worker answers with `refused` is a brief outage, not a
-  failure. The worker and the binding stay, no rejoin budget is spent and the
-  next heartbeat is the retry. The worker ends itself with an error once an
-  outage lasts as long as the server lease, and that error rejoins as above.
+  That holds from the moment the worker is ready, so a worker that exits while
+  its binding waits behind a slow removal withdraws that binding, and the
+  queued publish makes no put. A heartbeat that the worker answers with
+  `refused` is a brief outage, not a failure. The worker and the binding stay,
+  no rejoin budget is spent and the next heartbeat is the retry. The worker
+  ends itself with an error once an outage lasts as long as the server lease,
+  and that error rejoins as above.
 - **No title.** Heartbeats carry no session title.
 
 ## Known limits
@@ -269,6 +278,16 @@ unverified, inferred, or a deliberate choice.
 - **Entry read-back.** That `entry.list` returns the stored value strictly
   equal to the string that was put. If it does not, every join fails and
   chat stays off.
+- **Missing session.** That `session.get` of a deleted session rejects with the
+  core's `Session.NotFoundError`, tagged `Session.NotFoundError` and naming the
+  session. The published plugin types leave this failure `unknown`. The shape is
+  read from the upstream source at tag `v2.3.2` (`anomalyco/opencode`, commit
+  `c0ad18b4`): the host's `session.get` is `Session.get`, which fails with that
+  error for a session the store does not hold. The HTTP `SessionNotFoundError`
+  is only the server's mapping of it. A Promise plugin receives an Effect
+  failure as the error itself. If the host answers with another shape, a
+  deletion that falls into a gap is not found, and that session keeps its
+  worker and binding until the server stops.
 - **Fork event.** That `session.forked` carries the fork's own id in
   `data.sessionID`. If it carries the source's id, forking a root ends that
   root's chat for good.
@@ -330,10 +349,11 @@ unverified, inferred, or a deliberate choice.
   cleanup outside the serial queue would race the next owner's publish. The
   next join replaces the entry. The entry names an instance file. Once the core
   change from #149 is in the installed core, the worker discards that file
-  before it sends its end request, so a new open of its path finds nothing.
-  Until then the worker discards it only after a successful end. A late put
-  that lands while a successor confirms its own binding is put over once more
-  by the successor's publish.
+  before it sends its end request. The removal is best effort: when it
+  succeeds, a new open of its path finds nothing. Until then the worker
+  discards it only after a successful end. A late put that lands while a
+  successor confirms its own binding is put over once more by the successor's
+  publish.
 - **The binding text asks, the plugin does not check.** The binding tells the
   session to preserve local stop, Plan Mode and approvals. The plugin reads
   none of the three.
@@ -392,7 +412,8 @@ node --test
 
 The suites use doubles of the plugin context and of the worker. They cover the
 config refusals, the delegated-child refusal, root, child and fork eligibility,
-the fork and deletion records and their tombstones, owner failover and handoff,
+the fork and deletion records and their tombstones, the deletion check after a
+gap, owner failover and handoff,
 per-session fault isolation, the binding publish, replace and fail-closed
 context, the repair after a compaction signal or a gap with its currency rule
 and call time limit, the read-back at each heartbeat tick, the

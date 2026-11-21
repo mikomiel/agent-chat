@@ -23,6 +23,11 @@
 // no join. The deletion is also a tombstone in its own set, like fork evidence: no cache evicts it, and the next owner
 // receives it, so a late event for that session is never looked up again.
 //
+// A GAP CAN HIDE A DELETION. A `session.deleted` event lost in a stream gap would leave that session's worker and
+// binding alive, with no later event to end them. After a gap each joined session is asked whether it still exists, with
+// the same time limit as the eligibility lookup. Only the host's definite not-found takes the deletion path above. A
+// timeout, any other error and a session that is found change nothing beyond the read-back that the gap owes.
+//
 // A LOOKUP HOLDS NOTHING BACK. A record still in its eligibility lookup has no worker and no binding entry, so
 // `stop()` ends it at once and waits only for the worker and entry cleanup of joined sessions. A lookup that never
 // answers cannot keep the next owner waiting, and its late answer finds the manager inactive and starts nothing. It
@@ -53,6 +58,12 @@ export function isRootSession(info, sessionID) {
   if (info === null || typeof info !== "object" || info.id !== sessionID) return false
   return (info.parentID === undefined || info.parentID === null) && (info.fork === undefined || info.fork === null)
 }
+
+// The host's definite answer that a session does not exist. In process, `session.get` fails with the core's
+// `Session.NotFoundError`, tagged and naming the session; the HTTP `SessionNotFoundError` is only its server mapping.
+// The published plugin types leave this failure `unknown`, so the shape is read from the upstream source (see README).
+// Any other failure says nothing about the session.
+export const isMissing = (error, sessionID) => error?._tag === "Session.NotFoundError" && error.sessionID === sessionID
 
 // The id of the session an event belongs to, or null when it names none.
 export const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
@@ -174,17 +185,21 @@ export function createManager(ctx, config, parts, {
     void record.context.repair()
   }
 
+  // Fenced here, not on the record's chain: a lookup still in flight finds its record dead before it can join. The
+  // tombstone refuses the id from now on, so a fork record for it is spent.
+  function markDeleted(id) {
+    deleted.add(id)
+    forked.delete(id)
+    const known = records.get(id)
+    if (known) void dispose(known)
+  }
+
   function feed(event) {
     if (!active) return
     const id = sessionOf(event)
     if (id === null) return
     if (event.type === "session.deleted") {
-      // Fenced here, not on the record's chain: a lookup still in flight finds its record dead before it can join.
-      // The tombstone refuses the id from now on, so a fork record for it is spent.
-      deleted.add(id)
-      forked.delete(id)
-      const known = records.get(id)
-      if (known) void dispose(known)
+      markDeleted(id)
       return
     }
     if (event.type === "session.forked") {
@@ -210,12 +225,22 @@ export function createManager(ctx, config, parts, {
     current.chain = current.chain.then(() => handle(current, event)).catch(error => isolate(current, error))
   }
 
-  // The event stream broke or restarted: events may be missing, so every observation is stale.
+  // Does a joined session still exist? It is not queued on the record's chain: a lookup that is slow must not hold the
+  // session's events. Only a definite not-found ends the session's chat, as a received deletion does.
+  function confirmExists(record) {
+    lookup(record.id).then(() => {}, error => {
+      if (active && !record.dead && isMissing(error, record.id)) markDeleted(record.id)
+    })
+  }
+
+  // The event stream broke or restarted: events may be missing, so every observation is stale, and a deletion may have
+  // been among them.
   function reset() {
     for (const record of [...records.values()]) {
       record.chain = record.chain.then(() => {
         if (record.dead || !record.context) return
         record.context.reset() // a read-back is owed now, and asked for at the next event or tick
+        confirmExists(record)
       }).catch(error => isolate(record, error))
     }
   }
