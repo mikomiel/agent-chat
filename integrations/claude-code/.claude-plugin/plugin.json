@@ -1,8 +1,14 @@
 {
   "name": "agent-chat",
-  "version": "0.1.0",
+  "version": "0.8.0",
   "description": "Agent Chat for Claude Code: joins a session and delivers claimed messages through hooks, over the product's worker protocol.",
-  "author": { "name": "Agent Chat" },
+  "author": {
+    "name": "Agent Chat"
+  },
   "license": "AGPL-3.0-only",
-  "keywords": ["agent-chat", "hooks", "coordination"]
+  "keywords": [
+    "agent-chat",
+    "hooks",
+    "coordination"
+  ]
 }
