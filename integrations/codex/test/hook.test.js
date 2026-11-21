@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, join } from "node:path"
 import { Readable } from "node:stream"
@@ -363,4 +363,79 @@ test("a receiver socket that another user owns prints nothing and is never conne
     assert.deepEqual(seen.stdout, [])
     assert.deepEqual(seen.started, [], "no receiver was started on top of it")
   } finally { rmSync(w.root, { recursive: true, force: true }) }
+})
+
+// ---- the state directory is resolved once: every path the hook uses is the canonical one ----------------------------------
+
+// A state directory that is reached through a link above it: `<root>/via` leads to `<root>/real`, which holds the state
+// directory `s`. `decoy` has a state directory too, for a link that is moved afterwards.
+function linked(realMode = 0o755) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "acc-")))
+  const real = join(root, "real")
+  const decoy = join(root, "decoy")
+  for (const directory of [real, decoy]) {
+    mkdirSync(directory)
+    chmodSync(directory, directory === real ? realMode : 0o755)
+    mkdirSync(join(directory, "s"), { mode: 0o700 })
+    chmodSync(join(directory, "s"), 0o700)
+  }
+  symlinkSync(real, join(root, "via"))
+  const file = join(root, "chat.json")
+  writeFileSync(file, JSON.stringify({
+    chatEnabled: true, directory: join(root, "via", "s"), serverOrigin: "https://chat.example",
+    hostToken: "synthetic-host-token", python: "/usr/bin/python3",
+  }))
+  chmodSync(file, 0o600)
+  return { root, real, decoy, state: join(real, "s"), via: join(root, "via"), env: { AGENT_CHAT_CODEX_CONFIG: file } }
+}
+
+test("a state directory behind a link is resolved once: the lock, the socket and the receiver's directory are the canonical path, even when the link moves", async () => {
+  const w = linked()
+  const seen = { connects: [], started: [] }
+  const link = { async call() { return { context: null } }, async send() { return true }, close() {} }
+  const io = {
+    stdin: Readable.from([Buffer.from(JSON.stringify(base))]),
+    env: w.env,
+    connect: async path => {
+      seen.connects.push(path)
+      if (!seen.started.length) throw absent()
+      return link
+    },
+    startReceiver: config => { // the link moves while the receiver starts, as a hostile one could
+      seen.started.push(config.directory)
+      unlinkSync(w.via)
+      symlinkSync(w.decoy, w.via)
+    },
+    write: async () => true,
+    owner: () => 100,
+    sleep: never,
+  }
+  try {
+    assert.equal(await runHook("session-start", io), 0)
+    assert.deepEqual(seen.started, [w.state], "the receiver is started in the canonical directory")
+    assert.ok(seen.connects.length >= 2)
+    for (const path of seen.connects) assert.equal(path, paths(w.state, "session-1").socket, "every connection goes to the canonical socket")
+    assert.deepEqual(readdirSync(w.state), [], "the start lock was taken and released at the canonical path")
+    assert.deepEqual(readdirSync(join(w.decoy, "s")), [], "nothing was kept in the directory the link moved to")
+  } finally { rmSync(w.root, { recursive: true, force: true }) }
+})
+
+test("a state directory behind a link whose real directory others can change keeps every hook silent", async () => {
+  for (const mode of [0o777, 0o775]) {
+    const w = linked(mode)
+    const seen = { connects: 0, started: 0, written: 0 }
+    const io = {
+      stdin: Readable.from([Buffer.from(JSON.stringify(base))]),
+      env: w.env,
+      connect: async () => { seen.connects += 1; throw absent() },
+      startReceiver: () => { seen.started += 1 },
+      write: async () => { seen.written += 1; return true },
+      owner: () => 100,
+      sleep: never,
+    }
+    try {
+      assert.equal(await runHook("prompt", io), 0)
+      assert.deepEqual(seen, { connects: 0, started: 0, written: 0 }, mode.toString(8))
+    } finally { rmSync(w.root, { recursive: true, force: true }) }
+  }
 })

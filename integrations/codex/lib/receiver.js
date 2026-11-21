@@ -593,10 +593,12 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
 export async function runReceiver(argv, env) {
   const [sessionId, owner] = argv
-  const config = loadConfig(env)
-  if (!config || typeof sessionId !== "string" || !sessionId) return 1
+  const loaded = loadConfig(env)
+  if (!loaded || typeof sessionId !== "string" || !sessionId) return 1
+  // The state directory is resolved and checked once, here, and its canonical path stands for it from then on: the socket and
+  // its bind lock, and the worker's working directory and the directory it keeps the binding file in (`config.directory`).
+  const config = { ...loaded, directory: assertPrivateDirectory(loaded.directory) }
   const where = paths(config.directory, sessionId)
-  assertPrivateDirectory(config.directory)
   let listener = null
   const receiver = createReceiver(config, { sessionId, ownerPid: Number(owner) }, {
     release: () => listener?.close(),

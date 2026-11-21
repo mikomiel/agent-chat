@@ -14,29 +14,34 @@ import net from "node:net"
 import { dirname, join } from "node:path"
 import { HARNESS } from "./config.js"
 import { ownerAlive, processStartTime } from "./process.js"
-import { trustedDirectory, trustedSocket } from "./trust.js"
+import { fittingSocketPath, trustedDirectory, trustedSocket } from "./trust.js"
 
 export const MAX_LINE = 64 * 1024
-// sun_path holds 104 bytes on macOS and 108 on Linux, including the terminator.
-const MAX_PATH_BYTES = 100
 const LOCK_STALE_MS = 30_000
 const ABSENT = new Set(["ENOENT", "ECONNREFUSED"])
 
 const refusal = code => Object.assign(new Error(code), { code })
 
+// The socket and the start lock of one session, inside `directory`: the canonical path that `assertPrivateDirectory` returned.
+// A socket name that would not fit a Unix socket path (the limit of lib/trust.js) is refused as CHAT_SOCKET_PATH.
 export function paths(directory, sessionId) {
   const digest = createHash("sha256").update(sessionId).digest("hex").slice(0, 16)
-  const socket = join(directory, `${HARNESS}-${digest}.sock`)
-  if (Buffer.byteLength(socket) > MAX_PATH_BYTES) throw refusal("CHAT_SOCKET_PATH")
+  const socket = fittingSocketPath(join(directory, `${HARNESS}-${digest}.sock`), "CHAT_SOCKET_PATH")
   return { socket, lock: join(directory, `${HARNESS}-${digest}.lock`) }
 }
 
+// The state directory must be the user's own, mode 0700, not a symlink, and below directories that nobody else can change
+// (lib/trust.js). It returns the directory's canonical path, every symlink above it resolved, and the caller uses that
+// path, and no other spelling of it, for everything it keeps there: the start lock, the receiver's socket and its bind
+// lock, the binding file, and the worker's directory. A spelling that goes through a link would let the link be moved
+// between the check and the use.
 export function assertPrivateDirectory(directory) {
-  const info = lstatSync(directory)
+  const real = trustedDirectory(directory, { refuse: "CHAT_SOCKET_DIRECTORY" })
+  const info = lstatSync(real)
   if (!info.isDirectory() || info.uid !== process.geteuid() || (info.mode & 0o777) !== 0o700) {
     throw refusal("CHAT_SOCKET_DIRECTORY")
   }
-  trustedDirectory(directory, { refuse: "CHAT_SOCKET_DIRECTORY" }) // and nobody else can change a directory above it
+  return real
 }
 
 // One socket as an ordered stream of JSON objects. `next` resolves null on close
@@ -94,8 +99,9 @@ function channel(socket) {
 }
 
 // A client connection: `call` sends one object and waits for one reply. The path is trusted first, and the connection goes to
-// the checked real path: a socket that another user owns, or that sits below a directory others can change, is refused as
-// CHAT_SOCKET_UNTRUSTED before anything is connected to. `trust` replaces the check, for tests.
+// the checked real path: a socket that another user owns, that sits below a directory others can change, or whose real
+// path is too long for a Unix socket is refused as CHAT_SOCKET_UNTRUSTED before anything is connected to. `trust` replaces
+// the check, for tests.
 const trustSocket = path => trustedSocket(path, { refuse: "CHAT_SOCKET_UNTRUSTED" })
 export function connect(path, { timeoutMs = 1500, trust = trustSocket } = {}) {
   return new Promise((resolve, reject) => {
@@ -198,7 +204,11 @@ function takeBindLock(path, deps) {
 // name a receiver that closed late would remove its successor's socket. With the private name, closing touches
 // nothing public: `close` removes the public path itself, only while that path is still this listener's file, and
 // only under the bind lock, so no successor can publish its socket between the check and the removal.
+//
+// `path` is the canonical path from `assertPrivateDirectory`. Both pathnames that are bound, the private one and the public
+// one, must fit a Unix socket path (lib/trust.js) or `serve` refuses with CHAT_SOCKET_PATH before it listens.
 export async function serve(path, handler, { connectImpl = connect, alive = ownerAlive, startTime = processStartTime } = {}) {
+  fittingSocketPath(path, "CHAT_SOCKET_PATH")
   const gate = `${path}.bind`
   if (!takeBindLock(gate, { alive, startTime })) throw refusal("CHAT_RECEIVER_RUNNING")
   let server
@@ -214,6 +224,7 @@ export async function serve(path, handler, { connectImpl = connect, alive = owne
       if (!ABSENT.has(evidence)) throw refusal("CHAT_RECEIVER_RUNNING")
       try { unlinkSync(path) } catch (error) { if (error.code !== "ENOENT") throw error }
     }
+    const bound = fittingSocketPath(join(dirname(path), randomBytes(6).toString("hex")), "CHAT_SOCKET_PATH")
     server = net.createServer(async socket => {
       const session = channel(socket)
       try {
@@ -222,7 +233,6 @@ export async function serve(path, handler, { connectImpl = connect, alive = owne
       } catch { /* a handler failure ends only this connection */ }
       session.close()
     })
-    const bound = join(dirname(path), randomBytes(6).toString("hex"))
     await new Promise((resolve, reject) => {
       server.once("error", reject)
       server.listen(bound, () => { server.off("error", reject); resolve() })

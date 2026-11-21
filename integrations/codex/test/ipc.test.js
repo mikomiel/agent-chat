@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import { createInterface } from "node:readline"
 import { tmpdir } from "node:os"
@@ -642,3 +642,76 @@ test("an untrusted socket is not an absent one: no receiver is started on top of
   } finally { listener.close(); cleanup(root) }
 })
 
+
+// ---- the state directory is resolved once, and a socket path must fit a Unix socket -------------------------------------
+
+test("the state directory check returns the canonical path, and a link above the directory is resolved, not kept", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "acc-")))
+  try {
+    const real = join(root, "real")
+    mkdirSync(real)
+    chmodSync(real, 0o755) // not left to the umask: 002 would make it group-writable, which the check refuses
+    symlinkSync(real, join(root, "via"))
+    const state = join(real, "s")
+    mkdirSync(state, { mode: 0o700 })
+    chmodSync(state, 0o700)
+    assert.equal(assertPrivateDirectory(state), state, "a directory that is already canonical comes back as it is")
+    const through = assertPrivateDirectory(join(root, "via", "s"))
+    assert.equal(through, state, "spelled through a link above it, it comes back as the real path")
+    assert.ok(paths(through, "session-1").socket.startsWith(`${state}/`) && paths(through, "session-1").lock.startsWith(`${state}/`))
+    chmodSync(real, 0o777) // the real chain is not safe: refused, whatever the spelling
+    assert.throws(() => assertPrivateDirectory(join(root, "via", "s")), { code: "CHAT_SOCKET_DIRECTORY" })
+    assert.throws(() => assertPrivateDirectory(state), { code: "CHAT_SOCKET_DIRECTORY" })
+  } finally { cleanup(root) }
+})
+
+// A private directory below `base` for which `<directory>/<name>` is exactly `bytes` bytes long, or null when the
+// temporary directory leaves no room for it.
+function directoryFor(base, bytes, name) {
+  const room = bytes - Buffer.byteLength(base) - Buffer.byteLength(name) - 2
+  if (room < 1 || room > 255) return null
+  const directory = join(base, "d".repeat(room))
+  mkdirSync(directory, { mode: 0o700 })
+  chmodSync(directory, 0o700)
+  return { directory, socket: join(directory, name) }
+}
+const baseDirectory = () => realpathSync(privateDirectory())
+
+test("a socket path of 103 bytes is served and connected to, and one of 104 is neither: nothing is connected to, nothing is created", async t => {
+  const base = baseDirectory()
+  const fits = directoryFor(base, 103, "serve-ok.sock")
+  const over = directoryFor(base, 104, "serve-ok.sock")
+  if (!fits || !over) return t.skip("the temporary directory leaves no room for a path of this length")
+  let accepted = 0
+  const raw = net.createServer(socket => { accepted += 1; socket.destroy() })
+  const listening = await new Promise(resolve => { raw.once("error", () => resolve(false)); raw.listen(over.socket, () => resolve(true)) })
+  const listener = await serve(fits.socket, async (_first, link) => { await link.send({ ok: true }) })
+  try {
+    const link = await connect(fits.socket)
+    assert.deepEqual(await link.call({ hello: 1 }, 2000), { ok: true }, "103 bytes work end to end")
+    link.close()
+    await assert.rejects(connect(over.socket), { code: "CHAT_SOCKET_UNTRUSTED" }, "104 bytes are refused")
+    await new Promise(resolve => setTimeout(resolve, 50))
+    assert.equal(accepted, 0, `${listening ? "a socket that was listening there" : "nothing"} was never connected to`)
+    const attempt = await serve(over.socket, async () => {}).then(late => { late.close(); return null }, error => error)
+    assert.equal(attempt?.code, "CHAT_SOCKET_PATH", "and no receiver listens on it")
+    assert.deepEqual(readdirSync(over.directory).filter(name => name.endsWith(".bind")), [], "its bind lock was released")
+  } finally { listener.close(); raw.close(); cleanup(base) }
+})
+
+test("serve measures the private name it binds too, not only the public path, and refuses before it listens", async t => {
+  const base = baseDirectory()
+  const short = directoryFor(base, 103, "s.sock") // the public name fits; the private name next to it is six bytes longer
+  if (!short) return t.skip("the temporary directory leaves no room for a path of this length")
+  try {
+    const attempt = await serve(short.socket, async () => {}).then(late => { late.close(); return null }, error => error)
+    assert.equal(attempt?.code, "CHAT_SOCKET_PATH")
+    assert.deepEqual(readdirSync(short.directory), [], "nothing was created: no lock, no socket")
+  } finally { cleanup(base) }
+})
+
+test("the session socket path is held to the same limit: a directory of 75 bytes leaves room for it, 76 does not", () => {
+  const directory = bytes => `/${"d".repeat(bytes - 1)}`
+  assert.equal(Buffer.byteLength(paths(directory(75), "session-1").socket), 103)
+  assert.throws(() => paths(directory(76), "session-1"), { code: "CHAT_SOCKET_PATH" })
+})

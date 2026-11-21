@@ -2,11 +2,11 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createThread } from "../lib/appserver.js"
-import { createReceiver, processStartTime } from "../lib/receiver.js"
+import { createReceiver, processStartTime, runReceiver } from "../lib/receiver.js"
 import { startWorker } from "../lib/worker.js"
 import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES, WAKE_PREFIX } from "../lib/channel.js"
 import { fakeAppServer } from "./fake-app-server.js"
@@ -1642,3 +1642,22 @@ test("a bind that finds the socket untrusted after the join does not end chat, a
   assert.match(busy.sent[0].context, /"id":/, "busy delivery through the hook is unchanged")
 })
 
+
+// A receiver is a long-lived process that keeps a socket, a lock and the worker's binding file in the state directory, so it
+// does not start below a directory that others can change: it refuses before it creates, binds or starts anything.
+test("a receiver does not start in a state directory below a directory that others can change, and creates nothing there", async () => {
+  const root = mkdtempSync(join(tmpdir(), "acr-"))
+  try {
+    const parent = join(root, "p")
+    mkdirSync(parent)
+    chmodSync(parent, 0o777)
+    const state = join(parent, "s")
+    mkdirSync(state, { mode: 0o700 })
+    chmodSync(state, 0o700)
+    const file = join(root, "chat.json")
+    writeFileSync(file, JSON.stringify({ ...baseConfig, chatEnabled: true, directory: state }))
+    chmodSync(file, 0o600)
+    await assert.rejects(runReceiver(["session-1", "1"], { AGENT_CHAT_CODEX_CONFIG: file }), { code: "CHAT_SOCKET_DIRECTORY" })
+    assert.deepEqual(readdirSync(state), [], "no socket, no lock, no worker directory")
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})

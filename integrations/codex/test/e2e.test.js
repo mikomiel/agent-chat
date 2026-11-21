@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -33,7 +33,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   const frame = JSON.parse(line)
   if (frame.op === "join") {
     dir = frame.directory
-    log({ op: "join", pid: process.pid, ppid: process.ppid, harness: frame.harness, native: frame.native_session_id, env: Object.keys(process.env) })
+    log({ op: "join", pid: process.pid, ppid: process.ppid, harness: frame.harness, native: frame.native_session_id, directory: frame.directory, env: Object.keys(process.env) })
     return reply(frame.id, {
       session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
       room_id: "${ROOM}", host: "synthetic-host", harness: "codex", instance_file: dir + "/instance.json",
@@ -102,9 +102,19 @@ function appServerHandler(threadId, queued) {
   }
 }
 
-function fixture(session, withAppServer) {
-  const root = mkdtempSync(join(tmpdir(), "acc-"))
-  const state = join(root, "s")
+// `through` names the state directory by a path that goes through a link above it (`<root>/via/s`, where `via` leads to
+// `<root>/real`); `state` is always the real directory.
+function fixture(session, withAppServer, { through = false } = {}) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "acc-")))
+  let state = join(root, "s")
+  let named = state
+  if (through) {
+    mkdirSync(join(root, "real"))
+    chmodSync(join(root, "real"), 0o755) // not left to the umask: 002 would make it group-writable, which the trust rule refuses
+    symlinkSync(join(root, "real"), join(root, "via"))
+    state = join(root, "real", "s")
+    named = join(root, "via", "s")
+  }
   mkdirSync(state, { mode: 0o700 })
   chmodSync(state, 0o700)
   const python = join(root, "worker")
@@ -113,7 +123,7 @@ function fixture(session, withAppServer) {
   const control = join(root, "app.sock")
   const file = join(root, "chat.json")
   writeFileSync(file, JSON.stringify({
-    chatEnabled: true, directory: state, serverOrigin: "https://chat.example", hostToken: "synthetic-host-token", python,
+    chatEnabled: true, directory: named, serverOrigin: "https://chat.example", hostToken: "synthetic-host-token", python,
     ...(withAppServer ? { appServer: `unix://${control}` } : {}),
   }))
   chmodSync(file, 0o600)
@@ -301,5 +311,18 @@ test("a hook whose output pipe was closed exits 0, and the delivery it could not
     await f.until(() => f.ops("settle").length === 1, "the settle after the unwritten delivery")
     assert.deepEqual(f.ops("settle")[0].result, { outcome: "uncertain", reason: "transport_ambiguous" })
     assert.equal(f.ops("settle").some(entry => entry.result.outcome === "handed"), false, "nothing unwritten is ever handed")
+  } finally { await f.cleanup() }
+})
+
+test("a state directory named through a link is resolved once: the worker is joined with the canonical directory", { timeout: 60_000 }, async t => {
+  if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
+  const f = fixture("e2e-through-link", false, { through: true })
+  try {
+    const started = await hook(f.env, "session-start", { session_id: "e2e-through-link", permission_mode: "default", hook_event_name: "SessionStart", source: "startup" })
+    assert.equal(started.code, 0)
+    const [joined] = f.ops("join")
+    assert.ok(joined, "the receiver joined")
+    assert.equal(joined.directory, f.state, "the join frame names the canonical directory, not the path through the link")
+    assert.ok(existsSync(paths(f.state, "e2e-through-link").socket), "the socket is in the canonical directory")
   } finally { await f.cleanup() }
 })

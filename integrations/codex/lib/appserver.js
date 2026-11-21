@@ -231,12 +231,16 @@ export const isChildThread = thread =>
 const isCompleteRecord = thread =>
   typeof thread.ephemeral === "boolean" && (typeof thread.source === "string" || (thread.source !== null && typeof thread.source === "object"))
 
-const STATUS = { idle: "idle", active: "busy", notLoaded: "offline" }
+const STATUS = Object.assign(Object.create(null), { idle: "idle", active: "busy", notLoaded: "offline" }) // no prototype: `constructor` is not a status
 
 // The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket.
 export function createThread({ path, threadId, open = openAppServer, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
-  let provider = null
-  let queue = null // null: not probed, true: the documented answer came back, false: it did not
+  let provider = null // the provider of the bound thread: what each later record is compared with, whatever socket it comes from
+  // What the queue probe answered, and on which socket: { route, dev, ino }. `route` is true when the documented answer came
+  // back and false when it did not. A probe says what the app-server behind one socket does, so it counts only for the socket
+  // it was taken on: another device or inode (a replaced socket, another app-server) has not been probed.
+  let probed = null
+  const probedOn = identity => (probed !== null && probed.dev === identity.dev && probed.ino === identity.ino ? probed.route : null)
 
   async function withConnection(task, options) {
     const link = await open(path, options)
@@ -266,9 +270,9 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
 
   // A thread that was never queued answers the delete with { deleted: false }. Any other answer, an error included,
   // is not the documented one, and the route stays off.
-  async function probe(link) {
+  async function probe(link, ms = PROBE_MS) {
     try {
-      const answer = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: randomUUID() }, PROBE_MS)
+      const answer = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: randomUUID() }, ms)
       return answer.deleted === false
     } catch (error) {
       if (error?.code === "APP_SERVER_ERROR") return false
@@ -288,10 +292,11 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
   // The thread as the app-server shows it now, for the wake or the heartbeat: loaded, read, then the `thread/resume`
   // answer, which is a record of its own and newer than the read, and last the newest turn. The resume answer must be a
   // complete record that shows the thread idle, in default mode, and agree with the read and the bound provider; an answer
-  // that does not is no basis for a wake. The interruption check is last because an interruption is the one change that
+  // that does not is no basis for a wake. The newest-turn check is last because an interruption is the one change that
   // the other answers cannot show: the thread is idle after it too. The order is a trade: the status and the mode come from
   // an answer that is one request older than the last, so a turn that starts or a Plan Mode switch has that request's round
-  // trip as well as the add's to land in, where an interruption has only the add's. Every request ends by `deadline`.
+  // trip as well as the add's to land in, where an interruption has only the add's. The newest turn must be `completed`;
+  // see the end of this function for the rest. Every request ends by `deadline`.
   // observed: { status, stopped, plan }; `reason` is null only when the thread is clear.
   async function evaluate(link, deadline) {
     const observed = { status: "unknown", stopped: false, plan: null }
@@ -318,13 +323,20 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
     if (observed.plan !== false) return { reason: observed.plan === true ? "plan" : "unknown", observed }
     const turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline))
     if (!Array.isArray(turns.data)) throw failure("APP_SERVER_PROTOCOL")
-    observed.stopped = turns.data[0]?.status === "interrupted"
-    return { reason: observed.stopped ? "stopped" : null, observed }
+    // Only a newest turn that is known to be finished clears the thread. A turn that is running is busy; an interrupted one is
+    // stopped; no turn, a turn without a status and a status that is not known say nothing, and an unknown state never wakes.
+    const newest = turns.data[0]?.status
+    if (newest === "interrupted") { observed.stopped = true; return { reason: "stopped", observed } }
+    if (newest === "inProgress") { observed.status = "busy"; return { reason: "busy", observed } }
+    if (newest !== "completed") { observed.status = "unknown"; return { reason: "unknown", observed } }
+    return { reason: null, observed }
   }
 
   return {
     get provider() { return provider },
-    get route() { return queue },
+    // The answer of the newest probe that finished, whichever socket it was taken on; `wake` probes again when the socket it
+    // reaches is another one.
+    get route() { return probed === null ? null : probed.route },
 
     // Check the thread before the receiver joins: it must be loaded, its record must be complete, it must not be a
     // child, and it fixes the provider. The answer is about this call's reads alone, so a main thread shows only in
@@ -352,7 +364,7 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
           if (typeof thread.modelProvider !== "string" || !thread.modelProvider) return { status: "unavailable" }
           if (provider !== null && provider !== thread.modelProvider) return { status: "stale_binding" }
           onRead?.()
-          let route = queue
+          let route = probedOn(link.identity)
           if (route === null) {
             try { route = await probe(link) } catch {
               if (expired()) return { status: "unavailable" }
@@ -362,7 +374,7 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
           }
           if (expired()) return { status: "unavailable" }
           provider = thread.modelProvider
-          queue = route
+          probed = { route, dev: link.identity.dev, ino: link.identity.ino }
           return { status: "bound", route }
         })
       } catch (error) { return { status: error?.code === "CHAT_APPSERVER_UNTRUSTED" ? "untrusted" : "unavailable" } }
@@ -376,14 +388,18 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
       } catch { return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } } }
     },
 
-    // Queue `text` as one user turn and fence it. Resolves { outcome, reason } for the settle call.
-    //   deleted:true  - it never dispatched: deferred.
-    //   deleted:false - it dispatched: handed once a userMessage with its client id shows, else uncertain.
+    // Queue `text` as one user turn and fence it. Resolves { outcome, reason } for the settle call. Three things prove
+    // something, and everything else is uncertain:
+    //   deleted:true                       - the delete removed it before it dispatched: deferred (busy).
+    //   a userMessage with its client id   - it dispatched: handed.
+    //   anything else is uncertain: `deleted:false` says only that it is no longer queued (it may have dispatched or been
+    //   dropped), so without the matching userMessage by the end of the reservation it is uncertain; so is a lost add reply, a
+    //   reply without a submission id, and a delete that fails or is not answered, which prove neither removal nor dispatch.
     // A failure before the add frame is written is failed; any failure after it is uncertain. Nothing retries.
-    // The wake reads the thread again (`evaluate`: the same four reads as `observe`, the interruption check last), and
+    // The wake reads the thread again (`evaluate`: the same four reads as `observe`, the newest turn last), and
     // `proceed` is asked once with that reading, right before the add frame is written, with nothing awaited in between:
-    // the add goes out in the same turn as the last answer. What remains is that answer's own round trip (the newest turn,
-    // for the status and the mode) and the add's: see the README. `thread/resume` subscribes the connection that asks, so the
+    // the add goes out with no request between the last answer and itself. What remains is the round trip of that answer (the
+    // newest turn, for the status and the mode) and the add's: see the README. `thread/resume` subscribes the connection that asks, so the
     // reading is taken on a second connection that is closed first, and the connection for the add, the fence and the
     // confirmation is opened before it and never asks. Both connections must reach the same checked socket (the same
     // device and inode): the second is refused when the path names another one, and the first is asked, in the turn before
@@ -401,6 +417,16 @@ export function createThread({ path, threadId, open = openAppServer, now = Date.
       try { link = await open(path, { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())) }) } catch { return { outcome: "failed", reason: "native_unavailable" } }
       try {
         if (limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
+        // The probe says what the app-server behind one socket does, so only a positive answer taken on this very socket (its
+        // device and inode) counts. Without one, because no bind has probed, the socket is another one or the answer was negative,
+        // the wake probes it now, on the connection that will carry the add, and adds only on a positive answer. This is the one
+        // request before the reading. (The receiver wakes a thread only when its bind probed positive, so this is a second guard.)
+        if (probedOn(link.identity) !== true) {
+          let route
+          try { route = await probe(link, Math.max(1, Math.min(PROBE_MS, limit - now()))) } catch { return { outcome: "failed", reason: "native_unavailable" } }
+          probed = { route, dev: link.identity.dev, ino: link.identity.ino }
+          if (!route) return { outcome: "failed", reason: "native_unavailable" }
+        }
         let fresh
         try {
           fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })

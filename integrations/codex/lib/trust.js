@@ -8,6 +8,9 @@
 // The caller connects to the checked path, with those links resolved, and keeps the socket's identity (device and inode)
 // to tell later that the path still names the same socket (`sameSocket`).
 //
+// A socket path also has a length limit, checked here on the exact pathname that is handed to Node (the resolved one, not the
+// one the caller wrote): see MAX_SOCKET_PATH_BYTES.
+//
 // Node has no portable way to read a peer's credentials, so this is a check of the path, not of the peer: a process of
 // the same user, or a root process, that answers on a trusted path is trusted.
 //
@@ -16,7 +19,21 @@
 import { lstatSync, realpathSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 
+// The longest socket path, in bytes, that this package connects to or listens on. `sun_path` holds 104 bytes on macOS and the
+// BSDs (108 on Linux), the terminator included, so 103 bytes is the longest path that fits on every platform that Node
+// runs on. A longer path must never reach Node: a release that copies it into `sun_path` cut to fit, instead of refusing
+// it, would connect to or bind a socket other than the one that was checked. That was reported for older Node releases and
+// was not reproduced on the release this was written on, which refuses with EINVAL; the limit does not depend on it.
+export const MAX_SOCKET_PATH_BYTES = 103
+
 const refusal = code => Object.assign(new Error(code), { code })
+
+// `path` itself when it fits, else a refusal with the caller's code. For a pathname that is about to be connected to or
+// bound, in whatever form it takes then.
+export function fittingSocketPath(path, refuse) {
+  if (Buffer.byteLength(path) > MAX_SOCKET_PATH_BYTES) throw refusal(refuse)
+  return path
+}
 const guarded = (info, uid) => info.isDirectory() && (info.uid === uid || info.uid === 0) && ((info.mode & 0o022) === 0 || (info.mode & 0o1000) !== 0)
 
 function classify(error, refuse) {
@@ -38,12 +55,14 @@ export function trustedDirectory(directory, { refuse = "CHAT_UNTRUSTED", lstat =
   } catch (error) { throw classify(error, refuse) }
 }
 
-// { path, dev, ino }: the checked real path of the socket and its identity.
+// { path, dev, ino }: the checked real path of the socket and its identity. The real path is the one that is measured against
+// MAX_SOCKET_PATH_BYTES: a short spelling that resolves to a long path is refused like a long spelling.
 export function trustedSocket(path, options = {}) {
   const { refuse = "CHAT_UNTRUSTED", lstat = lstatSync, uid = process.geteuid() } = options
   const real = trustedDirectory(dirname(path), options)
   const target = join(real, basename(path))
   try {
+    fittingSocketPath(target, refuse)
     const info = lstat(target)
     if (!info.isSocket() || info.uid !== uid) throw refusal(refuse)
     return { path: target, dev: info.dev, ino: info.ino }

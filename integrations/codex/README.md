@@ -86,7 +86,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | Field | Meaning |
 |---|---|
 | `chatEnabled` | Must be `true`; any other value keeps chat off. |
-| `directory` | Absolute state directory, created beforehand, owned by the current user, mode `0700`, and below directories that only the current user or root can change (see [Idle wake](#idle-wake); `/tmp`, which is sticky, counts). It holds the receiver socket and its locks, so its path must be 72 bytes or fewer. |
+| `directory` | Absolute state directory, created beforehand, owned by the current user, mode `0700`, and below directories that only the current user or root can change (see [Idle wake](#idle-wake); `/tmp`, which is sticky, counts). It holds the receiver socket and its locks. The hook and the receiver each resolve it once and use its canonical path (every link above it resolved) for everything they keep there, and that path must be 75 bytes or fewer, so that the socket path fits (see [Idle wake](#idle-wake)). |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
@@ -149,9 +149,10 @@ sends its request: it does not wait for the worker to end its instance.
   `idle` (`Stop`) and a stop (`Interrupt`). A missing or non-string
   `permission_mode` makes the state `unknown`. With `appServer` configured the
   receiver also reads the thread while nothing is known to run: its status
-  (`idle`, `active`, `notLoaded`), whether its last turn was interrupted, and
-  its collaboration mode (`plan` or `default`, from `thread/resume` with
-  `excludeTurns`). The read, when there is one, is the authority for Plan Mode
+  (`idle`, `active`, `notLoaded`), the status of its newest turn (`completed`
+  clears it, `inProgress` is busy, `interrupted` is stopped, and anything else
+  is unknown), and its collaboration mode (`plan` or `default`, from
+  `thread/resume` with `excludeTurns`). The read, when there is one, is the authority for Plan Mode
   and for an idle session; any later hook event discards it.
 - **Busy delivery.** A `prompt` or `tool` hook asks the receiver for a batch
   while the turn runs. The receiver claims only when the session is busy, and
@@ -275,13 +276,29 @@ that a hook connects to.
   the sticky bit set, such as `/tmp`, passes: others cannot remove or rename
   what the current user owns in it, and the socket's owner is checked on its
   own;
-- the connection goes to the checked path with those links resolved.
+- the connection goes to the checked path with those links resolved;
+- that real path is at most 103 bytes long: `sun_path` holds 104 bytes on macOS
+  and the BSDs (108 on Linux), terminator included, and a longer path must never
+  reach Node, which on some releases could cut it to fit and connect to a
+  socket other than the one that was checked (reported for older Node, not
+  reproduced on the release this was written on, which refuses it). The limit
+  is on the resolved pathname, so a short spelling that resolves to a long path
+  is refused, and a path that is too long is refused rather than reported as
+  absent. The receiver measures the public socket path and the private name it
+  binds under the same limit before it listens.
 
 The state directory that holds the receiver socket must itself pass the directory
 part of the rule (it is also required to be `0700` and the user's own), and a
-receiver does not start in one that fails it. A hook whose receiver socket is
-untrusted prints nothing and exits 0, as it does for an absent receiver, and it
-starts no receiver on top of that socket.
+receiver does not start in one that fails it. It is resolved once: the hook and
+the receiver each take its canonical path (every link above it resolved) and
+use that path, and no other spelling of it, for everything they keep there: the
+start lock, the socket and its bind lock, the working directory of a receiver
+that a hook starts, and the worker's directory, which holds the binding file. A
+link that moves after the check changes none of them. The hook and the receiver
+resolve it separately, so a link moved between the two can leave them in two
+trusted directories: the hook then gets no answer and prints nothing. A hook
+whose receiver socket is untrusted prints nothing and exits 0, as it does for
+an absent receiver, and it starts no receiver on top of that socket.
 
 The wake adds one more check, because it uses two connections (step 5): the
 connection that carries the add is checked first and its socket's identity (device
@@ -330,18 +347,31 @@ already excluded.
 2. **Probe.** One `thread/queue/delete` of a random id must answer
    `{ "deleted": false }` within 1 second. Any other answer, an error
    included, leaves the wake route off; no answer within the second leaves it
-   undecided until the next bind.
+   undecided until the next bind. The answer belongs to the socket it was taken
+   on (its device and inode): it says what the app-server behind that socket
+   does. A bind on another socket probes again. A wake that reaches another
+   socket than the probed one, or one probed with a negative answer, probes it
+   first, on the connection that will carry the add, and sends the add only after
+   a positive answer; a wake that cannot finish that probe sends nothing and
+   settles `failed`. A wake on a thread that no bind has probed (the receiver
+   wakes none) has no answer to reuse, so it probes first in the same way.
 3. **Poll.** Every 2 seconds, when addressed messages are pending, the receiver
    reads the thread: `thread/loaded/list`, `thread/read`, then `thread/resume`,
    and last the newest turn from `thread/turns/list`. It must be idle, in
-   `default` mode, and its newest turn must not be interrupted. The
+   `default` mode, and its newest turn must be `completed`, the one status that
+   shows a finished turn. A turn that is `inProgress` refuses as `busy`, an
+   `interrupted` one as `stopped`, and every other answer refuses as `unknown`:
+   no turn at all, a turn without a status, a status that is not a string and a
+   status that is not known (`failed` included, which has not been confirmed as a
+   status of a finished turn). So a thread that has never had a turn is not woken
+   until it has one: an empty list says nothing about the thread. The
    `thread/resume` answer is a record of its own and must be complete: this
    thread's id, a status, the origin (`source`), the `ephemeral` flag and a model
    provider. It must agree with the read and with the bound provider. An answer
    that shows the thread active, in Plan Mode, a child, or on another provider,
    that has a mode that is not `default` or `plan`, or that is missing, is
    another thread's, or lacks any of those fields, refuses the wake. The
-   interruption check is last because an interruption is the one change that the
+   newest-turn check is last because an interruption is the one change that the
    other answers cannot show: the thread is idle after it too. A refusal here is
    retried after 10 seconds and spends no attempt.
 4. **Claim and check.** The receiver claims, asks the worker for the mute
@@ -352,12 +382,13 @@ already excluded.
    operator instruction.
 5. **Read again, add, then delete as a fence.** The claim and the status call
    take time, so the wake reads the thread again (the four reads of step 3, the
-   interruption check last) before the add. `thread/resume` subscribes the
+   newest-turn check last) before the add. `thread/resume` subscribes the
    connection that asks, so the wake opens the connection for the add first, takes
    the reading on a second connection and closes that one; the connection that
-   carries the add, the fence and the confirmation never asks. The
-   receiver then decides in the same turn as the last answer, with nothing
-   awaited between that decision and the write of the add frame. The session
+   carries the add, the fence and the confirmation never reads the thread. The
+   receiver then decides right after the last answer, and the add frame is the
+   next request on the wire, with nothing awaited between that decision and the
+   write of the add frame. The session
    must still be idle, not stopped and not in Plan Mode by that fresh reading,
    and by the receiver's own state: no hook event may have arrived since the
    read that cleared the wake, and no newer app-server read may have refused it.
@@ -377,17 +408,22 @@ already excluded.
    only when the fence's own two answers arrive.
 
    `thread/queue/add` queues the text with `clientUserMessageId`
-   `agent-chat:<attempt_id>`. `thread/queue/delete` of that submission then
-   answers whether it had already dispatched.
-   - `deleted: true`: the turn never started. The attempt settles `deferred`
-     with reason `busy`.
-   - `deleted: false`: it dispatched. The receiver reads `thread/items/list`
-     until a `userMessage` item with that client id shows, then settles
-     `handed`. If none shows before the reservation ends, it settles
-     `uncertain`.
-   - The add's reply is lost or carries no submission id, or the delete fails or
-     is not answered: nothing proves that the submission was removed or that it
-     was not, so the attempt settles `uncertain`, never `deferred`.
+   `agent-chat:<attempt_id>`, and `thread/queue/delete` of that submission is the
+   fence. Two things prove an outcome, and every other case settles `uncertain`:
+   - `deleted: true` proves that the delete removed the submission before it
+     dispatched. The attempt settles `deferred` with reason `busy`.
+   - A `userMessage` item with that client id in `thread/items/list` proves the
+     handoff. The attempt settles `handed`.
+   - Every other case settles `uncertain`, never `deferred`: nothing proves that
+     the submission was removed, and nothing proves that it was handed.
+     `deleted: false` is one of them. It says only that the submission is no longer
+     queued, which may mean that it dispatched or that something else took it out,
+     so the receiver reads `thread/items/list` until the reservation ends, and
+     settles `handed` only if the matching item shows. A competing turn that
+     finishes before the delete is the same case: the delete may find nothing to
+     remove, and the attempt is `handed` only if the matching item shows. So are an
+     add whose reply is lost or carries no submission id, and a delete that fails
+     or is not answered.
    - A failure before the add frame was written settles `failed`; a failure
      after it settles `uncertain`. The add is never sent twice for one attempt;
      the ledger may offer a `failed` or `deferred` batch again as a new attempt.
@@ -479,20 +515,23 @@ exercised live.
   can change between the moment its status and mode were read (the
   `thread/resume` answer) and the moment Codex handles the add. That is the
   `thread/turns/list` round trip, which follows the resume answer, and then the
-  add's own round trip. A turn that starts in that gap is queued and
-  then deleted by the fence, and the attempt settles `deferred` (`busy`), when the
-  add's reply and the delete's answer both arrive (see Fence coverage). A switch into Plan Mode in that gap is not caught by anything: the queued text
-  starts a turn in Plan Mode. The window is not closed. The client adds nothing
-  to it: the last answer and the add share one turn of the event loop. But the
-  order of the reads is a choice. The newest turn is read last so that an
+  add's own round trip. A turn that starts in that gap is queued, and if the queue
+  holds it back as documented (not run live) the fence deletes it and the attempt
+  settles `deferred` (`busy`), when the add's reply and the delete's answer both
+  arrive (see Fence coverage). A switch into Plan Mode in that gap is caught by
+  neither the fence nor any check of the plugin: the queued text may then start a
+  turn in Plan Mode. The window is not closed. The client adds nothing to it: no
+  other request goes between the last answer and the add, and a test pins that
+  order. But the order of the reads is a choice. The newest turn is read last so that an
   interruption has only the add's round trip to land in, and an interruption has the
   queue's documented pause after an interrupted turn as a backstop (not run
   live). A turn start or a Plan Mode switch therefore has one request more than
   it would if `thread/resume` were last, and Plan Mode has no backstop at all.
-- **Fence coverage.** The delete fence tells whether a queued submission
-  dispatched; it does not tell why. A submission that dispatches at once is
-  `handed` if the `userMessage` shows, whatever state the thread was in. The
-  fence works only when its two answers arrive. A lost add reply leaves no
+- **Fence coverage.** The delete fence proves removal only when it answers
+  `deleted: true`. It does not tell whether a submission dispatched, or why; only
+  the matching `userMessage` item proves a handoff, and a submission that
+  dispatches at once is `handed` if that item shows, whatever state the thread
+  was in. The fence works only when its two answers arrive. A lost add reply leaves no
   submission id, so there is nothing to delete, and a delete that fails or is
   not answered does not prove that the submission was removed. In both cases the
   submission may still be queued and may dispatch later, when the thread next
@@ -531,7 +570,7 @@ exercised live.
   report that the model read either.
 - **A stop is seen only through `Interrupt`.** `Interrupt` does not run for
   subagents, and a stop that happens while the receiver is down is not seen
-  until the next turn event. With `appServer`, an interrupted last turn is also
+  until the next turn event. With `appServer`, an interrupted newest turn is also
   read.
 - **Large retry batches.** A retry batch is claimed whole, up to 16 messages;
   only a first claim is packed to fit. With short synthetic values in the
@@ -581,7 +620,9 @@ exercised live.
   lock. The window is two system calls wide.
 - **Non-interactive runs.** `codex exec` is not exercised. With `appServer` its
   thread is refused as a child; without it nothing distinguishes it.
-- **Short state path.** A `directory` over 72 bytes disables chat, silently.
+- **Short state path.** A `directory` whose canonical path is over 75 bytes
+  disables chat, silently: the socket name takes 28 bytes of the 103 that a Unix
+  socket path may have.
 - **No in-session off switch.** Chat for a session ends with the session. To
   keep a session off, start it without the plugin or without the variable.
 
@@ -627,7 +668,8 @@ exercised live.
   socket there, and still closes its listener; a dead socket file is what the
   next receiver's stale-socket check already replaces.
 - The worker runs the configured Python interpreter with `-I` and the state
-  directory as its working directory.
+  directory, as its canonical path, as its working directory and as the
+  directory it keeps the binding file in.
 - The app-server client answers a server request with a method-not-found error
   and refuses a fragmented, binary or masked server frame. It sends only the
   methods listed under [Idle wake](#idle-wake), carries no credential and
@@ -656,10 +698,10 @@ node --test
 
 The suite covers config refusal, the worker join frame, frame validation and request deadline,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
-the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system, the hook and the client against a real receiver socket
-on trusted and untrusted paths, the WebSocket client against a
+the notice limits at the smallest bound and the wake rows, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included), the hook and the client against a real receiver socket
+on trusted and untrusted paths, the state directory resolved once behind a link, the WebSocket client against a
 fake control socket on a real Unix socket (the wake's own reading before the add on a second connection, the
-socket identity across its two connections, the bind's commit fence for a retired worker, and the trust rule against real file systems), the receiver's state, delivery,
+socket identity across its two connections, the probe that belongs to one socket, the newest-turn statuses, the bind's commit fence for a retired worker, and the trust rule against real file systems), the receiver's state, delivery,
 wake, settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
 hint), the plugin shape that Codex reads, and runs of the real hook and

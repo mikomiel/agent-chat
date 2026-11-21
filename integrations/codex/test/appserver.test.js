@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import net from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { CLIENT_ID_PREFIX, createThread, isChildThread, MIN_ADD_MS, openAppServer, SETTLE_MS } from "../lib/appserver.js"
@@ -518,10 +519,22 @@ const queueServer = (over = {}) => main({
   "thread/items/list": () => ok({ data: [], nextCursor: null }),
   ...over,
 })
+// The receiver wakes only a thread whose bind probed this socket, and a wake probes any socket the bind did not. So a wake
+// test binds first, against a thread that is healthy, and only then arms `over`: the bind's probe is not what a test replaces.
+function armed(over) {
+  const healthy = queueServer()
+  const changed = queueServer(over)
+  let on = false
+  return { handler: (message, connection) => (on ? changed : healthy)(message, connection), arm: () => { on = true } }
+}
 async function wakeWith(over, { reservation = 5000, text = "queued text", proceed } = {}) {
-  return withServer(queueServer(over), async (path, server) => {
+  const gate = armed(over)
+  return withServer(gate.handler, async (path, server) => {
     const ticks = clock()
     const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
     const result = await bound.wake({ text, attemptId: "attempt-9", until: ticks.now() + reservation, ...(proceed ? { proceed } : {}) })
     return { result, log: server.log, methods: server.methods(), ticks }
   })
@@ -563,7 +576,7 @@ test("the reading before the add is taken on a connection of its own, closed bef
     const result = await bound.wake({ text: "queued text", attemptId: "attempt-9", until: ticks.now() + 5000 })
     assert.deepEqual(result, { outcome: "handed", reason: null })
     assert.deepEqual(events, [
-      "open 0", "open 1", ...READS.map(method => `1 ${method}`), "close 1",
+      "open 0", "0 thread/queue/delete", "open 1", ...READS.map(method => `1 ${method}`), "close 1",
       "0 thread/queue/add", "0 thread/queue/delete", "0 thread/items/list", "close 0",
     ])
     await eventually(() => server.state.open === 0, "both connections to close")
@@ -673,10 +686,13 @@ const slowReplies = {
 }
 for (const slow of Object.keys(slowReplies)) {
   test(`a slow ${slow} reply ends the wake SETTLE_MS before the reservation, so the result can still be recorded`, async () => {
-    const handler = queueServer({ [slow]: async (...args) => { await new Promise(resolve => setTimeout(resolve, 1500)); return slowReplies[slow](...args) } })
-    await withServer(handler, async path => {
+    const gate = armed({ [slow]: async (...args) => { await new Promise(resolve => setTimeout(resolve, 1500)); return slowReplies[slow](...args) } })
+    await withServer(gate.handler, async path => {
+      const bound = createThread({ path, threadId: THREAD })
+      await bound.bind()
+      gate.arm()
       const until = Date.now() + SETTLE_MS + 600
-      const result = await createThread({ path, threadId: THREAD }).wake({ text: "t", attemptId: "attempt-9", until })
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until })
       const left = until - Date.now()
       assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
       assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
@@ -696,9 +712,13 @@ test("a connection that never finishes ends the wake SETTLE_MS before the reserv
 })
 
 test("the wake connection is closed when it is done", async () => {
-  await withServer(queueServer({ "thread/queue/delete": () => ok({ deleted: true }) }), async (path, server) => {
+  const gate = armed({ "thread/queue/delete": () => ok({ deleted: true }) })
+  await withServer(gate.handler, async (path, server) => {
     const ticks = clock()
-    await createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep }).wake({ text: "t", attemptId: "a", until: ticks.now() + 5000 })
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    gate.arm()
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "a", until: ticks.now() + 5000 }), { outcome: "deferred", reason: "busy" }, "the wake went as far as the fence")
     for (let waited = 0; server.state.open && waited < 1000; waited += 10) await new Promise(resolve => setTimeout(resolve, 10))
     assert.equal(server.state.open, 0)
   })
@@ -791,7 +811,49 @@ test("an interruption that lands after the resume answer is seen: the newest tur
   assert.deepEqual(methods, [...OPENS, ...READS], "all four reads, the turn list last, and no add frame")
 })
 
+// Only a newest turn that is known to be finished clears the thread, and the one finished status that the plugin knows is
+// `completed`. A running turn is busy, an interrupted one is stopped, and anything else says nothing about the thread: no
+// turn, a turn without a status, a status that is not a string or is not known (a failed turn included, which the
+// plugin has not confirmed as a finished status). An unknown state never wakes.
+const NEWEST = [
+  ["a turn that is still running", [{ id: "t1", status: "inProgress" }], "busy", "busy"],
+  ["a status that is not known", [{ id: "t1", status: "paused" }], "unknown", "unknown"],
+  ["a failed turn, which is not on the list of finished statuses", [{ id: "t1", status: "failed" }], "unknown", "unknown"],
+  ["a turn without a status", [{}], "unknown", "unknown"],
+  ["a status that is not a string", [{ id: "t1", status: 7 }], "unknown", "unknown"],
+  ["a turn that is null", [null], "unknown", "unknown"],
+  ["no turn at all", [], "unknown", "unknown"],
+]
+for (const [label, data, reason, status] of NEWEST) {
+  const over = { "thread/turns/list": () => ok({ data, nextCursor: null }) }
+  test(`a wake whose newest turn is ${label} sends no add, and defers as ${reason}`, async () => {
+    const { result, methods } = await wakeWith(over)
+    assert.deepEqual(result, { outcome: "deferred", reason })
+    assert.deepEqual(methods, [...OPENS, ...READS], "all four reads, and no add frame")
+  })
+  test(`a read of a thread whose newest turn is ${label} refuses with ${reason}`, async () => {
+    const { result } = await observeWith(over)
+    assert.deepEqual(result, { reason, observed: { status, stopped: false, plan: false } })
+  })
+}
+
+// A status is looked up in a table, and a name that Object.prototype has (`constructor`, `toString`) is not a status: it is
+// unknown, a string, like any other that the table lacks.
+test("a thread status that is a property name of every object is unknown, not a value from the prototype", async () => {
+  for (const type of ["constructor", "toString", "hasOwnProperty", "__proto__"]) {
+    const viaRead = await observeWith({ "thread/read": () => ok({ thread: thread({ status: { type } }) }) })
+    assert.deepEqual(viaRead.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }, `read: ${type}`)
+    const viaResume = await observeWith({ "thread/resume": () => ok({ thread: thread({ status: { type } }), collaborationMode: { mode: "default", settings: {} } }) })
+    assert.deepEqual(viaResume.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }, `resume: ${type}`)
+    const woken = await wakeWith({ "thread/read": () => ok({ thread: thread({ status: { type } }) }) })
+    assert.deepEqual(woken.result, { outcome: "deferred", reason: "unknown" }, `wake: ${type}`)
+    assert.equal(woken.methods.includes("thread/queue/add"), false)
+  }
+})
+
 // Both connections of a wake must reach the one socket that was checked: the same device and inode.
+// A wake on a thread that no bind has probed asks the probe first, on the add connection, before it opens the reading's.
+const PROBE = "thread/queue/delete"
 const swapping = (socket, inodes) => path => {
   const info = lstatSync(path)
   return path === socket ? Object.create(info, { ino: { value: inodes() } }) : info
@@ -810,7 +872,7 @@ async function wakeOverSwapping(inodes, proceed) {
 test("a socket replaced between the two connects is refused: the reading is not taken, and no add is sent", async () => {
   const { result, methods, connections } = await wakeOverSwapping(call => (call === 1 ? 100 : 200))
   assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
-  assert.deepEqual(methods, ["initialize"], "only the add connection was made, and it asked nothing")
+  assert.deepEqual(methods, ["initialize", PROBE], "only the add connection was made, and it asked only the probe")
   assert.equal(connections, 1, "the second connection was refused before it was made")
 })
 
@@ -818,14 +880,130 @@ test("a socket replaced after the reading, before the add frame, sends no add an
   let asked = 0
   const { result, methods } = await wakeOverSwapping(call => (call <= 2 ? 100 : 200), () => { asked += 1; return null })
   assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
-  assert.deepEqual(methods, [...OPENS, ...READS], "the reads were made, and no add frame")
+  assert.deepEqual(methods, ["initialize", PROBE, "initialize", ...READS], "the probe and the reads were made, and no add frame")
   assert.equal(asked, 0, "the receiver is not asked to adopt a reading from a socket that is gone")
 })
 
 test("a socket that is the same for the add connection, the reading and the add frame is used", async () => {
   const { result, methods } = await wakeOverSwapping(() => 100)
-  assert.deepEqual(methods.slice(0, 7), [...OPENS, ...READS, "thread/queue/add"])
+  assert.deepEqual(methods.slice(0, 8), ["initialize", PROBE, "initialize", ...READS, "thread/queue/add"])
   assert.deepEqual(result, { outcome: "handed", reason: null })
+})
+
+// ---- the probe belongs to the socket it was taken on -----------------------------------------------------------------
+
+const handedItems = { "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) }
+// Another listener takes over `path` without that path ever being bound twice: it listens under a second name and is renamed
+// over the first, so the two sockets have different inodes and the first one is still alive.
+async function replaceSocket(path, handler) {
+  const spare = `${path}.next`
+  const next = await fakeAppServer(spare, handler)
+  renameSync(spare, path)
+  return next
+}
+const wakeNow = bound => bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 })
+
+test("a probe taken on one socket does not count on another: the wake probes the replacement on its add connection before any add", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    assert.deepEqual(await bound.bind(), { status: "bound", route: true })
+    assert.equal((await wakeNow(bound)).outcome, "handed")
+    assert.deepEqual(first.methods().slice(4), [...OPENS, ...READS, "thread/queue/add", "thread/queue/delete", "thread/items/list"], "control: on the socket that was probed, the wake does not probe again")
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.route, true, "the cached answer is still the one for the first socket")
+    assert.deepEqual(await wakeNow(bound), { outcome: "handed", reason: null })
+    assert.deepEqual(second.methods(), ["initialize", "thread/queue/delete", "initialize", ...READS, "thread/queue/add", "thread/queue/delete", "thread/items/list"], "the probe is the first request after the add connection opens, before the reading and the add")
+    assert.match(second.log[1].params.queuedSubmissionId, /^[0-9a-f-]{36}$/, "it is the probe: an id nobody queued")
+    assert.equal(first.methods().filter(method => method === "thread/queue/add").length, 1, "the first socket was not asked again")
+    second.log.length = 0
+    await wakeNow(bound)
+    assert.deepEqual(second.methods().slice(0, 3), [...OPENS, "thread/loaded/list"], "the replacement is probed once: the next wake on it does not probe")
+  } finally { await first.close(); await second?.close() }
+})
+
+test("a replacement that does not answer the probe as documented gets no add: the wake fails and the route is off", async () => {
+  for (const answer of [() => ok({ deleted: true }), () => ({ error: { code: -32601, message: "method not found" } }), () => ok({})]) {
+    const path = socketPath()
+    const first = await fakeAppServer(path, queueServer(handedItems))
+    const bound = createThread({ path, threadId: THREAD })
+    let second
+    try {
+      assert.equal((await bound.bind()).status, "bound")
+      second = await replaceSocket(path, queueServer({ ...handedItems, "thread/queue/delete": answer }))
+      assert.deepEqual(await wakeNow(bound), { outcome: "failed", reason: "native_unavailable" })
+      assert.deepEqual(second.methods(), ["initialize", "thread/queue/delete"], "only the probe was sent: no reading, no add")
+      assert.equal(first.methods().includes("thread/queue/add"), false)
+      assert.equal(bound.route, false, "the answer for the socket that is there now")
+    } finally { await first.close(); await second?.close() }
+  }
+})
+
+test("a replacement that cannot complete the probe gets no add either, and nothing is recorded for it", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    await bound.bind()
+    second = await replaceSocket(path, queueServer({ ...handedItems, "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }))
+    assert.deepEqual(await wakeNow(bound), { outcome: "failed", reason: "native_unavailable" })
+    assert.equal(second.methods().includes("thread/queue/add"), false)
+    assert.equal(bound.route, true, "a transport failure is not an answer: the cached route is untouched")
+  } finally { await first.close(); await second?.close() }
+})
+
+test("a bind on a replaced socket probes it again, and a bind on the same socket does not", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    await bound.bind()
+    first.log.length = 0
+    assert.deepEqual(await bound.bind(), { status: "bound", route: true })
+    assert.equal(first.methods().includes("thread/queue/delete"), false, "the same socket is not probed twice")
+    second = await replaceSocket(path, queueServer({ ...handedItems, "thread/queue/delete": () => ok({ deleted: true }) }))
+    assert.deepEqual(await bound.bind(), { status: "bound", route: false }, "the replacement was probed, and answered differently")
+    assert.equal(second.methods().includes("thread/queue/delete"), true)
+    assert.equal(bound.route, false)
+  } finally { await first.close(); await second?.close() }
+})
+
+// No bind has probed the socket, so no cached answer can count: the receiver does not wake such a thread (its route is not
+// true), and `wake` itself still adds only after a positive probe on the very socket it will use.
+test("a wake on a thread that no bind has probed asks the probe first, and a probe that is not positive sends no add", async () => {
+  for (const answer of [() => ok({ deleted: true }), () => ok({}), () => ({ error: { code: -32600, message: "unknown queue entry" } })]) {
+    await withServer(queueServer({ "thread/queue/delete": answer }), async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD })
+      assert.deepEqual(await wakeNow(bound), { outcome: "failed", reason: "native_unavailable" })
+      assert.deepEqual(server.methods(), ["initialize", PROBE], "the probe, and nothing after it")
+      assert.equal(bound.route, false, "what the wake learned is kept for this socket")
+    })
+  }
+  await withServer(queueServer(handedItems), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.equal(bound.route, null)
+    assert.equal((await wakeNow(bound)).outcome, "handed")
+    assert.equal(server.methods().filter(method => method === PROBE).length, 2, "the probe, and the fence")
+    server.log.length = 0
+    assert.equal((await wakeNow(bound)).outcome, "handed")
+    assert.equal(server.methods().filter(method => method === PROBE).length, 1, "the answer is cached for this socket: the fence only")
+  })
+})
+
+// A reply that is not a JSON object is a protocol error that arrives after the frame was written: it settles `uncertain`,
+// and never reaches the code that reads the reply as a record.
+test("a reply that is not an object, to the add or to the fence, is uncertain and is not an exception", async () => {
+  for (const method of ["thread/queue/add", "thread/queue/delete"]) {
+    for (const reply of [null, [], "text", 7]) {
+      const { result, methods } = await wakeWith({ [method]: () => ok(reply) })
+      assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, `${method} answered ${JSON.stringify(reply)}`)
+      assert.equal(methods.filter(name => name === "thread/queue/add").length, 1, "the add is not repeated")
+    }
+  }
 })
 
 test("the add is the next request after the last read of the wake, and a failed read sends none", async () => {
@@ -889,6 +1067,41 @@ test("a socket that another user owns is refused by openAppServer as CHAT_APPSER
     link.close()
     assert.equal(server.state.connections, 1)
   })
+})
+
+// A socket path is held to 103 bytes, measured on the real path (see lib/trust.js), and a longer one never reaches Node.
+test("a control socket whose real path is over 103 bytes is refused as untrusted before anything is connected to, and one of 103 bytes is connected to", async t => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "acl-")))
+  try {
+    const room = 103 - Buffer.byteLength(base) - "s.sock".length - 2 // a directory for which `<directory>/s.sock` is 103 bytes
+    if (room < 1 || room > 254) return t.skip("the temporary directory leaves no room for a path of this length")
+    const fits = join(base, "d".repeat(room))
+    mkdirSync(fits, { mode: 0o700 })
+    chmodSync(fits, 0o700)
+    let connected = 0
+    const createConnection = (...args) => { connected += 1; return net.createConnection(...args) }
+    const server = await fakeAppServer(join(fits, "s.sock"), main())
+    try {
+      const link = await openAppServer(join(fits, "s.sock"), { createConnection })
+      link.close()
+      assert.equal(connected, 1, "103 bytes are connected to")
+    } finally { await server.close() }
+    connected = 0
+    const over = join(base, "e".repeat(room + 1)) // one byte more: `<over>/s.sock` is 104 bytes
+    mkdirSync(over, { mode: 0o700 })
+    chmodSync(over, 0o700)
+    assert.equal(Buffer.byteLength(join(over, "s.sock")), 104)
+    await assert.rejects(openAppServer(join(over, "s.sock"), { createConnection }), untrusted, "104 bytes, a socket that is not even there")
+    // a short spelling whose real path is long: a link above the directory, resolved first
+    mkdirSync(join(over, "inner"), { mode: 0o700 })
+    symlinkSync(over, join(base, "ln"))
+    const shortened = join(base, "ln", "inner", "s.sock")
+    assert.ok(Buffer.byteLength(shortened) < 103 && Buffer.byteLength(join(over, "inner", "s.sock")) > 103)
+    await assert.rejects(openAppServer(shortened, { createConnection }), untrusted, "a short spelling that resolves to a long path")
+    assert.equal(connected, 0, "nothing was connected to")
+    const bound = createThread({ path: join(over, "s.sock"), threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "untrusted" })
+  } finally { rmSync(base, { recursive: true, force: true }) }
 })
 
 test("an untrusted socket is refused before any connection: the bind says untrusted, the wake sends nothing, the read is offline", async () => {

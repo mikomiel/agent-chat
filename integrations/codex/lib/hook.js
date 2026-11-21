@@ -97,11 +97,13 @@ export async function runHook(name, io) {
   if (!payload || "agent_id" in payload) return 0
   const sessionId = payload.session_id
   if (typeof sessionId !== "string" || !sessionId) return 0
-  const config = loadConfig(io.env)
-  if (!config) return 0
+  const loaded = loadConfig(io.env)
+  if (!loaded) return 0
   try {
+    // The state directory is resolved and checked once. Its canonical path then stands for it everywhere in this hook: the
+    // start lock, the socket, and the working directory of a receiver that the hook starts (`config.directory`).
+    const config = { ...loaded, directory: assertPrivateDirectory(loaded.directory) }
     const where = paths(config.directory, sessionId)
-    assertPrivateDirectory(config.directory)
     return await Promise.race([dispatch(name, { payload, config, where, io }), io.sleep(limit).then(() => 0)])
   } catch { return 0 }
 }

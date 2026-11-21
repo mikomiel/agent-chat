@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { sameSocket, trustedDirectory, trustedSocket } from "../lib/trust.js"
+import { fittingSocketPath, MAX_SOCKET_PATH_BYTES, sameSocket, trustedDirectory, trustedSocket } from "../lib/trust.js"
 
 // The one trust rule for the app-server control socket and the receiver's own socket, against a file system that is a table
 // of path -> { kind, uid, mode, dev, ino }; a path that is not in it is not there.
@@ -82,4 +82,42 @@ test("the identity of a socket is its device and inode: the same socket is the s
   assert.equal(sameSocket(identity, view({ [SOCKET]: { kind: "socket", uid: OTHER, mode: 0o600, dev: 7, ino: 42 } })), false, "another owner")
   assert.equal(sameSocket(identity, view({ [SOCKET]: { kind: "file", uid: ME, mode: 0o600, dev: 7, ino: 42 } })), false, "no longer a socket")
   assert.equal(sameSocket(identity, view({ [SOCKET]: undefined })), false, "gone")
+})
+
+// The length limit is on the exact pathname handed to Node: the real path of the socket, in bytes.
+const socketOfBytes = (bytes, name = "s.sock") => { // a directory below the root, then the socket, of exactly `bytes` bytes
+  const directory = `/${"d".repeat(bytes - name.length - 2)}`
+  return { directory, socket: `${directory}/${name}` }
+}
+const roomy = (directory, socket) => ({ "/": { kind: "dir", uid: 0, mode: 0o755 }, [directory]: { kind: "dir", uid: ME, mode: 0o700 }, [socket]: { kind: "socket", uid: ME, mode: 0o600 } })
+
+test("a socket path is at most 103 bytes, the longest that fits sun_path on every platform, and a longer one is refused with the caller's code", () => {
+  assert.equal(MAX_SOCKET_PATH_BYTES, 103)
+  const fits = socketOfBytes(103)
+  assert.equal(Buffer.byteLength(fits.socket), 103)
+  assert.equal(trustedSocket(fits.socket, table(roomy(fits.directory, fits.socket))).path, fits.socket)
+  const long = socketOfBytes(104)
+  assert.equal(Buffer.byteLength(long.socket), 104)
+  assert.throws(() => trustedSocket(long.socket, table(roomy(long.directory, long.socket))), untrusted)
+  assert.throws(() => trustedSocket(long.socket, table({ ...roomy(long.directory, long.socket), [long.socket]: undefined })), untrusted, "refused before the socket is looked up, so a long path is not an absent one")
+  assert.equal(fittingSocketPath(fits.socket, "X"), fits.socket)
+  assert.throws(() => fittingSocketPath(long.socket, "X"), { code: "X" })
+})
+
+test("the limit counts bytes, not characters", () => {
+  const fits = `/${"d".repeat(85)}\u00e9\u00e9\u00e9\u00e9\u00e9/s.sock` // 98 characters, 103 bytes
+  const over = `/${"d".repeat(86)}\u00e9\u00e9\u00e9\u00e9\u00e9/s.sock` // 99 characters, 104 bytes
+  assert.equal(Buffer.byteLength(fits), 103)
+  assert.ok(over.length < 103 && Buffer.byteLength(over) === 104)
+  const at = path => roomy(path.slice(0, path.lastIndexOf("/")), path)
+  assert.equal(trustedSocket(fits, table(at(fits))).path, fits)
+  assert.throws(() => trustedSocket(over, table(at(over))), untrusted)
+})
+
+test("the limit is measured on the real path: a short spelling that resolves to a long path is refused", () => {
+  const long = socketOfBytes(104)
+  const entries = { ...roomy(long.directory, long.socket), "/short": { kind: "dir", uid: ME, mode: 0o700 } }
+  const resolving = { ...table(entries), realpath: path => (path === "/short" ? long.directory : path) }
+  assert.ok(Buffer.byteLength("/short/s.sock") < 103)
+  assert.throws(() => trustedSocket("/short/s.sock", resolving), untrusted)
 })
