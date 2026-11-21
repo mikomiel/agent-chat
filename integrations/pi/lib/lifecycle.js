@@ -245,7 +245,8 @@ export function createAgentChat(pi, config, {
           reportedPlan = snapshot.plan_mode
           const result = await request("heartbeat", { state: snapshot })
           if (refused(result)) {
-            if (REJOIN_AFTER.has(result.refused)) throw Object.assign(new Error(result.refused), { code: result.refused, operation: "heartbeat" })
+            if (REJOIN_AFTER.has(result.refused) && !BRIEF_OUTAGE.has(result.refused))
+              throw Object.assign(new Error(result.refused), { code: result.refused, operation: "heartbeat" })
           }
         }
         if (pollDue && live) {
@@ -264,7 +265,8 @@ export function createAgentChat(pi, config, {
     if (!live) return
     const refusal = refused(candidates)
     if (refusal) {
-      if (REJOIN_AFTER.has(refusal)) throw Object.assign(new Error(refusal), { code: refusal, operation: "pending" })
+      if (REJOIN_AFTER.has(refusal) && !BRIEF_OUTAGE.has(refusal))
+        throw Object.assign(new Error(refusal), { code: refusal, operation: "pending" })
       return
     }
     const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
@@ -447,3 +449,9 @@ export function createAgentChat(pi, config, {
 const REJOIN_AFTER = new Set([
   "STALE_INSTANCE", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN", "BINDING_CONFLICT",
 ])
+
+// The core's worker answers a brief outage on a heartbeat or a pending read with a non-terminal `refused` reply and
+// keeps the binding (`agent_chat/instance_worker.py`). The next tick is the retry, so the reply spends no rejoin
+// budget (#146). A refusal that proves the lease gone, a thrown worker error, a worker that died and the parent-side
+// timeout still rejoin.
+const BRIEF_OUTAGE = new Set(["SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"])

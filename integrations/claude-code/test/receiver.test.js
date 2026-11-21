@@ -733,6 +733,66 @@ test("an exhausted rejoin budget fails closed instead of retrying forever", asyn
   assert.equal(r.worker.bootIds.length, 4)
 })
 
+// #146: during a brief outage the core's worker answers a heartbeat or a pending read with the non-terminal
+// `{ refused: code }` and keeps the binding; the next heartbeat or poll is the retry. Claude Code shows no
+// reconnecting notice, so a rejoin shows as a second boot id, a stopped worker, a rejoin timer or a disable.
+test("brief heartbeat and pending refusals keep the worker and the binding and spend no rejoin budget", async () => {
+  const answered = []
+  const refusing = { heartbeat: null, pending: null } // the code the worker answers with, or null for a normal answer
+  const r = await rig({
+    handlers: {
+      heartbeat: () => {
+        if (refusing.heartbeat) { answered.push(["heartbeat", refusing.heartbeat]); return { refused: refusing.heartbeat } }
+        return {}
+      },
+      pending: () => {
+        if (refusing.pending) { answered.push(["pending", refusing.pending]); return { refused: refusing.pending } }
+        return { messages: [] }
+      },
+    },
+  })
+  await r.begin()
+  const timersBefore = r.clock.count()
+  // Four brief outages, one more than the hourly rejoin budget allows.
+  const outages = [
+    ["heartbeat", "SERVICE_UNAVAILABLE"], ["pending", "TRANSPORT_UNAVAILABLE"],
+    ["heartbeat", "REQUEST_UNCERTAIN"], ["pending", "SERVICE_UNAVAILABLE"],
+  ]
+  for (const [operation, code] of outages) {
+    refusing[operation] = code
+    if (operation === "heartbeat") await r.clock.advance(30_000)
+    else assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "no disable reply and no new announcement")
+    refusing[operation] = null
+  }
+  assert.deepEqual(answered, outages, "each refusal reached the receiver")
+  assert.equal(r.worker.bootIds.length, 1, "the same worker keeps serving")
+  assert.equal(r.worker.state.stops, 0, "the worker is not stopped")
+  assert.equal(r.clock.count(), timersBefore, "no rejoin timer is scheduled")
+  assert.notEqual(r.receiver.state(), "offline")
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the binding is still the announced one")
+  const before = r.worker.ops("heartbeat").length // the next tick is the retry
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.ops("heartbeat").length, before + 1)
+  assert.equal(r.worker.bootIds.length, 1)
+})
+
+test("a thrown worker error on a heartbeat still rejoins, even with a code that a refused reply would not rejoin on", async () => {
+  const terminal = Object.assign(new Error("CHAT_WORKER_REFUSED"), {
+    code: "CHAT_WORKER_REFUSED", workerCode: "SERVICE_UNAVAILABLE", operation: "heartbeat",
+  })
+  let failing = false
+  const r = await rig({ handlers: { heartbeat: () => { if (failing) throw terminal; return {} } } })
+  await r.begin()
+  failing = true
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.state.stops, 1, "the old worker is stopped")
+  assert.notEqual(r.receiver.state(), "offline")
+  failing = false
+  await r.clock.advance(3750)
+  assert.equal(r.worker.bootIds.length, 2, "a fresh worker joins after the back-off")
+  assert.notEqual(r.receiver.state(), "offline")
+})
+
 test("the heartbeat repeats on the core cadence", async () => {
   const r = await rig()
   await r.begin()

@@ -33,9 +33,16 @@ const REJOIN_AFTER = new Set([
   "STALE_INSTANCE", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN", "BINDING_CONFLICT",
 ])
 
+// The core's worker answers a brief outage on a heartbeat or a pending read with a non-terminal `refused` reply and
+// keeps the binding (`agent_chat/instance_worker.py`). The next tick is the retry, so the reply spends no rejoin
+// budget (#146). A refusal that proves the lease gone, a thrown worker error, a worker that died and the parent-side
+// timeout still rejoin.
+const BRIEF_OUTAGE = new Set(["SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"])
+
 const bytes = text => Buffer.byteLength(text, "utf8")
 const clamp = (value, max) => (Number.isFinite(value) ? Math.max(0, Math.min(max, value)) : 0)
 const refused = result => (result && typeof result === "object" && typeof result.refused === "string" ? result.refused : null)
+const brief = result => BRIEF_OUTAGE.has(refused(result))
 const isDone = (frame, outcome) => frame?.op === "done" && frame.outcome === outcome
 
 function ownerAlive(pid) {
@@ -165,6 +172,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   // A refusal that proves the lease or transport is gone ends this worker and
   // starts the rejoin policy; any other refusal is the ledger's ordinary answer.
+  // A heartbeat or a pending read skips this for a brief outage (`brief`).
   function check(result, operation) {
     const code = refused(result)
     if (code && REJOIN_AFTER.has(code)) throw Object.assign(new Error(code), { code, operation })
@@ -174,7 +182,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   async function beat() {
     const snapshot = heartbeatState()
     reported = JSON.stringify(snapshot)
-    check(await ask("heartbeat", { state: snapshot }), "heartbeat")
+    const result = await ask("heartbeat", { state: snapshot })
+    if (!brief(result)) check(result, "heartbeat")
   }
 
   function report() {
@@ -290,7 +299,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const prefix = (announce ? `${announce.text}\n\n` : "") + CHAT_PREFIX
         const bound = MAX_OUTPUT_BYTES - bytes(prefix)
         const candidates = await ask("pending", bodies ? { bodies: true } : {})
-        if (!live || check(candidates, "pending")) return false
+        if (!live || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
         // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply
