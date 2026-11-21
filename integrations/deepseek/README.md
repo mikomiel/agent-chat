@@ -122,9 +122,11 @@ The service and its host-token provisioning are documented in the product
   busy, and not in an unknown state. A claimed batch becomes one framed notice
   (metadata by default; bodies only when configured) and is handed over with
   `agent.steer` using source `plugin:agent-chat`. With `noticeBodies`, the
-  plugin reads each candidate's size from `pending` and claims only the prefix
-  that one 8 KiB notice can carry; a retry batch is claimed whole. `handed` is reported only
-  from the `agent/inbox/claimed` event for that message id.
+  plugin reads each candidate's size from `pending` and claims the longest
+  prefix that one 8 KiB notice is estimated to carry; a retry batch is claimed
+  whole. A body that outgrows the estimate can still be cut after the claim; the
+  [notice contract](../README.md#notice-contract) lists the limit. `handed` is
+  reported only from the `agent/inbox/claimed` event for that message id.
 - **The fence.** Before steering, the plugin checks the refused states, `status
   === 'idle'` and an empty `nextStep`/`nextTurn` inbox. After steering it checks
   that the agent is `running`. If the steer throws or the agent is not running,

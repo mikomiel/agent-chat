@@ -288,11 +288,12 @@ def pack_candidates(
     """The candidate IDs to claim, from a `pending` reply (`messages`, and with sizing `sizes` and `retry`).
 
     A retry batch, and a reply without sizes, are claimed whole: the server refuses any other set for a stored batch.
-    Otherwise this is the longest prefix, and at least one candidate, whose widest rendering fits `bound`. The widest
-    rendering of a candidate is its header, markers and pointer at their longest, plus a body of its stored size
-    capped at `cap` with every byte taken as a line break (three bytes). A missing or invalid size counts as a full
-    body. A body of control characters grows past that estimate; the renderer then halves its cap and the pointer
-    covers the rest.
+    Otherwise this is the longest prefix, and at least one candidate, whose estimated rendering fits `bound`. The
+    estimate for a candidate is its header, markers and pointer at their longest, plus a body of its stored size
+    capped at `cap` with every byte taken as a line break and its `> ` prefix (three bytes). A missing or invalid size
+    counts as a full body. The estimate does not bound the rendering: a body whose escapes are wider, as a control
+    character is (six bytes), can still make `render_notice` halve its cap after the claim. Every body then shares the
+    halved cap, a cut body carries its pointer line, and the notice stays within `bound`.
     """
     ids = pending.get("messages")
     if not isinstance(ids, list) or not ids:

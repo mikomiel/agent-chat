@@ -450,10 +450,10 @@ Before the cut, the renderer MUST write C0 controls other than LF and TAB, DEL, 
 - **AND** the body has no line break other than LF
 
 ### Requirement: The notice cuts a body on whole units and points at the rest
-The renderer MUST cut a body on whole units (a code point or one escape) at a per-body cap of 4096 UTF-8 bytes unless the caller sets another. It MUST give every body that it or the core cut a pointer line with the exact `history` arguments.
+The renderer MUST cut a body on whole units (a code point or one escape) at a per-body cap of 4096 UTF-8 bytes unless the caller sets another. The cap counts the body as written, so an escape counts as its `\uXXXX` text. It MUST give every body that it or the core cut a pointer line with the exact `history` arguments.
 
 #### Scenario: A body over the cap
-- **WHEN** a body is longer than 4096 UTF-8 bytes
+- **WHEN** a body, as written, is longer than 4096 UTF-8 bytes
 - **THEN** it ends on a code point or on one complete escape, never inside one
 - **AND** a pointer line after the closing marker gives the room, the history cursor, a limit of 1 and the message id to verify
 
@@ -488,13 +488,13 @@ A package MUST settle a batch for which the renderer returns nothing as `deferre
 - **THEN** the package settles the batch as `deferred` with reason `offline`
 - **AND** it sends no text to the session
 
-### Requirement: A package claims only what one notice can carry
-Before the claim, the package MUST take the longest prefix of the pending candidates, and at least one, whose widest rendering fits `bound`. It MUST claim a retry batch, or a batch for which the server reported no sizes, whole. A missing or invalid size MUST count as a full body.
+### Requirement: A package claims the longest prefix that one notice is estimated to carry
+Before the claim, the package MUST take the longest prefix of the pending candidates, and at least one, whose estimated rendering fits `bound`. The estimate MUST budget the widest header, markers and pointer for each message and 3 rendered bytes for each stored body byte, up to the body cap. It MUST claim a retry batch, or a batch for which the server reported no sizes, whole. A missing or invalid size MUST count as a full body.
 
-#### Scenario: More candidates than one notice can carry
-- **WHEN** `pending` reports more candidates, with sizes, than fit `bound` at their widest
-- **THEN** the package claims only the longest prefix that fits, and at least the first candidate
-- **AND** every claimed body is rendered whole
+#### Scenario: More candidates than one notice is estimated to carry
+- **WHEN** `pending` reports more candidates, with sizes, than the estimate says fit `bound`
+- **THEN** the package claims only the longest prefix that the estimate admits, and at least the first candidate
+- **AND** when every claimed body renders within 3 bytes for each stored byte, the halving step cuts none of them
 
 #### Scenario: A retry batch or a reply without sizes
 - **WHEN** `pending` marks the batch as a retry, or reports no sizes
@@ -504,6 +504,15 @@ Before the claim, the package MUST take the longest prefix of the pending candid
 #### Scenario: A size that cannot be trusted
 - **WHEN** a candidate's size is missing, negative or not a whole number
 - **THEN** it counts as a full body of the per-body cap
+
+### Requirement: A claimed body can still be cut when its escapes outgrow the estimate
+The estimate assumes that a body renders to at most 3 bytes for each stored byte, as text with many line feeds does. A body whose escapes expand it further, such as carriage returns written as six bytes each, MAY make the renderer halve the body cap after the claim, and the halved cap applies to every body in the notice. Each body cut that way MUST carry its pointer line, and the notice MUST NOT exceed `bound`.
+
+#### Scenario: Two bodies of carriage returns
+- **WHEN** `pending` reports two bodies of 650 carriage returns each, with sizes, under a bound of 8137 bytes
+- **THEN** the package claims both, because the estimate takes 3 bytes for each stored byte
+- **AND** the renderer, which writes each carriage return as six bytes, halves the cap and cuts both bodies
+- **AND** each cut body carries its pointer line, and the notice is at most 8137 bytes
 
 ### Requirement: Every renderer passes the same vectors
 The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs.

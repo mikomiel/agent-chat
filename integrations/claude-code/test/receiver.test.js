@@ -311,7 +311,7 @@ test("a retry batch is claimed whole even when it cannot be sent uncut", async (
   assert.deepEqual(settle.result, { outcome: "handed", reason: null })
 })
 
-test("a candidate list larger than one notice fits is split before the claim, and nothing claimed is cut", async () => {
+test("a candidate list larger than one notice is estimated to fit is split before the claim, and no claimed plain-text body is cut", async () => {
   const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "c".repeat(1200)))
   const { context, claim, settle } = await bodiesEvent(rows)
   const claimed = claim.messages
@@ -319,7 +319,7 @@ test("a candidate list larger than one notice fits is split before the claim, an
   assert.deepEqual(claimed, rows.slice(0, claimed.length).map(row => row.id), "a prefix, in order")
   assert.ok(bytes(context) <= MAX_OUTPUT_BYTES)
   for (const row of rows) assert.equal(context.includes(`message ${row.id} kind question`), claimed.includes(row.id))
-  assert.equal(context.split("\n").filter(line => line === `> ${"c".repeat(1200)}`).length, claimed.length, "every claimed body is whole")
+  assert.equal(context.split("\n").filter(line => line === `> ${"c".repeat(1200)}`).length, claimed.length, "every claimed plain-text body is whole")
   assert.doesNotMatch(context, /^Body cut\./m)
   assert.deepEqual(settle.result, { outcome: "handed", reason: null })
 })
@@ -369,13 +369,11 @@ test("the notice bound leaves room for the announcement and the delivery line", 
 
 test("a grant the renderer refuses is deferred offline and nothing is written", async () => {
   const grant = rows => rows.map(row => ({ ...row, sender_session_id: "peer-1" }))
-  const { r, settle } = await (async () => {
-    const r = await rig({ handlers: bodiesHandlers([bodyRow(1)], { grant }), config: { noticeBodies: true } })
-    await r.begin()
-    const hook = await r.op(turn({ event: "PostToolUse" }))
-    return { r, hook, settle: r.worker.ops("settle")[0] }
-  })()
-  assert.deepEqual(settle.result, { outcome: "deferred", reason: "offline" })
+  const r = await rig({ handlers: bodiesHandlers([bodyRow(1)], { grant }), config: { noticeBodies: true } })
+  await r.begin()
+  const hook = await r.op(turn({ event: "PostToolUse" }))
+  assert.deepEqual(hook.sent, [{ context: null }], "nothing is written to the model")
+  assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "deferred", reason: "offline" })
   assert.equal(r.worker.ops("settle").length, 1)
 })
 

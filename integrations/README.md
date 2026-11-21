@@ -109,10 +109,11 @@ pointer. There is no metadata fallback in bodies mode: the renderer returns `nul
 and the package then settles the batch `deferred` with reason `offline`. Metadata mode, the default, is unchanged: ids,
 kinds, room and history cursor as JSON, and no body.
 
-Before the claim, `packCandidates` takes the longest prefix of the `pending` candidates whose widest rendering fits
-`bound`, and at least one, from the `sizes` that `pending` reports. A retry batch, or a `pending` reply without
-`sizes`, is claimed whole, because the server refuses any other set for a stored batch. A missing or invalid size
-counts as a full body.
+Before the claim, `packCandidates` takes the longest prefix of the `pending` candidates whose estimated rendering
+fits `bound`, and at least one, from the `sizes` that `pending` reports. The estimate for a message is its header,
+markers and pointer at their longest, plus three bytes for each stored body byte, up to the body cap. A retry batch,
+or a `pending` reply without `sizes`, is claimed whole, because the server refuses any other set for a stored batch.
+A missing or invalid size counts as a full body.
 
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
 bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line
@@ -123,9 +124,13 @@ Limits that remain:
 
 - The frame and the escapes keep a body from imitating a header, a marker, the binding or an instruction line. They
   do not make a body safe to obey, and no test here shows what a model does with text inside a frame.
-- The packing estimate allows three bytes of notice for each byte of body (a line feed and its `> ` prefix). A body
-  made mostly of control characters renders larger, because each one becomes a six-byte escape. The halving step then
-  cuts a body that was claimed, and the cut body carries its pointer line.
+- The packing estimate allows three bytes of notice for each byte of body (a line feed and its `> ` prefix). It does
+  not bound the rendering. A body made mostly of control characters renders larger, because each one becomes a
+  six-byte escape. Two pending bodies of 650 carriage returns each (3,900 bytes once escaped) are both claimed under
+  the Pi and DeepSeek bound of 8,137 bytes, and the renderer then halves the cap and cuts both. The halved cap applies
+  to every body in the notice. Each cut body carries its pointer line, and the notice stays within `bound`. The
+  vectors `two-bodies-of-650-carriage-returns-are-both-packed` and
+  `two-bodies-of-650-carriage-returns-are-cut-by-halving-after-the-claim` pin this case.
 - A retry batch is claimed whole, up to 16 messages. Its headers, markers and pointers alone take about 7.5 KB in the
   test fixtures, and the shared suite checks that 16 such frames fit an 8 KiB bound. A Claude Code announcement
   larger than about 2.4 KB leaves less room than that, and the renderer then returns `null` for such a batch.

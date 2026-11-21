@@ -205,7 +205,7 @@ test("a retry batch is claimed whole even when it cannot be sent uncut", async (
   assert.deepEqual(settle.fields.result, { outcome: "handed", reason: null })
 })
 
-test("a candidate list larger than one notice fits is split before the claim, and nothing claimed is cut", async () => {
+test("a candidate list larger than one notice is estimated to fit is split before the claim, and no claimed plain-text body is cut", async () => {
   const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "c".repeat(1200)))
   const { delivery, claim, settle } = await bodiesPoll(rows)
   const claimed = claim.fields.messages
@@ -215,7 +215,7 @@ test("a candidate list larger than one notice fits is split before the claim, an
   const content = delivery.calls.deliver[0].batch.content
   assert.ok(whole(delivery) <= MAX_CONTEXT_BYTES)
   for (const row of rows) assert.equal(content.includes(`message ${row.id} kind question`), claimed.includes(row.id))
-  assert.equal(content.split("\n").filter(line => line === `> ${"c".repeat(1200)}`).length, claimed.length, "every claimed body is whole")
+  assert.equal(content.split("\n").filter(line => line === `> ${"c".repeat(1200)}`).length, claimed.length, "every claimed plain-text body is whole")
   assert.doesNotMatch(content, /^Body cut\./m)
   assert.deepEqual(settle.fields.result, { outcome: "handed", reason: null })
 })

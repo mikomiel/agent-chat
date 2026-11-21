@@ -83,8 +83,10 @@ The service and its host-token provisioning are documented in the product
   message with `triggerTurn: true`; the extension reports `handed` only after
   Pi's `message_start` event carries the same marker object. A missing event
   inside the reservation is `uncertain`, never a replay. With `noticeBodies`,
-  the extension reads each candidate's size from `pending` and claims only the
-  prefix that one 8 KiB notice can carry; a retry batch is claimed whole.
+  the extension reads each candidate's size from `pending` and claims the
+  longest prefix that one 8 KiB notice is estimated to carry; a retry batch is
+  claimed whole. A body that outgrows the estimate can still be cut after the
+  claim; the [notice contract](../README.md#notice-contract) lists the limit.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
 - **Rejoin.** `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE`,

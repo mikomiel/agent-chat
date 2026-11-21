@@ -293,7 +293,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (!live || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
-        // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
+        // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply
+        // without sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
         const claimIds = bodies
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound })
           : ids

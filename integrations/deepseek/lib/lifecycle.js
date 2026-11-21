@@ -239,7 +239,8 @@ export function createLifecycle(bus, delivery, config, {
     // The native half is the only owner of eligibility: a stopped, busy, plan,
     // muted, offline or unclassifiable agent never receives a claim.
     if (stopped || deliveryState() !== null) return
-    // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
+    // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply without
+    // sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
     const claimIds = bodies
       ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound: NOTICE_BOUND })
       : ids
