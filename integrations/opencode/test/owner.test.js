@@ -2,6 +2,8 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { createMember, createRegistry, globalRegistry } from "../lib/owner.js"
 import { EVENT_TYPES } from "../lib/manager.js"
+import { createDelivery } from "../lib/delivery.js"
+import { createLifecycle } from "../lib/lifecycle.js"
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
 const flush = async () => { for (let index = 0; index < 8; index++) await tick() }
@@ -94,7 +96,7 @@ test("failover: the next owner starts only after the old owner's workers ended, 
   assert.equal(log.at(-1), "feed second after")
 })
 
-test("a member that is not the owner leaves without disturbing the owner", async () => {
+test("a member that is not the owner leaves: the owner stays and its observations are reset", async () => {
   const registry = createRegistry()
   const log = []
   const first = fakeMember("first", log)
@@ -104,7 +106,7 @@ test("a member that is not the owner leaves without disturbing the owner", async
   await flush()
   log.length = 0
   await detachSecond()
-  assert.deepEqual(log, ["stop-pump second"])
+  assert.deepEqual(log, ["stop-pump second", "reset first"])
   assert.equal(registry.owner(), first)
   assert.deepEqual(registry.members(), [first])
 })
@@ -244,4 +246,117 @@ test("activate builds a manager that takes events, and deactivate stops it and p
   assert.equal(await member.deactivate(), true)
   assert.deepEqual(stops, ["stop"])
   assert.equal(await member.deactivate(), true) // already ended
+})
+
+// Review 6003128773, finding 1: a stream that is torn down hides events, and the registry cannot tell which
+// sessions it covered, so the owner's whole state is stale from that moment.
+test("a non-owner that leaves while a delivery is pending settles it uncertain, and a later delivered cannot hand over", async () => {
+  const registry = createRegistry()
+  const deliveries = []
+  const noTimers = { setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }
+  const ctx = {
+    ...streamCtx([]),
+    session: { get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }), synthetic: async () => ({ id: "msg_parked" }) },
+  }
+  const parts = {
+    createDelivery: (hostCtx, id) => { const delivery = createDelivery(hostCtx, id, noTimers); deliveries.push(delivery); return delivery },
+    createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }) } },
+  }
+  registry.attach(createMember(ctx, {}, parts))
+  const detachStandby = registry.attach(createMember(streamCtx([]), {}, {}))
+  await flush()
+  const send = (id, type, data = {}) => registry.dispatch({ id, type, data: { sessionID: "ses_a", ...data } })
+  send("e1", "session.inbox.enqueued", { item: { type: "user" } })
+  send("e2", "session.execution.started")
+  await flush()
+  assert.equal(deliveries[0].state(), null)
+  let settled = null
+  void deliveries[0]
+    .deliver({ content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }, Date.now() + 60_000)
+    .then(result => { settled = result })
+  await flush()
+  assert.equal(settled, null) // issued, waiting for its delivered event
+  await detachStandby()
+  await flush()
+  assert.deepEqual(settled, { outcome: "uncertain", reason: "transport_ambiguous" })
+  send("e3", "session.inbox.delivered", { inboxID: "msg_parked" })
+  await flush()
+  assert.notEqual(deliveries[0].state(), null) // every observation is stale until fresh events show them again
+})
+
+// Finding 4: the old owner's binding removal and the successor's put reach the same entry key.
+// One real owner with a joined session, a worker that ends only when stopped, and a removal that stays in flight.
+async function ownerWithSlowRemoval() {
+  const registry = createRegistry()
+  const log = []
+  const entries = new Map()
+  const removal = { finish: null }
+  const ctx = {
+    ...streamCtx([]),
+    session: {
+      get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }),
+      instructions: {
+        entry: {
+          put: async ({ key, value }) => { entries.set(key, value) },
+          list: async () => [...entries].map(([key, value]) => ({ key, value })),
+          remove: ({ key }) => new Promise(resolve => { removal.finish = () => { entries.delete(key); resolve() } }),
+        },
+      },
+    },
+  }
+  const joined = {
+    session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+    room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "opencode",
+    instance_file: "/tmp/agent-chat-state/boot-1.json",
+  }
+  let exit
+  const worker = {
+    ready: Promise.resolve(joined),
+    closed: new Promise(resolve => { exit = resolve }), // the worker ends only when it is stopped
+    request: async () => ({}),
+    stop() { exit({ code: 0, signal: null }); return this.closed },
+  }
+  const noTimers = { setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }
+  const parts = {
+    createDelivery: (hostCtx, id) => createDelivery(hostCtx, id, noTimers),
+    createLifecycle: (bus, delivery, config, options) => createLifecycle(bus, delivery, config, { ...options, ...noTimers, setIntervalImpl: () => 0, clearIntervalImpl: () => {} }),
+    startProcess: () => worker,
+  }
+  const config = { chatEnabled: true, directory: "/tmp/agent-chat-state", serverOrigin: "https://chat.example", hostToken: "synthetic-host-token", python: "/usr/bin/python3" }
+  const detachOwner = registry.attach(createMember(ctx, config, parts))
+  registry.attach(fakeMember("second", log))
+  await flush()
+  registry.dispatch(event("e1"))
+  await flush()
+  assert.equal(entries.size, 1) // the old owner's binding is confirmed
+  return { registry, log, entries, removal, detachOwner }
+}
+
+test("a successor is promoted only after the old owner's binding entry removal has finished", async () => {
+  const { registry, log, entries, removal, detachOwner } = await ownerWithSlowRemoval()
+  const closing = detachOwner()
+  await flush()
+  assert.equal(typeof removal.finish, "function") // the removal is in flight
+  assert.deepEqual(log, [], "no successor while the removal is in flight")
+  assert.equal(registry.owner(), null)
+  removal.finish()
+  await closing
+  assert.deepEqual(log, ["activate second"])
+  assert.equal(entries.size, 0)
+})
+
+test("a removal that a session ended before the teardown began still holds the successor back", async () => {
+  const { registry, log, entries, removal, detachOwner } = await ownerWithSlowRemoval()
+  // A fork event ends the joined session at once, so its record is gone before the owner is torn down.
+  registry.dispatch({ id: "e2", type: "session.forked", data: { sessionID: "ses_a" } })
+  await flush()
+  assert.equal(typeof removal.finish, "function") // the removal is in flight
+  const closing = detachOwner()
+  await flush()
+  assert.deepEqual(log, [], "no successor while that removal is in flight")
+  assert.equal(registry.owner(), null)
+  removal.finish()
+  await closing
+  assert.deepEqual(log, ["activate second"])
+  assert.equal(entries.size, 0)
 })

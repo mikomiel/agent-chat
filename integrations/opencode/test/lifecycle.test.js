@@ -1,7 +1,10 @@
-import test from "node:test"
+import test, { mock } from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
 import { readFileSync } from "node:fs"
+import { PassThrough } from "node:stream"
 import { createLifecycle } from "../lib/lifecycle.js"
+import { startWorker } from "../lib/worker.js"
 import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
 import { renderNotice } from "../lib/notice.js"
 
@@ -698,4 +701,69 @@ test("the pinned reason sets: every pair the core accepts is passed on, and ever
   assert.deepEqual(await settledAs({ outcome: "uncertain", reason: null }), ambiguous)
   assert.deepEqual(await settledAs({ outcome: "delivered", reason: null }), ambiguous)
   assert.deepEqual(await settledAs({}), ambiguous)
+})
+
+// Review 6003128773, finding 4: the removal of the binding entry is part of the end the caller waits for.
+test("stop resolves only after the binding entry removal has finished", async () => {
+  const bus = fakeBus()
+  const delivery = fakeDelivery()
+  let finishRemoval
+  delivery.context = text => {
+    delivery.calls.context.push(text)
+    if (text === null) return new Promise(resolve => { finishRemoval = resolve })
+  }
+  const worker = fakeWorker({ answer: op => deliveryAnswer(op) })
+  const lifecycle = createLifecycle(bus, delivery, config, { ...timers, startProcess: () => worker, now: () => 1000 })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  let ended = null
+  void lifecycle.stop().then(result => { ended = result })
+  await flush()
+  assert.equal(delivery.calls.context.at(-1), null)
+  assert.equal(ended, null, "a removal that has not finished is not an end")
+  finishRemoval()
+  await flush()
+  assert.deepEqual(ended, { code: 0, signal: null })
+})
+
+// Finding 7: a request that outlives the parent-side deadline must rejoin, as the core's own uncertain code does.
+const stdioChild = () => {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.kill = () => {}
+  return child
+}
+
+test("a worker request that outlives its deadline takes the rejoin path through the real worker", async t => {
+  mock.timers.enable({ apis: ["setTimeout"] })
+  t.after(() => mock.timers.reset())
+  const children = []
+  const spawnImpl = () => { const child = stdioChild(); children.push(child); return child }
+  const retries = []
+  const notices = []
+  const bus = fakeBus()
+  createLifecycle(bus, fakeDelivery(), config, {
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    now: () => 0,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    clearTimeoutImpl: () => {},
+    setIntervalImpl: () => 0,
+    clearIntervalImpl: () => {},
+    notice: text => notices.push(text),
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  children[0].stdout.write(`${JSON.stringify({ id: 0, result: joined })}\n`)
+  await flush() // joined and bound; the first heartbeat is written and never answered
+  mock.timers.tick(22_000)
+  await flush()
+  assert.doesNotMatch(notices.join("\n"), /stopped/, "not a permanent disable")
+  assert.match(notices.join("\n"), /reconnecting/)
+  assert.equal(retries.length, 1)
+  assert.equal(retries[0].ms, 2500)
+  retries[0].fn()
+  await flush()
+  assert.equal(children.length, 2, "a fresh worker joins after the back-off")
 })

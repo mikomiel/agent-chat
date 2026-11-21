@@ -8,6 +8,7 @@
 //
 // FAILOVER. When the owner's instance is torn down, the registry waits until that owner's workers have ended and
 // only then promotes the next member. A session rejoins at its next event. Registry changes run one at a time.
+// A member that leaves without being the owner is a continuity break for the owner, as a lost stream is.
 //
 // The registry holds members and their callbacks. The config, and with it the host token, lives only in the
 // closures a member was built from; no property of the registry or of a member carries it.
@@ -57,7 +58,12 @@ export function createRegistry() {
         stopPump()
         const index = members.indexOf(member)
         if (index >= 0) members.splice(index, 1)
-        if (owner !== member) return
+        if (owner !== member) {
+          // This member's stream may have been the only one covering some of the owner's sessions. Events it would
+          // have carried are lost now, so the owner's observations are stale: the same continuity break as a lost stream.
+          reset()
+          return
+        }
         owner = null
         // The previous owner's workers end before the next owner can join the same sessions.
         try { await member.deactivate() } catch { /* a failed end is the manager's to report */ }

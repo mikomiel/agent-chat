@@ -33,6 +33,7 @@ export function createManager(ctx, config, parts, {
 } = {}) {
   const records = new Map() // session id -> { id, delivery, lifecycle, chain, dead, closing }
   const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
+  const closings = new Set() // ends still in flight, so stop() also waits for a session that ended before it was called
   let active = true
 
   const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
@@ -62,6 +63,8 @@ export function createManager(ctx, config, parts, {
     catch { ended = Promise.resolve(null) }
     try { record.delivery?.dispose() } catch { /* the object is already latched */ }
     record.closing = ended.then(result => result?.code === 0, () => false)
+    closings.add(record.closing)
+    void record.closing.then(() => closings.delete(record.closing))
     return record.closing
   }
 
@@ -115,12 +118,6 @@ export function createManager(ctx, config, parts, {
       void dispose(record)
       return
     }
-    if (event.type === "session.forked") {
-      // This session is a fork: never a root, even if it was looked up as one before the event arrived.
-      refuse(record.id, Infinity)
-      void dispose(record)
-      return
-    }
     if (record.delivery.observe(event)) record.fire("state_changed", {})
     if (event.type === "session.compaction.ended") {
       // A compaction may drop the entry. Put it back or turn this session's chat off: no entry, no chat.
@@ -133,7 +130,16 @@ export function createManager(ctx, config, parts, {
   function feed(event) {
     if (!active) return
     const id = sessionOf(event)
-    if (id === null || isRefused(id)) return
+    if (id === null) return
+    if (event.type === "session.forked") {
+      // This session is a fork: never a root. Recorded before any refusal check, lookup or join, so a fork is not
+      // dropped during a temporary lookup refusal, and a lookup still in flight finds its record dead.
+      refuse(id, Infinity)
+      const known = records.get(id)
+      if (known) void dispose(known)
+      return
+    }
+    if (isRefused(id)) return
     let record = records.get(id)
     if (!record) {
       record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
@@ -156,11 +162,11 @@ export function createManager(ctx, config, parts, {
     }
   }
 
-  // Ends every session. Resolves true only when every worker end is proved.
+  // Ends every session, and waits for every end already in flight. Resolves true only when every worker end is proved.
   async function stop() {
     active = false
     const pending = [...records.values()].map(record => record.chain.then(() => dispose(record), () => dispose(record)))
-    const results = await Promise.all(pending)
+    const results = await Promise.all([...pending, ...closings])
     return results.every(proved => proved === true)
   }
 

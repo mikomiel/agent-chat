@@ -128,7 +128,10 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "openco
     return new Promise((resolve, reject) => {
       const id = sequence - 1
       pending = { id, op, resolve, reject, timer: setTimeout(() => {
-        rejectPending("CHAT_REQUEST_UNCERTAIN")
+        // The core's own code for a request that may or may not have run. The lifecycle rejoins on exactly this
+        // code, so a parent-side timeout is not a permanent disable. The worker-death sites above keep their
+        // CHAT_ code and stay fail-closed.
+        rejectPending("REQUEST_UNCERTAIN")
         void stop()
       }, REQUEST_MS) }
       child.stdin.write(frame)

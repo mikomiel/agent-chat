@@ -283,3 +283,48 @@ test("a stop that races a lookup in flight joins nothing", async () => {
   await flush()
   assert.equal(parts.lifecycles.size, 0)
 })
+
+// Review 6003128773, finding 3: fork evidence is recorded before any lookup, join or refusal check.
+test("a session whose first event is a fork is never looked up and never joins, whatever its record shows", async () => {
+  const parts = stubParts()
+  const ctx = fakeCtx(root) // a lookup would show root-shaped metadata
+  const manager = createManager(ctx, config, parts)
+  manager.feed(event("session.forked", "ses_fork", { parentID: "ses_source" }))
+  manager.feed(event("session.execution.started", "ses_fork"))
+  await flush()
+  assert.deepEqual(ctx.lookups, [])
+  assert.equal(parts.lifecycles.size, 0)
+  assert.deepEqual(manager.sessions(), [])
+})
+
+test("a fork event that arrives during a temporary lookup refusal is kept for good", async () => {
+  let clock = 1_000
+  let answer = new Error("unavailable")
+  const parts = stubParts()
+  const ctx = fakeCtx(() => answer)
+  const manager = createManager(ctx, config, parts, { now: () => clock })
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(ctx.lookups, ["ses_a"]) // refused for 60 seconds
+  manager.feed(event("session.forked", "ses_a", { parentID: "ses_source" }))
+  clock += 61_000
+  answer = root("ses_a")
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(ctx.lookups, ["ses_a"]) // not looked up again
+  assert.equal(parts.lifecycles.size, 0)
+})
+
+test("a fork event stops a lookup that is still in flight before it can join", async () => {
+  let release
+  const parts = stubParts()
+  const ctx = { session: { get: () => new Promise(resolve => { release = resolve }) } }
+  const manager = createManager(ctx, config, parts)
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  manager.feed(event("session.forked", "ses_a", { parentID: "ses_source" }))
+  release(root("ses_a"))
+  await flush()
+  assert.equal(parts.lifecycles.size, 0)
+  assert.deepEqual(manager.sessions(), [])
+})

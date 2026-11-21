@@ -93,10 +93,16 @@ export function createLifecycle(bus, delivery, config, {
     clearIntervalImpl(pollTimer)
     heartbeatTimer = null
     pollTimer = null
-    // A stale binding must not block an end; a removal that fails leaves an entry the next publish replaces.
-    try { void Promise.resolve(delivery.context?.(null)).catch(() => {}) } catch { /* nothing to recover */ }
-    if (!record?.worker) return Promise.resolve(null)
-    try { return record.worker.stop() } catch (error) { return Promise.reject(error) }
+    // The removal is part of the end the caller waits for: the next owner of this session publishes under the same
+    // key, and a removal still in flight could delete that binding. A removal that fails does not block the end: the
+    // next publish replaces a stale entry.
+    let removal
+    try { removal = Promise.resolve(delivery.context?.(null)).catch(() => {}) } catch { removal = Promise.resolve() }
+    if (!record?.worker) return removal.then(() => null)
+    let ended
+    try { ended = Promise.resolve(record.worker.stop()) } catch (error) { ended = Promise.reject(error) }
+    // The worker's `{code, signal}` stays the result, since the exit proof reads it.
+    return Promise.allSettled([ended, removal]).then(([result]) => result.status === "fulfilled" ? result.value : Promise.reject(result.reason))
   }
 
   function disconnect() {

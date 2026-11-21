@@ -11,6 +11,9 @@
 // deadline, a throwing call and a lost event stream are all `uncertain`: the input may be parked and drain later, and
 // a later `delivered` for it is ignored. Only `session.inbox.cancelled` for the id proves that nothing ran.
 //
+// A compaction may drop the binding entry. From `session.compaction.ended` the gate stays closed until the entry has
+// been read back (`verifyContext`); a read-back that fails keeps it closed, and the manager then turns chat off.
+//
 // State is read from events only. A fact the events have not shown is unknown, and unknown never reads as idle.
 import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES } from "./channel.js"
 
@@ -32,18 +35,23 @@ export function createDelivery(ctx, sessionID, {
   let stopped = true // every session starts chat-stopped; an operator prompt clears it
   let executing = null // true, false, or null when no event has shown it
   let compacting = false
+  let unverified = false // a compaction ended and the binding entry has not been read back since
+  let compactions = 0 // compaction endings so far: a read-back that began before the latest one proves nothing
   let agent = null
-  let pending = null // at most one issued input: { id, resolve, timer }
+  let pending = null // at most one issued input: { id, resolve, timer, deadline }
   let published = null // the binding text the entry should hold now
   let contextQueue = Promise.resolve()
   const seen = new Map() // inbox id -> "delivered" | "cancelled", newest last, bounded
   const attempts = new Map()
 
+  // A receipt that arrives at or after the absolute deadline is late whatever it says: the caller's reservation is
+  // over, so it settles uncertain. A delayed timer callback must not turn a late receipt into a definite answer.
   function finish(record, outcome, reason = null) {
     if (pending !== record) return
     pending = null
     clearTimeoutImpl(record.timer)
-    record.resolve({ outcome, reason })
+    if (outcome !== "uncertain" && now() >= record.deadline) record.resolve({ outcome: "uncertain", reason: "transport_ambiguous" })
+    else record.resolve({ outcome, reason })
   }
 
   // The input may exist and cannot be taken back: never a retryable answer.
@@ -68,7 +76,7 @@ export function createDelivery(ctx, sessionID, {
     if (agent === null) return "unknown"
     if (agent === PLAN_AGENT) return "plan"
     if (executing !== true) return "unknown"
-    if (compacting || pending) return "busy"
+    if (compacting || unverified || pending) return "busy"
     return null
   }
 
@@ -105,6 +113,10 @@ export function createDelivery(ctx, sessionID, {
         compacting = true
         return true
       case "session.compaction.ended":
+        compacting = false
+        unverified = true
+        compactions += 1
+        return true
       case "session.compaction.failed":
         compacting = false
         return true
@@ -132,10 +144,14 @@ export function createDelivery(ctx, sessionID, {
     if (typeof info?.agent === "string" && info.agent) agent = info.agent
   }
 
-  // The event stream broke or restarted: events may be missing, so every observation is stale.
+  // The event stream broke or restarted: events may be missing, so every observation is stale. The selected agent
+  // and the stop latch are observations too: a missed agent switch or operator interrupt must not stay hidden, so
+  // both go back to their start values and only fresh events clear them.
   function reset() {
     executing = null
     compacting = false
+    agent = null
+    stopped = true
     abandon()
   }
 
@@ -157,7 +173,7 @@ export function createDelivery(ctx, sessionID, {
 
     return new Promise(resolve => {
       // Armed before the call: the events for the input can reach this object before the call returns.
-      const record = { id: null, resolve, timer: null }
+      const record = { id: null, resolve, timer: null, deadline }
       pending = record
       record.timer = setTimeoutImpl(() => finish(record, "uncertain", "transport_ambiguous"), Math.max(0, deadline - now()))
       let call
@@ -222,12 +238,16 @@ export function createDelivery(ctx, sessionID, {
     })
   }
 
-  // After a compaction: put the entry back when it is gone or changed. Resolves quietly when nothing is published.
+  // After a compaction: put the entry back when it is gone or changed, then reopen the gate. Only the latest
+  // compaction's read-back reopens it. A rejection leaves the gate closed. Resolves quietly when nothing is published.
   function verifyContext() {
-    if (closed || published === null) return Promise.resolve()
+    const mark = compactions
+    const proved = () => { if (compactions === mark) unverified = false }
+    if (closed || published === null) { proved(); return Promise.resolve() }
     const text = published
     return queued(async () => {
       try { if (!await holds(text)) await publish(text) } catch { throw contextFailure() }
+      proved()
     })
   }
 

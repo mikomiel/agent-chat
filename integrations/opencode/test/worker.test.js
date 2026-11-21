@@ -1,4 +1,4 @@
-import test from "node:test"
+import test, { mock } from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
@@ -94,4 +94,16 @@ test("a relative directory or an unexpected harness is refused before spawn", ()
   assert.throws(() => startWorker({ ...config, directory: "state" }, identity, { spawnImpl }), { code: "CHAT_CONFIGURATION_INVALID" })
   assert.throws(() => startWorker(config, { ...identity, harness: "pi" }, { spawnImpl }), { code: "CHAT_CONFIGURATION_INVALID" })
   assert.equal(spawns, 0)
+})
+
+test("a request that outlives the parent-side deadline rejects with the core's REQUEST_UNCERTAIN", async t => {
+  mock.timers.enable({ apis: ["setTimeout"] })
+  t.after(() => mock.timers.reset())
+  const { child } = harness()
+  const worker = startWorker(config, identity, { spawnImpl: () => child })
+  child.stdout.write(`${JSON.stringify({ id: 0, result: { session_id: "s", instance_id: "i", room_id: "r", host: "h", harness: "opencode", instance_file: "/tmp/s.json" } })}\n`)
+  await worker.ready
+  const heartbeat = worker.request("heartbeat", { state: { native_state: "idle", stopped: false, plan_mode: false } })
+  mock.timers.tick(22_000)
+  await assert.rejects(heartbeat, { code: "REQUEST_UNCERTAIN", operation: "heartbeat" })
 })

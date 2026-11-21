@@ -123,19 +123,26 @@ The service and its host-token provisioning are documented in the product
   reads its own event stream and forwards events to the owner, and the
   registry drops an event id it has already seen. When the owner's instance
   is torn down, the next one takes over only after the old owner's workers
-  have ended. A session then rejoins at its next event.
+  and the removal of its binding entries have ended. A session then rejoins at
+  its next event. An instance that leaves without owning is a gap for the
+  owner too: its stream may have carried events no other stream did, so the
+  owner treats it as a lost event stream.
 - **One lifecycle per root session, one fault boundary each.** A session
   joins at the first event the owner sees for it. `session.get` must show no
   `parentID` and no `fork`. A subagent runs only in a child session, so it
   never joins. A fork is refused as well: whether a fork sets `parentID` is not
-  confirmed, so a session that might be a fork stays out. Events of one session
+  confirmed, so a session that might be a fork stays out. A `session.forked`
+  event is recorded before any lookup or join, and it is kept while lookups
+  are refused; a lookup already in flight cannot join afterwards. Events of one session
   run in order on that session's own chain. A fault there ends that session's
   chat and no other. A faulted or deleted session does not rejoin in this
   process.
 - **State comes from durable events only.** `session.execution.started`
   means busy. `succeeded`, `failed` and `interrupted` mean idle. A fact no
   event has shown is `unknown`, and `unknown` never reads as idle. A lost or
-  restarted event stream resets every session to `unknown`.
+  restarted event stream resets every session: the run state and the selected
+  agent become unknown and the stop latch is set again. Only fresh events clear
+  them.
 - **Stop and Plan Mode.** Every session starts chat-stopped. A `user` inbox
   item clears the stop. An interrupt with reason `user` sets it again. Other
   interrupt reasons do not. While the selected agent is `plan`, the session
@@ -148,7 +155,10 @@ The service and its host-token provisioning are documented in the product
   A put that fails or leaves no entry turns that session's chat off before
   anything is offered: no heartbeat, no pending read, no claim. There is no
   fallback to a prompt message. After a compaction the plugin checks the entry
-  again and puts it back, or turns chat off.
+  again and puts it back, or turns chat off. The session reads `busy` from
+  `session.compaction.ended` until that check has succeeded, so no claim and no
+  send runs in between. A compaction that ends while an earlier check is still
+  running is covered by its own check.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input
@@ -164,7 +174,10 @@ The service and its host-token provisioning are documented in the product
 - **Hazard rule.** A run that ends (`succeeded`, `failed` or `interrupted`)
   before the delivered event settles `uncertain`. So do a call that throws or
   rejects, a missed reservation deadline, a lost event stream and a disabled or
-  disposed session. A later `delivered` event for a settled input is ignored,
+  disposed session. A receipt that arrives at or after the reservation
+  deadline is late, even when the timer has not run yet: a `delivered` or
+  `cancelled` event or a `synthetic` result then settles `uncertain` too. A
+  later `delivered` event for a settled input is ignored,
   so a parked input that drains into an unrelated prompt can never turn into
   a `handed` result.
 - **Refusal reasons.** Before the call, the plugin returns `deferred` with
@@ -175,7 +188,9 @@ The service and its host-token provisioning are documented in the product
 - **Rejoin.** A lapsed instance rejoins only for the codes the core names. The
   wait, jitter, episode length and hourly budget mirror `agent_chat/models.py`,
   and `test/policy.test.js` pins the copy. Each join uses a new boot id and
-  replaces the old binding.
+  replaces the old binding. A worker request with no answer after 22 seconds
+  ends that worker and rejoins as the core's own `REQUEST_UNCERTAIN` does. A
+  worker that dies or breaks the protocol still turns that session's chat off.
 - **No title.** Heartbeats carry no session title.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
@@ -234,9 +249,16 @@ unverified, inferred, or a deliberate choice.
 - **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
   after each put and each compaction. After a crash an entry can remain with a
-  stale binding. The next join replaces it.
+  stale binding. The next join replaces it. An owner change waits for the old
+  owner's `entry.remove`, and for any context operation queued before it, to
+  settle. A call that never returns blocks the failover and the cleanup.
 - **Forks.** Whether a fork sets `parentID` is unknown. A session with a `fork`
   field or a `parentID` never joins.
+- **Agent after a gap.** Whether the host emits `session.agent.selected` again
+  without an agent switch. If it does not, a session stays out of chat after a
+  lost event stream, or after an instance that did not own the joins is torn
+  down, until its agent next changes. A compaction that ends entirely inside
+  such a gap is not read back either.
 - **Plain JavaScript plugin.** See "Install".
 - **Node built-ins.** Whether the plugin runtime allows `node:child_process`.
 - **Connection key.** How the connection-key work in issues #126 to #128
@@ -247,7 +269,9 @@ unverified, inferred, or a deliberate choice.
 - **Plan Mode** is an agent-id test: the agent named `plan`. A custom agent
   with the same limits is not detected. A session whose `agent` field is absent
   reports stopped and is never claimed for until an `agent.selected` event
-  shows one.
+  shows one. The same holds after a lost event stream: the agent and the stop
+  latch are reset, so a session is claimed for again only after a fresh
+  `agent.selected` event and a `user` inbox item, even if neither changed.
 - **A user input is not an operator.** A `user` inbox item clears the stop
   latch whether an operator or an API client sent it.
 - **Persisted idle sessions** join at their first event after the server

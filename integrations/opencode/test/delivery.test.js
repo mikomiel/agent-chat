@@ -79,7 +79,7 @@ test("state: a new session is stopped, then unknown until an event shows the run
   assert.equal(delivery.state(), null)
 })
 
-test("state: the plan agent, an idle session, a compaction and a pending input block a claim", () => {
+test("state: the plan agent, an idle session, a compaction and a pending input block a claim", async () => {
   const { delivery } = running()
   delivery.observe(event("session.agent.selected", { agent: "plan" }))
   assert.equal(delivery.state(), "plan")
@@ -88,6 +88,8 @@ test("state: the plan agent, an idle session, a compaction and a pending input b
   delivery.observe(event("session.compaction.started", { reason: "auto" }))
   assert.equal(delivery.state(), "busy")
   delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  assert.equal(delivery.state(), "busy") // ended is not enough: the binding entry is read back first
+  await delivery.verifyContext() // nothing is published here, so there is nothing to put back
   assert.equal(delivery.state(), null)
   delivery.observe(event("session.execution.succeeded"))
   // Idle is a known state, but this release never wakes an idle session; it must not be claimed for.
@@ -285,13 +287,13 @@ test("bad input, a repeated attempt, a spent reservation and an oversized notice
   assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "uncertain", reason: "transport_ambiguous" }) // replay
 })
 
-test("a lost event stream makes a pending input uncertain and the state unknown", async () => {
+test("a lost event stream makes a pending input uncertain and the state stopped", async () => {
   const { delivery } = running()
   const result = delivery.deliver(batch(), 5_000)
   await flush()
   delivery.reset()
   assert.deepEqual(await result, { outcome: "uncertain", reason: "transport_ambiguous" })
-  assert.equal(delivery.state(), "unknown")
+  assert.equal(delivery.state(), "stopped")
   assert.equal(delivery.heartbeatState().native_state, "unknown")
 })
 
@@ -361,4 +363,131 @@ test("context: operations run in order, so a clear never overtakes a publish", a
   const clear = delivery.context(null)
   await Promise.all([publish, clear])
   assert.equal(ctx.entries.size, 0)
+})
+
+// Review 6003128773, finding 2: the gate stays closed from the compaction until the binding is read back.
+test("a compaction keeps claims and native sends blocked until the binding read-back succeeds", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  let releaseList
+  const list = ctx.session.instructions.entry.list
+  ctx.session.instructions.entry.list = async () => { await new Promise(resolve => { releaseList = resolve }); return list() }
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  assert.equal(delivery.state(), "busy") // ended is not proof that the entry survived
+  const verifying = delivery.verifyContext()
+  await flush()
+  assert.equal(delivery.state(), "busy")
+  assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "deferred", reason: "busy" })
+  assert.equal(ctx.calls.synthetic.length, 0)
+  releaseList()
+  await verifying
+  assert.equal(delivery.state(), null)
+})
+
+test("a compaction whose read-back fails never reopens the gate", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  ctx.entries.clear() // the compaction dropped the entry
+  ctx.session.instructions.entry.put = async () => { throw new Error("unavailable") }
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  await assert.rejects(delivery.verifyContext(), { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  assert.equal(delivery.state(), "busy")
+  assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "deferred", reason: "busy" })
+  assert.equal(ctx.calls.synthetic.length, 0)
+})
+
+test("a read-back that finishes after a second compaction ended does not reopen the gate", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  await delivery.context("binding")
+  const releases = []
+  const list = ctx.session.instructions.entry.list
+  ctx.session.instructions.entry.list = async () => { await new Promise(resolve => releases.push(resolve)); return list() }
+  delivery.observe(event("session.compaction.ended"))
+  const first = delivery.verifyContext()
+  await flush()
+  delivery.observe(event("session.compaction.started"))
+  delivery.observe(event("session.compaction.ended"))
+  const second = delivery.verifyContext()
+  await flush()
+  releases[0]()
+  await first
+  assert.equal(delivery.state(), "busy") // the second compaction has not been read back yet
+  await flush() // the queue is serial: the second read-back starts only now
+  releases[1]()
+  await second
+  assert.equal(delivery.state(), null)
+})
+
+// Finding 5: after a gap both the agent and the stop latch are only what the events last showed.
+test("a stream gap makes the selected agent unknown again, so Plan Mode needs fresh evidence", () => {
+  const { delivery } = running()
+  assert.equal(delivery.state(), null)
+  delivery.reset()
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  delivery.observe(event("session.execution.started"))
+  assert.equal(delivery.state(), "unknown") // the old `build` selection is not carried over
+  delivery.observe(event("session.agent.selected", { agent: "plan" }))
+  assert.equal(delivery.state(), "plan")
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  assert.equal(delivery.state(), null)
+})
+
+test("a stream gap latches stop again, so a missed operator interrupt cannot stay hidden", () => {
+  const { delivery } = running()
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" }))
+  delivery.observe(event("session.execution.started"))
+  assert.equal(delivery.state(), "stopped") // the cleared latch is not carried over
+  assert.equal(delivery.heartbeatState().stopped, true)
+  delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+  assert.equal(delivery.state(), null)
+})
+
+// Finding 6: the absolute deadline is checked when a receipt arrives, not only when the timer runs.
+test("a delivered event after the absolute deadline is uncertain even when the timer has not run", async () => {
+  let current = 1_000
+  const { clock, delivery } = running(fakeCtx(), { now: () => current })
+  const result = delivery.deliver(batch(), 4_000)
+  await flush()
+  current = 4_500 // past the deadline; the delayed timer callback has not run
+  assert.equal(clock.all[0].cleared, false)
+  delivery.observe(event("session.inbox.delivered", { inboxID: "msg_1" }))
+  assert.deepEqual(await result, { outcome: "uncertain", reason: "transport_ambiguous" })
+})
+
+test("a cancelled event after the absolute deadline is uncertain, not a definite refusal", async () => {
+  let current = 1_000
+  const { delivery } = running(fakeCtx(), { now: () => current })
+  const result = delivery.deliver(batch(), 4_000)
+  await flush()
+  current = 4_000 // the deadline itself is already late
+  delivery.observe(event("session.inbox.cancelled", { inboxID: "msg_1" }))
+  assert.deepEqual(await result, { outcome: "uncertain", reason: "transport_ambiguous" })
+})
+
+test("a synthetic result after the absolute deadline is uncertain although its delivered event was seen", async () => {
+  let current = 1_000
+  let release
+  const ctx = fakeCtx({ answer: () => new Promise(resolve => { release = resolve }) })
+  const { delivery } = running(ctx, { now: () => current })
+  const result = delivery.deliver(batch(), 4_000)
+  delivery.observe(event("session.inbox.delivered", { inboxID: "msg_early" })) // before the call returned
+  current = 4_200
+  release({ id: "msg_early" })
+  assert.deepEqual(await result, { outcome: "uncertain", reason: "transport_ambiguous" })
+})
+
+test("a receipt before the absolute deadline is still handed", async () => {
+  let current = 1_000
+  const { delivery } = running(fakeCtx(), { now: () => current })
+  const result = delivery.deliver(batch(), 4_000)
+  await flush()
+  current = 3_999
+  delivery.observe(event("session.inbox.delivered", { inboxID: "msg_1" }))
+  assert.deepEqual(await result, { outcome: "handed", reason: null })
 })
