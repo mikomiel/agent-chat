@@ -428,6 +428,36 @@ test("a fork event that arrives between two owners is kept for the next one", as
   assert.deepEqual(started, [])
 })
 
+// Review 6005761762, finding 2: a created event that names a parent is fork evidence too, recorded from any event.
+const childCreatedEvent = (id, sessionID) => ({ id, type: "session.created", data: { sessionID, parentID: "ses_parent" } })
+
+test("a created event that names a parent, which one owner observed or that arrived between two owners, is kept for the next one", async () => {
+  const registry = createRegistry()
+  const lookupsNext = []
+  const started = []
+  const first = realMember([])
+  let openGate
+  const gate = new Promise(resolve => { openGate = resolve })
+  const deactivate = first.deactivate
+  first.deactivate = async () => { await gate; return deactivate() } // the old owner is still ending
+  const detachFirst = registry.attach(first)
+  registry.attach(realMember(lookupsNext, started))
+  await flush()
+  registry.dispatch(childCreatedEvent("e1", "ses_seen")) // the owner sees it
+  const detaching = detachFirst()
+  await flush()
+  assert.equal(registry.owner(), null)
+  registry.dispatch(childCreatedEvent("e2", "ses_between")) // no owner to take it
+  openGate()
+  await detaching
+  await flush()
+  registry.dispatch(startedEvent("e3", "ses_seen"))
+  registry.dispatch(startedEvent("e4", "ses_between"))
+  await flush()
+  assert.deepEqual(lookupsNext, [])
+  assert.deepEqual(started, [])
+})
+
 // Review 6003513413, finding 2: deletion tombstones are carried across a promotion, as fork evidence is.
 const deletedEvent = (id, sessionID) => ({ id, type: "session.deleted", data: { sessionID } })
 

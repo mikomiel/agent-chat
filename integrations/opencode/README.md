@@ -149,10 +149,13 @@ The service and its host-token provisioning are documented in the product
   the first lookup starts nothing. A subagent runs only in a child session, so
   it never joins. A fork is refused as well: whether a fork sets `parentID` is not
   confirmed, so a session that might be a fork stays out. A `session.forked`
-  event is recorded before any lookup or join, and it is kept while lookups
-  are refused; a lookup already in flight cannot join afterwards, whether it
-  answers or fails. The record is its own set. No cache evicts it, and the
-  next owner receives it, including an event that arrived between two owners.
+  event, and a `session.created` event that names a parent, are recorded before
+  any lookup or join, whenever they arrive, and they are kept while lookups
+  are refused. A lookup already in flight cannot join afterwards, whether it
+  answers or fails, and a session that has already joined ends its chat. The
+  record is its own set. No cache evicts it, it holds a session until that
+  session is deleted, and the next owner receives it, including an event that
+  arrived between two owners.
   A `session.deleted` event is fenced when it is received and not behind the
   lookup: the record ends at once, so a lookup that answers after the deletion
   starts no worker and sends no join. Events still queued for that session are
@@ -254,11 +257,17 @@ The service and its host-token provisioning are documented in the product
   worker that dies or breaks the protocol still turns that session's chat off.
   That holds from the moment the worker is ready, so a worker that exits while
   its binding waits behind a slow removal withdraws that binding, and the
-  queued publish makes no put. A heartbeat that the worker answers with
-  `refused` is a brief outage, not a failure. The worker and the binding stay,
-  no rejoin budget is spent and the next heartbeat is the retry. The worker
-  ends itself with an error once an outage lasts as long as the server lease,
-  and that error rejoins as above.
+  queued publish makes no put. Before a retry starts a replacement worker, it
+  asks the host once for the session's entry list, with the same 10-second
+  limit, because the session can be deleted during the backoff with no event
+  seen. The session's own `Session.NotFoundError` ends the chat through the
+  deletion path above and starts no worker. A timeout, any other error and a
+  session that is found leave the retry as it was. The first join asks nothing,
+  because the eligibility lookup came first. A heartbeat that the worker
+  answers with `refused` is a brief outage, not a failure. The worker and the
+  binding stay, no rejoin budget is spent and the next heartbeat is the retry.
+  The worker ends itself with an error once an outage lasts as long as the
+  server lease, and that error rejoins as above.
 - **No title.** Heartbeats carry no session title.
 
 ## Known limits
@@ -331,7 +340,8 @@ unverified, inferred, or a deliberate choice.
   each heartbeat tick, and when the entry is gone also a put and a confirming
   list. The repair completes at the first ask after the host answers.
 - **Forks.** Whether a fork sets `parentID` is unknown. A session with a `fork`
-  field or a `parentID` never joins.
+  field or a `parentID` never joins, and a `session.created` event that names a
+  parent ends the chat of a session that had joined.
 - **Plain JavaScript plugin.** See "Install".
 - **Node built-ins.** Whether the plugin runtime allows `node:child_process`.
 - **Connection key.** How the connection-key work in issues #126 to #128
@@ -423,8 +433,9 @@ node --test
 
 The suites use doubles of the plugin context and of the worker. They cover the
 config refusals, the delegated-child refusal, root, child and fork eligibility,
-the fork and deletion records and their tombstones, the deletion check at the
-heartbeat tick, owner failover and handoff,
+the fork and deletion records and their tombstones, a child's `session.created`
+event, the deletion check at the heartbeat tick and before a rejoin, owner
+failover and handoff,
 per-session fault isolation, the binding publish, replace and fail-closed
 context, the repair after a compaction signal or a gap with its currency rule
 and call time limit, the read-back at each heartbeat tick, the

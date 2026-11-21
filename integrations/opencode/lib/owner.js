@@ -10,11 +10,12 @@
 // an idempotent read-back again. A fork or a deletion is final and is recorded once per session.
 // An event that arrives while there is no owner is lost: nobody saw it. A session that it would have joined joins at
 // its next event.
-// A fork or a deletion is recorded from any event, before the owner check. A deletion leaves a tombstone. Both sets are
-// handed to every owner, so a promotion forgets none. A tombstone is final: a `session.forked` event that arrives
-// after it adds no fork record, because the tombstone already refuses the id. A fork record is dropped when its session
-// is deleted, so `forks` holds live forks only. `deletions` holds one id for each deleted session, and nothing else
-// grows with the number of sessions the process sees.
+// A fork, a child's `session.created` or a deletion is recorded from any event, before the owner check. A deletion
+// leaves a tombstone. Both sets are handed to every owner, so a promotion forgets none. A tombstone is final: a
+// `session.forked` or child `session.created` event that arrives after it adds no fork record, because the tombstone
+// already refuses the id. A fork record is dropped when its session is deleted, so `forks` holds the forks and child
+// sessions that are not deleted yet. `deletions` holds one id for each deleted session. These two sets are the only
+// state that grows with the sessions the process sees.
 //
 // FAILOVER. When the owner's instance is torn down, the registry waits until that owner's workers have ended and
 // only then promotes the next member. A session rejoins at its next event. Registry changes run one at a time.
@@ -22,7 +23,7 @@
 //
 // The registry holds members and their callbacks. The config, and with it the host token, lives only in the
 // closures a member was built from; no property of the registry or of a member carries it.
-import { EVENT_TYPES, createManager, deletedSessionOf, forkedSessionOf, sessionOf } from "./manager.js"
+import { EVENT_TYPES, createManager, deletedSessionOf, notRootSessionOf, sessionOf } from "./manager.js"
 
 const REGISTRY_KEY = Symbol.for("agent-chat.opencode.registry.v1")
 const RECONNECT_MIN_MS = 1_000
@@ -44,8 +45,8 @@ export function createRegistry() {
 
   function dispatch(event) {
     // Recorded before the owner check: a fork or deletion event between two owners is kept for the next one.
-    const forked = forkedSessionOf(event)
-    if (forked !== null && !deletions.has(forked)) forks.add(forked)
+    const notRoot = notRootSessionOf(event)
+    if (notRoot !== null && !deletions.has(notRoot)) forks.add(notRoot)
     const gone = deletedSessionOf(event)
     if (gone !== null) { deletions.add(gone); forks.delete(gone) }
     if (!owner || sessionOf(event) === null) return

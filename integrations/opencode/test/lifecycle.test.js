@@ -283,6 +283,82 @@ test("a retry that executes after the episode expires fails closed", async () =>
   assert.equal(native.calls.disable, 1)
 })
 
+// Review 6005761762, finding 1: a session can be deleted while a rejoin waits, with no event seen. A retry asks the native
+// half once, bounded, before it starts a replacement worker. The first join does not ask: the manager's lookup came first.
+function retryRig({ probe }) {
+  const bus = fakeBus()
+  const native = { ...fakeNative(), probe: () => probe(rig) }
+  const rig = { bus, native, starts: 0, retry: null, notices: [] }
+  const failure = Object.assign(new Error("TRANSPORT_UNAVAILABLE"), { code: "TRANSPORT_UNAVAILABLE", operation: "join" })
+  rig.lifecycle = createLifecycle(bus, native, config, {
+    ...timers,
+    startProcess: () => { rig.starts += 1; return rig.starts === 1 ? fakeWorker({ ready: Promise.reject(failure) }) : fakeWorker() },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: fn => { rig.retry = fn; return 1 },
+    notice: text => rig.notices.push(text),
+  })
+  return rig
+}
+
+test("a retry waits for one probe before it starts a replacement worker, and the first join makes none", async () => {
+  let probes = 0
+  let release = null
+  const rig = retryRig({ probe: () => { probes += 1; return new Promise(resolve => { release = resolve }) } })
+  rig.bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  assert.equal(rig.starts, 1)
+  assert.equal(probes, 0) // the first join asks nothing
+  rig.retry()
+  await flush()
+  assert.equal(probes, 1)
+  assert.equal(rig.starts, 1) // still waiting for the answer
+  release()
+  await flush()
+  assert.equal(rig.starts, 2) // the answer says nothing against it: the retry goes on
+  assert.equal(probes, 1)
+})
+
+for (const [how, end] of [
+  ["stopped", rig => rig.lifecycle.stop()],
+  ["shut down", rig => rig.bus.fire("session_shutdown")],
+  ["disabled", rig => rig.lifecycle.disable("deleted")],
+]) {
+  test(`a retry whose probe found the lifecycle ${how} starts no replacement worker`, async () => {
+    const rig = retryRig({ probe: async current => { end(current) } }) // what the owner does when the host says it is gone
+    rig.bus.fire("session_start", { nativeSessionId: "native-1" })
+    await flush()
+    rig.retry()
+    await flush()
+    assert.equal(rig.starts, 1)
+  })
+}
+
+test("a probe that rejects leaves the retry as it was", async () => {
+  const rig = retryRig({ probe: () => Promise.reject(new Error("unavailable")) })
+  rig.bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  rig.retry()
+  await flush()
+  assert.equal(rig.starts, 2)
+})
+
+test("a native half with no probe keeps the retry as it was", async () => {
+  const bus = fakeBus()
+  let retry = null
+  let starts = 0
+  const failure = Object.assign(new Error("TRANSPORT_UNAVAILABLE"), { code: "TRANSPORT_UNAVAILABLE", operation: "join" })
+  createLifecycle(bus, fakeNative(), config, {
+    ...timers,
+    startProcess: () => { starts += 1; return starts === 1 ? fakeWorker({ ready: Promise.reject(failure) }) : fakeWorker() },
+    now: () => 1000, random: () => 0, setTimeoutImpl: fn => { retry = fn; return 1 },
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  retry()
+  assert.equal(starts, 2) // started in the same turn: nothing was awaited
+})
+
 test("a wall-clock step does not end a rejoin episode: the default clock is monotonic", async t => {
   const realNow = Date.now
   t.after(() => { Date.now = realNow })

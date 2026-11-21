@@ -139,6 +139,59 @@ test("a created event that names a parent is refused without a lookup", async ()
   assert.equal(parts.lifecycles.size, 0)
 })
 
+// Review 6005761762, finding 2: a created event that names a parent is fenced when it is received, whenever it arrives.
+test("a created event that names a parent, received while the lookup is pending, stops it before a worker starts", async () => {
+  let release
+  const lookups = []
+  const forked = new Set()
+  const parts = stubParts()
+  const ctx = { session: { get: ({ sessionID }) => { lookups.push(sessionID); return new Promise(resolve => { release = resolve }) } } }
+  const manager = createManager(ctx, config, parts, { forked })
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  manager.feed(event("session.created", "ses_a", { parentID: "ses_parent" })) // received while `session.get` is pending
+  release(root("ses_a")) // the lookup then answers root-shaped
+  await flush()
+  assert.equal(parts.lifecycles.size, 0) // no worker starts and no join is sent
+  assert.equal(parts.contexts.size, 0)
+  assert.deepEqual(manager.sessions(), [])
+  assert.equal(forked.has("ses_a"), true) // fork evidence, kept for good and shared with the next owner
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(lookups, ["ses_a"]) // never looked up again
+})
+
+test("a created event that names a parent, received after the join, ends that session's chat for good", async () => {
+  const forked = new Set()
+  const parts = stubParts()
+  const ctx = fakeCtx(root)
+  const manager = createManager(ctx, config, parts, { forked })
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(manager.sessions(), ["ses_a"])
+  manager.feed(event("session.created", "ses_a", { parentID: null })) // no parent: nothing changes
+  await flush()
+  assert.deepEqual(manager.sessions(), ["ses_a"])
+  manager.feed(event("session.created", "ses_a", { parentID: "ses_parent" }))
+  await flush()
+  assert.deepEqual(manager.sessions(), [])
+  assert.equal(parts.lifecycles.get("ses_a").stops, 1) // its worker and binding are ended
+  assert.equal(parts.contexts.get("ses_a").disposed, 1)
+  assert.equal(forked.has("ses_a"), true)
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.deepEqual(ctx.lookups, ["ses_a"]) // it does not rejoin
+  assert.equal(parts.lifecycles.size, 1)
+})
+
+test("a created event that names a parent after the deletion adds no fork record", async () => {
+  const forked = new Set()
+  const manager = createManager(fakeCtx(root), config, stubParts(), { forked })
+  manager.feed(event("session.deleted", "ses_a"))
+  manager.feed(event("session.created", "ses_a", { parentID: "ses_parent" })) // late: the tombstone already refuses the id
+  assert.equal(forked.has("ses_a"), false)
+})
+
 test("a fork never joins, and a fork event ends a session that was taken for a root", async () => {
   const forkParts = stubParts()
   const forkCtx = fakeCtx(id => ({ id, fork: { sessionID: "ses_source", boundary: {} } }))
@@ -625,6 +678,128 @@ test("a heartbeat tick that finds its session gone ends that session's chat, and
   await flush()
   assert.equal(lookups.length, asked)
   assert.equal(workers.get("ses_gone").stopped, true)
+})
+
+// Review 6005761762, finding 1: a deletion during a rejoin backoff, with no event seen. The retry asks the host once,
+// bounded, before it starts a replacement worker. The session's own not-found takes the deletion path and starts no worker.
+// One joined session on the real context and lifecycle, with the heartbeat tick and the retry timer in the test's hands.
+async function backoffRig() {
+  const entries = new Map()
+  const deleted = new Set()
+  const callTimers = []
+  const workers = []
+  const rig = { entries, deleted, workers, gone: false, next: null, retry: null, tick: null }
+  const missing = Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID: "ses_a" })
+  const stale = Object.assign(new Error("STALE_INSTANCE"), { code: "STALE_INSTANCE" })
+  const gone = () => (rig.gone ? Promise.reject(missing) : null)
+  const ctx = {
+    session: {
+      get: async ({ sessionID }) => root(sessionID),
+      instructions: {
+        entry: {
+          put: ({ key, value }) => gone() ?? Promise.resolve(entries.set(key, value)),
+          remove: ({ key }) => gone() ?? Promise.resolve(entries.delete(key)),
+          list() { // `next` is the answer to the next list only: the probe's
+            const answer = rig.next
+            rig.next = null
+            if (rig.gone) return Promise.reject(missing)
+            if (answer === "error") return Promise.reject(new Error("unavailable"))
+            if (answer === "silent") return new Promise(() => {})
+            return Promise.resolve([...entries].map(([key, value]) => ({ key, value })))
+          },
+        },
+      },
+    },
+  }
+  const parts = stubParts()
+  parts.createContext = (hostCtx, id, options) => createContext(hostCtx, id, {
+    ...options,
+    setTimeoutImpl: (fn, ms) => { const timer = { fn, ms, cleared: false }; callTimers.push(timer); return timer },
+    clearTimeoutImpl: timer => { if (timer) timer.cleared = true },
+  })
+  parts.createLifecycle = (bus, context, passedConfig, options) => createLifecycle(bus, context, passedConfig, {
+    ...options,
+    now: () => 1_000,
+    random: () => 0,
+    setTimeoutImpl: fn => { rig.retry = fn; return 1 },
+    clearTimeoutImpl: () => {},
+    setIntervalImpl: fn => { rig.tick = fn; return 1 },
+    clearIntervalImpl: () => {},
+  })
+  parts.startProcess = (_config, { nativeSessionId }) => {
+    let close
+    const closed = new Promise(resolve => { close = resolve })
+    const worker = {
+      stopped: false,
+      ready: Promise.resolve({
+        session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+        room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "opencode",
+        instance_file: `/tmp/agent-chat-state/${nativeSessionId}-${workers.length}.json`,
+      }),
+      closed,
+      // The first instance's heartbeat is refused as stale, which starts a backoff. A later one answers.
+      request: op => (op === "heartbeat" && workers.length === 1 && rig.stale ? Promise.reject(stale) : Promise.resolve({})),
+      stop: () => { worker.stopped = true; close({ code: 0, signal: null }); return closed },
+    }
+    workers.push(worker)
+    return worker
+  }
+  rig.manager = createManager(ctx, config, parts, { deleted })
+  rig.armed = () => callTimers.filter(timer => !timer.cleared && timer.ms === CALL_TIMEOUT_MS)
+  rig.manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.equal(workers.length, 1) // joined
+  rig.stale = true
+  rig.tick() // the heartbeat is refused as stale: the worker ends and a retry is scheduled
+  await flush()
+  assert.equal(workers[0].stopped, true)
+  assert.equal(typeof rig.retry, "function") // in backoff, with no worker
+  return rig
+}
+
+test("a session deleted during a rejoin backoff, with no event seen, starts no replacement worker and is tombstoned", async () => {
+  const rig = await backoffRig()
+  rig.gone = true // deleted during the wait: no event
+  rig.retry()
+  await flush()
+  assert.equal(rig.workers.length, 1) // no replacement
+  assert.deepEqual([...rig.deleted], ["ses_a"]) // through the deletion path
+  assert.deepEqual(rig.manager.sessions(), [])
+  rig.manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.equal(rig.workers.length, 1) // and it does not rejoin
+})
+
+test("a retry whose probe fails with another error goes on and starts the replacement", async () => {
+  const rig = await backoffRig()
+  rig.next = "error"
+  rig.retry()
+  await flush()
+  assert.equal(rig.workers.length, 2)
+  assert.deepEqual([...rig.deleted], [])
+  assert.deepEqual(rig.manager.sessions(), ["ses_a"])
+})
+
+test("a retry whose probe runs out of time goes on after the limit and starts the replacement", async () => {
+  const rig = await backoffRig()
+  rig.next = "silent"
+  rig.retry()
+  await flush()
+  assert.equal(rig.workers.length, 1) // waiting for the bounded probe
+  assert.equal(rig.armed().length, 1)
+  rig.armed()[0].fn() // the time limit passes
+  await flush()
+  assert.equal(rig.workers.length, 2)
+  assert.deepEqual([...rig.deleted], [])
+  assert.deepEqual(rig.manager.sessions(), ["ses_a"])
+})
+
+test("a retry whose session still exists starts the replacement", async () => {
+  const rig = await backoffRig()
+  rig.retry()
+  await flush()
+  assert.equal(rig.workers.length, 2)
+  assert.deepEqual([...rig.deleted], [])
 })
 
 // Review 6003407206, finding 2: a deletion is fenced when it is received, not queued behind the lookup.

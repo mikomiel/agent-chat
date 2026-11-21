@@ -20,7 +20,8 @@
 //
 // A SESSION THAT IS GONE IS REPORTED, NOT REPAIRED. Every instruction-entry call first reads the session, so the tick's
 // read-back of a deleted session fails with `Session.NotFoundError`. A call that answers in time with it tells
-// `onMissing`, and the owner ends the session's chat. The call itself stays a failed call, as any other.
+// `onMissing`, and the owner ends the session's chat. The call itself stays a failed call, as any other. A rejoin after
+// a backoff asks once more before it starts a worker (`probe()`), since a deletion can happen during the wait.
 //
 // ONE CURRENCY RULE. A read-back is for one obligation and one binding. It proves the binding only while chat is open
 // and on, no newer gap or compaction signal has been applied, and no `context()` call has withdrawn or replaced the
@@ -226,6 +227,14 @@ export function createContext(ctx, sessionID, {
     return repair()
   }
 
+  // One bounded read of the entry list, off the serial queue: a read changes nothing, and a caller that waits for it must
+  // not wait behind a slow removal. A session the host no longer has is reported to `onMissing`, as at every call. It
+  // never rejects: any other answer, an error and a timeout say nothing, and its caller goes on.
+  function probe() {
+    if (closed || disabled) return Promise.resolve()
+    return call("list", { sessionID }).then(() => {}, () => {})
+  }
+
   function disable() {
     // Chat-only and per session: the session and the other sessions are untouched.
     disabled = true
@@ -236,5 +245,5 @@ export function createContext(ctx, sessionID, {
     closed = true
   }
 
-  return { context, observe, reset, repair, refresh, owed, disable, dispose }
+  return { context, observe, reset, repair, refresh, probe, owed, disable, dispose }
 }

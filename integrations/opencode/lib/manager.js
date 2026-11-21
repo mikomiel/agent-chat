@@ -14,9 +14,10 @@
 // entry back at every heartbeat tick as well. A read-back that fails or is overtaken leaves the obligation owed. It
 // turns chat off only when the host says the session is gone (below).
 //
-// FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
-// never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
-// answers later cannot undo it.
+// FORKS AND CHILDREN ARE PERMANENT. A `session.forked` event, and a `session.created` event that names a parent, are
+// evidence that outlives every cache: it is kept in its own set, never evicted, dropped only when the session is
+// deleted, and shared with the next owner. It is fenced when it is received, whenever it arrives: a lookup still pending
+// finds its record dead, and a session already joined ends its chat. A lookup that fails or answers later cannot undo it.
 //
 // A DELETION IS FENCED WHEN IT IS RECEIVED, as a fork is: it is not queued behind a lookup that is still running. The
 // record is ended at once, so a lookup that answers afterwards finds its record dead and starts no worker and sends
@@ -63,8 +64,13 @@ export function isRootSession(info, sessionID) {
 // The id of the session an event belongs to, or null when it names none.
 export const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
 
-// The id of the session a `session.forked` event describes, or null for any other event.
-export const forkedSessionOf = event => (event?.type === "session.forked" ? sessionOf(event) : null)
+// The id of the session that an event shows is never a root, or null for any other event: a `session.forked` event, and
+// a `session.created` event that names a parent. The `parentID` test is the one `start()` used on a first event.
+export const notRootSessionOf = event => {
+  if (event?.type === "session.forked") return sessionOf(event)
+  if (event?.type !== "session.created") return null
+  return event.data?.parentID !== undefined && event.data?.parentID !== null ? sessionOf(event) : null
+}
 
 // The id of the session a `session.deleted` event describes, or null for any other event.
 export const deletedSessionOf = event => (event?.type === "session.deleted" ? sessionOf(event) : null)
@@ -133,14 +139,8 @@ export function createManager(ctx, config, parts, {
     })
   }
 
-  async function start(record, first) {
+  async function start(record) {
     if (!active || record.dead) return
-    if (first?.type === "session.created" && first.data?.parentID !== undefined && first.data?.parentID !== null) {
-      refuse(record.id, Infinity)
-      records.delete(record.id)
-      record.dead = true
-      return
-    }
     let info
     try { info = await lookup(record.id) }
     catch {
@@ -197,12 +197,12 @@ export function createManager(ctx, config, parts, {
       markDeleted(id)
       return
     }
-    if (event.type === "session.forked") {
-      // A fork event that arrives after the deletion is late: the tombstone already refuses the id, and a fork record
-      // for it would be one that no later event removes.
+    if (notRootSessionOf(event) !== null) {
+      // An event that arrives after the deletion is late: the tombstone already refuses the id, and a fork record for it
+      // would be one that no later event removes.
       if (deleted.has(id)) return
-      // This session is a fork: never a root. Recorded before any refusal check, lookup or join, so a fork is not
-      // dropped during a temporary lookup refusal, and a lookup still in flight finds its record dead.
+      // This session is a fork or a child: never a root. Recorded before any refusal check, lookup or join, so it is not
+      // dropped during a temporary lookup refusal, and a lookup still in flight, or a join already made, ends with it.
       forked.add(id)
       const known = records.get(id)
       if (known) void dispose(known)
@@ -213,8 +213,7 @@ export function createManager(ctx, config, parts, {
     if (!record) {
       record = { id, context: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
       records.set(id, record)
-      const first = event
-      record.chain = record.chain.then(() => start(record, first)).catch(error => isolate(record, error))
+      record.chain = record.chain.then(() => start(record)).catch(error => isolate(record, error))
     }
     const current = record
     current.chain = current.chain.then(() => handle(current, event)).catch(error => isolate(current, error))

@@ -7,6 +7,7 @@
 //   native.context(text)   publishes (replacing) or clears the binding text. It resolves only when the text is
 //                          confirmed; a rejection turns this session's chat off. There is no fallback to a prompt.
 //   native.refresh()       asked at each heartbeat tick: reads the binding entry back and puts it back when it is wrong.
+//   native.probe()         asked once before a retry starts a replacement worker: one bounded read that never rejects.
 //   native.disable()       latches the native half off.
 //
 // The plugin reads no session state, so every heartbeat reports the unknown state: never idle, never busy.
@@ -103,7 +104,7 @@ export function createLifecycle(bus, native, config, {
     try { delay = policy.next(code) }
     catch (exhausted) { return failClosed(exhausted) }
     notify(`Agent Chat reconnecting in ${Math.ceil(delay / 1000)}s (${code}).`)
-    rejoinTimer = setTimeoutImpl(() => { void connect() }, delay)
+    rejoinTimer = setTimeoutImpl(() => { void connect(true) }, delay)
   }
 
   function bindingText() {
@@ -165,8 +166,16 @@ export function createLifecycle(bus, native, config, {
     try { void Promise.resolve(native.refresh?.()).catch(() => {}) } catch { /* advisory */ }
   }
 
-  async function connect() {
+  // A retry asks the host once before it starts a replacement worker: the session can be deleted during the backoff with
+  // no event seen, and a join for it would register a session that is gone. The first join follows the manager's own
+  // lookup and does not ask. The answer ends this lifecycle through the owner when the session is gone, and an error, a
+  // timeout or any other answer changes nothing.
+  async function connect(retry = false) {
     if (closed || disabled || !nativeSessionId) return
+    if (retry && typeof native.probe === "function") {
+      try { await native.probe() } catch { /* advisory */ }
+      if (closed || disabled || !nativeSessionId) return
+    }
     try { policy.check() } catch (error) { return failClosed(error) }
     rejoinTimer = null
     let worker

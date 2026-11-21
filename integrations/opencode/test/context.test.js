@@ -1106,3 +1106,72 @@ test("a context given no onMissing treats a not-found as any failed call", async
   assert.equal(await context.refresh(), false)
   assert.equal(context.owed(), true)
 })
+
+// Review 6005761762, finding 1: a rejoin asks once, bounded, before it starts a replacement worker. `probe()` is that one
+// read of the entry list. It never rejects, and only the session's own not-found is reported to `onMissing`.
+test("probe: one list, and a session the host has says nothing", async () => {
+  const { ctx, told, context } = watched()
+  await context.context("binding")
+  const lists = ctx.calls.list
+  assert.equal(await context.probe(), undefined)
+  assert.equal(ctx.calls.list, lists + 1)
+  assert.deepEqual(told, [])
+})
+
+test("probe: the session's not-found is reported once, and the probe still resolves", async () => {
+  const { ctx, told, context } = watched()
+  ctx.session.instructions.entry.list = () => Promise.reject(notFound())
+  assert.equal(await context.probe(), undefined)
+  assert.deepEqual(told, ["missing"])
+})
+
+for (const [label, error] of Object.entries({
+  "another failure": new Error("unavailable"),
+  "another session's not-found": notFound("ses_other"),
+  "the HTTP mapping's tag": notFound(SESSION, "SessionNotFoundError"),
+})) {
+  test(`probe: ${label} is not reported, and the probe resolves`, async () => {
+    const { ctx, told, context } = watched()
+    ctx.session.instructions.entry.list = () => Promise.reject(error)
+    assert.equal(await context.probe(), undefined)
+    assert.deepEqual(told, [])
+  })
+}
+
+test("probe: a list that never answers resolves at the time limit, and a later not-found is not reported", async () => {
+  const { ctx, clock, told, context } = watched()
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  let done = false
+  const probed = context.probe().then(() => { done = true })
+  await flush()
+  assert.equal(done, false) // it waits for the answer, within the limit
+  assert.equal(armed(clock).length, 1)
+  armed(clock)[0].fn() // the time limit passes
+  await probed
+  held.settle.reject(notFound()) // the host answers after the limit
+  await flush()
+  assert.deepEqual(told, [])
+})
+
+test("probe: no host call once the context is closed or turned off", async () => {
+  for (const end of ["dispose", "disable"]) {
+    const { ctx, context } = watched()
+    context[end]()
+    await context.probe()
+    assert.equal(ctx.calls.list, 0, end)
+  }
+})
+
+test("probe: it does not wait behind a removal that is still pending", async () => {
+  const { ctx, context } = watched()
+  await context.context("binding")
+  const held = holdFirst(ctx.session.instructions.entry, "remove")
+  void context.context(null) // the old binding's removal stays pending
+  await flush()
+  assert.equal(held.entered, true)
+  let done = false
+  void context.probe().then(() => { done = true })
+  await flush()
+  assert.equal(done, true) // not queued behind it
+  held.settle.resolve()
+})
