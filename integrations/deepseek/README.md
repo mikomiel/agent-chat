@@ -9,9 +9,16 @@ the native state, the delivery fence and the bounded rejoin scheduler.
 
 ## Requirements
 
-- DeepSeek Harness `0.2.2-rc.1` and Node 24.9.0 or newer. The Cordis plugin
-  API is in developer preview. Re-verify the integration on each DSH upgrade.
-- A Python 3.11+ interpreter with the `agent-chat` package installed.
+- DeepSeek Harness `0.2.2-rc.1` (the verified release) and Node 24.9.0 or
+  newer. The eligibility path for `0.2.2-rc.2` to `0.2.2-rc.5` is implemented
+  from their published type declarations and is `NOT RUN`; see the
+  [compatibility matrix](../README.md#compatibility).
+  The Cordis plugin API is in developer preview. Re-verify the integration on
+  each DSH upgrade.
+- A Python 3.11+ interpreter with the same version of the core installed: the PyPI
+  distribution `sessionyard`, which provides the `agent_chat` import. Do not install
+  `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
+  field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token accepted by it.
 - The Web profile. The plugin waits for the `webServer` service, so a headless,
   SDK or ACP profile never runs it.
@@ -42,6 +49,17 @@ itself is not a profile gate. The Web-only behavior comes from
 server service exists the injected callback never runs, and the plugin
 registers nothing. This matters because a Home-level patch also reaches
 `dsh --profile headless`.
+
+### Install a pinned release
+
+Without a checkout, install the release that matches your core. The release
+asset is `agent-chat-deepseek-<version>.tgz`. Download, verify and extract it
+into an absolute directory with the checked block in
+[Install a pinned release](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release):
+it extracts only after the `SHA256SUMS` check passes. Then set the row's `name`
+to `<absolute-extracted-dir>/extensions/agent-chat.js`. Keep the extracted layout
+intact: the extension imports `../lib/config.js`. Install the core at the same
+version first.
 
 ## Configure
 
@@ -86,10 +104,20 @@ The service and its host-token provisioning are documented in the product
 
 ## Behaviour
 
-- **One lifecycle per root agent.** `agent/created` adopts an agent that
-  `ctx.agents.roots()` reports and that is not a subagent child (`origin ===
-  'subagent'`, or a `parentSession` the agent is owned by). A fork root has a
-  `parentSession` and is included. `agent/disposed` ends the lifecycle. A new
+- **One lifecycle per root agent.** `agent/created` adopts a live agent
+  (`ctx.agents.get(agent.id)` returns it) with a readable session header that
+  is not a subagent child. The plugin detects the registry surface and names it
+  in its `registered` log line. With `roots()` and `isOwnedBy()`
+  (`0.2.2-rc.1`, `eligibility=registry-roots`) the agent must be listed by
+  `roots()`, and a child is `origin === 'subagent'` or a `parentSession` the
+  agent is owned by. With neither (`0.2.2-rc.2` and later,
+  `eligibility=header-origin`) a child is `origin === 'subagent'`, the host's
+  own test. A registry without `get()`, or with only one of `roots()` and
+  `isOwnedBy()`, refuses every agent (`eligibility=unreadable`). A fork root
+  has a `parentSession` and is included. Every refusal has a fixed reason code
+  (`registry_unreadable`, `agent_not_live`, `header_unreadable`,
+  `subagent_child`, `not_registry_root`, `eligibility_fault`), logged once per
+  plugin instance; `subagent_child` logs at info, the others at warn. `agent/disposed` ends the lifecycle. A new
   agent object for the same native session waits for the previous worker's
   successful exit; an unproved end keeps that session's chat closed rather than
   joining twice.

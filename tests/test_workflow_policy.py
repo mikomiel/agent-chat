@@ -321,12 +321,12 @@ def test_release_please_updates_the_lockfile_project_version() -> None:
     check in ``checks`` fails the release pull request instead of merging it.
     """
     config = json.loads((ROOT / "release-please-config.json").read_text(encoding="utf-8"))
-    (entry,) = config["packages"]["."]["extra-files"]
-    assert entry == {
+    entries = config["packages"]["."]["extra-files"]
+    assert {
         "type": "toml",
         "path": "uv.lock",
         "jsonpath": "$.package[?(@.name.value=='sessionyard')].version",
-    }
+    } in entries
 
 
 def test_checks_asserts_the_lockfile_is_current() -> None:

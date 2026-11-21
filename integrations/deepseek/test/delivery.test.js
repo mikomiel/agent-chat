@@ -32,14 +32,15 @@ function fakeAgent({ status = "idle", removeResult = true, removeThrows = false,
   return { agent, steers, removed }
 }
 
+// `registry` is the DSH surface: `rc.1` is 0.2.2-rc.1 (roots() and isOwnedBy());
+// `rc.2+` is 0.2.2-rc.2 and later (get() and list() only).
 function fakeCtx(agent, { plan = { active: false, pending: false }, planUnreadable = false,
-  title, titleThrows = false, titleOwner = true } = {}) {
+  title, titleThrows = false, titleOwner = true, registry = "rc.1" } = {}) {
+  const get = id => (id === agent.id ? agent : undefined)
   return {
-    agents: {
-      get: id => (id === agent.id ? agent : undefined),
-      isOwnedBy: () => false,
-      roots: () => [agent],
-    },
+    agents: registry === "rc.1"
+      ? { get, isOwnedBy: () => false, roots: () => [agent] }
+      : { get, list: () => [agent] },
     logger: { warn() {} },
     get(name) {
       if (name === "sessionProjections") {
@@ -292,3 +293,20 @@ test("the optional title is normalized and omitted when unusable or absent", () 
   assert.equal(normalizeTitle("\u202e\u0000"), undefined)
   assert.equal(normalizeTitle(42), undefined)
 })
+
+for (const registry of ["rc.1", "rc.2+"]) {
+  test(`the delivery needs only get() from the registry (${registry} registry)`, async () => {
+    const { delivery, steers, ctx } = setup({}, { registry })
+    delivery.onInserted({ source: { kind: "user", rpcId: "rpc-1" } })
+    assert.equal(delivery.state(), null)
+    const result = delivery.deliver({ content: "notice", attemptId: ATTEMPT }, DEADLINE)
+    delivery.onClaimed({ id: steers[0].id })
+    assert.deepEqual(await result, { outcome: "handed", reason: null })
+    // Once the registry no longer returns this agent object, the delivery is stale.
+    ctx.agents.get = () => undefined
+    assert.equal(delivery.state(), "stale_binding")
+    const after = await delivery.deliver({ content: "notice", attemptId: ATTEMPT }, DEADLINE)
+    assert.deepEqual(after, { outcome: "deferred", reason: "stale_binding" })
+    assert.equal(steers.length, 1)
+  })
+}
