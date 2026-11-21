@@ -4,7 +4,7 @@ import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSyn
 import net from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { CLIENT_ID_PREFIX, createThread, isChildThread, MIN_ADD_MS, openAppServer, SETTLE_MS } from "../lib/appserver.js"
+import { CLIENT_ID_PREFIX, createThread, isChildThread, MIN_ADD_MS, monotonic, openAppServer, SETTLE_MS } from "../lib/appserver.js"
 import { fakeAppServer, serverFrame } from "./fake-app-server.js"
 
 const THREAD = "thread-1"
@@ -108,6 +108,37 @@ test("a masked, fragmented or binary server frame fails the connection", async (
       const pending = link.request("thread/loaded/list", {}, 2000)
       server.state.current.write(bad)
       await assert.rejects(pending, { code: "APP_SERVER_PROTOCOL" })
+    })
+  }
+})
+
+// No extension is negotiated, so a reserved bit (RSV1-3, the top bits of the first byte after FIN) is a protocol error:
+// the frame is never read, whatever it carries. A reply that is well formed otherwise settles the call when the bit is 0.
+test("a server frame with a reserved bit set fails the connection and is never dispatched", async () => {
+  const reply = bit => (message, connection) => {
+    const frame = serverFrame(0x1, JSON.stringify({ id: message.id, result: { data: [THREAD], nextCursor: null } }))
+    frame[0] |= bit
+    connection.socket.write(frame)
+    return undefined
+  }
+  await withServer(reply(0), async path => {
+    const link = await openAppServer(path)
+    assert.deepEqual((await link.request("thread/loaded/list", {}, 2000)).data, [THREAD], "control: the same reply without the bit settles the call")
+    link.close()
+  })
+  for (const bit of [0x40, 0x20, 0x10, 0x70]) {
+    await withServer(reply(bit), async path => {
+      const link = await openAppServer(path)
+      await assert.rejects(link.request("thread/loaded/list", {}, 2000), { code: "APP_SERVER_PROTOCOL" }, `0x${bit.toString(16)} on a text frame`)
+    })
+    await withServer(() => undefined, async (path, server) => {
+      const link = await openAppServer(path)
+      const pending = link.request("thread/loaded/list", {}, 2000)
+      const ping = serverFrame(0x9, "hi")
+      ping[0] |= bit
+      server.state.current.write(ping)
+      await assert.rejects(pending, { code: "APP_SERVER_PROTOCOL" }, `0x${bit.toString(16)} on a ping`)
+      assert.deepEqual(server.state.pongs, [], "the ping was not answered")
     })
   }
 })
@@ -610,6 +641,24 @@ test("deleted:true means it never dispatched: deferred, and no confirmation is a
   assert.equal(methods.includes("thread/items/list"), false)
 })
 
+// A fence reply that is read as `deleted: true` is the one thing that settles a wake `deferred`, so a frame that must not be read
+// can never be allowed to say it: with a reserved bit set the connection fails, and a failed fence is uncertain.
+test("a fence reply with a reserved bit set is not read: the wake is uncertain, never deferred", async () => {
+  const fenced = bit => (message, connection) => {
+    const frame = serverFrame(0x1, JSON.stringify({ id: message.id, result: { deleted: true } }))
+    frame[0] |= bit
+    connection.socket.write(frame)
+    return undefined
+  }
+  const control = await wakeWith({ "thread/queue/delete": fenced(0) })
+  assert.deepEqual(control.result, { outcome: "deferred", reason: "busy" }, "control: the same reply without the bit proves the removal")
+  for (const bit of [0x40, 0x20, 0x10]) {
+    const { result, methods } = await wakeWith({ "thread/queue/delete": fenced(bit) })
+    assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, `0x${bit.toString(16)}`)
+    assert.equal(methods.filter(method => method === "thread/queue/add").length, 1, "nothing is retried")
+  }
+})
+
 test("deleted:false with the userMessage in the items is handed", async () => {
   const { result } = await wakeWith({
     "thread/items/list": () => ok({ data: [
@@ -669,7 +718,7 @@ test("an add that gets no answer is uncertain, and is never sent twice", async (
 
 test("a failure before the add frame is written is failed, and under half a second left after the margin sends nothing", async () => {
   const absent = createThread({ path: join(dir, "absent.sock"), threadId: THREAD })
-  assert.deepEqual(await absent.wake({ text: "t", attemptId: "a", until: Date.now() + 5000 }), { outcome: "failed", reason: "native_unavailable" })
+  assert.deepEqual(await absent.wake({ text: "t", attemptId: "a", until: monotonic() + 5000 }), { outcome: "failed", reason: "native_unavailable" })
   assert.equal(MIN_ADD_MS, 500)
   const { result, methods } = await wakeWith({}, { reservation: SETTLE_MS + MIN_ADD_MS - 1 })
   assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
@@ -711,9 +760,9 @@ for (const slow of Object.keys(slowReplies)) {
       const bound = createThread({ path, threadId: THREAD })
       await bound.bind()
       gate.arm()
-      const until = Date.now() + SETTLE_MS + 600
+      const until = monotonic() + SETTLE_MS + 600
       const result = await bound.wake({ text: "t", attemptId: "attempt-9", until })
-      const left = until - Date.now()
+      const left = until - monotonic()
       assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
       assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
     })
@@ -722,9 +771,9 @@ for (const slow of Object.keys(slowReplies)) {
 
 test("a connection that never finishes ends the wake SETTLE_MS before the reservation too, with nothing sent", async () => {
   await withServer(() => undefined, async (path, server) => {
-    const until = Date.now() + SETTLE_MS + 600
+    const until = monotonic() + SETTLE_MS + 600
     const result = await createThread({ path, threadId: THREAD }).wake({ text: "t", attemptId: "attempt-9", until })
-    const left = until - Date.now()
+    const left = until - monotonic()
     assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
     assert.deepEqual(server.methods(), ["initialize"], "nothing past initialize was sent")
     assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
@@ -742,6 +791,25 @@ test("the wake connection is closed when it is done", async () => {
     for (let waited = 0; server.state.open && waited < 1000; waited += 10) await new Promise(resolve => setTimeout(resolve, 10))
     assert.equal(server.state.open, 0)
   })
+})
+
+// The default clock is the monotonic one, because a reservation is a duration: a wall clock that is stepped back (an NTP
+// correction, an operator) must not give a wake more time than it has. Here every read of the wall clock steps it back an hour.
+test("by default the wake runs on the monotonic clock: a wall clock that steps back is never read, and cannot revive an expired reservation", async t => {
+  let wallTime = 1_800_000_000_000
+  const wall = t.mock.method(Date, "now", () => (wallTime -= 3_600_000))
+  const gate = armed({ "thread/queue/delete": () => ok({ deleted: true }) })
+  await withServer(gate.handler, async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "a", until: monotonic() + 5000 }), { outcome: "deferred", reason: "busy" }, "a live reservation goes as far as the fence")
+    server.log.length = 0
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "b", until: monotonic() - 1 }), { outcome: "failed", reason: "native_unavailable" }, "an expired one sends nothing")
+    assert.equal(server.methods().includes("thread/queue/add"), false)
+  })
+  assert.equal(wall.mock.callCount(), 0, "no deadline of the thread was measured on the wall clock")
 })
 
 // ---- a wake acts on the newest reading of the thread ------------------------------------------------------------
@@ -781,7 +849,7 @@ test("a wake whose resume answer shows another provider than the bound one is re
     const bound = createThread({ path, threadId: THREAD })
     await bound.bind()
     server.log.length = 0
-    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 }), { outcome: "deferred", reason: "stale_binding" })
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 }), { outcome: "deferred", reason: "stale_binding" })
     assert.equal(server.methods().includes("thread/queue/add"), false)
   })
 })
@@ -811,10 +879,10 @@ test("the reading before an add is taken afresh by every wake: the thread that w
   }), async (path, server) => {
     const bound = createThread({ path, threadId: THREAD })
     await bound.bind()
-    assert.equal((await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 })).outcome, "handed")
+    assert.equal((await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 })).outcome, "handed")
     busy = true
     server.log.length = 0
-    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 }), { outcome: "deferred", reason: "busy" })
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 }), { outcome: "deferred", reason: "busy" })
     assert.equal(server.methods().includes("thread/queue/add"), false)
   })
 })
@@ -913,7 +981,7 @@ async function wakeOverSwapping(inodes, proceed) {
     let calls = 0
     const lstat = swapping(realpathSync(path), () => inodes(++calls))
     const bound = createThread({ path, threadId: THREAD, open: (target, options) => openAppServer(target, { ...options, lstat }) })
-    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000, proceed })
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000, proceed })
     return { result, methods: server.methods(), connections: server.state.connections }
   })
 }
@@ -988,7 +1056,7 @@ test("a link in the configured path that moves after the reading sends no add, t
     const wake = async moved => {
       let asked = 0
       const bound = createThread({ path: w.path, threadId: THREAD, open: afterClose(1, moved) })
-      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000, proceed: () => { asked += 1; return null } })
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000, proceed: () => { asked += 1; return null } })
       return { result, asked }
     }
     assert.deepEqual(await wake(() => {}), { result: { outcome: "handed", reason: null }, asked: 1 }, "control: with the link where it was, the same wake is handed")
@@ -1004,7 +1072,7 @@ test("the configured path must still pass the whole trust rule before the add: a
   const w = await throughLink()
   try {
     const bound = createThread({ path: w.path, threadId: THREAD, open: afterClose(1, () => chmodSync(join(w.base, "a", "app"), 0o777)) })
-    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 })
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 })
     assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
     assert.equal(addsTo(w.old), 0, "the socket is the same one, but its directory is no longer one that nobody else can change")
   } finally { await w.close() }
@@ -1021,7 +1089,7 @@ async function replaceSocket(path, handler) {
   renameSync(spare, path)
   return next
 }
-const wakeNow = bound => bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 })
+const wakeNow = bound => bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 })
 
 test("a probe taken on one socket does not count on another: the wake probes the replacement on its add connection before any add", async () => {
   const path = socketPath()
@@ -1342,7 +1410,7 @@ test("an untrusted socket is refused before any connection: the bind says untrus
       assert.equal(bound.provider, null)
       assert.equal(bound.route, null)
       assert.equal((await bound.observe()).reason, "offline")
-      assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: Date.now() + 5000 }), { outcome: "failed", reason: "native_unavailable" })
+      assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 }), { outcome: "failed", reason: "native_unavailable" })
       assert.equal(server.state.connections, 0, "not one connection was made")
     } finally { await server.close() }
   } finally { rmSync(base, { recursive: true, force: true }) }

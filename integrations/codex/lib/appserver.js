@@ -1,9 +1,9 @@
 // The receiver's view of one Codex thread through the app-server control socket, and the idle wake.
 //
 // The app-server speaks JSON-RPC over a WebSocket. A control socket is a Unix socket, so this is a minimal RFC 6455
-// client over node:net: one HTTP Upgrade, masked client text frames, unfragmented server text frames, ping answered
-// with pong. It owns the wire, the thread reads and the add-then-delete fence. It owns no chat policy: the receiver
-// decides when to read and what a refusal means, and settles the claim.
+// client over node:net: one HTTP Upgrade, masked client text frames, unfragmented server text frames without reserved
+// bits (no extension is negotiated), ping answered with pong. It owns the wire, the thread reads and the add-then-delete
+// fence. It owns no chat policy: the receiver decides when to read and what a refusal means, and settles the claim.
 //
 // Every operation opens its own connection and closes it. A connection that called thread/resume is subscribed to
 // the thread's events, so it must not outlive the read. The wake is the one operation with two: one for the add, one for
@@ -13,6 +13,7 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { lstatSync, readFileSync } from "node:fs"
 import net from "node:net"
+import { performance } from "node:perf_hooks"
 import { trustedSocket } from "./trust.js"
 
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -41,6 +42,11 @@ const PAGE = 20
 
 const failure = (code, extra = {}) => Object.assign(new Error(code), { code, ...extra })
 
+// The default clock of the receiver and of its thread. A reservation and the deadlines of a wake are durations, so an
+// adjustable wall clock must not move them: a step back would let a wake start after its reservation ran out. What is
+// compared with a file's mtime (lib/ipc.js) stays on `Date.now`.
+export const monotonic = () => performance.now()
+
 function encode(opcode, payload) {
   const length = payload.length
   const head = length < 126 ? Buffer.alloc(2) : length < 65536 ? Buffer.alloc(4) : Buffer.alloc(10)
@@ -57,6 +63,7 @@ function encode(opcode, payload) {
 // One complete server frame from the front of `buffer`, or null when more bytes are needed.
 function decode(buffer) {
   if (buffer.length < 2) return null
+  if ((buffer[0] & 0x70) !== 0) throw failure("APP_SERVER_PROTOCOL") // RSV1-3 mean an extension, and none was negotiated
   if ((buffer[1] & 0x80) !== 0) throw failure("APP_SERVER_PROTOCOL") // a server never masks
   let length = buffer[1] & 0x7f
   let offset = 2
@@ -245,7 +252,7 @@ const statusOf = record => (typeof record.status?.type === "string" ? STATUS[rec
 
 // The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket, and `lstat` is the
 // file system that `replaced` looks at, for tests.
-export function createThread({ path, threadId, open = openAppServer, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), lstat = lstatSync }) {
+export function createThread({ path, threadId, open = openAppServer, now = monotonic, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), lstat = lstatSync }) {
   let provider = null // the provider of the bound thread: what each later record is compared with, whatever socket it comes from
   // What the queue probe answered, and on which socket: { route, dev, ino }. `route` is true when the documented answer came
   // back and false when it did not. A probe says what the app-server behind one socket does, so it counts only for the socket

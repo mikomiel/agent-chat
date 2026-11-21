@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { fittingSocketPath, MAX_SOCKET_PATH_BYTES, trustedDirectory, trustedSocket } from "../lib/trust.js"
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmdirSync, rmSync, symlinkSync, unlinkSync } from "node:fs"
 import net from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -80,6 +80,55 @@ test("a directory is trusted by the same rule: not a symlink, and no directory f
 test("a real path that comes back with U+FFFD is refused: a name that is not UTF-8 could stand for another directory", () => {
   const options = { ...good(), realpath: () => "/run/user/\uFFFD" }
   assert.throws(() => trustedDirectory("/run/user/app", options), untrusted)
+})
+
+// A directory name that is not UTF-8 comes back from realpath(3) with U+FFFD in it, and a string with U+FFFD names another
+// directory on disk: the one that a literal U+FFFD spells. So without the check the rule would judge that other directory.
+// The layout holds both, and every directory in it is private and the current user's, so only the replacement character can
+// make the rule refuse. `link` reaches the directory with the byte in its name, so the name itself never has to be spelled.
+// Names are bytes (Buffers) throughout, and the layout is torn down by its exact paths.
+function lossy(name) {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "act-")))
+  const slash = Buffer.from("/")
+  const under = (...names) => Buffer.concat([Buffer.from(root), ...names.flatMap(each => [slash, Buffer.from(each)])])
+  const made = []
+  const close = () => {
+    for (const path of made.reverse()) rmdirSync(path)
+    try { unlinkSync(join(root, "link")) } catch { /* never made */ }
+    rmSync(root, { recursive: true, force: true })
+  }
+  try {
+    for (const names of [[name], [name, "state"], ["\uFFFD"], ["\uFFFD", "state"]]) {
+      const path = under(...names)
+      mkdirSync(path, { mode: 0o700 })
+      made.push(path)
+      chmodSync(path, 0o700)
+    }
+    symlinkSync(under(name), join(root, "link"))
+  } catch (error) {
+    close()
+    if (["EILSEQ", "EINVAL"].includes(error?.code)) return null // a file system that keeps only UTF-8 names (macOS)
+    throw error
+  }
+  return { root, named: `${root}/link/state`, close }
+}
+
+test("with the real file system: a real path that comes back with U+FFFD is refused though every directory in it is private, and the same layout with a valid name is trusted", t => {
+  const bad = lossy(Buffer.from([0xff]))
+  if (bad === null) return t.skip("the file system refuses a name that is not UTF-8")
+  let fine = null
+  try {
+    fine = lossy(Buffer.from("ok"))
+    assert.ok(realpathSync.native(bad.named).includes("\uFFFD"), "control: the real path of the fixture comes back lossy")
+    assert.ok(!realpathSync.native(fine.named).includes("\uFFFD"))
+    assert.equal(trustedDirectory(fine.named), join(fine.root, "ok", "state"), "the same layout with a valid name is trusted")
+    assert.throws(() => trustedDirectory(bad.named), { code: "CHAT_UNTRUSTED" })
+  } finally {
+    bad.close()
+    fine?.close()
+  }
+  assert.equal(existsSync(bad.root) || existsSync(fine.root), false, "the layouts were torn down")
+  return undefined
 })
 
 test("the configured spelling of a socket path is bounded like its real path", () => {

@@ -841,6 +841,29 @@ test("the delivery vocabulary is the core's, and every reason this package can s
   ]) assert.ok(settleVocabulary(result), JSON.stringify(result))
 })
 
+// The reservation is timed by the receiver and the wake's deadlines by its thread; two clocks, one of them the adjustable wall
+// clock, would let a step back start a wake after its reservation ran out.
+test("the thread is handed the receiver's own clock, so the reservation and the wake's deadlines run on one clock", async () => {
+  let drift = 0
+  const thread = threadDouble()
+  const r = await rig({ thread, skew: () => drift })
+  const [handed] = thread.opened
+  assert.equal(typeof handed.now, "function", "the receiver passes a clock to the thread it opens")
+  drift = 123_456
+  assert.equal(handed.now(), r.clock.now() + 123_456, "it is the clock that the receiver itself reads")
+})
+
+test("with no clock injected the receiver and its thread run on the monotonic clock, and the wall clock is never read", t => {
+  const wall = t.mock.method(Date, "now", () => 0) // a wall clock that was stepped back to the epoch
+  const thread = threadDouble()
+  createReceiver({ ...baseConfig, appServer: APP_SERVER }, { sessionId: "session-1", ownerPid: 4242 }, {
+    openThread: options => { thread.opened.push(options); return thread },
+  })
+  const stamp = thread.opened[0].now()
+  assert.ok(Math.abs(stamp - performance.now()) < 1_000, "the handed clock reads performance.now()")
+  assert.equal(wall.mock.callCount(), 0, "no clock of the receiver or its thread is the wall clock")
+})
+
 test("without an app-server the package is hook-only: no thread is opened and an idle session waits for its next turn", async () => {
   const r = await rig({ handlers: wakeHandlers() })
   await idleSession(r)
@@ -1403,6 +1426,56 @@ test("the hook's plan hint yields to the app-server read, which is the authority
   }
 })
 
+// A hook's permission_mode is a hint, so a hook event discards the read's busy or idle answer but not its Plan Mode: that
+// stays until a later read shows another mode. `route: false` keeps the wake poll out of the claims counted here.
+test("a Plan Mode that the app-server showed outlasts hook events, whatever their permission_mode, until a later read shows another mode", async () => {
+  let plan = true
+  const thread = threadDouble({ route: false, observation: () => ({ reason: plan ? "plan" : null, observed: { status: "idle", stopped: false, plan } }) })
+  const r = await rig({ thread, handlers: { pending: () => ({ messages: ["m1"] }) } })
+  await r.begin()
+  await r.clock.advance(30_000) // the tick reads the thread: Plan Mode
+  assert.equal(r.receiver.state(), "plan")
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true })
+  r.worker.log.length = 0
+  for (const [label, event] of [["a prompt", turn({ permission_mode: "default" })], ["a tool result", turn({ event: "tool", permission_mode: "default" })]]) {
+    const hook = await r.op(event)
+    assert.equal(r.receiver.state(), "plan", `${label} in default mode does not end it`)
+    assert.deepEqual(hook.sent, [{ context: null }], `${label}: nothing is printed`)
+  }
+  await r.clock.advance(30_000) // the turn runs, so the tick reads nothing and reports what the receiver holds
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true })
+  assert.ok(r.worker.ops("heartbeat").every(entry => entry.state.plan_mode === true), "no heartbeat said the session left Plan Mode")
+  await r.op({ op: "stop", permission_mode: "default" })
+  assert.equal(r.receiver.state(), "plan", "a Stop does not end it either")
+  assert.deepEqual(r.worker.ops("pending"), [], "nothing was asked for")
+  assert.deepEqual(r.worker.ops("claim"), [], "nothing was claimed")
+  plan = false
+  await r.clock.advance(30_000) // the tick reads again, and the thread is in default mode
+  assert.equal(r.receiver.state(), null)
+  const after = await r.op(turn())
+  assert.equal(r.worker.ops("claim").length, 1, "the read that shows default mode restores delivery")
+  assert.match(after.sent[0].context, /"id":"m1"/)
+})
+
+test("a Plan Mode that a read does not contradict stays: a busy or unreadable thread shows no mode", async () => {
+  let observation = { reason: "plan", observed: { status: "idle", stopped: false, plan: true } }
+  const thread = threadDouble({ route: false, observation: () => observation })
+  const r = await rig({ thread, handlers: { pending: () => ({ messages: ["m1"] }) } })
+  await r.begin()
+  await r.clock.advance(30_000)
+  assert.equal(r.receiver.state(), "plan")
+  for (const next of [
+    { reason: "busy", observed: { status: "busy", stopped: false, plan: null } },
+    { reason: "offline", observed: { status: "offline", stopped: false, plan: null } },
+  ]) {
+    observation = next
+    await r.clock.advance(30_000)
+    assert.equal(r.receiver.state(), "plan", next.reason)
+  }
+  assert.deepEqual((await r.op(turn({ permission_mode: "default" }))).sent, [{ context: null }])
+  assert.deepEqual(r.worker.ops("claim"), [])
+})
+
 test("an app-server read that finds the newest turn interrupted reports stopped until the next prompt", async () => {
   const thread = threadDouble({ observation: { reason: "stopped", observed: { status: "idle", stopped: true, plan: null } } })
   const r = await rig({ thread })
@@ -1477,6 +1550,20 @@ for (const [label, fresh, reason, state] of [
     assert.notEqual(r.receiver.state(), "offline", "the session is not ended by a reading that only declines a wake")
   })
 }
+
+test("a Plan Mode that the wake's own reading showed outlasts a later hook event too", async () => {
+  const thread = threadDouble({ fresh: reading("plan", { plan: true }) })
+  const r = await rig({ handlers: wakeHandlers(), thread })
+  await idleSession(r)
+  await r.clock.advance(2000)
+  assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "deferred", reason: "plan" })
+  assert.equal(r.receiver.state(), "plan")
+  const claims = r.worker.ops("claim").length
+  const hook = await r.op(turn({ permission_mode: "default" }))
+  assert.equal(r.receiver.state(), "plan")
+  assert.equal(r.worker.ops("claim").length, claims, "the prompt claims nothing")
+  assert.deepEqual(hook.sent, [{ context: null }])
+})
 
 test("the reading before the add is the newest word only while nothing newer reached the receiver: a refusal that arrived first keeps its own reason", async () => {
   const thread = threadDouble({ fresh: reading("busy", { status: "busy", plan: null }) })

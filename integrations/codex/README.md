@@ -153,7 +153,17 @@ sends its request: it does not wait for the worker to end its instance.
   clears it, `inProgress` is busy, `interrupted` is stopped, and anything else
   is unknown), and its collaboration mode (`plan` or `default`, from
   `thread/resume` with `excludeTurns`). The read, when there is one, is the authority for Plan Mode
-  and for an idle session; any later hook event discards it.
+  and for an idle session. The two mode fields differ in what they can end. A hook's
+  `permission_mode` is only a hint: `plan` sets Plan Mode, and a later hook with another mode
+  ends a Plan Mode that a hook set, but it cannot end one that a read showed. A later hook event
+  discards the read's busy or idle answer, but not a Plan Mode that the read showed. That stays,
+  whatever the hook events say, until a later read shows another mode, so meanwhile the receiver
+  claims no hook delivery and the heartbeat reports Plan Mode. A read that shows no mode
+  changes nothing: a busy thread, one that is not loaded, an unreadable or untrusted socket, a
+  changed provider. The receiver reads the thread only while no turn is known to run, so after a
+  prompt in default mode the delivery waits for the next `Stop` and the first read after it. If no
+  read reaches the mode again (the app-server is gone, or the thread is no longer a bound main
+  thread), hook delivery stays withheld until the receiver ends.
 - **Busy delivery.** A `prompt` or `tool` hook asks the receiver for a batch
   while the turn runs. The receiver claims only when the session is busy, and
   never in Plan Mode, while stopped or in an unknown state. The reply is
@@ -483,7 +493,8 @@ exercised live.
   off without a message.
 - **Plan Mode from a hook.** Whether `permission_mode` `plan` in a hook payload
   follows the Plan collaboration mode is not confirmed. The app-server read is
-  the authority when it exists; without `appServer`, a session put into Plan
+  the authority when it exists, and a hook event cannot end a Plan Mode that it
+  showed (see State); without `appServer`, a session put into Plan
   Mode while idle is seen only if a hook payload says so.
 - **A delegate's hooks.** Codex gives a subagent's hooks the parent session
   id. Whether `UserPromptSubmit` and `PostToolUse` inside a subagent carry
@@ -709,8 +720,13 @@ exercised live.
   directory, as its canonical path, as its working directory and as the
   directory it keeps the binding file in.
 - The app-server client answers a server request with a method-not-found error
-  and refuses a fragmented, binary or masked server frame. It sends only the
-  methods listed under [Idle wake](#idle-wake), carries no credential and
+  and refuses a fragmented, binary or masked server frame, and a frame with a
+  reserved bit set, since it negotiates no extension: the connection fails and the
+  frame is never read, so a fence reply cannot say `deleted: true` through one. It
+  times a wake's reservation and deadlines on one monotonic clock (the receiver
+  passes its own to its thread), so an adjusted wall clock cannot give a wake more
+  time than its reservation has; whether that clock counts a suspended host's time
+  is the platform's. It sends only the methods listed under [Idle wake](#idle-wake), carries no credential and
   never starts a turn except through the queue.
 - A queued wake is a user turn, so it carries a fixed line and identifiers
   only. A peer message is coordination data, never operator authorization, and

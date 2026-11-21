@@ -9,7 +9,7 @@
 // queue, when the config names a control socket and the probe passed (lib/appserver.js);
 // without it a message waits for the next turn. A peer message never grants authority.
 import { randomUUID } from "node:crypto"
-import { createThread } from "./appserver.js"
+import { createThread, monotonic } from "./appserver.js"
 import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES, WAKE_PREFIX, wakeRows } from "./channel.js"
 import { appServerPath, loadConfig } from "./config.js"
 import { assertPrivateDirectory, paths, serve } from "./ipc.js"
@@ -56,7 +56,7 @@ const isDone = (frame, outcome) => frame?.op === "done" && frame.outcome === out
 export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
   openThread = createThread,
-  now = Date.now,
+  now = monotonic,
   random = Math.random,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
@@ -69,8 +69,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 } = {}) {
   const policy = createRejoinPolicy({ now, random })
   const socket = appServerPath(config.appServer)
-  // The hook session id is looked up in the app-server's loaded threads before it is trusted as a thread id.
-  const thread = socket ? openThread({ path: socket, threadId: sessionId }) : null
+  // The hook session id is looked up in the app-server's loaded threads before it is trusted as a thread id. The thread
+  // measures a wake's deadlines on this receiver's clock, the one that times the reservation.
+  const thread = socket ? openThread({ path: socket, threadId: sessionId, now }) : null
   let live = null // { worker } while a worker runs
   let joined = null
   let bootId = null
@@ -79,6 +80,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let planHint = false // the last hook payload said permission_mode "plan"
   let stopped = false // an Interrupt hook ran; only the next UserPromptSubmit clears it
   let observed = null // the last app-server read: { status, stopped, plan }; any hook event discards it
+  let planSeen = false // the newest app-server read that showed a mode showed Plan Mode; a hook event does not discard it
   let epoch = 0 // counts hook events and app-server refusals, so a read or a clearance that began before one is not kept
   let newestRefusal = null // the reason of the newest app-server read that refused a wake; a hook event discards it
   let threadBound = false // the newest bind decided the route: the thread is a main thread, its provider is fixed and the queue probe answered
@@ -114,10 +116,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   })
 
   // The hook says whether a turn runs and whether the operator interrupted it; the app-server read, when there is
-  // one, is the authority for Plan Mode and adds a busy or idle answer a hook cannot give while nothing runs.
+  // one, is the authority for Plan Mode and adds a busy or idle answer a hook cannot give while nothing runs. A hook's
+  // `permission_mode` is only a hint, so it cannot end a Plan Mode that the app-server showed: that ends with a read.
   function chatState() {
     if (failure) return "offline"
-    const plan = observed !== null && observed.plan !== null ? observed.plan : planHint
+    const plan = observed !== null && observed.plan !== null ? observed.plan : planHint || planSeen
     if (plan) return "plan"
     if (stopped || observed?.stopped === true) return "stopped"
     if (native === "busy" || observed?.status === "busy") return "busy"
@@ -271,10 +274,17 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const result = await thread.observe()
     const current = epoch === before && live === record
     if (current) {
-      observed = result.observed.status === "idle" || result.observed.status === "busy" ? result.observed : null
+      adopt(result.observed)
       if (result.reason !== null) { newestRefusal = result.reason; epoch += 1 }
     }
     return { ...result, current }
+  }
+
+  // Keep an app-server reading as the observed state. A read that shows a mode sets or ends the Plan Mode memory; one that
+  // shows none (a busy or an unreadable thread) leaves it as it was.
+  function adopt(read) {
+    observed = read.status === "idle" || read.status === "busy" ? read : null
+    if (read.plan !== null) planSeen = read.plan
   }
 
   async function connect() {
@@ -393,7 +403,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (state !== null) return state
     if (epoch !== cleared) return newestRefusal ?? "busy"
     if (fresh.reason === "child") return "offline" // the next read ends the session; this one only declines to wake it
-    observed = fresh.observed.status === "idle" || fresh.observed.status === "busy" ? fresh.observed : null
+    adopt(fresh.observed)
     if (fresh.reason === null) return null
     newestRefusal = fresh.reason
     epoch += 1
@@ -491,7 +501,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (isDone(await link.next(2_000), "written")) announced = announce.boot
   }
 
-  // A hook event is newer than any app-server read, so it discards the read. Only a prompt clears a local stop.
+  // A hook event is newer than any app-server read, so it discards the read, but not the Plan Mode that the read showed
+  // (`planSeen`): the hook's mode is a hint. Only a prompt clears a local stop.
   function setNative(request, running, event) {
     const mode = request.permission_mode
     planHint = mode === "plan"
