@@ -382,6 +382,64 @@ test("a spawn that makes no pipes fails that session's chat closed, and its end 
   await lifecycle.stop() // settles
 })
 
+// The closed watcher is registered as soon as the worker is ready, so a retryable failure of the first heartbeat must still
+// win over the exit that follows it: the failure is handled, a rejoin is scheduled, and chat does not fail closed. These
+// use the real worker module over an injected child. The child's replies are asynchronous on purpose: a real worker's
+// reply crosses a pipe and arrives in a later turn, never inside the `write` that asked for it. A reply inside `write`
+// would settle the request before `request()` returned its promise, so the exit would be seen first, an order no real
+// worker can produce.
+function childFailingFirstHeartbeat(code, closeInSameTurn) {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  child.kill = () => {}
+  child.stdin.on("data", chunk => {
+    for (const line of chunk.toString().split("\n").filter(Boolean)) {
+      const frame = JSON.parse(line)
+      if (frame.op === "join") setImmediate(() => child.stdout.write(`${JSON.stringify({ id: frame.id, result: joined })}\n`))
+      if (frame.op === "heartbeat") setImmediate(() => child.stdout.write(`${JSON.stringify({ id: frame.id, error: { code } })}\n`))
+    }
+  })
+  // Otherwise the process exits when it sees the end of its stdin, as the real worker does.
+  if (!closeInSameTurn) child.stdin.on("end", () => setImmediate(() => child.emit("close", 0, null)))
+  return child
+}
+
+for (const closeInSameTurn of [true, false]) {
+  for (const code of ["STALE_INSTANCE", "TRANSPORT_UNAVAILABLE", "SERVICE_UNAVAILABLE", "REQUEST_UNCERTAIN"]) {
+    test(`a first heartbeat that fails with ${code}, then a worker exit (${closeInSameTurn ? "same turn" : "later turn"}), schedules a rejoin`, async () => {
+      const bus = fakeBus()
+      const native = fakeNative()
+      const notices = []
+      let spawns = 0
+      let retry = null
+      const startProcess = (workerConfig, identity) => {
+        spawns += 1
+        const child = childFailingFirstHeartbeat(code, closeInSameTurn)
+        const worker = startWorker(workerConfig, identity, { spawnImpl: () => child })
+        // Added after the worker's own listener, so the close follows the rejection of the pending request in that turn.
+        if (closeInSameTurn) child.stdout.on("data", chunk => { if (chunk.toString().includes('"error"')) child.emit("close", 0, null) })
+        return worker
+      }
+      createLifecycle(bus, native, config, {
+        ...timers,
+        setTimeoutImpl: fn => { retry = fn; return 1 },
+        startProcess,
+        now: () => 1000,
+        random: () => 0,
+        notice: text => notices.push(text),
+      })
+      bus.fire("session_start", { nativeSessionId: "native-1" })
+      for (let turn = 0; turn < 8; turn++) await flush()
+      assert.equal(spawns, 1)
+      assert.equal(typeof retry, "function", notices.join(" | ")) // a rejoin is scheduled
+      assert.ok(notices.some(text => text.includes(`reconnecting (${code})`)), notices.join(" | "))
+      assert.equal(notices.some(text => /stopped/.test(text)), false, notices.join(" | ")) // and chat did not fail closed
+      assert.equal(native.calls.disable, 0)
+    })
+  }
+}
+
 test("a wall-clock step does not end a rejoin episode: the default clock is monotonic", async t => {
   const realNow = Date.now
   t.after(() => { Date.now = realNow })
