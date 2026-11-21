@@ -14,8 +14,8 @@
 // EVERY HEARTBEAT TICK READS THE ENTRY BACK (`refresh()`). An entry can change with no signal this object sees: a
 // compaction that ends inside a stream gap, after a put; a removal or put that lands after its time limit, after this
 // context closed; a host that answers again after a failed check. A tick owes the read-back again, without moving the
-// epoch, so whatever happened to the entry is repaired within one tick. It costs one list per tick, and a put only when
-// the entry is wrong. Only the join's own publish (`context()`)
+// epoch, so whatever happened to the entry gets a repair attempt at the next tick. It costs one list per tick, and a put
+// only when the entry is wrong. Only the join's own publish (`context()`)
 // rejects, and its caller decides what a failed join means.
 //
 // ONE CURRENCY RULE. A read-back is for one obligation and one binding. It proves the binding only while chat is open
@@ -105,12 +105,16 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
 
   // Put the entry and confirm it. `current` is asked after the put and before the confirming list: false stops there,
   // and the result is false. A put that left no entry throws: the caller decides what that means.
+  // A put of an earlier owner that ran out of time can land between this put and its confirming list, so a confirmation
+  // that finds other text puts once more before it fails.
   async function publish(text, current = () => true) {
-    await call("put", { sessionID, key: BINDING_KEY, value: text })
-    if (!current()) return false
-    // The surface is experimental.
-    if (!await holds(text)) throw contextFailure()
-    return true
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await call("put", { sessionID, key: BINDING_KEY, value: text })
+      if (!current()) return false
+      // The surface is experimental.
+      if (await holds(text)) return true
+    }
+    throw contextFailure()
   }
 
   // Publish the binding text, replacing any earlier one under the same key; null removes it. Rejects when the

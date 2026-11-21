@@ -109,6 +109,29 @@ test("context: an unavailable or unconfirmed entry rejects, so the session's cha
   await assert.rejects(make().context.context(42), { code: "CHAT_CONTEXT_UNAVAILABLE" })
 })
 
+test("context: an earlier owner's late put that lands between this put and its confirmation is put over once more", async () => {
+  const { ctx, context } = make()
+  const entry = ctx.session.instructions.entry
+  const list = entry.list
+  let lands = 1
+  entry.list = async input => {
+    if (lands-- > 0) ctx.entries.set(BINDING_KEY, "earlier owner's binding") // the late put lands just before this read
+    return list(input)
+  }
+  await context.context("successor binding")
+  assert.equal(ctx.calls.put.length, 2)
+  assert.equal(ctx.entries.get(BINDING_KEY), "successor binding")
+})
+
+test("context: a confirmation that finds other text twice rejects after two puts", async () => {
+  const { ctx, context } = make()
+  const entry = ctx.session.instructions.entry
+  const list = entry.list
+  entry.list = async input => { ctx.entries.set(BINDING_KEY, "earlier owner's binding"); return list(input) }
+  await assert.rejects(context.context("successor binding"), { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  assert.equal(ctx.calls.put.length, 2)
+})
+
 test("context: a failing removal is not an error and a disposed object publishes nothing", async () => {
   const { ctx, context } = make(fakeCtx({ removeFails: true }))
   await context.context("text")

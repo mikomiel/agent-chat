@@ -191,7 +191,9 @@ The service and its host-token provisioning are documented in the product
   seconds, whether or not anything is owed. An entry can change with no signal
   the plugin sees: a compaction that ends inside a gap after the read-back, a
   call that lands after its time limit, or a host that answers again after a
-  failed check. So any such change is repaired within one tick. The tick costs
+  failed check. So any such change gets a repair attempt at the next tick, at
+  most 30 seconds later; the attempt then runs its list, put and confirming list.
+  The tick costs
   one list per joined session, plus a put and a confirming list only when the
   entry is wrong.
   A read-back may run while a compaction runs. The signal that ends the
@@ -279,8 +281,8 @@ unverified, inferred, or a deliberate choice.
   on more than one instance's stream is not documented.
 - **Compaction events.** A compaction signal, a stream gap and the heartbeat
   tick trigger a read-back. If a compaction drops the entry and none of its
-  events arrives, the entry stays missing until the next tick, at most 30
-  seconds. A run that starts inside that window reads its instructions without
+  events arrives, the entry stays missing until the next tick's repair attempt,
+  which starts at most 30 seconds later. A run that starts inside that window reads its instructions without
   the binding. Whether a compaction drops the entry at all is unknown.
 - **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
@@ -314,13 +316,14 @@ unverified, inferred, or a deliberate choice.
 - **A late removal or put after the end.** The time limit trades a call that
   can hang for a call that can land late. A removal that times out during an
   owner change can land after the next owner's put and delete its binding. The
-  next owner's next tick puts it back, within 30 seconds. A put that times out
+  next owner's next tick, at most 30 seconds later, attempts to put it back. A put that times out
   during a join can land after the removal that follows the failed join, and
   leaves a stale entry with chat off. The plugin does not remove it again: a
   cleanup outside the serial queue would race the next owner's publish. The
-  next join replaces the entry. The core worker keeps the instance file when
-  its end request fails, and the server lease is the fallback, so that entry
-  can name a usable binding until the lease expires.
+  next join replaces the entry. The entry names an instance file that the core
+  worker discards before it sends its end request (#149), so nothing local can
+  use it. A late put that lands while a successor confirms its own binding is
+  put over once more by the successor's publish.
 - **The binding text asks, the plugin does not check.** The binding tells the
   session to preserve local stop, Plan Mode and approvals. The plugin reads
   none of the three.
