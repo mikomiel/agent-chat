@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { EVENT_TYPES, createManager, isMissing, isRootSession } from "../lib/manager.js"
+import { EVENT_TYPES, createManager, isRootSession } from "../lib/manager.js"
 import { createContext, CALL_TIMEOUT_MS } from "../lib/context.js"
 import { createLifecycle } from "../lib/lifecycle.js"
 import { BINDING_KEY } from "../lib/channel.js"
@@ -53,8 +53,8 @@ function stubParts({ onObserve = () => {}, verify = () => Promise.resolve(), sto
 const quiet = { setTimeoutImpl: () => 0, clearTimeoutImpl: () => {} }
 function withRealContext(parts) {
   const real = new Map()
-  parts.createContext = (hostCtx, id) => {
-    const context = Object.assign(createContext(hostCtx, id, quiet), { id })
+  parts.createContext = (hostCtx, id, options) => {
+    const context = Object.assign(createContext(hostCtx, id, { ...quiet, ...options }), { id })
     real.set(id, context)
     return context
   }
@@ -531,43 +531,30 @@ test("a read-back that fails after a gap is asked again at each later event unti
   assert.equal(parts.lifecycles.get("ses_a").stops, 0)
 })
 
-// Review 6005372163, finding 2: a deletion that fell into a stream gap is found when the gap ends.
-test("isMissing: only the host's tagged not-found for that session counts", () => {
-  const tagged = (sessionID, _tag = "Session.NotFoundError") => Object.assign(new Error("gone"), { _tag, sessionID })
-  assert.equal(isMissing(tagged("ses_a"), "ses_a"), true)
-  assert.equal(isMissing(tagged("ses_b"), "ses_a"), false) // another session's answer says nothing about this one
-  assert.equal(isMissing(tagged("ses_a", "UnknownError"), "ses_a"), false)
-  assert.equal(isMissing(tagged("ses_a", "SessionNotFoundError"), "ses_a"), false) // the HTTP mapping is not what a plugin gets
-  assert.equal(isMissing(new Error("not found"), "ses_a"), false)
-  assert.equal(isMissing(Object.assign(new Error("gone"), { code: "NOT_FOUND", status: 404 }), "ses_a"), false)
-  assert.equal(isMissing(null, "ses_a"), false)
-  assert.equal(isMissing(undefined, "ses_a"), false)
-})
-
-test("a gap: a joined session the host reports as not found ends its chat, and no other answer does", async () => {
-  const how = new Map() // what `session.get` does for a session now: "root" (the default), "missing", "error" or "silent"
-  const limits = [] // injected timers: the test fires a lookup's time limit by hand
+// Review 6005506743, finding 1: the host has no replay and no cursor, so a deletion can be lost with no gap marker. The
+// heartbeat tick reads each joined session's entry, and a session the host no longer has fails that read.
+test("a heartbeat tick that finds its session gone ends that session's chat, and no other answer does", async () => {
+  const how = new Map() // what the entry read does for a session now: "ok" (the default), "missing", "error" or "silent"
   const entries = new Map()
   const intervals = new Map()
   const workers = new Map()
   const deleted = new Set()
+  const lookups = []
   const missing = sessionID => Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID })
   const ctx = {
     session: {
-      get({ sessionID }) {
-        limits.at(-1).sessionID = sessionID // the lookup sets its timer just before it asks
-        const answer = how.get(sessionID) ?? "root"
-        if (answer === "missing") return Promise.reject(missing(sessionID))
-        if (answer === "error") return Promise.reject(new Error("unavailable"))
-        if (answer === "silent") return new Promise(() => {})
-        return Promise.resolve(root(sessionID))
-      },
+      get: async ({ sessionID }) => { lookups.push(sessionID); return root(sessionID) },
       instructions: {
         entry: {
           async put({ sessionID, key, value }) { entries.set(`${sessionID}/${key}`, value) },
-          async list({ sessionID }) {
-            return [...entries].filter(([name]) => name.startsWith(`${sessionID}/`))
-              .map(([name, value]) => ({ key: name.slice(sessionID.length + 1), value }))
+          list({ sessionID }) {
+            const answer = how.get(sessionID) ?? "ok"
+            if (answer === "missing") return Promise.reject(missing(sessionID))
+            if (answer === "wrong-session") return Promise.reject(missing("ses_other")) // another session's answer
+            if (answer === "error") return Promise.reject(new Error("unavailable"))
+            if (answer === "silent") return new Promise(() => {})
+            return Promise.resolve([...entries].filter(([name]) => name.startsWith(`${sessionID}/`))
+              .map(([name, value]) => ({ key: name.slice(sessionID.length + 1), value })))
           },
           async remove({ sessionID, key }) { entries.delete(`${sessionID}/${key}`) },
         },
@@ -582,7 +569,7 @@ test("a gap: a joined session the host reports as not found ends its chat, and n
     random: () => 0,
     setTimeoutImpl: () => 0,
     clearTimeoutImpl: () => {},
-    setIntervalImpl: () => { const timer = { cleared: false }; intervals.set(context.id, timer); return timer },
+    setIntervalImpl: fn => { const timer = { fn, cleared: false }; intervals.set(context.id, timer); return timer },
     clearIntervalImpl: timer => { if (timer) timer.cleared = true },
   })
   parts.startProcess = (_config, { nativeSessionId }) => {
@@ -602,42 +589,42 @@ test("a gap: a joined session the host reports as not found ends its chat, and n
     workers.set(nativeSessionId, worker)
     return worker
   }
-  const manager = createManager(ctx, config, parts, {
-    deleted,
-    setTimeoutImpl(fn, ms) { const timer = { fn, ms, cleared: false }; limits.push(timer); return timer },
-    clearTimeoutImpl(timer) { timer.cleared = true },
-  })
-  const ids = ["ses_gone", "ses_ok", "ses_error", "ses_silent"]
+  const manager = createManager(ctx, config, parts, { deleted })
+  const ids = ["ses_gone", "ses_ok", "ses_error", "ses_silent", "ses_wrong"]
   for (const id of ids) manager.feed(event("session.execution.started", id))
   await flush()
-  assert.deepEqual(manager.sessions().sort(), [...ids].sort()) // all four joined, each with a heartbeat timer and an entry
+  assert.deepEqual(manager.sessions().sort(), [...ids].sort()) // all joined, each with a heartbeat timer and a binding entry
   for (const id of ids) {
     assert.equal(intervals.get(id).cleared, false, id)
     assert.equal(entries.has(`${id}/${BINDING_KEY}`), true, id)
   }
+  for (const id of ids) intervals.get(id).fn() // a tick while every session exists changes nothing
+  await flush()
+  assert.deepEqual(manager.sessions().sort(), [...ids].sort())
+  assert.deepEqual([...deleted], [])
+  // No event for any of them: the deletion, and every other answer, reach the manager through the tick alone.
   how.set("ses_gone", "missing")
   how.set("ses_error", "error")
   how.set("ses_silent", "silent")
-  const before = limits.length
-  manager.reset() // the gap
+  how.set("ses_wrong", "wrong-session")
+  const asked = lookups.length
+  for (const id of ids) intervals.get(id).fn() // one tick
   await flush()
-  assert.deepEqual(limits.slice(before).map(timer => timer.sessionID).sort(), [...ids].sort()) // one lookup for each joined session
-  limits.slice(before).find(timer => timer.sessionID === "ses_silent").fn() // that lookup runs out of time
-  await flush()
-  assert.deepEqual(manager.sessions().sort(), ["ses_error", "ses_ok", "ses_silent"]) // only the session that is gone ended
+  assert.deepEqual(manager.sessions().sort(), ["ses_error", "ses_ok", "ses_silent", "ses_wrong"]) // only the one that is gone
   assert.deepEqual([...deleted], ["ses_gone"]) // through the deletion path: tombstoned
   assert.equal(intervals.get("ses_gone").cleared, true) // its heartbeats end
   assert.equal(workers.get("ses_gone").stopped, true)
   assert.equal(entries.has(`ses_gone/${BINDING_KEY}`), false) // and its binding is withdrawn
-  for (const id of ["ses_ok", "ses_error", "ses_silent"]) {
+  for (const id of ["ses_ok", "ses_error", "ses_silent", "ses_wrong"]) {
     assert.equal(intervals.get(id).cleared, false, id) // the others keep running
     assert.equal(workers.get(id).stopped, false, id)
     assert.equal(entries.has(`${id}/${BINDING_KEY}`), true, id)
   }
-  const lookups = limits.length
+  assert.equal(lookups.length, asked) // the tick asked the host nothing new, and a deleted session is not looked up again
   manager.feed(event("session.execution.started", "ses_gone"))
   await flush()
-  assert.equal(limits.length, lookups) // a later event for the deleted session is never looked up
+  assert.equal(lookups.length, asked)
+  assert.equal(workers.get("ses_gone").stopped, true)
 })
 
 // Review 6003407206, finding 2: a deletion is fenced when it is received, not queued behind the lookup.

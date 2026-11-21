@@ -11,8 +11,8 @@
 //
 // A GAP OWES A READ-BACK. The binding context owes it from the reset, and the manager asks for it at the next event the
 // session handles. Something the gap hid can still change the entry after that read-back, so the lifecycle reads the
-// entry back at every heartbeat tick as well. A read-back that fails or is overtaken leaves the obligation owed, and it
-// never turns chat off.
+// entry back at every heartbeat tick as well. A read-back that fails or is overtaken leaves the obligation owed. It
+// turns chat off only when the host says the session is gone (below).
 //
 // FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
 // never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
@@ -23,10 +23,11 @@
 // no join. The deletion is also a tombstone in its own set, like fork evidence: no cache evicts it, and the next owner
 // receives it, so a late event for that session is never looked up again.
 //
-// A GAP CAN HIDE A DELETION. A `session.deleted` event lost in a stream gap would leave that session's worker and
-// binding alive, with no later event to end them. After a gap each joined session is asked whether it still exists, with
-// the same time limit as the eligibility lookup. Only the host's definite not-found takes the deletion path above. A
-// timeout, any other error and a session that is found change nothing beyond the read-back that the gap owes.
+// A DELETION CAN BE MISSED, AND THE TICK FINDS IT. The host has no replay and no cursor, so a `session.deleted` event
+// can be lost with no gap marker, and nothing else would end that session's worker and binding. The heartbeat tick
+// reads the binding entry, and every such read first reads the session: a deleted one fails it with the core's
+// `Session.NotFoundError`. The binding context reports that answer (`onMissing`), and it takes the deletion path above.
+// A timeout, any other error and a session that is found change nothing. No host call is added for this.
 //
 // A LOOKUP HOLDS NOTHING BACK. A record still in its eligibility lookup has no worker and no binding entry, so
 // `stop()` ends it at once and waits only for the worker and entry cleanup of joined sessions. A lookup that never
@@ -58,12 +59,6 @@ export function isRootSession(info, sessionID) {
   if (info === null || typeof info !== "object" || info.id !== sessionID) return false
   return (info.parentID === undefined || info.parentID === null) && (info.fork === undefined || info.fork === null)
 }
-
-// The host's definite answer that a session does not exist. In process, `session.get` fails with the core's
-// `Session.NotFoundError`, tagged and naming the session; the HTTP `SessionNotFoundError` is only its server mapping.
-// The published plugin types leave this failure `unknown`, so the shape is read from the upstream source (see README).
-// Any other failure says nothing about the session.
-export const isMissing = (error, sessionID) => error?._tag === "Session.NotFoundError" && error.sessionID === sessionID
 
 // The id of the session an event belongs to, or null when it names none.
 export const sessionOf = event => (typeof event?.data?.sessionID === "string" && event.data.sessionID ? event.data.sessionID : null)
@@ -167,7 +162,7 @@ export function createManager(ctx, config, parts, {
     const handlers = new Map()
     const bus = { on(name, fn) { handlers.set(name, [...(handlers.get(name) ?? []), fn]) } }
     record.fire = (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload) }
-    record.context = parts.createContext(ctx, record.id)
+    record.context = parts.createContext(ctx, record.id, { onMissing: () => markDeleted(record.id) })
     record.lifecycle = parts.createLifecycle(bus, record.context, config, {
       startProcess: parts.startProcess,
       notice: text => notice(String(text)),
@@ -177,8 +172,8 @@ export function createManager(ctx, config, parts, {
 
   // A compaction signal, or the first event since a gap, may have left the binding entry dropped. The binding context
   // owes that read-back, failed and overtaken ones included, and says when one may start. A check that fails or is
-  // overtaken leaves the obligation owed, so the next event asks again. It never turns chat off and never rejects,
-  // so nothing is awaited or handled here.
+  // overtaken leaves the obligation owed, so the next event asks again. It never rejects, so nothing is awaited or
+  // handled here, and only a session the host reports gone ends (`onMissing`).
   function handle(record, event) {
     if (!active || record.dead || !record.context) return
     record.context.observe(event)
@@ -225,22 +220,12 @@ export function createManager(ctx, config, parts, {
     current.chain = current.chain.then(() => handle(current, event)).catch(error => isolate(current, error))
   }
 
-  // Does a joined session still exist? It is not queued on the record's chain: a lookup that is slow must not hold the
-  // session's events. Only a definite not-found ends the session's chat, as a received deletion does.
-  function confirmExists(record) {
-    lookup(record.id).then(() => {}, error => {
-      if (active && !record.dead && isMissing(error, record.id)) markDeleted(record.id)
-    })
-  }
-
-  // The event stream broke or restarted: events may be missing, so every observation is stale, and a deletion may have
-  // been among them.
+  // The event stream broke or restarted: events may be missing, so every observation is stale.
   function reset() {
     for (const record of [...records.values()]) {
       record.chain = record.chain.then(() => {
         if (record.dead || !record.context) return
         record.context.reset() // a read-back is owed now, and asked for at the next event or tick
-        confirmExists(record)
       }).catch(error => isolate(record, error))
     }
   }

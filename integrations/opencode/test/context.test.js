@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createContext, CALL_TIMEOUT_MS } from "../lib/context.js"
+import { createContext, isMissing, CALL_TIMEOUT_MS } from "../lib/context.js"
 import { BINDING_KEY } from "../lib/channel.js"
 
 const SESSION = "ses_synthetic0001"
@@ -1011,4 +1011,98 @@ test("a list that answers after its time limit owes nothing, because a read chan
   held.settle.resolve() // the first check's list answers late
   await flush()
   assert.equal(context.owed(), false)
+})
+
+// Review 6005506743, finding 1: a deletion with no event seen is found by the heartbeat tick. Every instruction-entry
+// call first reads the session, so a deleted session fails the tick's read-back with the core's tagged not-found, naming
+// the session. The context reports that answer, and its owner decides what it means.
+const notFound = (sessionID = SESSION, _tag = "Session.NotFoundError") => Object.assign(new Error("gone"), { _tag, sessionID })
+
+test("isMissing: only the host's tagged not-found for that session counts", () => {
+  assert.equal(isMissing(notFound("ses_a"), "ses_a"), true)
+  assert.equal(isMissing(notFound("ses_b"), "ses_a"), false) // another session's answer says nothing about this one
+  assert.equal(isMissing(notFound("ses_a", "UnknownError"), "ses_a"), false)
+  assert.equal(isMissing(notFound("ses_a", "SessionNotFoundError"), "ses_a"), false) // the HTTP mapping is not what a plugin gets
+  assert.equal(isMissing(new Error("not found"), "ses_a"), false)
+  assert.equal(isMissing(Object.assign(new Error("gone"), { code: "NOT_FOUND", status: 404 }), "ses_a"), false)
+  assert.equal(isMissing(null, "ses_a"), false)
+  assert.equal(isMissing(undefined, "ses_a"), false)
+})
+
+function watched(ctx = fakeCtx()) {
+  const clock = timers()
+  const told = []
+  return { ctx, clock, told, context: createContext(ctx, SESSION, { ...clock, onMissing: () => told.push("missing") }) }
+}
+
+test("the heartbeat tick's read-back finds a deleted session, and the read stays a failed read", async () => {
+  const { ctx, told, context } = watched()
+  await context.context("binding")
+  assert.equal(await context.refresh(), true) // the session exists: nothing is reported
+  assert.deepEqual(told, [])
+  ctx.session.instructions.entry.list = () => Promise.reject(notFound())
+  assert.equal(await context.refresh(), false)
+  assert.deepEqual(told, ["missing"])
+  assert.equal(context.owed(), true) // as any failed read: still owed, and nothing is turned off
+})
+
+for (const [name, drive] of [
+  ["list", async context => { assert.equal(await context.refresh(), false) }],
+  ["put", async context => { await assert.rejects(context.context("binding two"), { code: "CHAT_CONTEXT_UNAVAILABLE" }) }],
+  ["remove", async context => { await context.context(null) }], // a removal that fails is not an error
+]) {
+  test(`a ${name} that fails with the session's not-found tells onMissing once`, async () => {
+    const { ctx, told, context } = watched()
+    await context.context("binding")
+    ctx.session.instructions.entry[name] = () => Promise.reject(notFound())
+    await drive(context)
+    assert.deepEqual(told, ["missing"])
+  })
+}
+
+for (const [label, error] of Object.entries({
+  "another failure": new Error("unavailable"),
+  "another session's not-found": notFound("ses_other"),
+  "the HTTP mapping's tag": notFound(SESSION, "SessionNotFoundError"),
+  "a status and no tag": Object.assign(new Error("gone"), { status: 404 }),
+})) {
+  test(`a read that fails with ${label} does not tell onMissing`, async () => {
+    const { ctx, told, context } = watched()
+    await context.context("binding")
+    ctx.session.instructions.entry.list = () => Promise.reject(error)
+    assert.equal(await context.refresh(), false)
+    assert.deepEqual(told, [])
+  })
+}
+
+test("a read that runs out of time and later fails with not-found does not tell onMissing", async () => {
+  const { ctx, clock, told, context } = watched()
+  await context.context("binding")
+  const held = holdFirst(ctx.session.instructions.entry, "list")
+  const read = context.refresh()
+  await flush()
+  armed(clock)[0].fn() // the time limit passes
+  assert.equal(await read, false)
+  held.settle.reject(notFound()) // the host answers after the limit: it is not an answer in time
+  await flush()
+  assert.deepEqual(told, [])
+})
+
+test("an onMissing that throws changes nothing about the call", async () => {
+  const ctx = fakeCtx()
+  const context = createContext(ctx, SESSION, { ...timers(), onMissing: () => { throw new Error("boom") } })
+  await context.context("binding")
+  const list = ctx.session.instructions.entry.list
+  ctx.session.instructions.entry.list = () => Promise.reject(notFound())
+  assert.equal(await context.refresh(), false) // a failed read, as without the report
+  ctx.session.instructions.entry.list = list
+  assert.equal(await context.refresh(), true) // and the context goes on
+})
+
+test("a context given no onMissing treats a not-found as any failed call", async () => {
+  const { ctx, context } = make()
+  await context.context("binding")
+  ctx.session.instructions.entry.list = () => Promise.reject(notFound())
+  assert.equal(await context.refresh(), false)
+  assert.equal(context.owed(), true)
 })

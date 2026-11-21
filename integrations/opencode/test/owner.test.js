@@ -574,3 +574,100 @@ test("a compaction that ends after the stream broke and before it resumed is rea
   assert.equal(entries.get(BINDING_KEY), "binding text") // the entry is back
   assert.equal(context.owed(), false)
 })
+
+// Review 6005506743, finding 1: the host has no replay and no cursor, so a stream that comes back with no marker can hide
+// a deletion that no later event reports. A check tied to the break or the reconnect leaves a window after it. The
+// heartbeat tick reads the session's entry, so the deletion is found within one tick, wherever it happened.
+test("a session deleted while the stream was down, with a reconnect that marks nothing, is ended by the next heartbeat tick", async () => {
+  const registry = createRegistry()
+  const lookups = []
+  const entries = new Map()
+  const workers = []
+  let tickBeat = null
+  let heartbeats = null
+  let gone = false
+  let rounds = 0
+  let breakStream
+  const broken = new Promise(resolve => { breakStream = resolve })
+  const missing = Object.assign(new Error("not found"), { _tag: "Session.NotFoundError", sessionID: "ses_a" })
+  const answer = value => (gone ? Promise.reject(missing) : Promise.resolve(value))
+  const ctx = {
+    event: {
+      subscribe(options) {
+        const round = ++rounds
+        return (async function* () {
+          if (round === 1) {
+            yield startedEvent("e1", "ses_a")
+            await broken
+            throw new Error("stream broke")
+          }
+          // The stream resumed with no `server.connected` and no event of the session: nothing says what happened.
+          await new Promise(resolve => options.signal.addEventListener("abort", resolve, { once: true }))
+        })()
+      },
+    },
+    session: {
+      get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID, agent: "build" } },
+      instructions: {
+        entry: {
+          put: ({ key, value }) => answer(entries.set(key, value)),
+          list: () => answer([...entries].map(([key, value]) => ({ key, value }))),
+          remove: ({ key }) => answer(entries.delete(key)),
+        },
+      },
+    },
+  }
+  const parts = {
+    createContext: (hostCtx, id, options) => createContext(hostCtx, id, { ...noTimers, ...options }),
+    createLifecycle: (bus, context, passedConfig, options) => createLifecycle(bus, context, passedConfig, {
+      ...options,
+      now: () => 1_000,
+      random: () => 0,
+      setTimeoutImpl: () => 0,
+      clearTimeoutImpl: () => {},
+      setIntervalImpl: fn => { tickBeat = fn; heartbeats = { cleared: false }; return heartbeats },
+      clearIntervalImpl: timer => { if (timer) timer.cleared = true },
+    }),
+    startProcess: () => {
+      let close
+      const closed = new Promise(resolve => { close = resolve })
+      const worker = {
+        stopped: false,
+        ready: Promise.resolve({
+          session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+          room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "opencode",
+          instance_file: "/tmp/agent-chat-state/ses_a.json",
+        }),
+        closed,
+        request: () => Promise.resolve({}),
+        stop: () => { worker.stopped = true; close({ code: 0, signal: null }); return closed },
+      }
+      workers.push(worker)
+      return worker
+    },
+  }
+  const config = { chatEnabled: true, directory: "/tmp/state", serverOrigin: "https://chat.example", hostToken: "synthetic-token", python: "/usr/bin/python3" }
+  // The break happens first and the wait follows it. The session is deleted during the wait, and its event is lost.
+  const sleep = async () => { await flush(); gone = true }
+  registry.attach(createMember(ctx, config, parts, { sleep }))
+  await flush()
+  assert.equal(workers.length, 1) // joined, with a binding and a heartbeat
+  assert.equal(entries.size, 1)
+  tickBeat() // a tick while the session exists changes nothing
+  await flush()
+  assert.equal(workers[0].stopped, false)
+  breakStream()
+  await flush()
+  await flush() // the wait inside `sleep` takes one flush of its own
+  assert.equal(rounds, 2) // reconnected, and no event of the session came with it
+  assert.equal(workers[0].stopped, false) // nothing has told the plugin yet
+  tickBeat() // one tick
+  await flush()
+  assert.equal(workers[0].stopped, true) // the chat of the deleted session ended
+  assert.equal(heartbeats.cleared, true)
+  const asked = lookups.length
+  registry.dispatch(startedEvent("e2", "ses_a")) // a late event for it is refused: the deletion is a tombstone
+  await flush()
+  assert.equal(lookups.length, asked)
+  assert.equal(workers.length, 1)
+})

@@ -18,6 +18,10 @@
 // only when the entry is wrong. Only the join's own publish (`context()`)
 // rejects, and its caller decides what a failed join means.
 //
+// A SESSION THAT IS GONE IS REPORTED, NOT REPAIRED. Every instruction-entry call first reads the session, so the tick's
+// read-back of a deleted session fails with `Session.NotFoundError`. A call that answers in time with it tells
+// `onMissing`, and the owner ends the session's chat. The call itself stays a failed call, as any other.
+//
 // ONE CURRENCY RULE. A read-back is for one obligation and one binding. It proves the binding only while chat is open
 // and on, no newer gap or compaction signal has been applied, and no `context()` call has withdrawn or replaced the
 // binding. It asks that after every host call it awaits and before the next one, and before it proves. Before its first
@@ -48,7 +52,18 @@ export const CALL_TIMEOUT_MS = 10_000
 
 const contextFailure = () => Object.assign(new Error("CHAT_CONTEXT_UNAVAILABLE"), { code: "CHAT_CONTEXT_UNAVAILABLE" })
 
-export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, clearTimeoutImpl = clearTimeout } = {}) {
+// The host's definite answer that a session does not exist. Every instruction-entry call first reads the session, and
+// that read fails with the core's `Session.NotFoundError`, tagged and naming the session; the HTTP `SessionNotFoundError`
+// is only its server mapping. The published plugin types leave this failure `unknown`, so the shape is read from the
+// upstream source (see README). Any other failure says nothing about the session.
+export const isMissing = (error, sessionID) => error?._tag === "Session.NotFoundError" && error.sessionID === sessionID
+
+// `onMissing` is told when a call that answered in time found the session gone. Its owner decides what that means.
+export function createContext(ctx, sessionID, {
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+  onMissing = () => {},
+} = {}) {
   let closed = false
   let disabled = false
   let unverified = false // a compaction signal or a gap was applied, and the binding entry has not been read back since
@@ -89,7 +104,12 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
         clearTimeoutImpl(timer)
         settle(value)
       }
-      new Promise(begin => begin(ctx.session.instructions.entry[name](input))).then(answer(resolve), answer(reject))
+      const failed = answer(reject)
+      new Promise(begin => begin(ctx.session.instructions.entry[name](input))).then(answer(resolve), error => {
+        // The heartbeat tick reads the entry, so a session deleted with no event seen is found here, within a tick.
+        if (!over && isMissing(error, sessionID)) { try { onMissing() } catch { /* advisory */ } }
+        failed(error)
+      })
     })
   }
 
@@ -188,7 +208,7 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
         if (!current()) return done(false) // asked before the put, which is made in the same step
         if (!found && !await publish(text, { current })) return done(false)
       } catch {
-        return done(false) // a failed call proves nothing either way, and turns nothing off
+        return done(false) // a failed call proves nothing either way; only `onMissing`, told in `call`, can end the session
       }
       if (!current()) return done(false) // the last host call proves nothing about a binding that has since changed
       if (asks === asked) unverified = false // a tick that came after the reads began is not answered by them
