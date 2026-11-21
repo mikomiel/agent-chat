@@ -94,10 +94,11 @@ def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
 
 
 def _end(instance: instance_client.JoinedInstance, directory: Path) -> dict[str, Any]:
-    """End this binding, then drop its record; a failed end keeps the file and the server lease is the fallback."""
-    result = instance_client.end(instance)
-    instance_file.discard_instance(directory, instance.binding.boot_id)
-    return result
+    """End this binding and drop its record, even when the end fails: the server lease then ends the instance."""
+    try:
+        return instance_client.end(instance)
+    finally:
+        instance_file.discard_instance(directory, instance.binding.boot_id)
 
 
 def _asks_bodies(request: dict[str, Any]) -> bool:

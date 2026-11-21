@@ -185,8 +185,7 @@ class Adapter:
         try:
             self.operations.end(joined, deadline=self._request_deadline())
         except (ChatError, OSError):
-            # A failed end keeps the record; the server lease remains the fallback.
-            return
+            pass  # The server lease ends the instance; the record goes either way, so nothing local can use it.
         instance_file.discard_instance(self.config.directory, joined.binding.boot_id)
 
     def tick(self, now: float | None = None) -> float | None:
