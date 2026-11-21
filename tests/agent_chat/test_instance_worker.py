@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from uuid import uuid4
 import pytest
 
 from agent_chat import instance_client, instance_worker
-from agent_chat.instance_file import InstanceSecret, prepare_instance, read_instance
+from agent_chat.instance_file import InstanceSecret, prepare_instance
 from agent_chat.models import ChatError
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -108,7 +109,7 @@ def test_clean_end_eof_and_failure_cleanup_remove_only_the_own_record(join_frame
     assert [path.name for path in Path(join_frame["directory"]).iterdir()] == [f"{sibling.boot_id}.json"]
 
 
-def test_failed_end_keeps_the_record_for_the_server_lease_fallback(join_frame, db):
+def test_failed_end_still_discards_the_record_and_leaves_the_instance_to_the_server_lease(join_frame, db):
     directory = Path(join_frame["directory"])
     with subprocess.Popen(
         [sys.executable, "-m", "agent_chat.instance_worker"],
@@ -130,10 +131,59 @@ def test_failed_end_keeps_the_record_for_the_server_lease_fallback(join_frame, d
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=3)
-    assert Path(joined["instance_file"]).exists()
-    assert read_instance(Path(joined["instance_file"])).native_session_id == join_frame["native_session_id"]
-    assert db.execute("SELECT ended_at FROM agent_chat.instances").fetchone()["ended_at"] is None
-    assert [path.name for path in directory.iterdir()] == [Path(joined["instance_file"]).name]
+    assert not Path(joined["instance_file"]).exists()  # nothing local can use a binding whose end failed
+    assert db.execute("SELECT ended_at FROM agent_chat.instances").fetchone()["ended_at"] is None  # the lease ends it
+    assert list(directory.iterdir()) == []
+
+
+def test_end_drops_the_record_before_the_end_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    def discard(directory, boot_id):
+        calls.append("discard")
+
+    monkeypatch.setattr(instance_worker.instance_file, "discard_instance", discard)
+    monkeypatch.setattr(instance_worker.signal, "setitimer", lambda *args: None)  # no alarm in the test process
+
+    def end(instance, *, deadline=None):
+        calls.append("end")
+        raise ChatError("TRANSPORT_UNAVAILABLE")
+
+    monkeypatch.setattr(instance_worker.instance_client, "end", end)
+    instance = type("Joined", (), {"binding": type("Binding", (), {"boot_id": uuid4()})()})()
+    with pytest.raises(ChatError):
+        instance_worker._end(instance, Path("/nonexistent"))
+    assert calls == ["discard", "end"]
+
+
+def test_a_stalled_end_is_interrupted_after_a_removal_that_used_up_the_alarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(instance_worker, "REQUEST_SECONDS", 0.2)
+    previous = signal.signal(signal.SIGALRM, instance_worker._interrupt)
+    try:
+        def stalled_discard(directory, boot_id):
+            signal.setitimer(signal.ITIMER_REAL, 0.05)
+            try:
+                time.sleep(5)
+            except TimeoutError:
+                pass  # the removal swallows the worker's alarm
+
+        deadlines: list[float | None] = []
+
+        def stalled_end(instance, *, deadline=None):
+            deadlines.append(deadline)
+            time.sleep(5)  # stands for a stall before the request is sent, such as loading the trust store
+            return {"ended": True}
+
+        monkeypatch.setattr(instance_worker.instance_file, "discard_instance", stalled_discard)
+        monkeypatch.setattr(instance_worker.instance_client, "end", stalled_end)
+        instance = type("Joined", (), {"binding": type("Binding", (), {"boot_id": uuid4()})()})()
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            instance_worker._end(instance, Path("/nonexistent"))
+        assert time.monotonic() - started < 2  # the alarm armed again after the removal interrupted the end
+        assert deadlines == [None]  # under the alarm, like every other worker request
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 def test_worker_start_sweeps_only_long_untouched_records_and_never_uses_the_network(join_frame, db):
