@@ -10,7 +10,8 @@
 // nothing here keeps such a state.
 //
 // A GAP OWES A READ-BACK. The binding context owes it from the reset, and the manager asks for it at the next event the
-// session handles. Something the gap hid can still change the entry after that read-back, so the lifecycle reads the
+// session handles. A gap and a compaction signal are applied to a context that exists when they are received, so the
+// proof is taken back at once; only the read-back waits on the session's chain (`applyNow`). Something the gap hid can still change the entry after that read-back, so the lifecycle reads the
 // entry back at every heartbeat tick as well. A read-back that fails or is overtaken leaves the obligation owed. It
 // turns chat off only when the host says the session is gone (below).
 //
@@ -48,7 +49,7 @@
 // for ever: the cooldown below applies, and the next event after it asks afresh.
 //
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
-// rejection there disables chat for that session only. A deleted session never rejoins in this process. A session
+// rejection there, or in a signal applied on receipt, disables chat for that session only. A deleted session never rejoins in this process. A session
 // that faulted stays out while its refusal is in the bounded lookup cache, so a worker that is still ending is not
 // raced by a second join until that entry is evicted.
 import { CALL_TIMEOUT_MS, isMissing } from "./context.js"
@@ -210,11 +211,22 @@ export function createManager(ctx, config, parts, {
   // A compaction signal, or the first event since a gap, may have left the binding entry dropped. The binding context
   // owes that read-back, failed and overtaken ones included, and says when one may start. A check that fails or is
   // overtaken leaves the obligation owed, so the next event asks again. It never rejects, so nothing is awaited or
-  // handled here, and only a session the host reports gone ends (`onMissing`).
-  function handle(record, event) {
+  // handled here, and only a session the host reports gone ends (`onMissing`). An event that `applyNow` already gave to
+  // the context is not given again: only the repair waits for the chain.
+  function handle(record, event, applied) {
     if (!active || record.dead || !record.context) return
-    record.context.observe(event)
+    if (!applied) record.context.observe(event)
     void record.context.repair()
+  }
+
+  // A signal or a gap takes the binding's proof back when it is received, not when the session's chain reaches it: the
+  // lifecycle asks for the proof synchronously when it sends a join's first heartbeat, and a continuation already queued
+  // can run before the chain does. A session whose context does not exist yet gets the event on the chain, after its
+  // lookup, as before. True when the context took it now. A throw is that session's fault, as on its chain.
+  function applyNow(record, apply) {
+    if (!active || record.dead || !record.context) return false
+    try { apply(record.context) } catch (error) { isolate(record, error) }
+    return true
   }
 
   // Fenced here, not on the record's chain: a lookup still in flight finds its record dead before it can join. The
@@ -256,15 +268,18 @@ export function createManager(ctx, config, parts, {
       record.chain = record.chain.then(() => start(record)).catch(error => isolate(record, error))
     }
     const current = record
-    current.chain = current.chain.then(() => handle(current, event)).catch(error => isolate(current, error))
+    const applied = applyNow(current, context => context.observe(event))
+    current.chain = current.chain.then(() => handle(current, event, applied)).catch(error => isolate(current, error))
   }
 
-  // The event stream broke or restarted: events may be missing, so every observation is stale.
+  // The event stream broke or restarted: events may be missing, so every observation is stale. A read-back is owed now,
+  // and asked for at the next event or tick.
   function reset() {
     for (const record of [...records.values()]) {
+      if (applyNow(record, context => context.reset())) continue
       record.chain = record.chain.then(() => {
         if (record.dead || !record.context) return
-        record.context.reset() // a read-back is owed now, and asked for at the next event or tick
+        record.context.reset()
       }).catch(error => isolate(record, error))
     }
   }

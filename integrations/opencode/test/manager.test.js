@@ -1395,13 +1395,15 @@ test("a transient list rejection leaves the obligation owed and the session on, 
   assert.match(run.rig.entries.get(BINDING_KEY), /binding text/) // the entry is back
 })
 
-// A check that is in flight when a signal is received can still put the entry back before the signal is applied: that
-// put is at the wrong time and harmless, because the applied signal owes the read-back again and the next check proves.
-// The sweep completes the held list after 0..10 microtask ticks, so it reaches both sides of the signal's turn.
+// A check that is in flight when a signal is received can have put the entry back just before it: that put is at the
+// wrong time and harmless, because the signal owes the read-back again and the next check proves. The sweep completes the
+// held list after 0..10 microtask ticks, so it reaches both sides of the signal's turn. A signal is applied when it is
+// received, so the check that it overtook puts nothing after it; after a compaction signal, its own read-back does.
 for (const signal of ["reset", "compaction"]) {
   test(`a ${signal} received while a check's host call is pending: a put at the wrong time is harmless, and the next event's check proves`, async () => {
     const problems = []
     const wrongTime = new Set()
+    const before = new Set()
     for (const how of ["resolve", "reject"]) {
       for (let offset = 0; offset <= 10; offset++) {
         const label = `${how}@${offset}`
@@ -1411,6 +1413,7 @@ for (const signal of ["reset", "compaction"]) {
         run.signals[signal]()
         await flush()
         if (run.order.join(">").includes("signal>put")) wrongTime.add(label) // the put came after the signal was received
+        if (run.order.join(">").includes("put>signal")) before.add(label) // the put came just before it
         if (signal === "reset") run.send("session.execution.started")
         else run.send("session.compaction.ended", { reason: "auto" })
         await flush()
@@ -1419,7 +1422,84 @@ for (const signal of ["reset", "compaction"]) {
       }
     }
     assert.deepEqual(problems, [])
-    // Positive control: the sweep does reach a put after the signal was received, or an empty result would prove nothing.
-    assert.equal(wrongTime.size > 0, true)
+    // Positive control: the sweep does reach a put just before the signal, or an empty result would prove nothing.
+    assert.equal(before.size > 0, true)
+    // After a gap nothing puts until the next event; after a compaction signal, its own read-back puts the entry back.
+    if (signal === "reset") assert.deepEqual([...wrongTime], [])
+    else assert.equal(wrongTime.size > 0, true)
   })
 }
+
+// Review 6006715460, finding 3: a compaction signal or a gap takes the proof back when the manager receives it, for a
+// context that exists, not behind the session's chain. The lifecycle asks for the proof synchronously when it sends a
+// join's first heartbeat, so an event dispatched just before the publish's continuation runs must keep that heartbeat back.
+// The sweep dispatches the event 0..24 microtask ticks after the join's confirming list answers, so it lands on every
+// turn between the proof and the heartbeat.
+async function firstBeatRace(dispatch, offset) {
+  const rig = holdableCtx()
+  const beats = []
+  const parts = stubParts()
+  const real = withRealContext(parts)
+  parts.createLifecycle = (bus, context, passedConfig, options) => createLifecycle(bus, context, passedConfig, {
+    ...options, ...quiet, now: () => 1_000, random: () => 0, setIntervalImpl: () => 1, clearIntervalImpl: () => {},
+  })
+  parts.startProcess = () => ({
+    ready: Promise.resolve({
+      session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+      room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "opencode",
+      instance_file: "/tmp/agent-chat-state/ses_a.json",
+    }),
+    closed: new Promise(() => {}),
+    request: op => { if (op === "heartbeat") beats.push(op); return Promise.resolve({}) },
+    stop: () => Promise.resolve({ code: 0, signal: null }),
+  })
+  const manager = createManager(rig.ctx, config, parts)
+  rig.held.next = true // the join's confirming list waits
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.equal(rig.held.entered, true)
+  const context = real.get("ses_a")
+  rig.held.settle.resolve()
+  await tickAfter(offset)
+  const at = { proved: context.proved(), beats: beats.length }
+  dispatch(manager)
+  const now = context.proved()
+  await flush()
+  return { at, now, after: beats.length }
+}
+
+for (const [signal, dispatch] of [
+  ["compaction signal", manager => manager.feed(event("session.compaction.started", "ses_a", { reason: "auto" }))],
+  ["stream gap", manager => manager.reset()],
+]) {
+  test(`a ${signal} received just before the join's continuation runs takes the proof back at once, and the first heartbeat is not sent`, async () => {
+    const problems = []
+    let window = 0
+    for (let offset = 0; offset <= 24; offset++) {
+      const { at, now, after } = await firstBeatRace(dispatch, offset)
+      if (now) problems.push(`${offset}: still proved right after the dispatch`)
+      if (at.beats === 0 && after !== 0) problems.push(`${offset}: the first heartbeat went out after the ${signal}`)
+      if (at.proved && at.beats === 0) window += 1
+    }
+    assert.deepEqual(problems, [])
+    // Positive control: the sweep lands between the proof and the heartbeat, or an empty result would prove nothing.
+    assert.ok(window > 0)
+  })
+}
+
+// A gap is applied to an existing context when it is received, outside the session's chain, and a throw there is still
+// that session's fault only.
+test("a gap that a joined session's context throws on faults that session only, and reset() itself does not throw", async () => {
+  const parts = stubParts()
+  const manager = createManager(fakeCtx(root), config, parts)
+  manager.feed(event("session.execution.started", "ses_bad"))
+  manager.feed(event("session.execution.started", "ses_good"))
+  await flush()
+  parts.contexts.get("ses_bad").reset = () => { throw new Error("boom") }
+  assert.doesNotThrow(() => manager.reset())
+  await flush()
+  assert.equal(parts.lifecycles.get("ses_bad").stops, 1)
+  assert.equal(parts.lifecycles.get("ses_good").stops, 0)
+  assert.equal(parts.contexts.get("ses_good").resets, 1)
+  assert.deepEqual(manager.sessions(), ["ses_good"])
+})

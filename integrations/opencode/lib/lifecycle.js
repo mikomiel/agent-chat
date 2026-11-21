@@ -151,9 +151,14 @@ export function createLifecycle(bus, native, config, {
   // the join's publish.
   const unproved = () => typeof native.proved === "function" && !native.proved()
 
+  // Has this join's worker begun to end? `null` while it serves, "idle" once it said it ends for idleness, "stopped" for
+  // any other end (see `lib/worker.js`). A worker without `ending()` says nothing, so it is taken as serving.
+  const endingOf = record => (typeof record.worker.ending === "function" ? record.worker.ending() ?? null : null)
+
   // The gate guards a join's first heartbeat only. `opened` records that one was sent: after it the heartbeat goes on, and
   // a later gap or signal is healed by the tick's read-back, as it was before the gate. A rejoin is a new join, so a new gate.
-  const gateShut = () => live !== null && !live.opened && unproved()
+  // A worker that has begun to end never gets a first heartbeat: its exit decides what happens next (see `connect`).
+  const gateShut = () => live !== null && !live.opened && (endingOf(live) !== null || unproved())
 
   // One heartbeat at a time: the worker takes one request at a time, and a tick that finds one in flight is dropped.
   // The next tick is the retry. A `refused` answer is the worker's brief-outage reply: it keeps the binding alive and
@@ -213,10 +218,10 @@ export function createLifecycle(bus, native, config, {
       // that exits meanwhile must withdraw its binding before the publish makes a put for an instance that is gone.
       worker.closed.then(() => {
         if (live !== record || closed || disabled) return
-        // A worker that ends while its join waits for the first proof (the publish settled, no heartbeat sent yet) was
-        // idle for the server lease: the instance is gone, and a rejoin is the answer, not a shutdown. Every other
-        // exit turns this session's chat off.
-        if (heartbeatTimer !== null && !record.opened)
+        // A worker that said it ends for idleness while its join waits for the first proof (the publish settled, no
+        // heartbeat sent yet) has ended its instance: a rejoin is the answer, not a shutdown. Every other exit, a broken
+        // protocol or a crash in that wait included, turns this session's chat off.
+        if (heartbeatTimer !== null && !record.opened && endingOf(record) === "idle")
           return handleFailure(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "STALE_INSTANCE", operation: "end" }))
         failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
       })
