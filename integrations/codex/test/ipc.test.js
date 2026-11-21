@@ -2,13 +2,14 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import { createInterface } from "node:readline"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { assertPrivateDirectory, connect, connectOrStart, MAX_LINE, paths, serve } from "../lib/ipc.js"
 import { processStartTime } from "../lib/process.js"
+import { trustedSocket } from "../lib/trust.js"
 
 function privateDirectory() {
   const dir = mkdtempSync(join(tmpdir(), "acc-"))
@@ -580,3 +581,64 @@ test("an unexpected connect error is not retried as absence", async () => {
     assert.equal(started, 0)
   } finally { cleanup(dir) }
 })
+
+// ---- a client trusts the path to the receiver before it connects ------------------------------------------------------
+
+// A private state directory that sits below `parentMode`, the way an operator might have put it.
+function nested(parentMode) {
+  const root = mkdtempSync(join(tmpdir(), "acc-"))
+  const parent = join(root, "p")
+  mkdirSync(parent)
+  chmodSync(parent, parentMode)
+  const state = join(parent, "s")
+  mkdirSync(state, { mode: 0o700 })
+  chmodSync(state, 0o700)
+  return { root, state }
+}
+
+test("the state directory must also sit below directories that nobody else can change", () => {
+  for (const mode of [0o777, 0o775, 0o757]) {
+    const { root, state } = nested(mode)
+    try {
+      assert.throws(() => assertPrivateDirectory(state), { code: "CHAT_SOCKET_DIRECTORY" }, mode.toString(8))
+    } finally { cleanup(root) }
+  }
+  for (const mode of [0o700, 0o755, 0o1777]) {
+    const { root, state } = nested(mode)
+    try { assertPrivateDirectory(state) } finally { cleanup(root) }
+  }
+})
+
+test("a client never connects to a socket below a directory that others can change, or to one that another user owns", async () => {
+  const { root, state } = nested(0o777)
+  const dir = privateDirectory()
+  const served = []
+  let handled = 0
+  try {
+    for (const where of [paths(state, "session-1").socket, paths(dir, "session-1").socket]) {
+      served.push(await serve(where, async (_first, link) => { handled += 1; await link.send({ ok: true }) }))
+    }
+    await assert.rejects(connect(paths(state, "session-1").socket), { code: "CHAT_SOCKET_UNTRUSTED" }, "a directory that others can write")
+    const other = path => trustedSocket(path, {
+      refuse: "CHAT_SOCKET_UNTRUSTED",
+      lstat: target => { const info = lstatSync(target); return target.endsWith(".sock") ? Object.create(info, { uid: { value: process.geteuid() + 1 } }) : info },
+    })
+    await assert.rejects(connect(paths(dir, "session-1").socket, { trust: other }), { code: "CHAT_SOCKET_UNTRUSTED" }, "a socket of another user")
+    assert.equal(handled, 0, "neither receiver was ever connected to")
+    const link = await connect(paths(dir, "session-1").socket) // control: the same socket, trusted, is reachable
+    assert.deepEqual(await link.call({ hello: 1 }, 2000), { ok: true })
+    assert.equal(handled, 1, "and it was asked")
+    link.close()
+  } finally { for (const listener of served) listener.close(); cleanup(root); cleanup(dir) }
+})
+
+test("an untrusted socket is not an absent one: no receiver is started on top of it", async () => {
+  const { root, state } = nested(0o777)
+  let started = 0
+  const listener = await serve(paths(state, "session-1").socket, async (_first, link) => { await link.send({ ok: true }) })
+  try {
+    await assert.rejects(connectOrStart(paths(state, "session-1"), { start: () => { started += 1 }, ...fastClock() }), { code: "CHAT_SOCKET_UNTRUSTED" })
+    assert.equal(started, 0)
+  } finally { listener.close(); cleanup(root) }
+})
+

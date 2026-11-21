@@ -3,14 +3,18 @@
 //
 // The state directory is the one the product's worker already requires to be
 // owned by the user with mode 0700, so the socket needs no other access control.
-// This module owns paths, framing and the connect-or-start handshake. It owns no
-// chat policy.
+// That holds only while nobody else can swap the directory or the socket, so the
+// directory and every one above it must be unchangeable by others, and a client
+// connects only to a socket of the current user that passed the same check as the
+// app-server socket (lib/trust.js). This module owns paths, framing and the
+// connect-or-start handshake. It owns no chat policy.
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { chmodSync, closeSync, linkSync, lstatSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import { dirname, join } from "node:path"
 import { HARNESS } from "./config.js"
 import { ownerAlive, processStartTime } from "./process.js"
+import { trustedDirectory, trustedSocket } from "./trust.js"
 
 export const MAX_LINE = 64 * 1024
 // sun_path holds 104 bytes on macOS and 108 on Linux, including the terminator.
@@ -32,6 +36,7 @@ export function assertPrivateDirectory(directory) {
   if (!info.isDirectory() || info.uid !== process.geteuid() || (info.mode & 0o777) !== 0o700) {
     throw refusal("CHAT_SOCKET_DIRECTORY")
   }
+  trustedDirectory(directory, { refuse: "CHAT_SOCKET_DIRECTORY" }) // and nobody else can change a directory above it
 }
 
 // One socket as an ordered stream of JSON objects. `next` resolves null on close
@@ -88,10 +93,15 @@ function channel(socket) {
   }
 }
 
-// A client connection: `call` sends one object and waits for one reply.
-export function connect(path, { timeoutMs = 1500 } = {}) {
+// A client connection: `call` sends one object and waits for one reply. The path is trusted first, and the connection goes to
+// the checked real path: a socket that another user owns, or that sits below a directory others can change, is refused as
+// CHAT_SOCKET_UNTRUSTED before anything is connected to. `trust` replaces the check, for tests.
+const trustSocket = path => trustedSocket(path, { refuse: "CHAT_SOCKET_UNTRUSTED" })
+export function connect(path, { timeoutMs = 1500, trust = trustSocket } = {}) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(path)
+    let target
+    try { target = trust(path).path } catch (error) { return reject(error) }
+    const socket = net.createConnection(target)
     const link = channel(socket)
     const timer = setTimeout(() => { socket.destroy(); reject(refusal("CHAT_RECEIVER_TIMEOUT")) }, timeoutMs)
     socket.once("connect", () => {

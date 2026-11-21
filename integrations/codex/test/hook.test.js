@@ -1,19 +1,27 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { Readable } from "node:stream"
 import { ownerOf, runHook } from "../lib/hook.js"
 import { MAX_OUTPUT_BYTES } from "../lib/channel.js"
+import { connect, paths, serve } from "../lib/ipc.js"
+import { trustedSocket } from "../lib/trust.js"
 
 const absent = () => Object.assign(new Error("absent"), { code: "ENOENT" })
 const never = () => new Promise(() => {})
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-function world() {
+function world({ parentMode } = {}) {
   const root = mkdtempSync(join(tmpdir(), "acc-"))
-  const state = join(root, "s")
+  let parent = root
+  if (parentMode !== undefined) { // the state directory sits one level down, below a directory with this mode
+    parent = join(root, "p")
+    mkdirSync(parent)
+    chmodSync(parent, parentMode)
+  }
+  const state = join(parent, "s")
   mkdirSync(state, { mode: 0o700 })
   chmodSync(state, 0o700)
   const file = join(root, "chat.json")
@@ -293,4 +301,66 @@ test("a receiver that never answers cannot hold a hook past its budget, and stil
     assert.equal(result.code, 0, name)
     assert.deepEqual(result.stdout, [], name)
   }
+})
+
+// ---- the hook prints what a receiver says only when the path to it is trusted ---------------------------------------
+
+// A real receiver socket, and a hook that talks to it over the real transport. The receiver answers every request with a
+// context that a hook would print; `handled` counts the requests it ever received.
+async function overSocket(w, trust) {
+  const seen = { handled: 0, started: [], stdout: [] }
+  const receiver = await serve(paths(w.state, "session-1").socket, async (_first, link) => {
+    seen.handled += 1
+    await link.send({ context: "a notice that the model would read", ack: true })
+  })
+  const io = {
+    stdin: Readable.from([Buffer.from(JSON.stringify(base))]),
+    env: w.env,
+    connect: (path, options) => connect(path, { ...options, ...(trust ? { trust } : {}) }),
+    startReceiver: (_config, sessionId) => { seen.started.push(sessionId) },
+    write: async text => { seen.stdout.push(text); return true },
+    owner: () => 100,
+    sleep: never,
+  }
+  try { seen.code = await runHook("prompt", io); return seen } finally { receiver.close() }
+}
+// The shared trust rule with a file system in which the socket belongs to another user.
+const ownedByAnother = socket => path => trustedSocket(path, {
+  refuse: "CHAT_SOCKET_UNTRUSTED",
+  lstat: target => { const info = lstatSync(target); return basename(target) === basename(socket) ? Object.create(info, { uid: { value: process.geteuid() + 1 } }) : info },
+})
+
+test("control: a trusted socket in a private directory delivers, so the refusals below are the trust check and nothing else", async () => {
+  const w = world()
+  try {
+    const seen = await overSocket(w)
+    assert.equal(seen.code, 0)
+    assert.equal(seen.handled, 1)
+    assert.match(json(seen.stdout).hookSpecificOutput.additionalContext, /a notice that the model would read/)
+  } finally { rmSync(w.root, { recursive: true, force: true }) }
+})
+
+test("a state directory below a directory that others can write prints nothing and connects to nothing, as for an absent receiver", async () => {
+  for (const mode of [0o777, 0o775, 0o757]) {
+    const w = world({ parentMode: mode })
+    try {
+      const seen = await overSocket(w)
+      assert.equal(seen.code, 0, mode.toString(8))
+      assert.equal(seen.handled, 0, `${mode.toString(8)}: the receiver was never asked`)
+      assert.deepEqual(seen.stdout, [], mode.toString(8))
+      assert.deepEqual(seen.started, [], `${mode.toString(8)}: no receiver was started`)
+    } finally { rmSync(w.root, { recursive: true, force: true }) }
+  }
+})
+
+test("a receiver socket that another user owns prints nothing and is never connected to, as for an absent receiver", async () => {
+  const w = world()
+  try {
+    const socket = paths(w.state, "session-1").socket
+    const seen = await overSocket(w, ownedByAnother(socket))
+    assert.equal(seen.code, 0)
+    assert.equal(seen.handled, 0, "the receiver was never asked")
+    assert.deepEqual(seen.stdout, [])
+    assert.deepEqual(seen.started, [], "no receiver was started on top of it")
+  } finally { rmSync(w.root, { recursive: true, force: true }) }
 })
