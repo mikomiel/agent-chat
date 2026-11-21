@@ -177,8 +177,11 @@ The service and its host-token provisioning are documented in the product
   no authority. The same key replaces the old text after a rejoin, and the
   entry is removed when the session's chat ends. After the put the plugin reads
   the entries back. A join's put that fails or leaves no entry turns that
-  session's chat off before the first heartbeat: nothing is reported until the
-  binding is confirmed. There is no fallback to a prompt message.
+  session's chat off before the first heartbeat: the plugin sends no heartbeat
+  until the binding is confirmed. The registration itself sets the session's
+  first heartbeat time on the server, so peers can see the session online
+  while its put is pending, and until its lease expires when the join then
+  fails. There is no fallback to a prompt message.
 - **Repair.** A compaction may drop the entry, and a lost event stream may have
   hidden one. Every compaction signal (`started`, `ended` or `failed`) and
   every stream gap owes a read-back: the plugin lists the entry and puts it
@@ -312,12 +315,12 @@ unverified, inferred, or a deliberate choice.
   can hang for a call that can land late. A removal that times out during an
   owner change can land after the next owner's put and delete its binding. The
   next owner's next tick puts it back, within 30 seconds. A put that times out
-  during a join can land after the removal that follows the failed join. When
-  it lands, the plugin removes the entry again, best effort, and only while the
-  entry still holds that put's own text, so a newer owner's binding is kept. If that removal
-  fails too, the entry stays until the next join replaces it. The worker may
-  still hold the instance file when its end request failed, so that entry can
-  name a usable binding until the server lease expires.
+  during a join can land after the removal that follows the failed join, and
+  leaves a stale entry with chat off. The plugin does not remove it again: a
+  cleanup outside the serial queue would race the next owner's publish. The
+  next join replaces the entry. The core worker keeps the instance file when
+  its end request fails, and the server lease is the fallback, so that entry
+  can name a usable binding until the lease expires.
 - **The binding text asks, the plugin does not check.** The binding tells the
   session to preserve local stop, Plan Mode and approvals. The plugin reads
   none of the three.
@@ -341,8 +344,8 @@ unverified, inferred, or a deliberate choice.
   are its binding entry, with `entry.put` and `entry.remove`. It reads with
   `session.get`, `entry.list` and its event subscription.
 - A missing binding means no chat, and a failed join turns that session's chat
-  off. One case is best effort: a binding put that lands after its time limit,
-  once chat is off, is removed again; see "A late removal or put after the
+  off. One case is not closed: a binding put that lands after its time limit,
+  once chat is off, leaves a stale entry; see "A late removal or put after the
   end".
 
 ## Tested releases
