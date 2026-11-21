@@ -158,6 +158,62 @@ test("a rejoin publishes the new binding over the old one: clear, then put", asy
   assert.doesNotMatch(lifecycle.context(), /boot-1\.json/)
 })
 
+// Review 6005292356, finding 2: after STALE_INSTANCE the replacement's publish queues behind the old binding's removal.
+test("a rejoin whose publish waits behind the old removal puts nothing once the lifecycle ended before the removal did", async () => {
+  for (const end of ["stop", "shutdown"]) {
+    const bus = fakeBus()
+    const entries = new Map()
+    const puts = []
+    let removals = 0
+    let release = null
+    const host = {
+      session: {
+        instructions: {
+          entry: {
+            async put({ key, value }) { puts.push(value); entries.set(key, value) },
+            async list() { return [...entries].map(([key, value]) => ({ key, value })) },
+            async remove({ key }) { // the old binding's removal is the first, and it stays pending until released
+              if (removals++ === 0) await new Promise(resolve => { release = resolve })
+              entries.delete(key)
+            },
+          },
+        },
+      },
+    }
+    const context = createContext(host, "ses_synthetic0001", timers)
+    const published = []
+    const native = { ...context, context: text => { published.push(text); return context.context(text) } }
+    let retry = null
+    let starts = 0
+    const stale = Object.assign(new Error("STALE_INSTANCE"), { code: "STALE_INSTANCE", operation: "heartbeat" })
+    const first = fakeWorker({ answer: op => { if (op === "heartbeat") throw stale; return {} } })
+    const second = fakeWorker({ ready: Promise.resolve({ ...joined, instance_file: "/tmp/agent-chat-state/boot-2.json" }) })
+    const lifecycle = createLifecycle(bus, native, config, {
+      ...timers,
+      startProcess: () => (starts++ === 0 ? first : second),
+      setTimeoutImpl: fn => { retry = fn; return 1 },
+      random: () => 0,
+      now: () => 1000,
+    })
+    bus.fire("session_start", { nativeSessionId: "native-1" })
+    await flush()
+    assert.equal(removals, 1, end) // the stale instance's removal was issued and is pending
+    assert.equal(typeof release, "function", end)
+    retry()
+    await flush()
+    assert.equal(starts, 2, end) // the replacement joined
+    assert.match(published.at(-1), /boot-2\.json/, end) // and handed its binding to the context, behind the removal
+    assert.equal(puts.length, 1, end) // only the first instance's put: the replacement's publish has not run
+    if (end === "shutdown") bus.fire("session_shutdown") // the bus event began the end, and stop() returns that same one
+    const ended = lifecycle.stop()
+    context.dispose() // after the lifecycle's stop, as the manager does it
+    release()
+    assert.deepEqual(await ended, { code: 0, signal: null }, end)
+    assert.equal(puts.filter(text => /boot-2\.json/.test(text)).length, 0, end) // no put after the teardown
+    assert.equal(entries.has(BINDING_KEY), false, end)
+  }
+})
+
 test("a rejoinable join failure schedules one bounded retry", async () => {
   const bus = fakeBus()
   let delay = null

@@ -25,12 +25,15 @@
 //
 // A LOOKUP HOLDS NOTHING BACK. A record still in its eligibility lookup has no worker and no binding entry, so
 // `stop()` ends it at once and waits only for the worker and entry cleanup of joined sessions. A lookup that never
-// answers cannot keep the next owner waiting, and its late answer finds the manager inactive and starts nothing.
+// answers cannot keep the next owner waiting, and its late answer finds the manager inactive and starts nothing. It
+// also ends at the call time limit as a failed lookup, so the later events of its session are not queued behind it
+// for ever: the cooldown below applies, and the next event after it asks afresh.
 //
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
 // rejection there disables chat for that session only. A deleted session never rejoins in this process. A session
 // that faulted stays out while its refusal is in the bounded lookup cache, so a worker that is still ending is not
 // raced by a second join until that entry is evicted.
+import { CALL_TIMEOUT_MS } from "./context.js"
 import { describeFailure } from "./worker.js"
 
 // The events the manager reads. Session events of other kinds, such as every tool call, are never subscribed to.
@@ -62,6 +65,8 @@ export const deletedSessionOf = event => (event?.type === "session.deleted" ? se
 
 export function createManager(ctx, config, parts, {
   now = Date.now,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
   notice = () => {},
   forked = new Set(), // fork evidence: session ids that are never roots; the registry hands every owner the same set
   deleted = new Set(), // deletion tombstones: ids of sessions that ended; never evicted, shared like `forked`
@@ -109,6 +114,19 @@ export function createManager(ctx, config, parts, {
     void dispose(record)
   }
 
+  // The eligibility lookup has the same time limit as one instruction-entry call: a lookup that never answers would hold
+  // its session's chain, and every later event of that session, for ever. A lookup that runs out of time is a failed
+  // lookup. The host is not told to stop it, and its late answer settles a promise that already ended, so it reaches
+  // nothing: only `start` can create a worker, and it has moved on.
+  function lookup(sessionID) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeoutImpl(() => reject(new Error("LOOKUP_TIMEOUT")), CALL_TIMEOUT_MS)
+      timer?.unref?.() // a lookup that is never answered must not keep a stopping process alive for the limit
+      const answer = settle => value => { clearTimeoutImpl(timer); settle(value) }
+      new Promise(begin => begin(ctx.session.get({ sessionID }))).then(answer(resolve), answer(reject))
+    })
+  }
+
   async function start(record, first) {
     if (!active || record.dead) return
     if (first?.type === "session.created" && first.data?.parentID !== undefined && first.data?.parentID !== null) {
@@ -118,7 +136,7 @@ export function createManager(ctx, config, parts, {
       return
     }
     let info
-    try { info = await ctx.session.get({ sessionID: record.id }) }
+    try { info = await lookup(record.id) }
     catch {
       // A record that was ended while the lookup ran (a fork, a deletion, a fault) keeps the refusal that ended it.
       if (!active || record.dead) return

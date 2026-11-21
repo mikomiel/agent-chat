@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { EVENT_TYPES, createManager, isRootSession } from "../lib/manager.js"
-import { createContext } from "../lib/context.js"
+import { createContext, CALL_TIMEOUT_MS } from "../lib/context.js"
 import { createLifecycle } from "../lib/lifecycle.js"
 import { BINDING_KEY } from "../lib/channel.js"
 
@@ -178,6 +178,45 @@ test("a lookup that fails is retried later, not on every event and not as a refu
   await flush()
   assert.deepEqual(ctx.lookups, ["ses_a", "ses_a"])
   assert.equal(parts.lifecycles.size, 1)
+})
+
+// Review 6005292356, finding 3: a lookup that never settles must not hold its session's later events for ever.
+test("a lookup that never settles times out into the cooldown, a later event looks up again, and the late answer starts nothing", async () => {
+  let clock = 1_000
+  const limits = [] // injected timers: the test fires the lookup's time limit by hand, and no test waits for the clock
+  const answers = []
+  const parts = stubParts()
+  const ctx = { session: { get: ({ sessionID }) => new Promise(resolve => { answers.push({ sessionID, resolve }) }) } }
+  const manager = createManager(ctx, config, parts, {
+    now: () => clock,
+    setTimeoutImpl(fn, ms) { const timer = { fn, ms, cleared: false }; limits.push(timer); return timer },
+    clearTimeoutImpl(timer) { timer.cleared = true },
+  })
+  manager.feed(event("session.execution.started", "ses_a"))
+  manager.feed(event("session.execution.started", "ses_a")) // queued behind the lookup on the session's chain
+  await flush()
+  assert.equal(answers.length, 1)
+  assert.deepEqual(limits.map(timer => timer.ms), [CALL_TIMEOUT_MS]) // the lookup has the same limit as a host call
+  limits[0].fn()
+  await flush()
+  assert.deepEqual(manager.sessions(), []) // a failed lookup: the record is gone
+  clock += 30_000
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.equal(answers.length, 1) // inside the cooldown: not looked up again
+  clock += 31_000 // past the 60 second cooldown
+  manager.feed(event("session.execution.started", "ses_a"))
+  await flush()
+  assert.equal(answers.length, 2) // a fresh lookup, which the stuck one no longer blocks
+  answers[0].resolve(root("ses_a")) // the original lookup answers late, root-shaped
+  await flush()
+  assert.equal(parts.lifecycles.size, 0) // and starts no worker
+  assert.deepEqual(manager.sessions(), ["ses_a"]) // only the fresh record exists
+  answers[1].resolve(root("ses_a"))
+  await flush()
+  assert.equal(parts.lifecycles.size, 1) // the fresh lookup joins once
+  assert.equal(parts.lifecycles.get("ses_a").started.length, 1)
+  assert.equal(limits[1].cleared, true) // an answer in time clears its own timer
 })
 
 test("one session's fault disables that session only", async () => {

@@ -158,6 +158,29 @@ test("context: no second put once the binding is withdrawn or the context is tor
   }
 })
 
+// Review 6005292356, finding 2: the first put is wanted-checked too, not only the second.
+test("context: a publish queued behind a slow removal makes no put once its binding was torn down before it started", async () => {
+  for (const end of ["withdraw", "replace", "dispose", "disable"]) {
+    const { ctx, context } = make()
+    await context.context("old binding")
+    const held = holdFirst(ctx.session.instructions.entry, "remove") // the old binding's removal is issued and pending
+    void context.context(null)
+    await flush()
+    assert.equal(held.entered, true, end)
+    const publish = context.context("binding") // its first put waits behind that removal on the queue
+    await flush()
+    assert.equal(ctx.calls.put.length, 1, end) // only the old binding's put: nothing of the queued publish ran yet
+    let after = Promise.resolve()
+    if (end === "withdraw") after = context.context(null)
+    else if (end === "replace") after = context.context("newer binding")
+    else context[end]()
+    held.settle.resolve()
+    await assert.rejects(publish, { code: "CHAT_CONTEXT_UNAVAILABLE" }, end)
+    await after
+    assert.equal(ctx.calls.put.filter(input => input.value === "binding").length, 0, end) // no put, not even a first one
+  }
+})
+
 test("context: a repair makes no second put once a newer signal overtook its confirmation", async () => {
   const { ctx, context } = make()
   await context.context("binding")
@@ -221,7 +244,10 @@ test("context: operations run in order, so a clear never overtakes a publish", a
   const { ctx, context } = make()
   const publish = context.context("binding")
   const clear = context.context(null)
-  await Promise.all([publish, clear])
+  // The clear withdrew the binding before its queued publish started, so that publish puts nothing and fails.
+  await assert.rejects(publish, { code: "CHAT_CONTEXT_UNAVAILABLE" })
+  await clear
+  assert.equal(ctx.calls.put.length, 0)
   assert.equal(ctx.entries.size, 0)
 })
 

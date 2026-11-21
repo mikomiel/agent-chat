@@ -103,21 +103,23 @@ export function createContext(ctx, sessionID, { setTimeoutImpl = setTimeout, cle
   // that was closed or disabled.
   const currentAt = (mark, binding) => () => !closed && !disabled && compactions === mark && generation === binding
 
-  // Put the entry and confirm it. `current` is asked after the put and before the confirming list: false stops there,
-  // and the result is false. A put that left no entry throws: the caller decides what that means.
+  // Put the entry and confirm it. A put is made only while the work is still wanted, and that is asked before every put,
+  // the first included: a publish queued behind a slow removal may start after its binding was torn down, and a retired
+  // context must not write. `current` false ends a repair with false, and `wanted` false (the binding was withdrawn,
+  // replaced or torn down) fails a join's publish, so a stale binding is never written over a newer one.
+  // `current` is also asked after the put and before the confirming list: false stops there, and the result is false.
+  // A put that left no entry throws: the caller decides what that means.
   // A put of an earlier owner that ran out of time can land between this put and its confirming list, so a confirmation
-  // that finds other text puts once more before it fails. The second put is made only while the work is still wanted:
-  // `current` false ends a repair with false, and `wanted` false (the binding was withdrawn, replaced or torn down) fails
-  // a join's publish, so a stale binding is never written over a newer one.
+  // that finds other text puts once more before it fails.
   async function publish(text, { current = () => true, wanted = () => true } = {}) {
     for (let attempt = 0; ; attempt += 1) {
+      if (!current()) return false
+      if (!wanted()) throw contextFailure()
       await call("put", { sessionID, key: BINDING_KEY, value: text })
       if (!current()) return false
       // The surface is experimental.
       if (await holds(text)) return true
       if (attempt >= 1) throw contextFailure()
-      if (!current()) return false
-      if (!wanted()) throw contextFailure()
     }
   }
 

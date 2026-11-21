@@ -142,8 +142,12 @@ The service and its host-token provisioning are documented in the product
   events no other stream did, so the owner treats it as a lost event stream.
 - **One lifecycle per root session, one fault boundary each.** A session
   joins at the first event the owner sees for it. `session.get` must show no
-  `parentID` and no `fork`. A subagent runs only in a child session, so it
-  never joins. A fork is refused as well: whether a fork sets `parentID` is not
+  `parentID` and no `fork`. The lookup has the same 10-second limit as an
+  instruction-entry call. A lookup that runs out of time counts as failed: the
+  session is refused for 60 seconds, or until the bounded lookup cache below
+  evicts that refusal. A later event then asks afresh, and the late answer of
+  the first lookup starts nothing. A subagent runs only in a child session, so
+  it never joins. A fork is refused as well: whether a fork sets `parentID` is not
   confirmed, so a session that might be a fork stays out. A `session.forked`
   event is recorded before any lookup or join, and it is kept while lookups
   are refused; a lookup already in flight cannot join afterwards, whether it
@@ -282,9 +286,11 @@ unverified, inferred, or a deliberate choice.
   on more than one instance's stream is not documented.
 - **Compaction events.** A compaction signal, a stream gap and the heartbeat
   tick trigger a read-back. If a compaction drops the entry and none of its
-  events arrives, the entry stays missing until the next tick's repair attempt,
-  which starts at most 30 seconds later. A run that starts inside that window reads its instructions without
-  the binding. Whether a compaction drops the entry at all is unknown.
+  events arrives, the entry stays missing until a repair that the next tick
+  requests, at most 30 seconds later. The tick is the cadence for requesting a
+  repair. A repair already in flight can defer the follow-up past it. A run that
+  starts inside that window reads its instructions without the binding. Whether
+  a compaction drops the entry at all is unknown.
 - **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
   after each put, each compaction signal and each gap. After a crash an entry
@@ -317,14 +323,17 @@ unverified, inferred, or a deliberate choice.
 - **A late removal or put after the end.** The time limit trades a call that
   can hang for a call that can land late. A removal that times out during an
   owner change can land after the next owner's put and delete its binding. The
-  next owner's next tick, at most 30 seconds later, attempts to put it back. A put that times out
+  next owner's next tick requests a repair that puts it back; a repair already
+  in flight can defer that past the tick. A put that times out
   during a join can land after the removal that follows the failed join, and
   leaves a stale entry with chat off. The plugin does not remove it again: a
   cleanup outside the serial queue would race the next owner's publish. The
-  next join replaces the entry. The entry names an instance file that the core
-  worker discards before it sends its end request (#149), so nothing local can
-  use it. A late put that lands while a successor confirms its own binding is
-  put over once more by the successor's publish.
+  next join replaces the entry. The entry names an instance file. Once the core
+  change from #149 is in the installed core, the worker discards that file
+  before it sends its end request, so a new open of its path finds nothing.
+  Until then the worker discards it only after a successful end. A late put
+  that lands while a successor confirms its own binding is put over once more
+  by the successor's publish.
 - **The binding text asks, the plugin does not check.** The binding tells the
   session to preserve local stop, Plan Mode and approvals. The plugin reads
   none of the three.
