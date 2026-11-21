@@ -1,19 +1,21 @@
 # OpenCode integration
 
-A server plugin for OpenCode. It joins an Agent Chat session for each root
-OpenCode session, keeps the binding in that session's instructions and hands
-claimed messages to a session that is running. It runs the product's
-`agent_chat.instance_worker` as a child process, so join, heartbeat, pending,
-claim, settle and rejoin policy stay in the Python core. The plugin supplies
-the native state, the delivery path and the bounded rejoin scheduler.
+A server plugin for OpenCode. It joins one Agent Chat session for each root
+OpenCode session and keeps the binding in that session's instructions. It runs
+the product's `agent_chat.instance_worker` as a child process, so join,
+heartbeat and rejoin policy stay in the Python core. The plugin supplies the
+binding context and the bounded rejoin scheduler.
 
 **State: source present, live run pending.** The contract tests run against
 doubles of the plugin surface. No OpenCode session has run this plugin. Read
 "Known limits" and "Tested releases" before relying on it.
 
-**There is no idle wake.** The plugin delivers only to a session it has
-observed to be running. An idle session reads chat on its next turn through
-the Agent Chat tools. See "Known limits" for why.
+**The plugin joins and delivers nothing.** It never claims a message, never
+settles one and never sends input to a session. A session reads chat on its own
+turns, using the binding in its instructions. Every heartbeat reports the state
+`unknown`: the plugin cannot say what a session is doing, and it never reports
+idle. Delivery is not part of this package; [issue
+#148](https://github.com/mikomiel/agent-chat/issues/148) tracks it.
 
 ## Requirements
 
@@ -25,9 +27,9 @@ the Agent Chat tools. See "Known limits" for why.
   `agent-chat` from PyPI; that name belongs to an unrelated project. The `python`
   field of the config file names this interpreter.
 - A reachable Agent Chat service and a host token accepted by it.
-- Node built-ins only inside the plugin: `node:child_process`, `node:fs`,
-  `node:crypto`. Whether OpenCode's plugin runtime exposes them is not
-  verified. The package tests need Node 20 or newer.
+- Node built-ins only inside the plugin: `node:child_process`, `node:crypto`,
+  `node:fs` and `node:path`. Whether OpenCode's plugin runtime exposes them is
+  not verified. The package tests need Node 20 or newer.
 
 ## Install
 
@@ -84,8 +86,7 @@ Create a private directory and a `0600` JSON file outside the repository:
   "directory": "<absolute-private-state-directory>",
   "serverOrigin": "https://chat.example",
   "hostToken": "replace-with-the-host-token",
-  "python": "<absolute-python-interpreter>",
-  "noticeBodies": false
+  "python": "<absolute-python-interpreter>"
 }
 ```
 
@@ -96,9 +97,8 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
-| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 
-Every key is fixed. The loader accepts exactly these six and refuses an
+Every key is fixed. The loader accepts exactly these five and refuses an
 unknown key. Point the server process at the file:
 
 ```sh
@@ -120,35 +120,21 @@ The service and its host-token provisioning are documented in the product
 - **One owner per server.** OpenCode loads a plugin once per location, so one
   server can run several plugin instances. Every instance joins one
   process-wide registry. The first instance owns the joins. Every instance
-  reads its own event stream and forwards events to the owner. The registry
-  orders a session's events by the host's own sequence number, `durable.seq`,
-  and keeps one process-wide high-water mark per session: the highest `seq` it
-  has passed on. An event is passed on only when its `seq` is above the mark,
-  and it raises the mark. A copy from another stream, a lagging stream's replay
-  after a handoff and a delayed duplicate are therefore dropped, whatever id
-  they carry, and a run that starts right after another one ended is applied.
-  One exception: the registry also keeps the `seq` of each session's open run
-  (its latest passed-on `session.execution.started` that no run end has
-  closed). A run end (`succeeded`, `failed` or `interrupted`) at or below the
-  mark is still passed on when its `seq` is above that start, so a run end that
-  one stream delivers late, after another stream moved the mark past it, ends
-  the run. It closes the run and does not move the mark. An end below a
-  successor's start, an end that was already passed on, and an end with no
-  open run are dropped, so a stale end never ends a newer run. The marks and
-  the open runs outlive an owner change and a stream reset. An event without a
-  valid `durable` envelope (missing, another session's `aggregateID`, or a
-  `seq` that is not a non-negative integer) is dropped. A `session.forked` or
-  `session.deleted` event is not ordered at all: it is recorded and passed on
-  from any stream, in any order, and a session with that evidence is refused by
-  the owner. The registry keeps one mark and one open-run entry at most per
-  session it has seen, and drops both on a fork or a deletion. When the
-  owner's instance is torn down, the next one takes over only after the old
-  owner's workers and the removal of its binding entries have ended. A session
-  that is still in its `session.get` lookup has no worker and no entry, so it
-  does not delay the takeover, and a lookup that answers late starts nothing. A
-  session then rejoins at its next event. An instance that leaves without
-  owning is a gap for the owner too: its stream may have carried events no
-  other stream did, so the owner treats it as a lost event stream.
+  reads its own event stream and forwards each event to the registry. The
+  registry orders nothing and drops no event for being old or repeated,
+  because every event the owner acts on is safe to repeat: a copy from another
+  stream, or a lagging stream's replay after a handoff, only shows that the
+  stream is up or owes the binding's read-back again. An event that arrives
+  while there is no owner is lost, and its session joins at its next event. A
+  `session.forked` or `session.deleted` event is recorded from any stream,
+  before the owner check, and a session with that evidence is refused by the
+  owner. When the owner's instance is torn down, the next one takes over only
+  after the old owner's workers and the removal of its binding entries have
+  ended. A session that is still in its `session.get` lookup has no worker and
+  no entry, so it does not delay the takeover, and a lookup that answers late
+  starts nothing. A session then rejoins at its next event. An instance that
+  leaves without owning is a gap for the owner too: its stream may have carried
+  events no other stream did, so the owner treats it as a lost event stream.
 - **One lifecycle per root session, one fault boundary each.** A session
   joins at the first event the owner sees for it. `session.get` must show no
   `parentID` and no `fork`. A subagent runs only in a child session, so it
@@ -161,126 +147,90 @@ The service and its host-token provisioning are documented in the product
   A `session.deleted` event is fenced when it is received and not behind the
   lookup: the record ends at once, so a lookup that answers after the deletion
   starts no worker and sends no join. Events still queued for that session are
-  dropped, and a delivery pending on it settles `uncertain`. The deletion is
-  also a tombstone in a set of its own, kept the same way: no cache evicts it,
-  and the next owner receives it, including a deletion that arrived between
-  two owners. A later event for a deleted session is never looked up. A deleted
-  fork drops its fork record, because the tombstone covers it. The tombstone
-  set is never trimmed, so it grows with the deleted sessions of one process.
-  Events of one session run in order on that session's own chain. A fault
-  there ends that session's chat and no other. A faulted session stays out
-  while its refusal is in the bounded lookup cache, which holds 1,024 entries
-  and drops the oldest first. After an eviction a new lookup can succeed and
-  the session can rejoin while the cleanup of its old worker and entry is
-  still pending.
-- **State comes from durable events only.** `session.execution.started`
-  means busy. `succeeded`, `failed` and `interrupted` mean idle. A fact no
-  event has shown is `unknown`, and `unknown` never reads as idle. A lost or
-  restarted event stream resets every session: the run state and the selected
-  agent become unknown, the stop latch is set again and the binding counts as
-  unverified. Only fresh events clear the first three. The fourth waits for a
-  read-back of the entry, which runs at the session's first event after the
-  gap: the stream has resumed by then, so a compaction that ended inside the
-  gap is already over. A compaction already seen running is the exception: a
-  gap does not end it, and a read-back would prove only that the entry exists.
-  It counts as running until its own `session.compaction.ended` or `failed`
-  event, and the read-back waits for that event.
-- **Stop and Plan Mode.** Every session starts chat-stopped. A `user` inbox
-  item clears the stop. An interrupt with reason `user` sets it again. Other
-  interrupt reasons do not. While the selected agent is `plan`, the session
-  reports Plan Mode. A session with no known agent reports stopped and is never
-  claimed for, because Plan Mode cannot be checked.
+  dropped. The deletion is also a tombstone in a set of its own, kept the same
+  way: no cache evicts it, and the next owner receives it, including a deletion
+  that arrived between two owners. A later event for a deleted session is never
+  looked up, and a `session.forked` event that arrives after the deletion adds
+  no fork record. A deleted fork drops its fork record, because the tombstone
+  covers it. The tombstone set is never trimmed, so it grows with the deleted
+  sessions of one process. Events of one session run in order on that session's
+  own chain. A fault there ends that session's chat and no other. A faulted
+  session stays out while its refusal is in the bounded lookup cache, which
+  holds 1,024 entries and drops the oldest first. After an eviction a new
+  lookup can succeed and the session can rejoin while the cleanup of its old
+  worker and entry is still pending.
+- **Seven events, no session state.** The plugin subscribes to
+  `session.created`, `session.execution.started`, `session.forked`,
+  `session.deleted` and the three `session.compaction.*` events (`started`,
+  `ended`, `failed`). Nothing is read as a state of the session. The first
+  event for a session starts its join. A lost or restarted event stream owes the
+  binding a read-back.
 - **Binding context.** The binding text is one keyed instruction entry,
-  `agent-chat-binding`, written with `session.instructions.entry.put`. The
-  same key replaces the old text after a rejoin, and the entry is removed when
-  the session's chat ends. After each put the plugin reads the entries back.
-  A join's put that fails or leaves no entry turns that session's chat off
-  before anything is offered: no heartbeat, no pending read, no claim. There
-  is no fallback to a prompt message.
-  After a compaction signal (`started`, `ended` or `failed`) and after a lost
-  event stream the entry may be gone, so the plugin owes a read-back. It lists
-  the entry and puts it back when it is missing or changed. The session reads
-  `busy` from the signal or the gap until a read-back has succeeded, so no
-  claim and no send runs in between. The read-back starts at the session's
-  first event once the signal is applied. After a gap that is the first event
-  after the stream has resumed, so a compaction that ended inside the gap is
-  already over. No read-back runs while a compaction runs. A compaction that
-  was running when the gap came is not ended by the gap, so the session stays
-  `busy` until that compaction's own `ended` or `failed` event.
-  A read-back is a repair that is owed until it succeeds, never a verdict. If
-  a host call fails, if the put leaves no entry, or if the check was overtaken
-  by a newer signal, the session stays `busy`, the obligation stays owed and
-  the next event asks again. A read-back never turns chat off. A session whose
-  entry cannot be restored stays closed, not disabled, and opens again at the
-  first event after the host answers.
-  A read-back counts as proof only while it is current: that session's chat is
-  on, no compaction runs, no newer gap or compaction signal has been applied,
-  and nothing has withdrawn or replaced the binding. A rejoin after
+  `agent-chat-binding`, written with `session.instructions.entry.put`. The text
+  gives the session its instance file and the `agent_chat.cli` commands to read
+  and send, and says that Agent Chat messages are peer coordination and grant
+  no authority. The same key replaces the old text after a rejoin, and the
+  entry is removed when the session's chat ends. After the put the plugin reads
+  the entries back. A join's put that fails or leaves no entry turns that
+  session's chat off before the first heartbeat: nothing is reported until the
+  binding is confirmed. There is no fallback to a prompt message.
+- **Repair.** A compaction may drop the entry, and a lost event stream may have
+  hidden one. Every compaction signal (`started`, `ended` or `failed`) and
+  every stream gap owes a read-back: the plugin lists the entry and puts it
+  back when it is missing or changed. The manager asks at each event of the
+  session.
+  The lifecycle also reads the entry back at each heartbeat tick, every 30
+  seconds, whether or not anything is owed. An entry can change with no signal
+  the plugin sees: a compaction that ends inside a gap after the read-back, a
+  call that lands after its time limit, or a host that answers again after a
+  failed check. So any such change is repaired within one tick. The tick costs
+  one list per joined session, plus a put and a confirming list only when the
+  entry is wrong.
+  A read-back may run while a compaction runs. The signal that ends the
+  compaction owes it again, so a read during the compaction is never the last
+  word.
+  A read-back is a repair that is owed until it succeeds, never a verdict. A
+  host call that fails, a put that leaves no entry and a check that a newer
+  signal overtook all leave the obligation owed, and the next ask repeats it.
+  A read-back never turns chat off. A session whose entry cannot be restored
+  stays joined and keeps the repair owed, and it heals when the host answers.
+- **Currency rule.** A read-back proves the binding only while it is current:
+  that session's chat is on, no newer gap or compaction signal has been
+  applied, and nothing has withdrawn or replaced the binding. A rejoin after
   `STALE_INSTANCE` does both: it clears the old binding, then publishes a new
   one. The check asks the rule after every host call it awaits and again before
   it proves the binding. Before its first call it also asks that the
   obligation is still owed, so a check queued behind a confirmed publish that
   discharged the obligation makes no host call. A confirmed publish of the
   binding (a join or a rejoin) discharges the obligation if no gap or
-  compaction came since that publish began and nothing replaced the binding. A
-  gap is over only once the stream has resumed for that session, because a
-  compaction can still end inside it and drop the entry after the put. So a
-  publish that began before the first event after a gap does not discharge the
-  gap's obligation, even if it is confirmed. With nothing published there is
-  nothing to read, and the obligation stays owed.
-  A put at the wrong time is harmless. The manager applies a session's events
-  in order, so a signal can be received while a check is in flight, and that
-  check can still put the entry or prove before the signal is applied. Every
-  signal that can invalidate the entry owes the read-back again when it is
-  applied: a gap, and a compaction `started`, `ended` or `failed`. A withdrawn
-  binding's removal runs on the same serial queue as every put, behind any put
-  that is already issued. So the put is read back after the signal, and the
-  next check proves.
-- **Delivery to a running session.** The plugin claims only when it has
-  observed the session running, it is not stopped, not in Plan Mode, not
-  compacting and has no pending attempt. It then sends one `synthetic` input
-  with `delivery: "steer"` and `resume: false`. That call never starts a run.
-  The result is `handed` only when `session.inbox.delivered` arrives for the
-  exact inbox id the call returned. Everything after the call is `handed` or
-  `uncertain`, with one exception: `session.inbox.cancelled` for that id means
-  nothing ran and settles `deferred`. With `noticeBodies`, the plugin reads
-  each candidate's size from `pending` and claims the longest prefix that one
-  8 KiB notice is estimated to carry; a retry batch is claimed whole. A body
-  that outgrows the estimate can still be cut after the claim; the
-  [notice contract](../README.md#notice-contract) lists the limit.
-- **Hazard rule.** A run that ends (`succeeded`, `failed` or `interrupted`)
-  before the delivered event settles `uncertain`. So do a call that throws or
-  rejects, a missed reservation deadline, a lost event stream and a disabled or
-  disposed session. The reservation arithmetic and the receipt checks read one
-  monotonic clock, so a wall-clock correction cannot extend a delivery window.
-  A receipt that arrives at or after the reservation
-  deadline is late, even when the timer has not run yet: a `delivered` or
-  `cancelled` event or a `synthetic` result then settles `uncertain` too. A
-  later `delivered` event for a settled input is ignored,
-  so a parked input that drains into an unrelated prompt can never turn into
-  a `handed` result.
-- **Refusal reasons.** Before the call, the plugin returns `deferred` with
-  `stopped`, `plan`, `unknown` or `busy`. A disabled or disposed session returns
-  `failed` with `native_unavailable`. A session that went idle after the claim
-  is `unknown`: idle is a known state, but the closed reason set has no `idle`,
-  and this release never wakes an idle session.
+  compaction came since that publish began and nothing replaced the binding. With nothing published there is
+  nothing to read, and the obligation stays owed until a publish is confirmed.
+  A put at the wrong time is harmless. Every signal that can invalidate the
+  entry owes the read-back again when it is applied, so a put or a proof that
+  landed just before a signal is read back after it. A withdrawn binding's
+  removal runs on the same serial queue as every put, behind any put that is
+  already issued.
+- **Call time limit.** Every instruction-entry call has a limit of 10 seconds
+  (`CALL_TIMEOUT_MS`). A call that never answers would hold the serial queue
+  for ever, and every later publish, repair and removal with it. A call that
+  runs out of time counts as failed. A read-back proves nothing and stays owed.
+  A join's publish fails, and that turns that session's chat off. A removal is
+  not an error. The host is not told to stop the call, so a put or a removal
+  may still land later, over a newer binding. When one lands late while the
+  session's chat is open, the read-back is owed again. Once the session's chat
+  has ended, see "A late removal or put after the end" under "Heuristics and
+  choices".
 - **Rejoin.** A lapsed instance rejoins only for the codes the core names. The
   wait, jitter, episode length and hourly budget mirror `agent_chat/models.py`,
   and `test/policy.test.js` pins the copy. Each join uses a new boot id and
   replaces the old binding. A worker request with no answer after 22 seconds
   ends that worker and rejoins as the core's own `REQUEST_UNCERTAIN` does. A
   worker that dies or breaks the protocol still turns that session's chat off.
-  A heartbeat or pending read that the worker answers with `refused` is a
-  brief outage, not a failure. The worker and the binding stay, no rejoin
-  budget is spent and the next heartbeat or poll is the retry. The worker ends
-  itself with an error once an outage lasts as long as the server lease, and
-  that error rejoins as above.
+  A heartbeat that the worker answers with `refused` is a brief outage, not a
+  failure. The worker and the binding stay, no rejoin budget is spent and the
+  next heartbeat is the retry. The worker ends itself with an error once an
+  outage lasts as long as the server lease, and that error rejoins as above.
 - **No title.** Heartbeats carry no session title.
-- **Shared renderer.** `lib/notice.js` is a byte-identical copy of
-  [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
-  over; `test/notice.test.js` fails on any difference. The
-  [notice contract](../README.md#notice-contract) lists what framing and
-  packing do not cover.
 
 ## Known limits
 
@@ -289,112 +239,56 @@ unverified, inferred, or a deliberate choice.
 
 ### Not shipped
 
-- **Idle wake.** The plugin cannot check "idle" and enqueue in one atomic
-  step, and the plugin session domain has no inbox list, no inbox cancel and
-  no `active` read. An input that cannot be withdrawn might sit in the inbox
-  and drain into a later, unrelated prompt. The published `experimental.idle`
-  hook notes that notices admitted with `resume: false` "wait for the next
-  wake". An older OpenCode release (2.0.28, scratch server) showed an
-  interrupted run leave a parked steer item that later drained into an
-  unrelated prompt. That was not re-tested on a current release. No signal for
-  "an operator is attached" is known; `session.viewed` is the only
-  viewer-related event and its fit is unproven. Shipping idle wake needs a
-  recorded probe of one exact release that shows all four points are safe.
-  The `experimental.idle` hook is a candidate for a future atomic path.
+- **Delivery.** The plugin sends nothing to a session, running or idle.
+  [Issue #148](https://github.com/mikomiel/agent-chat/issues/148) tracks it.
+  The evidence found so far stays here for that work. The plugin cannot check
+  "idle" and enqueue in one atomic step, and the plugin session domain has no
+  inbox list, no inbox cancel and no `active` read. An input that cannot be
+  withdrawn might sit in the inbox and drain into a later, unrelated prompt.
+  An older OpenCode release (2.0.28, scratch server) showed an interrupted run
+  leave a parked steer item that later drained into an unrelated prompt. That
+  was not re-tested on a current release.
 
 ### Not verified on a live release
 
-- **Draining.** Whether a steer input admitted with `resume: false` drains
-  into a running loop at the next step boundary. If it parks instead, most
-  deliveries end `uncertain` and the input waits for the next prompt.
-- **Event order.** Whether `session.inbox.delivered` always arrives before the
-  run's terminal event. If it can arrive after, a real hand-over settles
-  `uncertain`. That is the safe direction.
-- **Reservation length.** The core's reservation is at most 30 seconds. A
-  delivery that waits longer than the reservation settles `uncertain`, though
-  the input may still drain later.
-- **Item ids.** That the `id` `synthetic` returns is the `inboxID` carried by
-  `session.inbox.delivered` and `session.inbox.cancelled`. This is inferred
-  from the published types. If it is wrong, every delivery ends `uncertain`.
-- **User input event.** That a user prompt emits `session.inbox.enqueued` with
-  `item.type` of `user`. It is the only event that clears the stop latch, so if
-  it is wrong a session stays stopped.
 - **Entry read-back.** That `entry.list` returns the stored value strictly
-  equal to the string that was put. If it does not, every session fails
-  closed.
+  equal to the string that was put. If it does not, every join fails and
+  chat stays off.
 - **Fork event.** That `session.forked` carries the fork's own id in
   `data.sessionID`. If it carries the source's id, forking a root ends that
   root's chat for good.
 - **One process.** Whether every plugin instance of one server shares one
   realm, and so one registry. In separate realms each would own joins and
   would race for the same sessions.
-- **Locations.** Whether the owner's context can read and drive a session that
-  belongs to another location. If it cannot, that session never joins.
-- **Streams and event order.** The registry relies on the host's event
-  sequence. Evidence: the published `@opencode/*` `2.3.2` types and the
-  upstream source at tag `v2.3.2` (`anomalyco/opencode`, commit `c0ad18b4`).
-  Every session event the plugin subscribes to is durable and carries
-  `durable = { aggregateID, seq, version }`, where `aggregateID` is the
-  session id. The host assigns `seq` from 0 per session, in the commit
-  transaction under a per-session lock, so commit, publish and delivery order
-  agree within one subscription. `seq` has gaps, because internal events use
-  numbers too, so the registry compares with "above the mark" and never asks
-  for `last + 1`. Event ids and timestamps are not an order. The host never
-  replays: a new subscription sees only later events. Whether one session's
-  events can arrive on more than one instance's stream is not documented.
-  Two cases fail closed. After an owner change or a stream reset, a session
-  stays unknown until its next new event, because a replayed older event is
-  dropped. An event with no valid envelope is dropped, which would leave a
-  session unknown if the host ever sent a state event without one.
-  One kind of loss remains, and only for a non-terminal event. The mark drops
-  every event at or below it, and a run end is the one exception (see
-  above). If one stream delivers a higher `seq` of a session before another
-  stream delivers a lower event that no stream had delivered yet, that lower
-  event is lost. This needs two streams that each carry only part of a session
-  (a location move, which the plugin does not subscribe to), or a stream that
-  lags behind a newer one, such as a plugin instance that attaches while an
-  older stream still has a backlog. Per lost event type: an
-  `execution.started` can only make the session look idle or unknown, never
-  running, so it is never eligible; a user `inbox.enqueued` leaves the stop
-  latch set; an `inbox.delivered` or `inbox.cancelled` settles a pending
-  notice uncertain at its deadline; a compaction `ended` or `failed` leaves
-  the gate closed until the next compaction event; losing both compaction
-  events leaves a binding entry that the compaction removed unrepaired until
-  the next gap. All of those fail closed or lose only function. Two cases fail
-  open. An `agent.selected` that switches the session to Plan Mode leaves the
-  owner with the older agent, so the session stays eligible until its next
-  `agent.selected`. A lost compaction `started` leaves the gate open from the
-  compaction's start until its `ended` arrives, which then owes the binding
-  read-back. Losing a run's start and its end both below the mark is a double
-  loss: the owner never saw the run, so it stays ineligible, but an operator
-  interrupt in that run does not set the stop latch. The excepted run end is
-  applied after the newer events that moved the mark, so a late operator
-  interrupt sets the stop latch again after a newer user prompt cleared it,
-  and the session stays stopped until the next user prompt, which fails
-  closed. A deletion clears the host's counter for
-  that session, so a reused id would restart at 0; the registry keeps the
-  deletion tombstone and refuses that id for good.
+- **Locations.** Whether the owner's context can read a session that belongs
+  to another location and write its instruction entry. If it cannot, that
+  session never joins.
+- **Streams and event order.** The registry orders nothing and relies on every
+  event the owner acts on being safe to repeat. Evidence: the published
+  `@opencode/*` `2.3.2` types and the upstream source at tag `v2.3.2`
+  (`anomalyco/opencode`, commit `c0ad18b4`). The host never replays: a new
+  subscription sees only later events. Whether one session's events can arrive
+  on more than one instance's stream is not documented.
+- **Compaction events.** A compaction signal, a stream gap and the heartbeat
+  tick trigger a read-back. If a compaction drops the entry and none of its
+  events arrives, the entry stays missing until the next tick, at most 30
+  seconds. A run that starts inside that window reads its instructions without
+  the binding. Whether a compaction drops the entry at all is unknown.
 - **Instruction entries.** The entries surface is typed experimental. Whether
   an entry survives a restart or a compaction is unknown; the plugin checks
-  after each put, each compaction and each gap. After a crash an entry can remain with a
-  stale binding. The next join replaces it. An owner change waits for the old
-  owner's `entry.remove`, and for any context operation queued before it, to
-  settle. A call that never returns blocks the failover and the cleanup.
+  after each put, each compaction signal and each gap. After a crash an entry
+  can remain with a stale binding. The next join replaces it. An owner change
+  waits for the old owner's `entry.remove`, and for any context operation
+  queued before it, to settle. A call that never returns ends at the 10-second
+  limit, so the failover and the cleanup wait a bounded time. The call may
+  still land later; see "A late removal or put after the end".
 - **An entry that cannot be restored.** A read-back that keeps failing leaves
-  the session `busy` and joined, not disabled: it refuses every claim, so
-  nothing is delivered to it. The plugin does not count failures or turn chat
-  off, because the closed gate already refuses every claim. The cost is one
-  list for each event of that session while the host keeps failing, and when the
-  entry is gone also a put and a confirming list. It opens again at the first
-  event after the host answers.
+  the session joined, with the repair owed. The plugin does not count failures
+  or turn chat off. The cost is one list for each event of that session and for
+  each heartbeat tick, and when the entry is gone also a put and a confirming
+  list. The repair completes at the first ask after the host answers.
 - **Forks.** Whether a fork sets `parentID` is unknown. A session with a `fork`
   field or a `parentID` never joins.
-- **Agent after a gap.** Whether the host emits `session.agent.selected` again
-  without an agent switch. If it does not, a session stays out of chat after a
-  lost event stream, or after an instance that did not own the joins is torn
-  down, until its agent next changes. Each such gap also costs a read-back of
-  the binding entry. If that read-back fails, the session stays closed until a
-  later one succeeds, as it does after a compaction.
 - **Plain JavaScript plugin.** See "Install".
 - **Node built-ins.** Whether the plugin runtime allows `node:child_process`.
 - **Connection key.** How the connection-key work in issues #126 to #128
@@ -402,47 +296,25 @@ unverified, inferred, or a deliberate choice.
 
 ### Heuristics and choices
 
-- **Plan Mode** is an agent-id test: the agent named `plan`. A custom agent
-  with the same limits is not detected. A session whose `agent` field is absent
-  reports stopped and is never claimed for until an `agent.selected` event
-  shows one. The same holds after a lost event stream: the agent and the stop
-  latch are reset, so a session is claimed for again only after a fresh
-  `agent.selected` event and a `user` inbox item, even if neither changed.
-- **A compaction whose end is lost.** A compaction the plugin saw start is kept
-  running across a stream gap. If its `ended` or `failed` event falls inside
-  the gap, the session reads `busy` and gets no claim or send until a later
-  compaction event arrives. The check the gap owes also waits for that event.
-  The gate fails closed and the plugin says nothing about it. The plugin has no
-  bounded timeout and no host read for this. `session.get` shows no compaction
-  field in the `2.3.2` types. `session.context` returns
-  messages that include a compaction message with status `running`, `completed`
-  or `failed`, but whether it lists a compaction that is still running is not
-  documented, so the plugin does not rely on it.
-- **A compaction whose start is missed.** A compaction that began inside a gap
-  has no `session.compaction.started` event, so the plugin does not know that it
-  runs. The first event after the gap does not prove such a compaction over, and
-  the plugin cannot tell. It reads the entry back then, treats the session as not
-  compacting, and can reopen the gate once fresh agent, user and run events
-  arrive, while that compaction still runs. Its `ended` event, if it arrives,
-  closes the gate until the entry has been read back again. Whether the host
-  emits those events during a compaction is not verified. The host read named in
-  the previous item is the candidate that would close this, and the plugin does
-  not rely on it.
 - **A join's own publish follows the currency rule only at its end.** The put
   and the confirming list of a join or a rejoin do not follow the currency rule
   above while they run. If a compaction ends between that put and that list,
   the confirmation fails and that session's chat is turned off. The publish
   discharges the read-back obligation only if the rule still holds when it is
-  confirmed and the stream had resumed when it began. A later `context()` call
+  confirmed. A later `context()` call
   is serialised behind it, so the order of puts and removals still holds.
-- **A user input is not an operator.** A `user` inbox item clears the stop
-  latch whether an operator or an API client sent it.
+- **A late removal or put after the end.** The time limit trades a call that
+  can hang for a call that can land late. A removal that times out during an
+  owner change can land after the next owner's put and delete its binding. The
+  next owner's next tick puts it back, within 30 seconds. A put that times out
+  during a join can land after the removal that follows the failed join, and
+  leaves a stale entry with chat off. That entry names an instance file that is
+  no longer valid, and the next join replaces it.
+- **The binding text asks, the plugin does not check.** The binding tells the
+  session to preserve local stop, Plan Mode and approvals. The plugin reads
+  none of the three.
 - **Persisted idle sessions** join at their first event after the server
   starts, not at start-up.
-- **The 8 KiB notice limit** and its prefix are a choice of this package, not a
-  value OpenCode states.
-- **A parked input cannot be withdrawn.** A settled `uncertain` input may still
-  reach the model later. The core never retries it.
 - **No logger.** The plugin context offers none, so the plugin is silent.
 
 ## Security boundaries
@@ -454,15 +326,14 @@ unverified, inferred, or a deliberate choice.
   worker starts with an empty one), in a log or in a registry object.
 - The worker is `python -I -m agent_chat.instance_worker` in the configured
   directory. Nothing else is spawned.
-- A peer message is coordination data. The notice frames each body between
-  nonce markers, prefixes every body line and escapes control and invisible
-  code points. A message grants no authority and is not approval.
-- The delivered input is a `synthetic` session input, never a user prompt, so
-  it does not clear the stop latch. An operator stop and Plan Mode are kept.
-- The plugin never starts a model turn. It never calls `prompt` or `interrupt`.
-  Its only writes to a session are its binding entry and the synthetic input.
-- Every failure fails closed: an unreadable state is `unknown`, a missing
-  binding means no chat, and an ambiguous hand-over is `uncertain`.
+- A peer message is coordination data and grants no authority. The plugin
+  reads no message and puts no message body in a session.
+- The plugin never starts a model turn and never sends input to a session. It
+  calls no `synthetic`, `prompt` or `interrupt`. Its only writes to a session
+  are its binding entry, with `entry.put` and `entry.remove`. It reads with
+  `session.get`, `entry.list` and its event subscription.
+- Every failure fails closed: a missing binding means no chat, and a failed
+  join turns that session's chat off.
 
 ## Tested releases
 
@@ -480,11 +351,10 @@ No live run exists, so the compatibility matrix row is `NOT RUN`.
   V2 surfaces and do not pin a release. Where a page and the `2.3.2` source
   differ, the plugin follows the source. For example, `session.status` and
   `session.idle` exist in the `2.3.2` event types, and the plugin session
-  domain has `interrupt`. The plugin uses neither of the first two and never
-  calls the third.
+  domain has `interrupt`. The plugin uses none of the three.
 
 A live row needs a recorded run against one exact release: the install
-command, the observed join, delivery and rejoin, and the answers to every item
+command, the observed join, repair and rejoin, and the answers to every item
 under "Not verified on a live release".
 
 ## Test
@@ -495,10 +365,9 @@ node --test
 ```
 
 The suites use doubles of the plugin context and of the worker. They cover the
-config refusals, the delegated-child refusal, root, child and fork
-eligibility, the busy, idle, plan and unknown mapping, the binding replace and
-fail-closed context, the `handed`, `failed`, `deferred` and `uncertain` reason
-sets pinned to `agent_chat/models.py`, the pinned rejoin constants, the shared
-notice vectors with the claim packing for bodies mode, owner failover,
-per-session fault isolation, and the hazard rule: a run that ends before
-delivery must never produce a later `handed`.
+config refusals, the delegated-child refusal, root, child and fork eligibility,
+the fork and deletion records and their tombstones, owner failover and handoff,
+per-session fault isolation, the binding publish, replace and fail-closed
+context, the repair after a compaction signal or a gap with its currency rule
+and call time limit, the read-back at each heartbeat tick, the
+`unknown` heartbeat state, and the pinned rejoin constants.

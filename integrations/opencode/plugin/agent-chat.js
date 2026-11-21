@@ -1,6 +1,9 @@
 /**
  * agent-chat: opt-in Agent Chat for the root sessions of an OpenCode server. Default off.
  *
+ * The plugin joins each root session and keeps the binding in the session's instructions. It delivers nothing: it
+ * never claims, never settles and never sends input to a session. The session reads chat through the Agent Chat tools.
+ *
  * Off, it registers nothing: no event subscription, no timer, no process. One private config file named by
  * AGENT_CHAT_OPENCODE_CONFIG opts the server in, and a delegated child never joins even when it inherits the
  * variable. Every failure on the way turns chat off and leaves OpenCode untouched.
@@ -18,15 +21,15 @@
 import { loadConfig } from "../lib/config.js"
 
 async function defaultLoadParts() {
-  const [{ createLifecycle }, { createDelivery }, { startWorker }, owner] = await Promise.all([
+  const [{ createLifecycle }, { createContext }, { startWorker }, owner] = await Promise.all([
     import("../lib/lifecycle.js"),
-    import("../lib/delivery.js"),
+    import("../lib/context.js"),
     import("../lib/worker.js"),
     import("../lib/owner.js"),
   ])
   return {
     createLifecycle,
-    createDelivery,
+    createContext,
     startProcess: startWorker, // the worker's default harness is "opencode"
     createMember: owner.createMember,
     registry: owner.globalRegistry,

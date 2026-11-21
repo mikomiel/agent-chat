@@ -1,46 +1,31 @@
-// One harness-neutral Agent Chat lifecycle, for one OpenCode session. The product's worker owns join, heartbeat,
-// pending, claim and settle; this module supplies the binding text, the bounded rejoin scheduler and the readiness
-// checks around a delivery object. The native half supplies the bus and the delivery:
+// One harness-neutral Agent Chat lifecycle, for one OpenCode session. The product's worker owns join and heartbeat; this
+// module supplies the binding text, the bounded rejoin scheduler and the heartbeat timer around a native half. It
+// claims nothing, settles nothing and sends nothing to the session. The native half supplies the bus and the binding
+// context:
 //
-//   bus.on(name, fn)          receives session_start ({ nativeSessionId }), state_changed and session_shutdown.
-//   delivery.state()          null when a batch may be handed over now, or one of
-//                             busy/plan/stopped/offline/unknown/stale_binding.
-//   delivery.heartbeatState() the Heartbeat object published every 30 seconds and on a state change.
-//   delivery.deliver(batch, deadline)
-//                             hands one rendered notice to the model and
-//                             resolves to { outcome, reason }.
-//   delivery.context(text)    publishes (replacing) or clears the binding text. It resolves only when the text is
-//                             confirmed; a rejection turns this session's chat off. There is no fallback to a prompt.
-//   delivery.disable()        latches the native half off.
+//   bus.on(name, fn)       receives session_start ({ nativeSessionId }) and session_shutdown.
+//   native.context(text)   publishes (replacing) or clears the binding text. It resolves only when the text is
+//                          confirmed; a rejection turns this session's chat off. There is no fallback to a prompt.
+//   native.refresh()       asked at each heartbeat tick: reads the binding entry back and puts it back when it is wrong.
+//   native.disable()       latches the native half off.
 //
-// This module never starts a model turn on its own and never treats a peer message as authorization.
+// The plugin reads no session state, so every heartbeat reports the unknown state: never idle, never busy.
+// This module never starts a model turn and never treats a peer message as authorization.
 import { randomUUID } from "node:crypto"
-import { NOTICE_BOUND, monotonicNow } from "./channel.js"
-import { packCandidates, renderNotice } from "./notice.js"
+import { monotonicNow } from "./channel.js"
 import { createRejoinPolicy } from "./policy.js"
 import { describeFailure, startWorker } from "./worker.js"
 
 const HEARTBEAT_MS = 30_000
-const POLL_MS = 2_000
-const MIN_RESERVATION_MS = 500
-
-// Every outcome and the reasons it may carry, from `agent_chat/models.py`.
-// Anything else is uncertain; the server never receives an invented pair.
-const DELIVERY_REASONS = {
-  handed: new Set([null]),
-  failed: new Set(["native_unavailable"]),
-  deferred: new Set(["busy", "muted", "stopped", "plan", "unknown", "offline", "stale_binding"]),
-  uncertain: new Set(["transport_ambiguous"]),
-}
 
 const requestFailure = (error, operation) => Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation })
 
-// What a heartbeat reports when the native half cannot say: unknown and stopped, never idle.
+// What every heartbeat reports: the plugin cannot say what the session is doing, so it is unknown and stopped, never idle.
 const UNKNOWN_STATE = Object.freeze({ native_state: "unknown", stopped: true, plan_mode: false })
 
 const contextUnavailable = () => Object.assign(new Error("CHAT_CONTEXT_UNAVAILABLE"), { code: "CHAT_CONTEXT_UNAVAILABLE", operation: "join" })
 
-export function createLifecycle(bus, delivery, config, {
+export function createLifecycle(bus, native, config, {
   startProcess = startWorker,
   now = monotonicNow,
   random = Math.random,
@@ -54,14 +39,11 @@ export function createLifecycle(bus, delivery, config, {
   let live = null
   let joined = null
   let heartbeatTimer = null
-  let pollTimer = null
   let rejoinTimer = null
   let ending = null
   let drainFailed = false
   const draining = new Set()
-  let busy = false
-  let dirty = false
-  let pollDue = false
+  let beating = false
   let closed = false
   let disabled = false
   const policy = createRejoinPolicy({ now, random })
@@ -70,34 +52,18 @@ export function createLifecycle(bus, delivery, config, {
     try { notice(text) } catch { /* advisory */ }
   }
 
-  function deliveryState() {
-    if (typeof delivery.state !== "function") return "unknown"
-    try {
-      const reason = delivery.state()
-      return typeof reason === "string" || reason === null ? reason : "unknown"
-    } catch { return "unknown" }
-  }
-
-  function heartbeatState() {
-    let state
-    try { state = delivery.heartbeatState?.() } catch { state = undefined }
-    if (!state || typeof state !== "object") return UNKNOWN_STATE
-    return state
-  }
-
   function stopLive() {
     const record = live
     live = null
     joined = null
     clearIntervalImpl(heartbeatTimer)
-    clearIntervalImpl(pollTimer)
     heartbeatTimer = null
-    pollTimer = null
     // The removal is part of the end the caller waits for: the next owner of this session publishes under the same
     // key, and a removal still in flight could delete that binding. A removal that fails does not block the end: the
-    // next publish replaces a stale entry.
+    // next publish replaces a stale entry. A removal that never answers fails at the context's call time limit, so
+    // the wait is bounded, and that removal may still land later: the bound is not a guarantee.
     let removal
-    try { removal = Promise.resolve(delivery.context?.(null)).catch(() => {}) } catch { removal = Promise.resolve() }
+    try { removal = Promise.resolve(native.context?.(null)).catch(() => {}) } catch { removal = Promise.resolve() }
     if (!record?.worker) return removal.then(() => null)
     let ended
     try { ended = Promise.resolve(record.worker.stop()) } catch (error) { ended = Promise.reject(error) }
@@ -114,7 +80,7 @@ export function createLifecycle(bus, delivery, config, {
   function disableChat(reason) {
     if (closed || disabled) return Promise.resolve(null)
     disabled = true
-    try { delivery.disable?.() } catch { /* chat-only latch */ }
+    try { native.disable?.() } catch { /* chat-only latch */ }
     notify(`Agent Chat stopped (${reason ?? "local stop"}); the OpenCode session is unchanged.`)
     return trackDrain(disconnect())
   }
@@ -138,11 +104,6 @@ export function createLifecycle(bus, delivery, config, {
     catch (exhausted) { return failClosed(exhausted) }
     notify(`Agent Chat reconnecting in ${Math.ceil(delay / 1000)}s (${code}).`)
     rejoinTimer = setTimeoutImpl(() => { void connect() }, delay)
-  }
-
-  function state() {
-    if (closed || disabled) return "offline"
-    return deliveryState()
   }
 
   function bindingText() {
@@ -173,8 +134,8 @@ export function createLifecycle(bus, delivery, config, {
   // No binding context means no chat: a missing or unconfirmed entry is a failure, never a skipped step.
   async function publishContext() {
     const text = bindingText()
-    if (text === null || typeof delivery.context !== "function") throw contextUnavailable()
-    await delivery.context(text)
+    if (text === null || typeof native.context !== "function") throw contextUnavailable()
+    await native.context(text)
   }
 
   function request(operation, fields) {
@@ -182,124 +143,26 @@ export function createLifecycle(bus, delivery, config, {
     return live.worker.request(operation, fields)
   }
 
-  function refused(result) {
-    return result && typeof result === "object" && typeof result.refused === "string" ? result.refused : null
-  }
-
-  function normalized(result) {
-    const outcome = typeof result?.outcome === "string" ? result.outcome : null
-    const reason = result?.reason ?? null
-    if (outcome && DELIVERY_REASONS[outcome]?.has(reason)) return { outcome, reason }
-    return { outcome: "uncertain", reason: "transport_ambiguous" }
-  }
-
-  async function deliver(content, attemptId, deadline) {
-    if (typeof delivery.deliver !== "function") return { outcome: "failed", reason: "native_unavailable" }
+  // One heartbeat at a time: the worker takes one request at a time, and a tick that finds one in flight is dropped.
+  // The next tick is the retry. A `refused` answer is the worker's brief-outage reply: it keeps the binding alive and
+  // the next heartbeat is the retry. Only a worker error, which `request` rejects with, ends the worker.
+  async function heartbeat() {
+    // Nothing is sent before this join's binding is confirmed (`bound`).
+    if (!live || !joined || !live.bound || closed || disabled || beating) return
+    beating = true
     try {
-      return normalized(await delivery.deliver({ content, attemptId }, deadline))
-    } catch {
-      // A throwing native sender is ambiguous: it may have crossed the hand-over
-      // boundary before it threw.
-      return { outcome: "uncertain", reason: "transport_ambiguous" }
-    }
-  }
-
-  async function drive({ heartbeat = false, poll = false } = {}) {
-    // Nothing is published or claimed before this join's binding is confirmed (`bound`).
-    if (!live || !joined || !live.bound || closed || disabled) return
-    dirty ||= heartbeat
-    pollDue ||= poll
-    if (busy) return
-    busy = true
-    try {
-      while ((dirty || pollDue) && live && !closed && !disabled) {
-        if (dirty) {
-          dirty = false
-          // A `refused` answer is the worker's brief-outage reply: it keeps the binding alive and the next heartbeat
-          // is the retry. Only a worker error, which `request` rejects with, ends the worker.
-          await request("heartbeat", { state: heartbeatState() })
-        }
-        if (pollDue && live) {
-          pollDue = false
-          await pollOnce()
-        }
-      }
+      await request("heartbeat", { state: UNKNOWN_STATE })
     } catch (error) {
       handleFailure(requestFailure(error, error?.operation))
-    } finally { busy = false }
+    } finally { beating = false }
   }
 
-  async function pollOnce() {
-    const bodies = config.noticeBodies === true
-    const candidates = await request("pending", bodies ? { bodies: true } : {})
-    if (!live) return
-    // The same brief-outage reply: nothing was read, and the next poll is the retry.
-    if (refused(candidates)) return
-    const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
-    if (!ids.length) return
-    // The native half is the only owner of eligibility: a session that is not proved to be running, or is stopped,
-    // in plan mode, offline or unclassifiable, never receives a claim. A claim spends wake allowance.
-    if (deliveryState() !== null) return
-    // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
-    const claimIds = bodies
-      ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound: NOTICE_BOUND })
-      : ids
-    const started = now()
-    const grant = await request("claim", {
-      key: randomUUID(),
-      messages: claimIds,
-      ...(bodies ? { bodies: true } : {}),
-    })
-    if (!live) return
-    const claimRefusal = refused(grant)
-    if (claimRefusal) {
-      if (REJOIN_AFTER.has(claimRefusal)) throw Object.assign(new Error(claimRefusal), { code: claimRefusal, operation: "claim" })
-      return
-    }
-    if (grant.dispatch !== true || typeof grant.attempt_id !== "string") return
-    const reservation = Number(grant.reservation_ms)
-    if (!Number.isFinite(reservation) || reservation <= 0) {
-      await settle(grant.attempt_id, { outcome: "uncertain", reason: "transport_ambiguous" })
-      return
-    }
-    let result
-    if (started + reservation - now() <= MIN_RESERVATION_MS) {
-      result = { outcome: "uncertain", reason: "transport_ambiguous" }
-    } else {
-      const status = await request("status")
-      if (!live) return
-      const statusRefusal = refused(status)
-      if (statusRefusal) {
-        if (REJOIN_AFTER.has(statusRefusal)) throw Object.assign(new Error(statusRefusal), { code: statusRefusal, operation: "status" })
-        result = { outcome: "deferred", reason: isDeferredReason(statusRefusal) ? statusRefusal : "unknown" }
-      } else if (status.muted !== false) {
-        result = { outcome: "deferred", reason: status.muted === true ? "muted" : "unknown" }
-      } else if (started + reservation - now() <= MIN_RESERVATION_MS) {
-        // The status round trip can consume the reservation; an expired
-        // reservation is uncertain, never a retryable native failure.
-        result = { outcome: "uncertain", reason: "transport_ambiguous" }
-      } else {
-        const content = renderNotice(joined, config.python, grant.messages ?? [], {
-          bodies, bound: NOTICE_BOUND, admittedAt: grant.admitted_at,
-        })
-        result = content === null
-          ? { outcome: "deferred", reason: "offline" }
-          : await deliver(content, grant.attempt_id, started + reservation)
-      }
-    }
-    if (!live) return
-    await settle(grant.attempt_id, result)
-  }
-
-  function isDeferredReason(reason) {
-    return reason !== null && DELIVERY_REASONS.deferred.has(reason)
-  }
-
-  async function settle(attemptId, result) {
-    const settled = await request("settle", { attempt: attemptId, result })
-    const settleRefusal = refused(settled)
-    if (settleRefusal && REJOIN_AFTER.has(settleRefusal))
-      throw Object.assign(new Error(settleRefusal), { code: settleRefusal, operation: "settle" })
+  // The same tick asks the native half to read its binding entry back and repair it. An entry can change with no event
+  // the session raises (a compaction inside a gap, a call that landed late), so the tick asks every time. A failed ask
+  // never reaches the heartbeat.
+  function refreshContext() {
+    if (!live?.bound || closed || disabled) return
+    try { void Promise.resolve(native.refresh?.()).catch(() => {}) } catch { /* advisory */ }
   }
 
   async function connect() {
@@ -318,13 +181,12 @@ export function createLifecycle(bus, delivery, config, {
       joined = result
       policy.succeeded()
       notify(`Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.`)
-      // Before the first heartbeat or poll: nothing is offered or claimed until this join's binding is confirmed.
+      // Before the first heartbeat: nothing is reported until this join's binding is confirmed.
       await publishContext()
       if (live !== record || closed || disabled) return
       record.bound = true
-      heartbeatTimer = setIntervalImpl(() => { void drive({ heartbeat: true }) }, HEARTBEAT_MS)
-      pollTimer = setIntervalImpl(() => { void drive({ poll: true }) }, POLL_MS)
-      await drive({ heartbeat: true, poll: true })
+      heartbeatTimer = setIntervalImpl(() => { void heartbeat(); refreshContext() }, HEARTBEAT_MS)
+      await heartbeat()
     } catch (error) {
       if (live !== record) return
       joined = null
@@ -340,10 +202,6 @@ export function createLifecycle(bus, delivery, config, {
     if (closed || disabled) return
     nativeSessionId = typeof event?.nativeSessionId === "string" && event.nativeSessionId ? event.nativeSessionId : null
     if (nativeSessionId) void connect()
-  })
-  // A running agent or a changed state is worth publishing now, not at the next scheduled heartbeat.
-  bus.on("state_changed", () => {
-    if (live && !closed && !disabled) void drive({ heartbeat: true })
   })
   bus.on("session_shutdown", () => {
     if (closed) return
@@ -383,16 +241,15 @@ export function createLifecycle(bus, delivery, config, {
     if (ending) return ending
     closed = true
     disabled = true
-    try { delivery.disable?.() } catch { /* chat-only latch */ }
+    try { native.disable?.() } catch { /* chat-only latch */ }
     ending = finishExit()
     return ending
   }
 
   return {
-    connect, disconnect, disable: disableChat, stop, state, context: bindingText, heartbeatState,
-    // Contract-test hooks. The plugin drives these through the timers only.
-    poll: () => drive({ poll: true }),
-    heartbeat: () => drive({ heartbeat: true }),
+    connect, disconnect, disable: disableChat, stop, context: bindingText,
+    // Contract-test hook. The plugin drives the heartbeat through the timer only.
+    heartbeat,
   }
 }
 

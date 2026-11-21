@@ -1,43 +1,30 @@
-import test, { beforeEach } from "node:test"
+import test from "node:test"
 import assert from "node:assert/strict"
 import { createMember, createRegistry, globalRegistry } from "../lib/owner.js"
 import { EVENT_TYPES } from "../lib/manager.js"
-import { createDelivery } from "../lib/delivery.js"
+import { createContext } from "../lib/context.js"
 import { createLifecycle } from "../lib/lifecycle.js"
-import { monotonicNow } from "../lib/channel.js"
+import { BINDING_KEY } from "../lib/channel.js"
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
 const flush = async () => { for (let index = 0; index < 8; index++) await tick() }
 
-// Every session event carries the host's `durable` envelope, and the registry orders by its `seq`. A test event takes
-// the next `seq` of its session unless the caller names one. An id seen before for that session gets its earlier `seq`
-// again: the same host event, delivered a second time by another stream.
-const seqs = new Map()
-const nextSeq = new Map()
-beforeEach(() => { seqs.clear(); nextSeq.clear() })
-function durableFor(id, sessionID, seq) {
-  const key = `${sessionID}/${id}`
-  if (seq === undefined && !seqs.has(key)) {
-    seqs.set(key, nextSeq.get(sessionID) ?? 0)
-    nextSeq.set(sessionID, seqs.get(key) + 1)
-  }
-  return { aggregateID: sessionID, seq: seq ?? seqs.get(key), version: 1 }
-}
-const durable = (sessionID, seq) => ({ aggregateID: sessionID, seq, version: 1 })
+const event = (id, type = "session.execution.started", sessionID = "ses_a") => ({ id, type, data: { sessionID } })
 const fed = log => log.filter(line => line.startsWith("feed"))
-const event = (id, type = "session.execution.started", sessionID = "ses_a", seq) => ({ id, type, data: { sessionID }, durable: durableFor(id, sessionID, seq) })
+const noTimers = { setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }
 
 function fakeMember(name, log, { feedThrows = false } = {}) {
   const member = {
     name,
     dispatch: null,
     resetStream: null,
+    sets: null,
     pump(dispatch, reset) {
       member.dispatch = dispatch
       member.resetStream = reset
       return () => log.push(`stop-pump ${name}`)
     },
-    activate() { log.push(`activate ${name}`) },
+    activate(forked, deleted) { member.sets = { forked, deleted }; log.push(`activate ${name}`) },
     async deactivate() {
       log.push(`deactivate-start ${name}`)
       await tick()
@@ -63,40 +50,30 @@ test("the first member owns the joins and the others stand by", async () => {
   await flush()
   assert.deepEqual(log, ["activate first"])
   assert.equal(registry.owner(), first)
-  // An event read by any member goes to the owner, once.
+  // An event read by any member goes to the owner.
   first.dispatch(event("e1"))
-  second.dispatch(event("e1")) // the same host event from the second stream: its seq is not above the mark
-  second.dispatch(event("e2", undefined, "ses_b")) // another session
+  second.dispatch(event("e2", undefined, "ses_b")) // another member's stream, another session
   assert.deepEqual(log.slice(1), ["feed first e1", "feed first e2"])
   second.resetStream()
   assert.equal(log.at(-1), "reset first")
 })
 
-test("an event without an id is ordered by its seq alone", async () => {
+// The registry keeps no order and drops nothing the owner can use: every event the manager acts on is safe to repeat.
+test("a repeat of an event, from the same stream or another one, is passed on, and an event that names no session is not", async () => {
   const registry = createRegistry()
   const log = []
-  const member = fakeMember("only", log)
-  registry.attach(member)
+  const first = fakeMember("first", log)
+  const second = fakeMember("second", log)
+  registry.attach(first)
+  registry.attach(second)
   await flush()
-  const bare = seq => ({ type: "session.execution.started", data: { sessionID: "ses_a" }, durable: durable("ses_a", seq) })
-  member.dispatch(bare(0))
-  member.dispatch(bare(1))
-  member.dispatch(bare(1)) // a repeat
-  assert.equal(log.filter(line => line.startsWith("feed")).length, 2)
-})
-
-// Review 6004544584, finding 1: the id plays no part. The registry keeps no id memory and orders by `durable.seq`.
-test("a repeat of a seq is dropped whatever its id, and the same id with a higher seq is a new event", async () => {
-  const registry = createRegistry()
-  const log = []
-  const member = fakeMember("only", log)
-  registry.attach(member)
-  await flush()
-  member.dispatch(event("same", undefined, "ses_a", 0))
-  member.dispatch(event("same", undefined, "ses_a", 0)) // a repeat
-  member.dispatch(event("other", undefined, "ses_a", 0)) // another id, the same seq
-  member.dispatch(event("same", undefined, "ses_a", 1)) // the same id, a higher seq
-  assert.deepEqual(log.filter(line => line.startsWith("feed")), ["feed only same", "feed only same"])
+  log.length = 0
+  first.dispatch(event("e1"))
+  first.dispatch(event("e1")) // a repeat
+  second.dispatch(event("e1")) // the same host event from the second stream
+  first.dispatch({ id: "e2", type: "session.execution.started", data: {} })
+  first.dispatch({ id: "e3", type: "session.execution.started" })
+  assert.deepEqual(fed(log), ["feed first e1", "feed first e1", "feed first e1"])
 })
 
 test("failover: the next owner starts only after the old owner's workers ended, and events in between are dropped", async () => {
@@ -249,12 +226,15 @@ test("tearing a member down stops its stream for good", async () => {
   assert.equal(ctx.calls[0].signal.aborted, true)
 })
 
+// A binding context double for the tests that only need a session to join.
+const idleContext = () => ({ observe() {}, reset() {}, repair: () => Promise.resolve(false), dispose() {} })
+
 test("activate builds a manager that takes events, and deactivate stops it and proves the end", async () => {
   const lookups = []
   const ctx = { ...streamCtx([]), session: { get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID } } } }
   const stops = []
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createContext: idleContext,
     createLifecycle: (bus) => { bus.on("session_start", () => {}); return { stop: () => { stops.push("stop"); return Promise.resolve({ code: 0 }) } } },
   }
   const member = createMember(ctx, {}, parts)
@@ -270,40 +250,48 @@ test("activate builds a manager that takes events, and deactivate stops it and p
   assert.equal(await member.deactivate(), true) // already ended
 })
 
-// Review 6003128773, finding 1: a stream that is torn down hides events, and the registry cannot tell which
-// sessions it covered, so the owner's whole state is stale from that moment.
-test("a non-owner that leaves while a delivery is pending settles it uncertain, and a later delivered cannot hand over", async () => {
-  const registry = createRegistry()
-  const deliveries = []
-  const noTimers = { setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }
-  const ctx = {
-    ...streamCtx([]),
-    session: { get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }), synthetic: async () => ({ id: "msg_parked" }) },
+// A host double with a binding entry kept in a map, the instruction-entry calls of the real binding context, and a
+// session lookup that answers with a root.
+function entryHost(entries, removal) {
+  return {
+    get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }),
+    instructions: {
+      entry: {
+        put: async ({ key, value }) => { entries.set(key, value) },
+        list: async () => [...entries].map(([key, value]) => ({ key, value })),
+        remove: removal ?? (async ({ key }) => { entries.delete(key) }),
+      },
+    },
   }
+}
+
+// Review 6003128773, finding 1: a stream that is torn down hides events, and the registry cannot tell which sessions it
+// covered, so the owner's whole state is stale from that moment. That is a gap: the owner's binding is read back at the
+// session's next event.
+test("a non-owner that leaves is a gap for the owner: the binding is read back at the session's next event", async () => {
+  const registry = createRegistry()
+  const entries = new Map()
+  let context = null
+  const ctx = { ...streamCtx([]), session: entryHost(entries) }
   const parts = {
-    createDelivery: (hostCtx, id) => { const delivery = createDelivery(hostCtx, id, noTimers); deliveries.push(delivery); return delivery },
+    createContext: (hostCtx, id) => { context = createContext(hostCtx, id, noTimers); return context },
     createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }) } },
   }
   registry.attach(createMember(ctx, {}, parts))
   const detachStandby = registry.attach(createMember(streamCtx([]), {}, {}))
   await flush()
-  const send = (id, type, data = {}) => registry.dispatch({ id, type, data: { sessionID: "ses_a", ...data }, durable: durableFor(id, "ses_a") })
-  send("e1", "session.inbox.enqueued", { item: { type: "user" } })
-  send("e2", "session.execution.started")
+  registry.dispatch(event("e1"))
   await flush()
-  assert.equal(deliveries[0].state(), null)
-  let settled = null
-  void deliveries[0]
-    .deliver({ content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }, monotonicNow() + 60_000)
-    .then(result => { settled = result })
-  await flush()
-  assert.equal(settled, null) // issued, waiting for its delivered event
+  await context.context("binding text")
+  entries.clear() // a compaction dropped the entry, and the standby's stream may have been the one that carried its events
   await detachStandby()
   await flush()
-  assert.deepEqual(settled, { outcome: "uncertain", reason: "transport_ambiguous" })
-  send("e3", "session.inbox.delivered", { inboxID: "msg_parked" })
+  assert.equal(entries.size, 0) // the gap is applied, but nothing is read before the stream shows the session again
+  assert.equal(context.owed(), true)
+  registry.dispatch(event("e2"))
   await flush()
-  assert.notEqual(deliveries[0].state(), null) // every observation is stale until fresh events show them again
+  assert.equal(entries.get(BINDING_KEY), "binding text")
+  assert.equal(context.owed(), false)
 })
 
 // Finding 4: the old owner's binding removal and the successor's put reach the same entry key.
@@ -315,16 +303,7 @@ async function ownerWithSlowRemoval() {
   const removal = { finish: null }
   const ctx = {
     ...streamCtx([]),
-    session: {
-      get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }),
-      instructions: {
-        entry: {
-          put: async ({ key, value }) => { entries.set(key, value) },
-          list: async () => [...entries].map(([key, value]) => ({ key, value })),
-          remove: ({ key }) => new Promise(resolve => { removal.finish = () => { entries.delete(key); resolve() } }),
-        },
-      },
-    },
+    session: entryHost(entries, ({ key }) => new Promise(resolve => { removal.finish = () => { entries.delete(key); resolve() } })),
   }
   const joined = {
     session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
@@ -338,10 +317,9 @@ async function ownerWithSlowRemoval() {
     request: async () => ({}),
     stop() { exit({ code: 0, signal: null }); return this.closed },
   }
-  const noTimers = { setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }
   const parts = {
-    createDelivery: (hostCtx, id) => createDelivery(hostCtx, id, noTimers),
-    createLifecycle: (bus, delivery, config, options) => createLifecycle(bus, delivery, config, { ...options, ...noTimers, setIntervalImpl: () => 0, clearIntervalImpl: () => {} }),
+    createContext: (hostCtx, id) => createContext(hostCtx, id, noTimers),
+    createLifecycle: (bus, context, config, options) => createLifecycle(bus, context, config, { ...options, ...noTimers, setIntervalImpl: () => 0, clearIntervalImpl: () => {} }),
     startProcess: () => worker,
   }
   const config = { chatEnabled: true, directory: "/tmp/agent-chat-state", serverOrigin: "https://chat.example", hostToken: "synthetic-host-token", python: "/usr/bin/python3" }
@@ -395,7 +373,7 @@ function realMember(lookups, started = [], { stuck = [] } = {}) {
     },
   }
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createContext: idleContext,
     createLifecycle: bus => {
       bus.on("session_start", payload => started.push(payload.nativeSessionId))
       return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) }
@@ -403,7 +381,7 @@ function realMember(lookups, started = [], { stuck = [] } = {}) {
   }
   return createMember(ctx, {}, parts)
 }
-const forkedEvent = (id, sessionID) => ({ id, type: "session.forked", data: { sessionID, parentID: "ses_source" }, durable: durableFor(id, sessionID) })
+const forkedEvent = (id, sessionID) => ({ id, type: "session.forked", data: { sessionID, parentID: "ses_source" } })
 const startedEvent = (id, sessionID) => event(id, "session.execution.started", sessionID)
 
 test("a fork that one owner observed is still refused by the next owner", async () => {
@@ -451,7 +429,7 @@ test("a fork event that arrives between two owners is kept for the next one", as
 })
 
 // Review 6003513413, finding 2: deletion tombstones are carried across a promotion, as fork evidence is.
-const deletedEvent = (id, sessionID) => ({ id, type: "session.deleted", data: { sessionID }, durable: durableFor(id, sessionID) })
+const deletedEvent = (id, sessionID) => ({ id, type: "session.deleted", data: { sessionID } })
 
 test("a deletion that one owner observed is still refused by the next owner", async () => {
   const registry = createRegistry()
@@ -495,6 +473,44 @@ test("a deletion event that arrives between two owners is kept for the next one"
   assert.deepEqual(started, [])
 })
 
+// A tombstone is final. A `session.forked` event that arrives after the deletion adds no fork record: the tombstone
+// already refuses the id, and nothing would ever remove the record again.
+test("a late fork event for a deleted session adds no fork record, with an owner and between two owners", async () => {
+  const registry = createRegistry()
+  const log = []
+  const first = fakeMember("first", log)
+  const second = fakeMember("second", log)
+  const detachFirst = registry.attach(first)
+  registry.attach(second)
+  await flush()
+  first.dispatch(deletedEvent("d1", "ses_a"))
+  first.dispatch(forkedEvent("f1", "ses_a")) // late, with an owner
+  assert.equal(first.sets.deleted.has("ses_a"), true)
+  assert.equal(first.sets.forked.has("ses_a"), false)
+  const detaching = detachFirst()
+  await tick()
+  assert.equal(registry.owner(), null)
+  second.dispatch(deletedEvent("d2", "ses_b"))
+  second.dispatch(forkedEvent("f2", "ses_b")) // late, with no owner to take it
+  await detaching
+  assert.equal(second.sets.deleted.has("ses_a"), true) // carried to the next owner
+  assert.equal(second.sets.deleted.has("ses_b"), true)
+  assert.equal(second.sets.forked.has("ses_a"), false)
+  assert.equal(second.sets.forked.has("ses_b"), false)
+})
+
+test("a fork record is dropped with its session, and a fork before the deletion still leaves a tombstone only", async () => {
+  const registry = createRegistry()
+  const first = fakeMember("first", [])
+  registry.attach(first)
+  await flush()
+  first.dispatch(forkedEvent("f1", "ses_a"))
+  assert.equal(first.sets.forked.has("ses_a"), true)
+  first.dispatch(deletedEvent("d1", "ses_a"))
+  assert.equal(first.sets.forked.has("ses_a"), false)
+  assert.equal(first.sets.deleted.has("ses_a"), true)
+})
+
 // Review 6003513413, finding 3: a pending eligibility lookup must not keep the registry ownerless.
 test("a lookup that never answers does not hold back failover, and the standby serves other sessions", async () => {
   const registry = createRegistry()
@@ -515,13 +531,10 @@ test("a lookup that never answers does not hold back failover, and the standby s
 
 // Review 6003305717, finding 2, ordering: `pump` resets when the stream breaks, before the wait and the resubscribe.
 // A compaction can still end after the break and before the stream resumes, and no event reports it.
-test("a compaction that ends after the stream broke and before it resumed is read back before delivery resumes", async () => {
+test("a compaction that ends after the stream broke and before it resumed is read back at the first event after the gap", async () => {
   const registry = createRegistry()
   const entries = new Map()
-  const synthetic = []
-  let hold = false
-  let releaseList = null
-  let delivery = null
+  let context = null
   let rounds = 0
   let breakStream
   const broken = new Promise(resolve => { breakStream = resolve })
@@ -536,419 +549,28 @@ test("a compaction that ends after the stream broke and before it resumed is rea
             throw new Error("stream broke")
           }
           // The stream resumed with no `server.connected`: only the session's own events.
-          yield { id: "e2", type: "session.agent.selected", data: { sessionID: "ses_a", agent: "build" }, durable: durableFor("e2", "ses_a") }
-          yield { id: "e3", type: "session.inbox.enqueued", data: { sessionID: "ses_a", item: { type: "user" } }, durable: durableFor("e3", "ses_a") }
-          yield startedEvent("e4", "ses_a")
+          yield startedEvent("e2", "ses_a")
           await new Promise(resolve => options.signal.addEventListener("abort", resolve, { once: true }))
         })()
       },
     },
-    session: {
-      get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }),
-      synthetic: input => { synthetic.push(input); return Promise.resolve({ id: "msg_1" }) },
-      instructions: {
-        entry: {
-          put: async ({ key, value }) => { entries.set(key, value) },
-          list: async () => {
-            if (hold) await new Promise(resolve => { releaseList = resolve })
-            return [...entries].map(([key, value]) => ({ key, value }))
-          },
-          remove: async ({ key }) => { entries.delete(key) },
-        },
-      },
-    },
+    session: entryHost(entries),
   }
-  const noTimers = { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }
   const parts = {
-    createDelivery: (hostCtx, id) => { delivery = createDelivery(hostCtx, id, noTimers); return delivery },
-    createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) } },
+    createContext: (hostCtx, id) => { context = createContext(hostCtx, id, noTimers); return context },
+    createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }) } },
   }
-  // The break happens first and the wait follows it. The read-back that the break triggers finishes first, and then a
-  // compaction ends during the wait, so its event is lost.
-  const sleep = async () => { await flush(); entries.clear(); hold = true }
+  // The break happens first and the wait follows it. The reset that the break triggers is applied first, and then a
+  // compaction ends during the wait, so its event is lost and the entry is gone.
+  const sleep = async () => { await flush(); entries.clear() }
   registry.attach(createMember(ctx, {}, parts, { sleep }))
   await flush()
-  await delivery.context("binding text")
+  await context.context("binding text")
   assert.equal(entries.size, 1)
   breakStream()
   await flush()
   await flush() // the wait inside `sleep` takes one flush of its own
-  assert.equal(rounds, 2) // the stream resumed
-  assert.equal(entries.size, 0) // the entry is gone, and no event said so
-  const batch = { content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }
-  let refusal = null
-  void delivery.deliver(batch, 5_000).then(result => { refusal = result })
-  await flush()
-  assert.deepEqual(refusal, { outcome: "deferred", reason: "busy" })
-  assert.equal(synthetic.length, 0)
-  hold = false
-  releaseList()
-  await flush()
-  assert.equal(entries.size, 1) // the entry is back
-  assert.equal(delivery.state(), null)
-})
-
-// Review 6004544584, finding 1: the registry orders a session's events by the host's own `durable.seq`, with one
-// process-wide high-water mark per session. A stream, an id or a handoff plays no part: an event is passed on only
-// when its `seq` is above the mark, and passing it on raises the mark.
-test("two streams that take turns being ahead: each event reaches the owner once, in seq order, from whichever delivers it first", async () => {
-  const registry = createRegistry()
-  const log = []
-  const first = fakeMember("first", log)
-  const second = fakeMember("second", log)
-  registry.attach(first)
-  registry.attach(second)
-  await flush()
-  log.length = 0
-  const [e0, e1, e2, e3, e4, e5] = [0, 1, 2, 3, 4, 5].map(seq => event(`e${seq}`, undefined, "ses_a", seq))
-  first.dispatch(e0)
-  second.dispatch(e0)
-  second.dispatch(e1) // the first stream is quiet, and the second one is ahead
-  second.dispatch(e2)
-  first.dispatch(e1) // the first stream catches up on events that were applied already
-  first.dispatch(e2)
-  first.dispatch(e3) // and now it is ahead
-  second.dispatch(e3)
-  second.dispatch(e2) // an older event, late
-  second.dispatch(e4)
-  first.dispatch(e4)
-  second.dispatch(e5) // the first stream never delivers this one
-  assert.deepEqual(fed(log), ["feed first e0", "feed first e1", "feed first e2", "feed first e3", "feed first e4", "feed first e5"]) // the owner is `first`
-})
-
-test("an event at or below the session's mark is dropped, whatever stream and id it comes with, and sessions are separate", async () => {
-  const registry = createRegistry()
-  const log = []
-  const first = fakeMember("first", log)
-  const second = fakeMember("second", log)
-  registry.attach(first)
-  registry.attach(second)
-  await flush()
-  log.length = 0
-  first.dispatch(event("a", undefined, "ses_a", 5))
-  second.dispatch(event("b", undefined, "ses_a", 3)) // older, and this stream never delivered seq 5
-  second.dispatch(event("c", undefined, "ses_a", 5)) // the same seq, another id
-  first.dispatch(event("d", undefined, "ses_a", 6))
-  second.dispatch(event("e", undefined, "ses_b", 0)) // another session has its own mark
-  assert.deepEqual(fed(log), ["feed first a", "feed first d", "feed first e"])
-})
-
-test("a gap in seq is not a reason to drop: only a seq at or below the mark is stale", async () => {
-  const registry = createRegistry()
-  const log = []
-  const member = fakeMember("only", log)
-  registry.attach(member)
-  await flush()
-  member.dispatch(event("first", undefined, "ses_a", 0)) // the host counts from 0
-  member.dispatch(event("gap", undefined, "ses_a", 7)) // internal events used 1 to 6
-  member.dispatch(event("next", undefined, "ses_a", 8))
-  assert.deepEqual(fed(log), ["feed only first", "feed only gap", "feed only next"])
-})
-
-test("an event without a valid durable envelope is dropped and raises no mark", async () => {
-  const registry = createRegistry()
-  const log = []
-  const member = fakeMember("only", log)
-  registry.attach(member)
-  await flush()
-  const base = { id: "x", type: "session.execution.started", data: { sessionID: "ses_a" } }
-  const malformed = [
-    base, // no envelope
-    { ...base, durable: null },
-    { ...base, durable: "ses_a" },
-    { ...base, durable: { seq: 1 } }, // no aggregate
-    { ...base, durable: durable("ses_b", 1) }, // another session's envelope
-    { ...base, durable: durable("ses_a", -1) },
-    { ...base, durable: durable("ses_a", 1.5) },
-    { ...base, durable: durable("ses_a", "2") },
-    { ...base, durable: durable("ses_a", Number.NaN) },
-    { ...base, durable: durable("ses_a", undefined) },
-    { ...base, durable: durable("ses_a", Number.MAX_SAFE_INTEGER + 1) }, // not an exact integer
-    { ...base, data: {}, durable: durable("ses_a", 2) }, // no session
-  ]
-  for (const item of malformed) member.dispatch(item)
-  assert.deepEqual(fed(log), [])
-  member.dispatch({ ...base, id: "ok", durable: durable("ses_a", 0) }) // nothing above raised the mark
-  assert.deepEqual(fed(log), ["feed only ok"])
-})
-
-test("a lost stream does not clear the marks, so a lagging stream's replay stays dropped", async () => {
-  const registry = createRegistry()
-  const log = []
-  const first = fakeMember("first", log)
-  const second = fakeMember("second", log)
-  registry.attach(first)
-  registry.attach(second)
-  await flush()
-  log.length = 0
-  first.dispatch(event("e5", undefined, "ses_a", 5))
-  first.resetStream()
-  second.dispatch(event("e5", undefined, "ses_a", 5)) // the replay
-  second.dispatch(event("e4", undefined, "ses_a", 4))
-  second.dispatch(event("e6", undefined, "ses_a", 6))
-  assert.deepEqual(log, ["feed first e5", "reset first", "feed first e6"])
-})
-
-test("the marks survive an owner promotion", async () => {
-  const registry = createRegistry()
-  const log = []
-  const first = fakeMember("first", log)
-  const second = fakeMember("second", log)
-  const detachFirst = registry.attach(first)
-  registry.attach(second)
-  await flush()
-  first.dispatch(event("e5", undefined, "ses_a", 5))
-  await detachFirst() // the second member owns now
-  log.length = 0
-  second.dispatch(event("e3", undefined, "ses_a", 3))
-  second.dispatch(event("e5", undefined, "ses_a", 5))
-  second.dispatch(event("e6", undefined, "ses_a", 6))
-  assert.deepEqual(fed(log), ["feed second e6"])
-})
-
-test("an event that arrives while nobody owns is not recorded, so its other copy is still new", async () => {
-  const registry = createRegistry()
-  const log = []
-  const first = fakeMember("first", log)
-  const second = fakeMember("second", log)
-  const detachFirst = registry.attach(first)
-  registry.attach(second)
-  await flush()
-  const detaching = detachFirst()
-  await tick()
-  assert.equal(registry.owner(), null)
-  second.dispatch(event("during", undefined, "ses_a", 4)) // nobody saw it
-  await detaching
-  log.length = 0
-  second.dispatch(event("during", undefined, "ses_a", 4)) // the same event, now that an owner exists
-  assert.deepEqual(fed(log), ["feed second during"])
-})
-
-test("a fork or a deletion needs no envelope and no order, from any stream", async () => {
-  const registry = createRegistry()
-  const log = []
-  const first = fakeMember("first", log)
-  const second = fakeMember("second", log)
-  registry.attach(first)
-  registry.attach(second)
-  await flush()
-  log.length = 0
-  first.dispatch(event("e1", undefined, "ses_a", 5))
-  first.dispatch(event("e2", undefined, "ses_b", 5))
-  second.dispatch({ id: "e3", type: "session.deleted", data: { sessionID: "ses_a" } }) // no envelope
-  second.dispatch({ ...forkedEvent("e4", "ses_b"), durable: durable("ses_b", 1) }) // below the mark
-  // The owner refuses a session with that evidence, so what follows is passed on without an order to be refused.
-  second.dispatch({ id: "e5", type: "session.execution.started", data: { sessionID: "ses_a" } })
-  assert.deepEqual(fed(log), ["feed first e1", "feed first e2", "feed first e3", "feed first e4", "feed first e5"])
-})
-
-// The run-end exception to the mark: a run end at or below the mark still reaches the owner when it ends the open run,
-// the run whose start was passed on last and has not been closed. Every other event at or below the mark is dropped.
-const RUN_ENDS = ["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"]
-
-async function twoMembers() {
-  const registry = createRegistry()
-  const log = []
-  const first = fakeMember("first", log)
-  const second = fakeMember("second", log)
-  const detachFirst = registry.attach(first)
-  registry.attach(second)
-  await flush()
-  log.length = 0
-  return { log, first, second, detachFirst }
-}
-
-test("a run end below the mark ends the open run, whichever way the run ended, and does not move the mark", async () => {
-  for (const type of RUN_ENDS) {
-    const { log, first, second } = await twoMembers()
-    first.dispatch(event("run", "session.execution.started", "ses_a", 2))
-    second.dispatch(event("later", "session.agent.selected", "ses_a", 4)) // another stream is ahead
-    first.dispatch(event("end", type, "ses_a", 3)) // the end, late
-    second.dispatch(event("dup", type, "ses_a", 3)) // the same end from the other stream: the run is closed
-    second.dispatch(event("same", "session.agent.selected", "ses_a", 4)) // the mark is still 4
-    first.dispatch(event("next", "session.agent.selected", "ses_a", 5))
-    assert.deepEqual(fed(log), ["feed first run", "feed first later", "feed first end", "feed first next"], type)
-  }
-})
-
-test("a run end below a successor's start is dropped, and so is an end with no open run", async () => {
-  const { log, first, second } = await twoMembers()
-  first.dispatch(event("run1", "session.execution.started", "ses_a", 2))
-  second.dispatch(event("run2", "session.execution.started", "ses_a", 4)) // the successor replaces the open run
-  first.dispatch(event("old-end", "session.execution.succeeded", "ses_a", 3)) // the first run's end
-  second.dispatch(event("end2", "session.execution.succeeded", "ses_a", 5)) // above the mark: the normal rule
-  second.dispatch(event("sel", "session.agent.selected", "ses_b", 4)) // another session, never seen started
-  first.dispatch(event("orphan-end", "session.execution.failed", "ses_b", 3))
-  assert.deepEqual(fed(log), ["feed first run1", "feed first run2", "feed first end2", "feed first sel"])
-})
-
-test("an end that was already passed on is not passed on again, not even after a reset", async () => {
-  const { log, first, second } = await twoMembers()
-  first.dispatch(event("run", "session.execution.started", "ses_a", 2))
-  first.dispatch(event("end", "session.execution.succeeded", "ses_a", 3)) // above the mark: closes the run
-  first.resetStream()
-  second.dispatch(event("end", "session.execution.succeeded", "ses_a", 3)) // the lagging stream's copy
-  assert.deepEqual(log, ["feed first run", "feed first end", "reset first"])
-})
-
-test("every other event below the mark is dropped, even while a run is open", async () => {
-  const { log, first, second } = await twoMembers()
-  first.dispatch(event("run", "session.execution.started", "ses_a", 2))
-  second.dispatch(event("later", "session.agent.selected", "ses_a", 6))
-  second.dispatch(event("delivered", "session.inbox.delivered", "ses_a", 3))
-  second.dispatch(event("selected", "session.agent.selected", "ses_a", 1))
-  second.dispatch(event("run2", "session.execution.started", "ses_a", 5)) // a start below the mark does not replace the open run
-  second.dispatch(event("end", "session.execution.succeeded", "ses_a", 4)) // above the first run's start: it ends that run
-  assert.deepEqual(fed(log), ["feed first run", "feed first later", "feed first end"])
-})
-
-test("the open run survives a stream reset and an owner promotion", async () => {
-  for (const how of ["reset", "promotion"]) {
-    const { log, first, second, detachFirst } = await twoMembers()
-    first.dispatch(event("run", "session.execution.started", "ses_a", 2))
-    second.dispatch(event("later", "session.agent.selected", "ses_a", 4))
-    if (how === "reset") first.resetStream()
-    else await detachFirst() // the second member owns now
-    log.length = 0
-    second.dispatch(event("end", "session.execution.succeeded", "ses_a", 3))
-    assert.equal(fed(log).length, 1, how)
-    assert.match(fed(log)[0], / end$/, how)
-  }
-})
-
-// Two real members whose streams the test drives by hand, and one real delivery for `ses_a` behind the owner. The
-// owner's context keeps the binding entry in a map and records every synthetic input.
-async function handDrivenStreams() {
-  const registry = createRegistry()
-  let delivery = null
-  const entries = new Map()
-  const synthetic = []
-  const ctx = {
-    ...streamCtx([]),
-    session: {
-      get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }),
-      synthetic: input => { synthetic.push(input); return Promise.resolve({ id: "msg_1" }) },
-      instructions: {
-        entry: {
-          put: async ({ key, value }) => { entries.set(key, value) },
-          list: async () => [...entries].map(([key, value]) => ({ key, value })),
-          remove: async ({ key }) => { entries.delete(key) },
-        },
-      },
-    },
-  }
-  const parts = {
-    createDelivery: (hostCtx, id) => {
-      if (id !== "ses_a") return { seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve("proved"), dispose() {} }
-      delivery = createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} })
-      return delivery
-    },
-    createLifecycle: bus => { bus.on("session_start", () => {}); return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) } },
-  }
-  const streams = {}
-  const attach = name => {
-    const member = createMember(name === "a" ? ctx : streamCtx([]), {}, parts)
-    return Object.assign(member, { pump(dispatch, reset) { streams[name] = { dispatch, reset }; return () => {} } })
-  }
-  registry.attach(attach("a"))
-  registry.attach(attach("b"))
-  await flush()
-  return {
-    send: (name, item) => streams[name].dispatch(item),
-    lose: name => streams[name].reset(),
-    delivery: () => delivery,
-    synthetic,
-  }
-}
-const userItem = (id, sessionID = "ses_a", seq) => ({ id, type: "session.inbox.enqueued", data: { sessionID, item: { type: "user" } }, durable: durableFor(id, sessionID, seq) })
-const selected = (id, seq, sessionID = "ses_a") => ({ ...event(id, "session.agent.selected", sessionID, seq), data: { sessionID, agent: "build" } })
-
-// The session of the finding: started and finished on one stream, then a delayed duplicate of the start arrives from
-// another stream long after, with many other events in between. The registry holds no id memory to run out of: the
-// duplicate's seq is at or below the session's mark.
-test("a delayed duplicate start from another stream does not mark an idle session running, however many events came between", async () => {
-  const rig = await handDrivenStreams()
-  rig.send("a", event("e0", "session.agent.selected"))
-  rig.send("a", userItem("e0b"))
-  rig.send("a", event("e1", "session.execution.started"))
-  rig.send("a", event("e2", "session.execution.succeeded"))
-  await flush()
-  const delivery = rig.delivery()
-  assert.notEqual(delivery, null)
-  assert.equal(delivery.heartbeatState().native_state, "idle") // started and finished
-  assert.notEqual(delivery.state(), null)
-  for (let index = 0; index < 1100; index++) rig.send("a", event(`filler-${index}`, "session.execution.started", `ses_other_${index}`))
-  rig.send("b", event("e1", "session.execution.started")) // the delayed duplicate
-  await flush()
-  assert.equal(delivery.heartbeatState().native_state, "idle") // still idle
-  assert.notEqual(delivery.state(), null) // so no notice can be handed over
-})
-
-// Review 6004544584, finding 1. A session ended on the first stream. The first stream is lost, and a lagging stream
-// replays the same events and pauses before the run end. The replay is at or below the session's mark, so it is dropped:
-// it cannot make the ended session look busy, and with a published binding no notice can be claimed for it.
-test("after a handoff a lagging stream's replay is dropped, so an ended session stays unclaimable even with a published binding", async () => {
-  const rig = await handDrivenStreams()
-  const replay = [selected("sel"), userItem("usr"), event("run", "session.execution.started")]
-  const end = event("end", "session.execution.succeeded")
-  for (const item of replay) rig.send("a", item)
-  await flush()
-  const delivery = rig.delivery()
-  assert.equal(delivery.state(), null) // running with a known agent: a notice could be handed over
-  rig.send("a", end)
-  await flush()
-  assert.equal(delivery.heartbeatState().native_state, "idle")
-  await delivery.context("binding text") // the binding is published and confirmed
-  rig.lose("a") // the first stream is lost: nothing is known about the session now
-  await flush()
-  for (const item of replay) rig.send("b", item) // the lagging stream replays up to the run start
-  await flush()
-  await delivery.context("binding text") // a publish after the replay
-  await flush()
-  assert.equal(delivery.heartbeatState().native_state, "unknown") // nothing was applied: the session is not busy
-  assert.notEqual(delivery.state(), null) // so no claim
-  const batch = { content: "peer notice", attemptId: "11111111-1111-4111-8111-111111111111" }
-  assert.deepEqual(await delivery.deliver(batch, 5_000), { outcome: "deferred", reason: "stopped" })
-  assert.equal(rig.synthetic.length, 0)
-})
-
-test("a run that starts right after another ended has a higher seq and is applied, and the old end is not", async () => {
-  const rig = await handDrivenStreams()
-  const end = event("end", "session.execution.succeeded")
-  for (const item of [event("sel", "session.agent.selected"), userItem("usr"), event("run1", "session.execution.started"), end]) rig.send("a", item)
-  rig.send("a", event("run2", "session.execution.started")) // no idle event between the two
-  await flush()
-  assert.equal(rig.delivery().heartbeatState().native_state, "busy")
-  rig.send("b", end) // the first run's end, delayed on the other stream
-  await flush()
-  assert.equal(rig.delivery().heartbeatState().native_state, "busy") // it is not applied over the second run
-})
-
-// The finding's own sequence: b delivers a newer event of the session before a delivers the run end. The end is below
-// the mark and ends the open run, so the session does not stay running and eligible.
-test("a run end that arrives below another stream's newer event still ends the run, so the session is no longer eligible", async () => {
-  const rig = await handDrivenStreams()
-  rig.send("a", selected("sel", 0))
-  rig.send("a", userItem("usr", "ses_a", 1))
-  rig.send("a", event("run", "session.execution.started", "ses_a", 2))
-  await flush()
-  assert.equal(rig.delivery().heartbeatState().native_state, "busy")
-  assert.equal(rig.delivery().state(), null) // running with a known agent: eligible
-  rig.send("b", selected("again", 4)) // the other stream is ahead
-  rig.send("a", event("end", "session.execution.succeeded", "ses_a", 3))
-  await flush()
-  assert.equal(rig.delivery().heartbeatState().native_state, "idle")
-  assert.notEqual(rig.delivery().state(), null)
-})
-
-test("a successor started at 4 keeps the session running when the first run's end at 3 arrives late", async () => {
-  const rig = await handDrivenStreams()
-  rig.send("a", selected("sel", 0))
-  rig.send("a", userItem("usr", "ses_a", 1))
-  rig.send("a", event("run1", "session.execution.started", "ses_a", 2))
-  rig.send("b", event("run2", "session.execution.started", "ses_a", 4)) // no end of the first run between them
-  rig.send("a", event("end1", "session.execution.succeeded", "ses_a", 3)) // the first run's end, late
-  await flush()
-  assert.equal(rig.delivery().heartbeatState().native_state, "busy")
-  assert.equal(rig.delivery().state(), null)
+  assert.equal(rounds, 2) // the stream resumed, and its first event asked for the read-back
+  assert.equal(entries.get(BINDING_KEY), "binding text") // the entry is back
+  assert.equal(context.owed(), false)
 })

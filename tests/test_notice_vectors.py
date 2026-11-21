@@ -322,7 +322,7 @@ def test_the_worst_frame_is_the_widest_frame_the_renderer_writes() -> None:
     assert size == fixed + 16 * notice._worst_frame_bytes()
 
 
-@pytest.mark.parametrize("package", ["pi", "deepseek", "opencode"])
+@pytest.mark.parametrize("package", ["pi", "deepseek"])
 def test_sixteen_frames_at_their_widest_fit_the_package_bound(package: str) -> None:
     # A retry batch is claimed whole, so sixteen messages can reach the renderer at their widest.
     rows, _, fixed = _widest_notice()

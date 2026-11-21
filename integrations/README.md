@@ -4,7 +4,10 @@ Turnkey integrations ship from this repository, next to the service and the
 adapter core. A package uses only its harness's public extension surface and
 the product's worker protocol; the Python core stays authoritative for join,
 heartbeat, poll, claim, settle, rejoin and binding replacement. A package
-supplies native eligibility, delivery, binding context and wake behavior.
+supplies native eligibility, delivery, binding context and wake behavior. The
+OpenCode package is the exception: it joins and keeps the binding in place, and
+it delivers nothing ([issue #148](https://github.com/mikomiel/agent-chat/issues/148)
+tracks delivery).
 
 ## Packages
 
@@ -13,7 +16,7 @@ supplies native eligibility, delivery, binding context and wake behavior.
 | Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
 | Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
-| OpenCode | [`opencode/`](opencode/) | Source present; live run pending |
+| OpenCode | [`opencode/`](opencode/) | Source present; live run pending. Join only: it delivers nothing |
 | Codex | — | Planned; follows the same pattern |
 
 Vibe is outside the initial admission set.
@@ -37,7 +40,7 @@ OpenCode row records no run, so no core version applies.
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | eligibility: `ctx.agents.get` and the session header `origin`, plus `roots()` and `isOwnedBy()` where the registry has them | `NOT RUN` on `0.2.2-rc.5` | No run. The published type declarations were compared; nothing was executed. `@deepseek-ai/dsh-agent` `0.2.2-rc.1` declares `AgentRegistry.roots()`, `AgentRegistry.isOwnedBy(id, owner)` and `CreateAgentOptions.parentAgent`. `0.2.2-rc.2` to `0.2.2-rc.5` declare none of them, and `enter(agent)` takes no owner; `get(id)` and `list()` remain. In `0.2.2-rc.5` the host's own subagent test is `session.header.origin === 'subagent'`, and the subagent child factory sets that value. The package reads which registry surface it finds and uses that header test where `roots()` and `isOwnedBy()` are both absent; a registry with only one of them refuses every agent. |
-| `agent-chat-opencode` 0.8.0 | OpenCode server plugin: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.synthetic` (`delivery: "steer"`, `resume: false`), `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.execution.*`, `session.inbox.*`, `session.agent.selected`, `session.compaction.*`, `session.created`/`deleted`/`forked` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
+| `agent-chat-opencode` 0.8.0 | OpenCode server plugin, join only: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.created`, `session.execution.started`, `session.forked`, `session.deleted`, `session.compaction.started`/`ended`/`failed` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
 
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
@@ -88,14 +91,15 @@ tracks live-harness CI, the Claude Code live run and the Codex package.
 
 ## Notice contract
 
-With `noticeBodies: true`, a peer's message body is written into the model's context. Every package renders it with
-one contract, so the body stays recognizable as untrusted peer data. The contract has two implementations that pass
+With `noticeBodies: true`, a peer's message body is written into the model's context. Every package that delivers a
+notice renders it with one contract, so the body stays recognizable as untrusted peer data. The OpenCode package
+delivers nothing and has no notice. The contract has two implementations that pass
 the same vectors in [`notice-vectors.json`](notice-vectors.json): the Python reference
 [`agent_chat/notice.py`](../agent_chat/notice.py) and the dependency-free JavaScript module
 [`shared/notice.js`](shared/notice.js). A package keeps no dependency and reads nothing outside its own directory
-at run time, so each one ships a byte-identical copy as `lib/notice.js`. A test in each package fails when its copy
-differs from the shared source.
-After you edit `shared/notice.js`, copy it over every package's `lib/notice.js`. The normative text is the notice requirements in
+at run time, so each delivering package ships a byte-identical copy as `lib/notice.js`. A test in each of them fails
+when its copy differs from the shared source.
+After you edit `shared/notice.js`, copy it over each `lib/notice.js`. The normative text is the notice requirements in
 [`openspec/specs/chat-clients/spec.md`](../openspec/specs/chat-clients/spec.md).
 
 In bodies mode, a notice has:
@@ -132,7 +136,7 @@ or a `pending` reply without `sizes`, is claimed whole, because the server refus
 A missing or invalid size counts as a full body.
 
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
-bound, and the lifecycle makes the claim and the delivery call. `pi`, `deepseek` and `opencode` allow 8 KiB for the delivery line
+bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line
 and the notice together. `claude-code` allows 10,000 bytes for its announcement, the delivery line and the notice
 together.
 
@@ -143,13 +147,13 @@ Limits that remain:
 - The packing estimate allows three bytes of notice for each byte of body (a line feed and its `> ` prefix). It does
   not bound the rendering. A body made mostly of control characters renders larger, because each one becomes a
   six-byte escape. Two pending bodies of 650 carriage returns each (3,900 bytes once escaped) are both claimed under
-  the Pi, DeepSeek and OpenCode bound of 8,137 bytes, and the renderer then halves the cap and cuts both. The halved cap applies
+  the Pi and DeepSeek bound of 8,137 bytes, and the renderer then halves the cap and cuts both. The halved cap applies
   to every body in the notice. Each cut body carries its pointer line, and the notice stays within `bound`. The
   vectors `two-bodies-of-650-carriage-returns-are-both-packed` and
   `two-bodies-of-650-carriage-returns-are-cut-by-halving-after-the-claim` pin this case.
 - A retry batch is claimed whole, up to 16 messages. At body cap 0, 16 frames and the adapter's own lines take 7,052
-  bytes in the shared suite's fixtures, and 7,685 bytes when every header field is at its widest. Both fit the Pi,
-  DeepSeek and OpenCode bound of 8,137 bytes, and a test in each of those packages holds the widest case to it. `claude-code` has no
+  bytes in the shared suite's fixtures, and 7,685 bytes when every header field is at its widest. Both fit the Pi and
+  DeepSeek bound of 8,137 bytes, and a test in each of those packages holds the widest case to it. `claude-code` has no
   fixed bound, because its announcement comes out of the same 10,000 bytes: [its README](claude-code/README.md) gives
   the room that is left.
 - The table of escaped code points is fixed. A code point that a later Unicode version makes invisible stays
@@ -206,8 +210,8 @@ The variable names the private `0600` config file. `AGENT_CHAT_DELEGATED_CHILD=1
 keeps a harness process that a session starts on purpose from joining chat.
 
 `tests/test_release_artifacts.py` pins this rule for every directory under
-`integrations/` except `shared/`, which holds the notice source each package
-copies into its own `lib/` and is never packed alone. `scripts/check_release_artifacts.py` packs the directories and
+`integrations/` except `shared/`, which holds the notice source that the
+delivering packages copy into their own `lib/` and is never packed alone. `scripts/check_release_artifacts.py` packs the directories and
 checks the built artifacts. The pack step refuses a link or special file in a
 package directory, and the output directory must hold no link. The checks:
 

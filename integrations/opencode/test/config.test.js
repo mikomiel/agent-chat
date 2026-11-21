@@ -32,10 +32,9 @@ test("a private complete record is accepted", () => {
   assert.deepEqual(withConfig(base), base)
 })
 
-test("the optional noticeBodies flag is accepted as a boolean only", () => {
-  assert.equal(withConfig({ ...base, noticeBodies: true }).noticeBodies, true)
-  assert.equal(withConfig({ ...base, noticeBodies: false }).noticeBodies, false)
-  assert.equal(withConfig({ ...base, noticeBodies: "yes" }), null)
+test("the removed noticeBodies flag is an unknown key: the plugin delivers nothing, so it has no such option", () => {
+  assert.equal(withConfig({ ...base, noticeBodies: true }), null)
+  assert.equal(withConfig({ ...base, noticeBodies: false }), null)
 })
 
 test("a group- or world-readable record is refused", () => {

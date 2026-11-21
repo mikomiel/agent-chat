@@ -1,16 +1,18 @@
-// One manager per OpenCode server process: it turns the plugin event stream into one delivery object and one
-// lifecycle per root session.
+// One manager per OpenCode server process: it turns the plugin event stream into one binding context and one
+// lifecycle per root session. The plugin joins and keeps the binding in place. It never sends input to a session.
 //
 // ROOT SESSIONS ONLY. A session joins only when `session.get` shows no `parentID` and no `fork`. A subagent runs
 // only in a child session and a child has a `parentID`. Whether a fork sets `parentID` is not confirmed, so a fork
 // is refused too: when in doubt a session stays out. A parent pointer is not trusted as a root test either way.
 //
-// A GAP IS READ BACK AT THE FIRST EVENT AFTER IT. The stream resets when it breaks, before it resumes, so a read-back
-// run at the reset would end before the gap does. The delivery owes the read-back from the reset, and the manager asks
-// for it at the first event the session handles afterwards: the stream has resumed by then, so whatever it missed is
-// over. The exception is a compaction already seen running: a read-back then proves only that the entry exists, so the
-// delivery holds it back until that compaction's own `ended` or `failed` event. A read-back that fails or is overtaken
-// leaves the obligation owed and is asked for again at the next event. It never turns chat off.
+// THE FIRST EVENT OF A SESSION ONLY SAYS THAT IT EXISTS. The first event the manager handles for a session it has not
+// seen, of any subscribed kind, starts the lookup and the join. It says nothing about what the session is doing, and
+// nothing here keeps such a state.
+//
+// A GAP OWES A READ-BACK. The binding context owes it from the reset, and the manager asks for it at the next event the
+// session handles. Something the gap hid can still change the entry after that read-back, so the lifecycle reads the
+// entry back at every heartbeat tick as well. A read-back that fails or is overtaken leaves the obligation owed, and it
+// never turns chat off.
 //
 // FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
 // never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
@@ -32,10 +34,11 @@
 import { describeFailure } from "./worker.js"
 
 // The events the manager reads. Session events of other kinds, such as every tool call, are never subscribed to.
+// Each kind shows that a session exists: the first event seen for a session starts its join, and any later one is a
+// sign that the stream is up. No event is read as a state of the session. A compaction signal also owes the binding
+// read-back.
 export const EVENT_TYPES = Object.freeze([
-  "session.created", "session.deleted", "session.forked", "session.agent.selected",
-  "session.execution.started", "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted",
-  "session.inbox.enqueued", "session.inbox.delivered", "session.inbox.cancelled",
+  "session.created", "session.execution.started", "session.forked", "session.deleted",
   "session.compaction.started", "session.compaction.ended", "session.compaction.failed",
 ])
 
@@ -63,7 +66,7 @@ export function createManager(ctx, config, parts, {
   forked = new Set(), // fork evidence: session ids that are never roots; the registry hands every owner the same set
   deleted = new Set(), // deletion tombstones: ids of sessions that ended; never evicted, shared like `forked`
 } = {}) {
-  const records = new Map() // session id -> { id, delivery, lifecycle, chain, dead, closing }
+  const records = new Map() // session id -> { id, context, lifecycle, chain, dead, closing }
   const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
   const closings = new Set() // ends still in flight, so stop() also waits for a session that ended before it was called
   let active = true
@@ -84,7 +87,7 @@ export function createManager(ctx, config, parts, {
   }
 
   // Ends one session's chat. The lifecycle stops first: it queues the removal of the binding entry and proves the
-  // worker's end. The delivery is disposed afterwards so a pending input settles as uncertain, never as handed.
+  // worker's end. The binding context is disposed afterwards, so a check still in flight proves and repairs nothing.
   function dispose(record) {
     if (record.closing) return record.closing
     record.dead = true
@@ -92,7 +95,7 @@ export function createManager(ctx, config, parts, {
     let ended
     try { ended = record.lifecycle ? Promise.resolve(record.lifecycle.stop()) : Promise.resolve({ code: 0 }) }
     catch { ended = Promise.resolve(null) }
-    try { record.delivery?.dispose() } catch { /* the object is already latched */ }
+    try { record.context?.dispose() } catch { /* the object is already latched */ }
     record.closing = ended.then(result => result?.code === 0, () => false)
     closings.add(record.closing)
     void record.closing.then(() => closings.delete(record.closing))
@@ -135,28 +138,22 @@ export function createManager(ctx, config, parts, {
     const handlers = new Map()
     const bus = { on(name, fn) { handlers.set(name, [...(handlers.get(name) ?? []), fn]) } }
     record.fire = (name, payload) => { for (const fn of handlers.get(name) ?? []) fn(payload) }
-    record.delivery = parts.createDelivery(ctx, record.id)
-    record.delivery.seed(info)
-    record.lifecycle = parts.createLifecycle(bus, record.delivery, config, {
+    record.context = parts.createContext(ctx, record.id)
+    record.lifecycle = parts.createLifecycle(bus, record.context, config, {
       startProcess: parts.startProcess,
       notice: text => notice(String(text)),
     })
     record.fire("session_start", { nativeSessionId: record.id })
   }
 
-  function handle(record, event) {
-    if (!active || record.dead || !record.delivery) return
-    if (record.delivery.observe(event)) record.fire("state_changed", {})
-    // A compaction signal, or the first event since a gap, may have left the binding entry dropped. The delivery owes
-    // that read-back, failed and overtaken ones included, and says when one may start.
-    if (record.delivery.needsReadBack()) readBack(record)
-  }
-
-  // Put the binding entry back. The delivery keeps its gate closed until this succeeds, and a check that fails or is
+  // A compaction signal, or the first event since a gap, may have left the binding entry dropped. The binding context
+  // owes that read-back, failed and overtaken ones included, and says when one may start. A check that fails or is
   // overtaken leaves the obligation owed, so the next event asks again. It never turns chat off and never rejects,
   // so nothing is awaited or handled here.
-  function readBack(record) {
-    void record.delivery.verifyContext()
+  function handle(record, event) {
+    if (!active || record.dead || !record.context) return
+    record.context.observe(event)
+    void record.context.repair()
   }
 
   function feed(event) {
@@ -173,6 +170,9 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (event.type === "session.forked") {
+      // A fork event that arrives after the deletion is late: the tombstone already refuses the id, and a fork record
+      // for it would be one that no later event removes.
+      if (deleted.has(id)) return
       // This session is a fork: never a root. Recorded before any refusal check, lookup or join, so a fork is not
       // dropped during a temporary lookup refusal, and a lookup still in flight finds its record dead.
       forked.add(id)
@@ -183,7 +183,7 @@ export function createManager(ctx, config, parts, {
     if (isRefused(id)) return
     let record = records.get(id)
     if (!record) {
-      record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
+      record = { id, context: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
       records.set(id, record)
       const first = event
       record.chain = record.chain.then(() => start(record, first)).catch(error => isolate(record, error))
@@ -196,9 +196,8 @@ export function createManager(ctx, config, parts, {
   function reset() {
     for (const record of [...records.values()]) {
       record.chain = record.chain.then(() => {
-        if (record.dead || !record.delivery) return
-        record.delivery.reset() // a read-back is owed now, and asked for at the next event, once the stream has resumed
-        record.fire("state_changed", {})
+        if (record.dead || !record.context) return
+        record.context.reset() // a read-back is owed now, and asked for at the next event or tick
       }).catch(error => isolate(record, error))
     }
   }
