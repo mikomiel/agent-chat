@@ -718,6 +718,43 @@ def test_an_empty_or_unreadable_sums_file_fails(release: tuple[Path, Path, list[
     assert any(f"{script.SUMS}: cannot read the file" in error for error in problems(release))
 
 
+@pytest.mark.parametrize("damage", ["crc", "length", "truncated"])
+def test_a_damaged_gzip_stream_fails_even_when_the_sums_match_the_damaged_bytes(
+    release: tuple[Path, Path, list[str]], damage: str
+) -> None:
+    write_alpha(release, alpha_entries())
+    _, dist, _ = release
+    tarball = dist / ALPHA
+    data = bytearray(tarball.read_bytes())
+    if damage == "crc":
+        data[-8] ^= 0xFF  # the CRC32 field of the gzip trailer
+    elif damage == "length":
+        data[-1] ^= 0xFF  # the ISIZE field of the gzip trailer
+    else:
+        del data[-20:]
+    tarball.write_bytes(data)
+    write_sums(dist)
+    errors = problems(release)
+    assert any(f"{ALPHA}: cannot read the archive" in error for error in errors)
+    assert not any("wrong digest" in error for error in errors), "the sums were rewritten over the damaged bytes"
+
+
+@pytest.mark.parametrize(
+    ("lie", "message"),
+    [
+        pytest.param(lambda names: names[:-1], "the headers hold", id="one-member-fewer"),
+        pytest.param(lambda names: [*names[:-1], "package/other.js"], "has the header name", id="another-name"),
+    ],
+)
+def test_a_header_walk_that_disagrees_with_tarfile_fails_closed(
+    release: tuple[Path, Path, list[str]], monkeypatch: pytest.MonkeyPatch, lie, message: str
+) -> None:
+    real = script.header_names
+    monkeypatch.setattr(script, "header_names", lambda path: lie(real(path)))
+    errors = problems(release)
+    assert any(f"{ALPHA}: cannot read the archive" in error and message in error for error in errors)
+
+
 def write_sdist(dist: Path, names: list[str]) -> None:
     write_tarball(dist / "sessionyard-1.2.3.tar.gz", {f"sessionyard-1.2.3/{name}": "x" for name in names})
 
@@ -961,6 +998,51 @@ def test_pack_refuses_a_link_in_the_output_directory(repository: Path, fake_npm:
     with pytest.raises(SystemExit, match="is a link"):
         script.pack(repository, dist)
     assert outside.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("dangling", [False, True], ids=["link-to-a-directory", "dangling-link"])
+def test_pack_refuses_an_output_directory_that_is_a_link(
+    repository: Path, fake_npm: Path, tmp_path: Path, dangling: bool
+) -> None:
+    real = tmp_path / "real"
+    if not dangling:
+        real.mkdir()
+    dist = tmp_path / "dist"
+    dist.symlink_to(real, target_is_directory=not dangling)
+    with pytest.raises(SystemExit, match="is a link"):
+        script.pack(repository, dist)
+    assert not real.exists() or list(real.iterdir()) == [], "nothing is written through the link"
+    assert list(fake_npm.iterdir()) == [], "npm never ran"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs fifos")
+@pytest.mark.parametrize("name", ["agent-chat-x-0.8.0.tgz", script.SUMS])
+def test_pack_refuses_a_fifo_named_like_an_artifact_without_opening_it(
+    fake_npm: Path, tmp_path: Path, name: str
+) -> None:
+    """A regression would block on open(); a child process with a timeout turns that into a failure."""
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    os.mkfifo(dist / name)
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "check_release_artifacts.py"), "--pack", str(dist)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        cwd=tmp_path,
+    )
+    assert result.returncode != 0
+    assert f"{dist / name} is not a regular file" in result.stderr
+    assert list(fake_npm.iterdir()) == [], "refused before npm ran or anything was staged"
+
+
+def test_write_sums_refuses_a_tarball_that_is_not_a_regular_file(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    (dist / "agent-chat-x-0.8.0.tgz").mkdir(parents=True)
+    with pytest.raises(SystemExit, match="is not a regular file"):
+        script.write_sums(dist)
+    assert not (dist / script.SUMS).exists()
 
 
 def test_the_sums_file_is_replaced_and_never_written_through(tmp_path: Path) -> None:

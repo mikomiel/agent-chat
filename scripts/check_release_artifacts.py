@@ -13,9 +13,12 @@ never listed: a new harness package is packed, and checked, when its directory
 appears. ``npm pack`` runs on a copy of each directory that also holds the
 repository ``LICENSE``, because npm packs only files inside the package
 directory. The pack step refuses a link, device or fifo anywhere in a package
-directory and a link among the files already in ``<dist-dir>``, creates the
-copied ``LICENSE`` exclusively and replaces ``SHA256SUMS`` instead of writing
-through it, so no write can reach a file outside the directories it names.
+directory, a ``<dist-dir>`` that is a link, a link among the files already in
+it and a ``*.tgz`` or ``SHA256SUMS`` there that is not a regular file (checked
+with ``lstat`` before anything in it is read, so a fifo cannot block it). It
+creates the copied ``LICENSE`` exclusively and replaces ``SHA256SUMS`` instead
+of writing through it, so no write can reach a file outside the directories it
+names.
 
 The checks:
 
@@ -32,6 +35,8 @@ The checks:
   endings and a name of letters, digits and ``._+-`` only. A malformed line, a
   binary-mode ``*name`` record or a repeated name fails, and every digest must
   match its tarball;
+* each tarball's gzip stream reads to the end, so a bad CRC or length trailer
+  or a truncated stream is reported as unreadable;
 * each tarball carries ``package.json`` at the product version, every declared
   entry point, the repository ``LICENSE`` byte for byte, every tracked file of
   its directory except ``test/``, and nothing else;
@@ -154,9 +159,27 @@ def stage_package(directory: Path, scratch: Path, license_file: Path) -> Path:
     return staged
 
 
+def require_regular(path: Path) -> None:
+    """Stop unless ``path`` is a regular file. ``lstat`` never opens it, so a fifo cannot block this."""
+    if not stat.S_ISREG(os.lstat(path).st_mode):
+        raise SystemExit(f"{path} is not a regular file")
+
+
+def refuse_unsafe_artifacts(dist: Path) -> None:
+    """Stop unless ``dist`` holds no link and every ``*.tgz`` and ``SHA256SUMS`` is a regular file."""
+    for child in dist.iterdir():
+        if child.is_symlink():
+            raise SystemExit(f"{child} is a link; npm pack and the sums file would write through it")
+        if child.name.endswith(".tgz") or child.name == SUMS:
+            require_regular(child)
+
+
 def write_sums(dist: Path) -> None:
     """Write ``SHA256SUMS`` over the tarballs by replacing it, never by writing through a link."""
-    lines = [f"{sha256(path)}  {path.name}\n" for path in sorted(dist.glob("*.tgz"))]
+    tarballs = sorted(dist.glob("*.tgz"))
+    for path in tarballs:
+        require_regular(path)  # before any of them is opened and hashed
+    lines = [f"{sha256(path)}  {path.name}\n" for path in tarballs]
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=dist, prefix=f"{SUMS}.", delete=False) as handle:
         handle.write("".join(lines))
     os.chmod(handle.name, 0o644)
@@ -176,10 +199,11 @@ def pack(root: Path, dist: Path) -> None:
     license_file = root / LICENSE
     if not license_file.is_file():
         raise SystemExit(f"{license_file} is missing; every tarball ships it")
+    # The output directory itself may not be a link either: checked before it is created or listed.
+    if dist.is_symlink():
+        raise SystemExit(f"{dist} is a link; npm pack and the sums file would write through it")
     dist.mkdir(parents=True, exist_ok=True)
-    for child in dist.iterdir():
-        if child.is_symlink():
-            raise SystemExit(f"{child} is a link; npm pack and the sums file would write through it")
+    refuse_unsafe_artifacts(dist)
     with tempfile.TemporaryDirectory(prefix="agent-chat-pack-") as scratch:
         for directory in package_directories(root):
             staged = stage_package(directory, Path(scratch), license_file)
@@ -338,6 +362,13 @@ def pax_path(data: bytes) -> str | None:
     return found
 
 
+def read_to_the_end(path: Path) -> None:
+    """Read the whole gzip stream: a bad CRC or length trailer, or a truncated stream, raises."""
+    with gzip.open(path, "rb") as stream:
+        while stream.read(1 << 20):
+            pass
+
+
 def header_names(path: Path) -> list[str]:
     """Every member name, spelled as its archive header spells it.
 
@@ -382,6 +413,8 @@ def read_tarball(path: Path, errors: list[str]) -> Contents:
     with tarfile.open(path, "r:gz") as archive:
         members = archive.getmembers()
         raw_names = header_names(path)
+        # Both walks stop at the end-of-archive blocks, before the gzip trailer.
+        read_to_the_end(path)
         if len(raw_names) != len(members):
             raise ValueError(f"the headers hold {len(raw_names)} members and tarfile reads {len(members)}")
         for member, raw in zip(members, raw_names, strict=True):
