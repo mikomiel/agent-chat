@@ -343,16 +343,21 @@ test("context: a failing removal is not an error and a disposed object publishes
 test("context: a compaction that dropped the entry is repaired, and an intact entry is left alone", async () => {
   const ctx = fakeCtx()
   const { delivery } = running(ctx)
+  const compacted = () => delivery.observe(event("session.compaction.ended")) // a read-back is owed after it, and only then does a check read
+  compacted()
   await delivery.verifyContext() // nothing published yet
   assert.equal(ctx.calls.put.length, 0)
   await delivery.context("binding")
+  compacted()
   await delivery.verifyContext()
   assert.equal(ctx.calls.put.length, 1)
   ctx.entries.clear()
+  compacted()
   await delivery.verifyContext()
   assert.equal(ctx.calls.put.length, 2)
   assert.equal(ctx.entries.get(BINDING_KEY), "binding")
   ctx.entries.set(BINDING_KEY, "stale")
+  compacted()
   await delivery.verifyContext()
   assert.equal(ctx.entries.get(BINDING_KEY), "binding")
 })
@@ -395,8 +400,9 @@ test("a compaction whose read-back fails never reopens the gate", async () => {
   ctx.session.instructions.entry.put = async () => { throw new Error("unavailable") }
   delivery.observe(event("session.compaction.started", { reason: "auto" }))
   delivery.observe(event("session.compaction.ended", { reason: "auto" }))
-  assert.deepEqual(await readBack(delivery), { outcome: "failed", failures: ["CHAT_CONTEXT_UNAVAILABLE"] })
-  assert.equal(delivery.state(), "busy")
+  assert.equal(await delivery.verifyContext(), false)
+  assert.equal(delivery.state(), "busy") // closed, and not "offline": chat is still on
+  assert.equal(delivery.needsReadBack(), true) // the next event asks again
   assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "deferred", reason: "busy" })
   assert.equal(ctx.calls.synthetic.length, 0)
 })
@@ -546,7 +552,7 @@ test("a read-back that fails after a gap keeps the gate closed", async () => {
   ctx.entries.clear()
   ctx.session.instructions.entry.put = async () => { throw new Error("unavailable") }
   delivery.reset()
-  assert.deepEqual(await readBack(delivery), { outcome: "failed", failures: ["CHAT_CONTEXT_UNAVAILABLE"] })
+  assert.equal(await delivery.verifyContext(), false)
   delivery.observe(event("session.agent.selected", { agent: "build" }))
   delivery.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
   delivery.observe(event("session.execution.started"))
@@ -649,8 +655,8 @@ test("a read-back is asked for once per obligation, and again after a newer one"
   delivery.observe(event("session.compaction.ended", { reason: "auto" }))
   assert.equal(delivery.needsReadBack(), true)
   ctx.session.instructions.entry.list = async () => { throw new Error("unavailable") }
-  assert.deepEqual(await readBack(delivery), { outcome: "failed", failures: ["CHAT_CONTEXT_UNAVAILABLE"] })
-  assert.equal(delivery.needsReadBack(), false) // a read that failed is not asked for again in the same epoch
+  assert.equal(await delivery.verifyContext(), false)
+  assert.equal(delivery.needsReadBack(), true) // a read that failed is still owed: the next event asks again
 })
 
 // Review 6003597565, findings 1 and 2: every host call of a read-back is made only while the read-back may still touch the host.
@@ -718,6 +724,30 @@ test("a compaction that begins while the repair put is pending stops the read-ba
   assert.equal(delivery.state(), null)
 })
 
+test("a compaction that begins while the repair's confirming list is pending proves nothing, and the obligation stays owed", async () => {
+  const { ctx, delivery } = await gapped()
+  const entry = ctx.session.instructions.entry
+  const list = entry.list
+  let calls = 0
+  let release = null
+  entry.list = async (...args) => {
+    calls += 1
+    if (calls === 2) await new Promise(resolve => { release = resolve }) // the confirming list, after the repair put
+    return list(...args)
+  }
+  const read = delivery.verifyContext()
+  await flush()
+  assert.equal(typeof release, "function") // the put is made and its confirming list is pending
+  delivery.observe(event("session.compaction.started", { reason: "auto" }))
+  delivery.observe(event("session.compaction.ended", { reason: "auto" }))
+  release() // the entry is there, but the check began before that compaction
+  assert.equal(await read, false)
+  assert.equal(delivery.state(), "busy")
+  assert.equal(delivery.needsReadBack(), true)
+  assert.equal(await delivery.verifyContext(), true)
+  assert.equal(delivery.state(), null)
+})
+
 test("a read that fails while a compaction began during it is ignored, and the check stays owed", async () => {
   const { ctx, delivery } = await gapped()
   const held = holdFirst(ctx.session.instructions.entry, "list")
@@ -769,10 +799,12 @@ test("a read that succeeds across a compaction that began and failed does not cl
   assert.equal(delivery.state(), null)
 })
 
-test("a read that fails with no compaction and no newer gap is a context failure", async () => {
+test("a read that fails with no compaction and no newer gap leaves the gate closed and chat on", async () => {
   const { ctx, delivery } = await gapped()
   ctx.session.instructions.entry.list = async () => { throw new Error("unavailable") }
-  assert.deepEqual(await readBack(delivery), { outcome: "failed", failures: ["CHAT_CONTEXT_UNAVAILABLE"] })
+  assert.equal(await delivery.verifyContext(), false)
+  assert.equal(delivery.state(), "busy") // not "offline": nothing turns chat off
+  assert.equal(delivery.needsReadBack(), true)
 })
 
 test("a read-back queued behind an earlier operation does no I/O after a newer gap, and its failure is ignored", async () => {
@@ -794,7 +826,7 @@ test("a read-back queued behind an earlier operation does no I/O after a newer g
   delivery.reset() // a newer gap supersedes it
   held.settle.resolve()
   await earlier
-  await stale // resolves: a superseded check neither reads nor fails
+  await stale // resolves: a superseded check neither reads nor proves
   assert.equal(attempts, 1) // only the earlier operation's own list
   assert.equal(delivery.needsReadBack(), true) // the newest gap still owes its own check
   entry.list = base
@@ -803,47 +835,34 @@ test("a read-back queued behind an earlier operation does no I/O after a newer g
 })
 
 // Review 6003650164, findings 1 and 2: one currency rule. A read-back asks, after every host call it awaits and before it
-// acts on a failure, whether it is still the check this obligation and this binding call for. It never rejects: it
-// reports "proved", "stale" or "failed", and it calls `onFailed` itself, in the same step as that decision.
-async function readBack(delivery) {
-  const failures = []
-  const outcome = await delivery.verifyContext(error => failures.push(error.code))
-  return { outcome, failures }
-}
-
-test("a read-back whose check holds proves the binding, and one that fails reports failed through its callback", async () => {
+// proves, whether it is still the check this obligation and this binding call for. It never rejects: it resolves true
+// only when it proved the binding, and false for every other end, which leaves the obligation owed.
+test("a read-back whose check holds proves the binding, and one that fails leaves the gate closed and is asked for again", async () => {
   const { ctx, delivery } = await gapped()
-  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] })
+  assert.equal(await delivery.verifyContext(), true)
   assert.equal(ctx.entries.get(BINDING_KEY), "binding")
   delivery.reset()
   ctx.session.instructions.entry.list = async () => { throw new Error("unavailable") }
-  assert.deepEqual(await readBack(delivery), { outcome: "failed", failures: ["CHAT_CONTEXT_UNAVAILABLE"] })
+  assert.equal(await delivery.verifyContext(), false)
   assert.notEqual(delivery.state(), null) // the gate stays closed
-  assert.equal(delivery.needsReadBack(), false) // and a failed read is not asked for again in the same epoch
-})
-
-test("a read-back whose failure callback throws still resolves with its outcome", async () => {
-  const { ctx, delivery } = await gapped()
-  ctx.session.instructions.entry.list = async () => { throw new Error("unavailable") }
-  assert.equal(await delivery.verifyContext(() => { throw new Error("handler broke") }), "failed")
+  assert.notEqual(delivery.state(), "offline") // and chat stays on
+  assert.equal(delivery.needsReadBack(), true) // and the next event asks again
 })
 
 test("a withdrawn binding is not put back: the binding is cleared while the first list is pending", async () => {
   const { ctx, delivery, calls } = await gapped()
   const held = holdFirst(ctx.session.instructions.entry, "list")
-  const failures = []
-  const read = delivery.verifyContext(error => failures.push(error.code))
+  const read = delivery.verifyContext()
   await flush()
   assert.equal(held.entered, true)
   const cleared = delivery.context(null) // a heartbeat answered STALE_INSTANCE: the binding is withdrawn, the entry removed
   held.settle.resolve() // the list answers: no entry
-  assert.equal(await read, "stale")
+  assert.equal(await read, false)
   await cleared
   assert.equal(ctx.calls.put.length, calls.puts) // the withdrawn text was never put
   assert.equal(ctx.calls.list, calls.lists + 1) // and nothing was read after it
-  assert.deepEqual(failures, [])
   assert.equal(ctx.entries.has(BINDING_KEY), false)
-  // The stale check changed nothing: the obligation is still owed, and the gate stays closed until a binding is proved.
+  // The overtaken check changed nothing: the obligation is still owed, and the gate stays closed until a binding is proved.
   assert.equal(delivery.state(), "busy")
   assert.equal(delivery.needsReadBack(), true)
   // The rejoin publishes its new binding. Its confirmed put is a read-back no gap or compaction overlapped, so it
@@ -854,18 +873,17 @@ test("a withdrawn binding is not put back: the binding is cleared while the firs
   assert.equal(delivery.state(), null)
 })
 
-test("a failed list is not a failure once the binding it was for is withdrawn", async () => {
+test("a failed list changes nothing once the binding it was for is withdrawn", async () => {
   const { ctx, delivery } = await gapped()
   const held = holdFirst(ctx.session.instructions.entry, "list")
-  const failures = []
-  const read = delivery.verifyContext(error => failures.push(error.code))
+  const read = delivery.verifyContext()
   await flush()
   void delivery.context(null)
   held.settle.reject(new Error("unavailable"))
-  assert.equal(await read, "stale")
-  assert.deepEqual(failures, []) // chat stays on, and the rejoin goes on
+  assert.equal(await read, false)
+  assert.notEqual(delivery.state(), "offline") // chat stays on, and the rejoin goes on
   await delivery.context("binding two")
-  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] })
+  assert.equal(delivery.state(), null) // the rejoin's confirmed publish discharged the obligation: a check has nothing left to do
 })
 
 test("a replaced binding with the same text is still a different binding", async () => {
@@ -875,10 +893,25 @@ test("a replaced binding with the same text is still a different binding", async
   await flush()
   const replaced = delivery.context("binding") // the same text, published again by a rejoin: the old check is not for this binding
   held.settle.resolve()
-  assert.equal(await read, "stale")
+  assert.equal(await read, false)
   await replaced
   assert.equal(ctx.calls.put.length, calls.puts + 1) // only the new call's own put
-  assert.equal(delivery.needsReadBack(), false) // discharged by that put's own confirmation, not by the stale check
+  assert.equal(delivery.needsReadBack(), false) // discharged by that put's own confirmation, not by the overtaken check
+})
+
+test("a withdrawn binding's removal lands behind a repair put that is already issued", async () => {
+  const { ctx, delivery, calls } = await gapped()
+  const held = holdFirst(ctx.session.instructions.entry, "put") // the entry is gone, so the check's repair put is issued and pending
+  const read = delivery.verifyContext()
+  await flush()
+  assert.equal(held.entered, true)
+  const cleared = delivery.context(null) // the binding is withdrawn: its removal queues behind the check on the context queue
+  held.settle.resolve()
+  assert.equal(await read, false) // it stops before the confirming list: the binding is gone
+  await cleared
+  assert.equal(ctx.calls.put.length, calls.puts + 1) // the put was issued, so the test is not vacuous
+  assert.equal(ctx.calls.remove.length, 1) // and the removal ran
+  assert.equal(ctx.entries.has(BINDING_KEY), false) // after it, so the late put does not outlive the withdrawal
 })
 
 test("a confirming list that answers after the binding was withdrawn proves nothing", async () => {
@@ -891,57 +924,22 @@ test("a confirming list that answers after the binding was withdrawn proves noth
   await flush()
   void delivery.context(null)
   held.settle.resolve() // the entry is there, but the binding it names is withdrawn
-  assert.equal(await read, "stale")
+  assert.equal(await read, false)
   assert.equal(delivery.needsReadBack(), true) // the obligation is still owed
 })
 
-test("a read-back that is closed or disabled while a host call is pending does not act on its failure", async () => {
+test("a read-back that is closed or disabled while a host call is pending proves nothing and repairs nothing", async () => {
   for (const end of ["disable", "dispose"]) {
-    const { ctx, delivery } = await gapped()
+    const { ctx, delivery, calls } = await gapped()
     const held = holdFirst(ctx.session.instructions.entry, "list")
-    const failures = []
-    const read = delivery.verifyContext(error => failures.push(error.code))
+    const read = delivery.verifyContext()
     await flush()
     delivery[end]()
-    held.settle.reject(new Error("unavailable"))
-    assert.equal(await read, "stale", end)
-    assert.deepEqual(failures, [], end)
+    held.settle.resolve() // the list answers: no entry, so a repair put would follow if the check were still current
+    assert.equal(await read, false, end)
+    assert.equal(ctx.calls.put.length, calls.puts, end)
+    assert.equal(delivery.needsReadBack(), false, end)
   }
-})
-
-// Review 6003960841, finding 2: `invalidate()` is the receipt-time fence. It moves the read-back epoch and changes
-// nothing the delivery observed, so the event it announces can still be applied in order when its turn comes.
-test("invalidate makes a pending check stale on receipt and leaves the observed state alone", async () => {
-  const { ctx, delivery, calls } = await gapped()
-  const held = holdFirst(ctx.session.instructions.entry, "list")
-  const failures = []
-  const read = delivery.verifyContext(error => failures.push(error.code))
-  await flush()
-  const before = delivery.heartbeatState()
-  delivery.invalidate()
-  assert.deepEqual(delivery.heartbeatState(), before) // nothing it observed changed
-  assert.equal(delivery.state(), "busy") // a running session, its binding still owed
-  held.settle.resolve() // the list answers: no entry
-  assert.equal(await read, "stale")
-  assert.equal(ctx.calls.put.length, calls.puts) // no put
-  assert.deepEqual(failures, [])
-  assert.equal(delivery.needsReadBack(), true) // the obligation is still owed, and asked for again
-  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] })
-  assert.equal(ctx.entries.get(BINDING_KEY), "binding")
-  assert.equal(delivery.state(), null)
-})
-
-test("invalidate also makes a failure of the pending check no failure", async () => {
-  const { ctx, delivery } = await gapped()
-  const held = holdFirst(ctx.session.instructions.entry, "list")
-  const failures = []
-  const read = delivery.verifyContext(error => failures.push(error.code))
-  await flush()
-  delivery.invalidate()
-  held.settle.reject(new Error("unavailable"))
-  assert.equal(await read, "stale")
-  assert.deepEqual(failures, [])
-  assert.equal(delivery.needsReadBack(), true)
 })
 
 // Review 6003960841, note: nothing published is not a proof. The obligation stays owed, and a confirmed `context()`
@@ -959,10 +957,10 @@ async function gappedWithNoBinding() {
 test("with no binding published the obligation stays owed, and a confirmed publish discharges it", async () => {
   const { ctx, delivery } = await gappedWithNoBinding()
   assert.equal(delivery.needsReadBack(), true)
-  assert.equal(await delivery.verifyContext(), "stale") // nothing to read, and nothing proved
+  assert.equal(await delivery.verifyContext(), false) // nothing to read, and nothing proved
   assert.equal(ctx.calls.list, 0)
-  assert.equal(delivery.needsReadBack(), false) // asked once per epoch, not at every event
-  assert.equal(delivery.state(), "busy") // still owed
+  assert.equal(delivery.needsReadBack(), true) // still owed, and asking costs no host call
+  assert.equal(delivery.state(), "busy")
   await delivery.context("binding") // the join's publish, confirmed
   assert.equal(delivery.state(), null)
 })
@@ -981,7 +979,7 @@ test("a confirmed publish that a gap overlapped does not discharge the obligatio
   await publish
   assert.equal(delivery.state(), "busy")
   assert.equal(delivery.needsReadBack(), true)
-  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] }) // the next event's check discharges it
+  assert.equal(await delivery.verifyContext(), true) // the next event's check discharges it
   assert.equal(delivery.state(), null)
 })
 
@@ -1026,7 +1024,7 @@ test("a confirmed publish before the first event after a gap leaves the obligati
   delivery.observe(event("session.agent.selected", { agent: "build" })) // the first event after the gap
   assert.equal(delivery.needsReadBack(), true) // the caller asks for the read-back now
   ctx.entries.clear() // a compaction that ended in the gap dropped the entry after the publish
-  assert.deepEqual(await readBack(delivery), { outcome: "proved", failures: [] })
+  assert.equal(await delivery.verifyContext(), true)
   assert.equal(ctx.entries.get(BINDING_KEY), "binding two") // the read-back found it gone and put it back
   assert.equal(delivery.needsReadBack(), false)
 })
@@ -1056,6 +1054,120 @@ test("a publish that began before the first event after a gap does not discharge
   await publish
   assert.equal(delivery.needsReadBack(), true) // the put may have preceded the end of a compaction inside the gap
 })
+
+// Round 8: a read-back is a repair that is owed until it succeeds. A failure leaves the gate closed and the obligation
+// owed, so the next event asks again, and nothing about it turns chat off.
+const TRANSIENT = {
+  "the list rejects"(ctx) {
+    const entry = ctx.session.instructions.entry
+    const list = entry.list
+    entry.list = async () => { throw new Error("unavailable") }
+    return () => { entry.list = list }
+  },
+  "the repair put rejects"(ctx) {
+    const entry = ctx.session.instructions.entry
+    const put = entry.put
+    entry.put = async () => { throw new Error("unavailable") }
+    return () => { entry.put = put }
+  },
+  "the put leaves no entry to confirm"(ctx) {
+    const entry = ctx.session.instructions.entry
+    const put = entry.put
+    entry.put = async input => { ctx.calls.put.push(input) }
+    return () => { entry.put = put }
+  },
+}
+
+for (const [failure, break_] of Object.entries(TRANSIENT)) {
+  test(`a transient failure (${failure}) leaves the gate closed and chat on, and the next check proves and reopens`, async () => {
+    const { ctx, delivery } = await gapped()
+    const mend = break_(ctx)
+    assert.equal(await delivery.verifyContext(), false)
+    assert.equal(delivery.state(), "busy") // closed, and not "offline": nothing turned chat off
+    assert.deepEqual(await delivery.deliver(batch(), 5_000), { outcome: "deferred", reason: "busy" })
+    assert.equal(delivery.needsReadBack(), true) // owed, and the next event asks again
+    assert.equal(await delivery.verifyContext(), false) // a second failed check changes nothing either
+    assert.equal(delivery.state(), "busy")
+    mend() // the host answers again
+    assert.equal(delivery.needsReadBack(), true)
+    assert.equal(await delivery.verifyContext(), true)
+    assert.equal(ctx.entries.get(BINDING_KEY), "binding") // the entry a compaction dropped is back
+    assert.equal(delivery.state(), null)
+    assert.equal(delivery.needsReadBack(), false)
+  })
+}
+
+test("a check queued behind a publish that discharged the obligation makes no host call", async () => {
+  const ctx = fakeCtx()
+  const { delivery } = running(ctx)
+  delivery.reset()
+  delivery.observe(event("session.agent.selected", { agent: "build" })) // the stream has resumed, so a publish may discharge the gap
+  assert.equal(delivery.needsReadBack(), true)
+  const held = holdFirst(ctx.session.instructions.entry, "put")
+  const publish = delivery.context("binding") // the join's publish: its put is pending
+  await flush()
+  assert.equal(held.entered, true)
+  const read = delivery.verifyContext() // asked for while the obligation was owed, and queued behind the publish
+  held.settle.resolve()
+  await publish // confirmed, and nothing overlapped it: the obligation is discharged
+  assert.equal(await read, false)
+  assert.equal(ctx.calls.list, 1) // only the publish's own confirming list
+  assert.equal(ctx.calls.put.length, 1)
+  assert.equal(delivery.needsReadBack(), false)
+})
+
+// Every signal that can invalidate the entry owes the read-back again when it is applied, so a put or a proof that
+// landed just before the signal was applied is read back after it.
+const SIGNALS = {
+  "a gap": { apply: d => d.reset(), resume: d => {
+    d.observe(event("session.agent.selected", { agent: "build" }))
+    d.observe(event("session.inbox.enqueued", { item: { type: "user" } }))
+    d.observe(event("session.execution.started"))
+  } },
+  "a compaction that ended": { apply: d => d.observe(event("session.compaction.ended")), resume: () => {} },
+  "a compaction that started and failed": { apply: d => {
+    d.observe(event("session.compaction.started"))
+    assert.equal(d.state(), "busy") // closed while it runs
+    d.observe(event("session.compaction.failed"))
+  }, resume: () => {} },
+}
+
+for (const [name, signal] of Object.entries(SIGNALS)) {
+  test(`${name} owes a proved binding again once it is applied`, async () => {
+    const ctx = fakeCtx()
+    const { delivery } = running(ctx)
+    await delivery.context("binding")
+    delivery.observe(event("session.compaction.ended")) // owed, then proved
+    assert.equal(await delivery.verifyContext(), true)
+    assert.equal(delivery.state(), null)
+    signal.apply(delivery)
+    signal.resume(delivery)
+    assert.equal(delivery.needsReadBack(), true)
+    assert.equal(delivery.state(), "busy")
+    assert.equal(await delivery.verifyContext(), true)
+    assert.equal(delivery.state(), null)
+  })
+
+  test(`a repair put that landed before ${name} was applied is owed again by it, and the next check proves`, async () => {
+    const { ctx, delivery } = await gapped()
+    const held = holdFirst(ctx.session.instructions.entry, "list")
+    const read = delivery.verifyContext()
+    await flush()
+    // The signal has been received but not applied, so the check is still current: it puts the entry back and proves.
+    held.settle.resolve()
+    assert.equal(await read, true)
+    assert.equal(ctx.entries.get(BINDING_KEY), "binding")
+    assert.equal(delivery.needsReadBack(), false)
+    // The signal is applied now, and what it dropped is not there.
+    ctx.entries.clear()
+    signal.apply(delivery)
+    signal.resume(delivery)
+    assert.equal(delivery.needsReadBack(), true)
+    assert.equal(await delivery.verifyContext(), true)
+    assert.equal(ctx.entries.get(BINDING_KEY), "binding") // put back by the next check
+    assert.equal(delivery.state(), null)
+  })
+}
 
 // Finding 4 (non-blocking): reservation arithmetic and receipt checks share one monotonic clock.
 test("the default clock is monotonic: a wall-clock step cannot decide whether a reservation is over", async t => {

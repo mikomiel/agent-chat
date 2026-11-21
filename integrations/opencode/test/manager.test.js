@@ -18,7 +18,7 @@ function stubParts({ observe = () => false, verify = () => Promise.resolve(), st
     lifecycles,
     createDelivery(_ctx, id) {
       const delivery = {
-        id, seeded: null, seen: [], resets: 0, disposed: 0, owed: false, invalidations: 0,
+        id, seeded: null, seen: [], resets: 0, disposed: 0, owed: false,
         seed(info) { delivery.seeded = info },
         observe(item) {
           delivery.seen.push(item.type)
@@ -26,10 +26,10 @@ function stubParts({ observe = () => false, verify = () => Promise.resolve(), st
           return observe(id, item)
         },
         reset() { delivery.resets += 1; delivery.owed = true },
-        invalidate() { delivery.invalidations += 1 }, // the read-back epoch moves on receipt; nothing observed changes
-        needsReadBack: () => delivery.owed, // owed after a gap and after an end, and asked for once
-        // The delivery contract: it never rejects, and it calls `onFailed` itself when a current check fails.
-        verifyContext(onFailed) { delivery.owed = false; return verify(id).then(() => "proved", error => { onFailed(error); return "failed" }) },
+        needsReadBack: () => delivery.owed, // owed after a gap and after an end, and asked for once per ask
+        // The delivery contract: it never rejects, never turns chat off, and resolves true only when it proved the
+        // binding. A check that did not prove it leaves the obligation owed.
+        verifyContext() { delivery.owed = false; return verify(id).then(() => true, () => { delivery.owed = true; return false }) },
         dispose() { delivery.disposed += 1 },
       }
       deliveries.set(id, delivery)
@@ -236,14 +236,20 @@ test("a lost event stream resets every session and publishes the unknown state",
   }
 })
 
-test("a compaction that cannot restore the binding turns that session's chat off", async () => {
-  const parts = stubParts({ verify: id => (id === "ses_bad" ? Promise.reject(Object.assign(new Error("x"), { code: "CHAT_CONTEXT_UNAVAILABLE" })) : Promise.resolve()) })
+test("a compaction whose binding cannot be restored leaves that session closed, not disabled, and its next event asks again", async () => {
+  const asked = []
+  const parts = stubParts({ verify: id => { asked.push(id); return id === "ses_bad" ? Promise.reject(Object.assign(new Error("x"), { code: "CHAT_CONTEXT_UNAVAILABLE" })) : Promise.resolve() } })
   const manager = createManager(fakeCtx(root), config, parts)
   manager.feed(event("session.compaction.ended", "ses_bad", { reason: "auto" }))
   manager.feed(event("session.compaction.ended", "ses_ok", { reason: "auto" }))
   await flush()
-  assert.deepEqual(parts.lifecycles.get("ses_bad").disables, ["CHAT_CONTEXT_UNAVAILABLE"])
+  assert.deepEqual(parts.lifecycles.get("ses_bad").disables, []) // a failed check turns nothing off
   assert.deepEqual(parts.lifecycles.get("ses_ok").disables, [])
+  manager.feed(event("session.execution.started", "ses_bad"))
+  manager.feed(event("session.execution.started", "ses_ok"))
+  await flush()
+  assert.deepEqual(asked.sort(), ["ses_bad", "ses_bad", "ses_ok"]) // the failed one is asked again, the proved one is not
+  assert.deepEqual(parts.lifecycles.get("ses_bad").disables, [])
 })
 
 test("events without a session id are ignored", async () => {
@@ -451,18 +457,19 @@ test("a stream gap reads the binding back for every live session, at its first e
   assert.deepEqual(verified.sort(), ["ses_a", "ses_b"]) // once per gap, not once per event
 })
 
-test("a read-back that fails after a gap turns that session's chat off and no other", async () => {
-  const parts = stubParts({ verify: id => (id === "ses_a" ? Promise.reject(Object.assign(new Error("x"), { code: "CHAT_CONTEXT_UNAVAILABLE" })) : Promise.resolve()) })
+test("a read-back that fails after a gap does not turn chat off: each later event asks again until one proves", async () => {
+  let asked = 0
+  const parts = stubParts({ verify: () => (++asked <= 2 ? Promise.reject(Object.assign(new Error("x"), { code: "CHAT_CONTEXT_UNAVAILABLE" })) : Promise.resolve()) })
   const manager = createManager(fakeCtx(root), config, parts)
   manager.feed(event("session.execution.started", "ses_a"))
-  manager.feed(event("session.execution.started", "ses_b"))
   await flush()
   manager.reset()
-  manager.feed(event("session.execution.started", "ses_a"))
-  manager.feed(event("session.execution.started", "ses_b"))
-  await flush()
-  assert.equal(parts.lifecycles.get("ses_a").disables.length, 1)
-  assert.equal(parts.lifecycles.get("ses_b").disables.length, 0)
+  for (let event_ = 1; event_ <= 5; event_++) {
+    manager.feed(event("session.execution.started", "ses_a"))
+    await flush()
+    assert.deepEqual(parts.lifecycles.get("ses_a").disables, [], `event ${event_}`)
+  }
+  assert.equal(asked, 3) // two failed asks, one that proved, then nothing is owed
 })
 
 // Review 6003407206, finding 2: a deletion is fenced when it is received, not queued behind the lookup.
@@ -786,50 +793,6 @@ function holdableCtx() {
 
 const tickAfter = async count => { for (let tick = 0; tick < count; tick++) await Promise.resolve() }
 
-test("a failed read-back is never acted on once a compaction has begun, whatever the order of the microtasks", async () => {
-  const violations = []
-  const outcomes = [] // per offset: what the delivery saw and the lifecycle was told, in order
-  for (let offset = 0; offset <= 8; offset++) {
-    const rig = holdableCtx()
-    const order = []
-    let delivery = null
-    const parts = stubParts()
-    parts.createDelivery = (hostCtx, id) => {
-      delivery = Object.assign(createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} }), { id })
-      const observe = delivery.observe
-      delivery.observe = item => { if (item.type === "session.compaction.started") order.push("started"); return observe(item) }
-      return delivery
-    }
-    const manager = createManager(rig.ctx, config, parts)
-    const send = (type, data = {}) => manager.feed(event(type, "ses_a", data))
-    send("session.execution.started")
-    await flush()
-    await delivery.context("binding text")
-    const lifecycle = parts.lifecycles.get("ses_a")
-    const disable = lifecycle.disable
-    lifecycle.disable = reason => { order.push("disable"); return disable(reason) }
-    rig.entries.clear() // a compaction dropped the entry
-    rig.held.next = true
-    manager.reset()
-    await flush()
-    send("session.agent.selected", { agent: "build" }) // the first event after the gap: the read-back starts and its list is held
-    send("session.inbox.enqueued", { item: { type: "user" } })
-    send("session.execution.started")
-    await flush()
-    assert.equal(rig.held.entered, true, `offset ${offset}`)
-    rig.held.settle.reject(new Error("unavailable"))
-    await tickAfter(offset)
-    send("session.compaction.started", { reason: "auto" })
-    await flush()
-    if (order.join() === "started,disable") violations.push(offset)
-    outcomes.push(`${offset}:${order.join(">") || "none"}`)
-  }
-  assert.deepEqual(violations, []) // the offsets at which chat was disabled after the compaction had begun
-  // Positive control: the sweep must reach both sides of the decision, or an empty result would prove nothing.
-  assert.equal(outcomes.some(line => line.endsWith(":started")), true, outcomes.join(" "))
-  assert.equal(outcomes.some(line => line.endsWith(":disable>started")), true, outcomes.join(" "))
-})
-
 // A real manager, delivery and lifecycle around a worker double. The first heartbeat after the join waits for the test.
 async function staleInstanceRun(answer) {
   const rig = holdableCtx()
@@ -917,29 +880,6 @@ for (const answer of ["resolve", "reject"]) {
   })
 }
 
-// Review 6003960841, finding 2: a signal that will change the delivery's state is applied in order on the session's
-// chain, but it fences an in-flight check when it is received. The check asks `current()` only about state that was
-// already applied, so the chain's turn is too late: a list that completes first could still put or disable.
-test("a reset and a compaction event fence the delivery on receipt, and an ordinary event does not", async () => {
-  const parts = stubParts()
-  const manager = createManager(fakeCtx(root), config, parts)
-  manager.feed(event("session.execution.started", "ses_a"))
-  manager.feed(event("session.execution.started", "ses_b"))
-  await flush()
-  const delivery = id => parts.deliveries.get(id)
-  const fenced = () => [delivery("ses_a").invalidations, delivery("ses_b").invalidations]
-  manager.feed(event("session.agent.selected", "ses_a", { agent: "build" }))
-  assert.deepEqual(fenced(), [0, 0]) // an ordinary event waits for its turn and fences nothing
-  for (const [count, type] of [[1, "session.compaction.started"], [2, "session.compaction.ended"], [3, "session.compaction.failed"]]) {
-    manager.feed(event(type, "ses_a", { reason: "auto" }))
-    assert.deepEqual(fenced(), [count, 0], type) // synchronously, before the event is queued: this session only
-  }
-  manager.reset()
-  assert.deepEqual(fenced(), [4, 1]) // every record, synchronously
-  await flush()
-  assert.deepEqual(delivery("ses_a").seen.slice(-3), ["session.compaction.started", "session.compaction.ended", "session.compaction.failed"])
-})
-
 // A real delivery behind a manager, with a read-back whose first list is held. `order` records the host calls and the
 // decisions that follow a signal: "put", "disable", and the "signal" the test sends.
 async function pendingCheck() {
@@ -1010,48 +950,47 @@ test("a publish confirmed before the first event after a gap does not skip that 
   assert.match(rig.entries.get(BINDING_KEY), /binding text/)
 })
 
+// Round 8: a read-back never disables chat. A failed one is asked for again at the next event.
+test("a transient list rejection leaves the gate closed and chat on, and the next event's check proves and reopens", async () => {
+  const run = await pendingCheck()
+  run.answer("reject")
+  await flush()
+  assert.deepEqual(run.lifecycle.disables, []) // chat is still on
+  assert.equal(run.delivery.state(), "busy") // and the gate is closed
+  assert.equal(run.delivery.needsReadBack(), true) // owed: the next event asks again
+  run.send("session.execution.started") // the next event
+  await flush()
+  assert.equal(run.delivery.state(), null)
+  assert.match(run.rig.entries.get(BINDING_KEY), /binding text/) // the entry is back
+  assert.deepEqual(run.lifecycle.disables, [])
+})
+
+// A check that is in flight when a signal is received can still put the entry back before the signal is applied: that
+// put is at the wrong time and harmless, because the applied signal owes the read-back again and the next check proves.
+// The sweep completes the held list after 0..10 microtask ticks, so it reaches both sides of the signal's turn.
 for (const signal of ["reset", "compaction"]) {
-  test(`a ${signal} received while a check's host call is pending: nothing is put or disabled after it, whatever the order of the microtasks`, async () => {
-    const violations = []
-    const orders = new Set()
+  test(`a ${signal} received while a check's host call is pending: a put at the wrong time is harmless, chat is never disabled, and the next event's check proves`, async () => {
+    const problems = []
+    const wrongTime = new Set()
     for (const how of ["resolve", "reject"]) {
       for (let offset = 0; offset <= 10; offset++) {
+        const label = `${how}@${offset}`
         const run = await pendingCheck()
         run.answer(how)
         await tickAfter(offset)
         run.signals[signal]()
         await flush()
-        const after = run.order.slice(run.order.indexOf("signal") + 1)
-        if (after.length) violations.push(`${how}@${offset}: ${run.order.join(">")}`)
-        orders.add(run.order.join(">"))
+        if (run.order.join(">").includes("signal>put")) wrongTime.add(label) // the put came after the signal was received
+        if (signal === "reset") run.resume()
+        else run.send("session.compaction.ended", { reason: "auto" })
+        await flush()
+        if (run.lifecycle.disables.length) problems.push(`${label}: chat disabled`)
+        if (!/binding text/.test(run.rig.entries.get(BINDING_KEY) ?? "")) problems.push(`${label}: no entry`)
+        if (run.delivery.state() !== null) problems.push(`${label}: gate ${run.delivery.state()}`)
       }
     }
-    assert.deepEqual(violations, [])
-    // Positive control: the sweep reaches both sides of the decision, or an empty result would prove nothing.
-    assert.equal(orders.has("signal"), true, [...orders].join(" "))
-    assert.equal([...orders].some(line => /^(put|disable)>signal$/.test(line)), true, [...orders].join(" "))
+    assert.deepEqual(problems, [])
+    // Positive control: the sweep does reach a put after the signal was received, or an empty result would prove nothing.
+    assert.equal(wrongTime.size > 0, true)
   })
-
-  for (const how of ["resolve", "reject"]) {
-    test(`a ${signal} after an ordinary event while the list is pending, then the list ${how}s: no put, no disable, the obligation stays owed and the next event asks again`, async () => {
-      const run = await pendingCheck()
-      const puts = run.rig.puts.length
-      run.send("session.agent.selected", { agent: "build" }) // queued first
-      run.signals[signal]()
-      run.answer(how)
-      await flush()
-      assert.equal(run.rig.puts.length, puts)
-      assert.deepEqual(run.lifecycle.disables, [])
-      assert.notEqual(run.delivery.state(), null) // the gate is still closed
-      if (signal === "reset") run.resume()
-      else run.send("session.compaction.ended", { reason: "auto" })
-      await flush()
-      assert.equal(run.rig.puts.length, puts + 1) // the owed check ran after the signal, and put the entry back
-      assert.match(run.rig.entries.get(BINDING_KEY), /binding text/)
-      assert.deepEqual(run.lifecycle.disables, [])
-      if (signal === "compaction") run.resume()
-      await flush()
-      assert.equal(run.delivery.state(), null)
-    })
-  }
 }

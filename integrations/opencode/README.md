@@ -184,52 +184,48 @@ The service and its host-token provisioning are documented in the product
   `agent-chat-binding`, written with `session.instructions.entry.put`. The
   same key replaces the old text after a rejoin, and the entry is removed when
   the session's chat ends. After each put the plugin reads the entries back.
-  A put that fails or leaves no entry turns that session's chat off before
-  anything is offered: no heartbeat, no pending read, no claim. There is no
-  fallback to a prompt message. After a compaction, and after a lost event
-  stream, the plugin checks the entry again and puts it back, or turns that
-  session's chat off. The session reads `busy` from `session.compaction.started`
-  until `ended` or `failed`, and from `ended` and from the gap until that check
-  has succeeded, so no claim and no send runs in between. The check after a gap
-  waits for the session's first event after it, and a check that fails then
-  turns that session's chat off. A compaction or a gap that comes while an
-  earlier check is still running is covered by its own check. A compaction that
-  ended inside a gap is covered too, because the gap alone invalidates the
-  proof. A compaction that was running when the gap came is not ended by the
-  gap, and no check runs while it is running: the session stays `busy`, and the
-  check runs only after that compaction's own `ended` or `failed` event.
-  One rule says whether a check may still act. A check is current only while
-  that session's chat is on, no compaction runs, no newer gap or compaction
-  start or end has come, and nothing has withdrawn or replaced the binding. A
-  rejoin after `STALE_INSTANCE` does both: it clears the old binding, then
-  publishes a new one. The check asks the rule after every host call it awaits
-  and before the next one, and again in the step in which it would prove the
-  binding or turn chat off. So a check queued behind an earlier context
-  operation reads nothing if a compaction began, or a newer gap came, while it
-  waited, and the same holds between its list, its put and its confirming list.
-  A check that is no longer current ends without error: it puts nothing,
-  proves nothing and ignores its failure. A compaction that started while a
-  check was running counts the same way, even if it has already ended or
-  failed. The obligation then stays owed. A signal that moves the rule is
-  fenced when it is received, not when its turn comes: the manager applies a
-  session's events in order, so a lost stream and a compaction event
-  (`started`, `ended`, `failed`) are queued behind earlier events. On receipt
-  they only advance the check's epoch, so a check in flight stops being current
-  now and cannot put or turn chat off in the gap before the queued event runs.
-  They change nothing the session shows; the queued event does that, in order.
-  A session with nothing published has nothing to read, so the obligation stays
-  owed. Only a failure of a current check turns that session's chat off, and
-  the check does that itself, in that same step, not after the answer has
-  passed through a promise. The gate stays closed until the binding is proved.
-  A check proves it. So does a confirmed publish of the binding (a join or a
-  rejoin), if no gap or compaction came since that publish began and nothing
-  replaced the binding. A gap is over only once the stream has resumed for that
-  session, because a compaction can still end inside it and drop the entry
-  after the put. So a publish that began before the first event after a gap
-  does not discharge the gap's obligation, even if it is confirmed: that first
-  event still asks for the read-back. A check that ended stale is asked for
-  again at the session's next event, unless a confirmed publish has discharged
-  the obligation first.
+  A join's put that fails or leaves no entry turns that session's chat off
+  before anything is offered: no heartbeat, no pending read, no claim. There
+  is no fallback to a prompt message.
+  After a compaction signal (`started`, `ended` or `failed`) and after a lost
+  event stream the entry may be gone, so the plugin owes a read-back. It lists
+  the entry and puts it back when it is missing or changed. The session reads
+  `busy` from the signal or the gap until a read-back has succeeded, so no
+  claim and no send runs in between. The read-back starts at the session's
+  first event once the signal is applied. After a gap that is the first event
+  after the stream has resumed, so a compaction that ended inside the gap is
+  already over. No read-back runs while a compaction runs. A compaction that
+  was running when the gap came is not ended by the gap, so the session stays
+  `busy` until that compaction's own `ended` or `failed` event.
+  A read-back is a repair that is owed until it succeeds, never a verdict. If
+  a host call fails, if the put leaves no entry, or if the check was overtaken
+  by a newer signal, the session stays `busy`, the obligation stays owed and
+  the next event asks again. A read-back never turns chat off. A session whose
+  entry cannot be restored stays closed, not disabled, and opens again at the
+  first event after the host answers.
+  A read-back counts as proof only while it is current: that session's chat is
+  on, no compaction runs, no newer gap or compaction signal has been applied,
+  and nothing has withdrawn or replaced the binding. A rejoin after
+  `STALE_INSTANCE` does both: it clears the old binding, then publishes a new
+  one. The check asks the rule after every host call it awaits and again before
+  it proves the binding. Before its first call it also asks that the
+  obligation is still owed, so a check queued behind a confirmed publish that
+  discharged the obligation makes no host call. A confirmed publish of the
+  binding (a join or a rejoin) discharges the obligation if no gap or
+  compaction came since that publish began and nothing replaced the binding. A
+  gap is over only once the stream has resumed for that session, because a
+  compaction can still end inside it and drop the entry after the put. So a
+  publish that began before the first event after a gap does not discharge the
+  gap's obligation, even if it is confirmed. With nothing published there is
+  nothing to read, and the obligation stays owed.
+  A put at the wrong time is harmless. The manager applies a session's events
+  in order, so a signal can be received while a check is in flight, and that
+  check can still put the entry or prove before the signal is applied. Every
+  signal that can invalidate the entry owes the read-back again when it is
+  applied: a gap, and a compaction `started`, `ended` or `failed`. A withdrawn
+  binding's removal runs on the same serial queue as every put, behind any put
+  that is already issued. So the put is read back after the signal, and the
+  next check proves.
 - **Delivery to a running session.** The plugin claims only when it has
   observed the session running, it is not stopped, not in Plan Mode, not
   compacting and has no pending attempt. It then sends one `synthetic` input
@@ -346,14 +342,21 @@ unverified, inferred, or a deliberate choice.
   stale binding. The next join replaces it. An owner change waits for the old
   owner's `entry.remove`, and for any context operation queued before it, to
   settle. A call that never returns blocks the failover and the cleanup.
+- **An entry that cannot be restored.** A read-back that keeps failing leaves
+  the session `busy` and joined, not disabled: it refuses every claim, so
+  nothing is delivered to it. The plugin does not count failures or turn chat
+  off, because the closed gate already refuses every claim. The cost is one
+  list for each event of that session while the host keeps failing, and when the
+  entry is gone also a put and a confirming list. It opens again at the first
+  event after the host answers.
 - **Forks.** Whether a fork sets `parentID` is unknown. A session with a `fork`
   field or a `parentID` never joins.
 - **Agent after a gap.** Whether the host emits `session.agent.selected` again
   without an agent switch. If it does not, a session stays out of chat after a
   lost event stream, or after an instance that did not own the joins is torn
   down, until its agent next changes. Each such gap also costs a read-back of
-  the binding entry. If that read-back fails, that session's chat is turned
-  off, as it is after a compaction.
+  the binding entry. If that read-back fails, the session stays closed until a
+  later one succeeds, as it does after a compaction.
 - **Plain JavaScript plugin.** See "Install".
 - **Node built-ins.** Whether the plugin runtime allows `node:child_process`.
 - **Connection key.** How the connection-key work in issues #126 to #128
@@ -392,8 +395,8 @@ unverified, inferred, or a deliberate choice.
   above while they run. If a compaction ends between that put and that list,
   the confirmation fails and that session's chat is turned off. The publish
   discharges the read-back obligation only if the rule still holds when it is
-  confirmed and the stream had resumed when it began. A later `context()` call is serialised behind it, so the order of
-  puts and removals still holds.
+  confirmed and the stream had resumed when it began. A later `context()` call
+  is serialised behind it, so the order of puts and removals still holds.
 - **A user input is not an operator.** A `user` inbox item clears the stop
   latch whether an operator or an API client sent it.
 - **Persisted idle sessions** join at their first event after the server

@@ -11,28 +11,31 @@
 // deadline, a throwing call and a lost event stream are all `uncertain`: the input may be parked and drain later, and
 // a later `delivered` for it is ignored. Only `session.inbox.cancelled` for the id proves that nothing ran.
 //
-// A compaction may drop the binding entry, and a lost event stream may have hidden one. From `session.compaction.ended`
-// and from a stream gap the gate stays closed until the entry has been read back (`verifyContext`); a read-back that
-// fails keeps it closed, and the caller's `onFailed` then turns chat off. A read-back proves only that the entry exists
-// at that moment, never that a compaction has ended: a compaction already seen running stays running across a gap, and
-// only its own terminal event (`ended` or `failed`) clears it.
+// A compaction may drop the binding entry, and a lost event stream may have hidden one. From a compaction signal and
+// from a stream gap the gate stays closed until the entry has been read back (`verifyContext`). A read-back proves only
+// that the entry exists at that moment, never that a compaction has ended: a compaction already seen running stays
+// running across a gap, and only its own terminal event (`ended` or `failed`) lets a check start.
 //
-// ONE CURRENCY RULE. A read-back is for one obligation and one binding. It is current only while chat is open and on,
-// no compaction runs, no newer gap, compaction start or end has come, and no `context()` call has withdrawn or
-// replaced the binding. It asks that after every host call it awaits, before the next one, and again at the point
-// where it would act on a failure or prove the binding. A check that is not current does nothing more and reports
-// "stale": it neither puts, nor fails, nor proves, and the obligation stays owed for the next event. It reports
-// "proved" or "failed" only in the step in which it was still current, and it calls `onFailed` in that same step.
-// The same rule lets a confirmed `context()` publish discharge the obligation: nothing published proves nothing, so
-// with no binding the obligation stays owed until a publish that no gap or compaction overlapped has been confirmed.
-// A gap is over only when the stream has resumed for the session: a compaction can still end inside it and drop the
-// entry after the put. So a publish that began before the first event after a gap does not discharge it, and the read-back
-// at that first event runs as before.
+// A READ-BACK IS A REPAIR OWED UNTIL IT SUCCEEDS, NEVER A VERDICT. It puts the entry back when it is gone and reopens
+// the gate. A host call that fails, an entry that cannot be confirmed and a check that was overtaken all leave the gate
+// closed and the obligation owed, and the next event asks again. Nothing here turns chat off: a session whose entry
+// cannot be restored stays closed, which refuses every claim, and heals when the host answers again. Only the join's
+// own publish (`context()`) rejects, and its caller decides what a failed join means.
 //
-// FENCED ON RECEIPT. The caller applies events in order, on a chain, so an event can be received before it is applied.
-// `invalidate()` is called at receipt for a signal that will move the epoch (a gap, a compaction start, end or
-// failure). It advances the epoch and changes nothing observed, so a check in flight stops being current now, and the
-// event itself still lands in order when its turn comes.
+// ONE CURRENCY RULE. A read-back is for one obligation and one binding. It proves the binding only while chat is open and
+// on, no compaction runs, no newer gap or compaction signal has been applied, and no `context()` call has withdrawn or
+// replaced the binding. It asks that after every host call it awaits and before the next one, and before it proves. Before
+// its first host call it also asks that the obligation is still owed: a check queued behind a publish that discharged it
+// makes no call. A confirmed `context()` publish discharges the obligation under the same rule. With nothing published
+// there is nothing to read, so the obligation stays owed until a publish is confirmed. A gap is over only when the
+// stream has resumed for the session: a compaction can still end inside it and drop the entry after the put. So a publish
+// that began before the first event after a gap does not discharge it.
+//
+// WHY A PUT AT THE WRONG TIME IS HARMLESS. A put is never the last word. Every signal that can invalidate the entry
+// re-owes the obligation when it is applied: a gap (`reset`) and a compaction `started`, `ended` or `failed` each set
+// `unverified` and move the epoch. So a put or a proof that landed just before such a signal was applied is owed again
+// and read back after it. A withdrawn binding's removal runs on the same serial queue as every put, so it always lands
+// behind a put that is already issued, and a check begun for a withdrawn binding makes no call at all.
 //
 // State is read from events only. A fact the events have not shown is unknown, and unknown never reads as idle.
 import { BINDING_KEY, CHAT_PREFIX, CHAT_SOURCE, MAX_CONTEXT_BYTES, monotonicNow } from "./channel.js"
@@ -57,7 +60,7 @@ export function createDelivery(ctx, sessionID, {
   let compacting = false
   let unverified = false // a compaction ended, or the stream broke, and the binding entry has not been read back since
   let resuming = false // the stream broke and no event has arrived since: a compaction may still end inside the gap
-  let compactions = 0 // compaction starts, endings, gaps and receipts of them so far: a read-back that began before the latest one proves nothing
+  let compactions = 0 // compaction signals and gaps applied so far: a read-back that began before the latest one proves nothing
   let verifying = null // the `compactions` value a queued read-back was asked for: one read per obligation
   let generation = 0 // `context()` calls so far: a read-back made for an earlier call is for a binding that is gone
   let agent = null
@@ -134,16 +137,13 @@ export function createDelivery(ctx, sessionID, {
         agent = typeof data.agent === "string" && data.agent ? data.agent : null
         return true
       case "session.compaction.started":
-        compacting = true
-        compactions += 1 // a read-back that was already running overlapped this compaction, whatever ends it
-        return true
       case "session.compaction.ended":
-        compacting = false
+      case "session.compaction.failed":
+        // Each one owes the binding read-back again and moves the epoch: a check that was already running overlapped
+        // the compaction, and a proof from before it says nothing about the entry after it.
+        compacting = event.type === "session.compaction.started"
         unverified = true
         compactions += 1
-        return true
-      case "session.compaction.failed":
-        compacting = false
         return true
       case "session.inbox.enqueued":
         // A user input is the only thing that clears the stop latch. It cannot be told apart as an operator or an
@@ -253,8 +253,7 @@ export function createDelivery(ctx, sessionID, {
   const currentAt = (mark, binding) => () => !closed && !disabled && !compacting && compactions === mark && generation === binding
 
   // Put the entry and confirm it. `current` is asked after the put and before the confirming list: false stops there,
-  // and the result is false. A put that left no entry means no binding context, which means chat off. A caller that
-  // passes a `current` re-asks it for the failure this throws.
+  // and the result is false. A put that left no entry throws: the caller decides what that means.
   async function publish(text, current = () => true) {
     await ctx.session.instructions.entry.put({ sessionID, key: BINDING_KEY, value: text })
     if (!current()) return false
@@ -286,11 +285,6 @@ export function createDelivery(ctx, sessionID, {
     })
   }
 
-  // A signal that moves the read-back epoch has been received and is queued behind earlier events. This moves the epoch
-  // now, so a check in flight is no longer current, and changes nothing observed: the queued event does that in order.
-  // `needsReadBack()` asks for a fresh check once that event has landed and `unverified` is set.
-  function invalidate() { compactions += 1 }
-
   // A read-back is owed after a compaction ended and after a gap, until one that began while nothing was compacting
   // has succeeded, or a confirmed `context()` publish has discharged it. Whoever drives it asks here, so it is asked
   // for once per obligation and never during a compaction.
@@ -298,36 +292,31 @@ export function createDelivery(ctx, sessionID, {
     return unverified && !compacting && !closed && !disabled && verifying !== compactions
   }
 
-  // After a compaction or a gap: put the entry back when it is gone or changed, then reopen the gate. Only the latest
-  // obligation's read-back reopens it. Resolves, and never rejects, with one of:
-  //   "proved"  the entry is there and the read-back was current throughout; the gate may reopen
-  //   "failed"  a host call failed while the read-back was current; `onFailed(error)` was called in that step
-  //   "stale"   it stopped, or its failure was ignored, because it was no longer current; the obligation stays owed
-  // With nothing published there is nothing to read, so it is "stale" and the obligation stays owed: a confirmed
-  // `context()` publish discharges it. `onFailed` may re-enter the delivery, so nothing is touched after it runs.
-  function verifyContext(onFailed = () => {}) {
+  // After a compaction or a gap: put the entry back when it is gone or changed, then reopen the gate. Resolves, and never
+  // rejects, with true only when this check proved the binding while it was still current. Every other end resolves
+  // false and leaves the obligation owed: the gate stays closed and the next event asks again.
+  function verifyContext() {
+    if (closed || published === null) return Promise.resolve(false) // nothing to read: a confirmed publish discharges it
     const mark = compactions
-    const binding = generation
-    const current = currentAt(mark, binding) // asked after every host call, and again for the failure and the proof
-    if (closed) return Promise.resolve("stale")
-    verifying = mark // one read per obligation, also when there is nothing to read
-    if (published === null) return Promise.resolve("stale")
+    const current = currentAt(mark, generation)
     const text = published
-    const stale = () => { if (verifying === mark) verifying = null; return "stale" }
+    verifying = mark // one check per obligation at a time
+    const done = proved => {
+      if (!proved && verifying === mark) verifying = null // still owed: the next event asks again
+      return proved
+    }
     return queued(async () => {
+      if (!unverified || !current()) return done(false) // discharged or overtaken while it waited: no host call
       try {
-        if (!current()) return stale() // the wait behind earlier context operations
         const found = await holds(text)
-        if (!current()) return stale() // asked before the put, which is made in the same step
-        if (!found && !await publish(text, current)) return stale()
+        if (!current()) return done(false) // asked before the put, which is made in the same step
+        if (!found && !await publish(text, current)) return done(false)
       } catch {
-        if (!current()) return stale() // a failure that overlapped a compaction, a newer gap or a new binding is no evidence
-        try { onFailed(contextFailure()) } catch { /* the caller's handler is its own; the outcome stands */ }
-        return "failed"
+        return done(false) // a failed call proves nothing either way, and turns nothing off
       }
-      if (!current()) return stale() // the last host call proves nothing about a binding that has since changed
+      if (!current()) return done(false) // the last host call proves nothing about a binding that has since changed
       unverified = false
-      return "proved"
+      return done(true)
     })
   }
 
@@ -345,5 +334,5 @@ export function createDelivery(ctx, sessionID, {
     attempts.clear()
   }
 
-  return { state, heartbeatState, observe, seed, reset, invalidate, deliver, sendChat, context, needsReadBack, verifyContext, disable, dispose }
+  return { state, heartbeatState, observe, seed, reset, deliver, sendChat, context, needsReadBack, verifyContext, disable, dispose }
 }

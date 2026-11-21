@@ -234,7 +234,7 @@ test("activate builds a manager that takes events, and deactivate stops it and p
   const ctx = { ...streamCtx([]), session: { get: async ({ sessionID }) => { lookups.push(sessionID); return { id: sessionID } } } }
   const stops = []
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, invalidate() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
     createLifecycle: (bus) => { bus.on("session_start", () => {}); return { stop: () => { stops.push("stop"); return Promise.resolve({ code: 0 }) } } },
   }
   const member = createMember(ctx, {}, parts)
@@ -375,7 +375,7 @@ function realMember(lookups, started = [], { stuck = [] } = {}) {
     },
   }
   const parts = {
-    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, invalidate() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
+    createDelivery: () => ({ seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve(), dispose() {} }),
     createLifecycle: bus => {
       bus.on("session_start", payload => started.push(payload.nativeSessionId))
       return { stop: () => Promise.resolve({ code: 0 }), disable: () => Promise.resolve(null) }
@@ -648,7 +648,7 @@ async function handDrivenStreams() {
   const ctx = { ...streamCtx([]), session: { get: async ({ sessionID }) => ({ id: sessionID, agent: "build" }) } }
   const parts = {
     createDelivery: (hostCtx, id) => {
-      if (id !== "ses_a") return { seed() {}, observe: () => false, reset() {}, invalidate() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve("proved"), dispose() {} }
+      if (id !== "ses_a") return { seed() {}, observe: () => false, reset() {}, needsReadBack: () => false, verifyContext: () => Promise.resolve("proved"), dispose() {} }
       delivery = createDelivery(hostCtx, id, { now: () => 1_000, setTimeoutImpl: () => ({}), clearTimeoutImpl: () => {} })
       return delivery
     },

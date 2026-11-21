@@ -9,12 +9,8 @@
 // run at the reset would end before the gap does. The delivery owes the read-back from the reset, and the manager asks
 // for it at the first event the session handles afterwards: the stream has resumed by then, so whatever it missed is
 // over. The exception is a compaction already seen running: a read-back then proves only that the entry exists, so the
-// delivery holds it back until that compaction's own `ended` or `failed` event.
-//
-// A SIGNAL THAT MOVES THE READ-BACK IS FENCED WHEN IT IS RECEIVED. Events run on the session's chain, so a lost stream
-// (`reset()`) or a compaction event can be received before it is applied, and a check in flight would still put or turn
-// chat off in that gap. `feed()` and `reset()` therefore call `delivery.invalidate()` synchronously, which only advances
-// the check's epoch; the event itself is applied in order when its turn comes, and the next event asks again.
+// delivery holds it back until that compaction's own `ended` or `failed` event. A read-back that fails or is overtaken
+// leaves the obligation owed and is asked for again at the next event. It never turns chat off.
 //
 // FORKS ARE PERMANENT. A `session.forked` event is evidence that outlives every cache: it is kept in its own set,
 // never evicted, dropped only when the session is deleted, and shared with the next owner. A lookup that fails or
@@ -42,10 +38,6 @@ export const EVENT_TYPES = Object.freeze([
   "session.inbox.enqueued", "session.inbox.delivered", "session.inbox.cancelled",
   "session.compaction.started", "session.compaction.ended", "session.compaction.failed",
 ])
-
-// The events that move a delivery's read-back epoch when they are applied. Each also fences an in-flight check when it
-// is received, not when its turn on the session's chain comes.
-const FENCING_EVENTS = new Set(["session.compaction.started", "session.compaction.ended", "session.compaction.failed"])
 
 const RETRY_LOOKUP_MS = 60_000
 const MAX_REFUSED = 1024
@@ -155,20 +147,16 @@ export function createManager(ctx, config, parts, {
   function handle(record, event) {
     if (!active || record.dead || !record.delivery) return
     if (record.delivery.observe(event)) record.fire("state_changed", {})
-    // A compaction ended, or this is the first event since a gap: either may have dropped the binding entry. The
-    // delivery owes that read-back and says when it may start.
+    // A compaction signal, or the first event since a gap, may have left the binding entry dropped. The delivery owes
+    // that read-back, failed and overtaken ones included, and says when one may start.
     if (record.delivery.needsReadBack()) readBack(record)
   }
 
-  // Put the binding entry back or turn this session's chat off: no entry, no chat. The delivery keeps its gate
-  // closed until this succeeds. The delivery decides, and it calls this handler in the step in which it decided,
-  // while its check was still current: a failure is never carried over a promise hop and interpreted here later, when
-  // a compaction, a gap or a new binding may have made it stale. Nothing is awaited here, and the delivery's answer
-  // ("proved", "stale" or "failed") needs no handling: it never rejects, and a stale check stays owed for the next event.
+  // Put the binding entry back. The delivery keeps its gate closed until this succeeds, and a check that fails or is
+  // overtaken leaves the obligation owed, so the next event asks again. It never turns chat off and never rejects,
+  // so nothing is awaited or handled here.
   function readBack(record) {
-    void record.delivery.verifyContext(error => {
-      try { void record.lifecycle.disable(describeFailure(error)) } catch { /* already latched */ }
-    })
+    void record.delivery.verifyContext()
   }
 
   function feed(event) {
@@ -193,10 +181,6 @@ export function createManager(ctx, config, parts, {
       return
     }
     if (isRefused(id)) return
-    // Fenced on receipt: the event below is applied in order, behind whatever is queued, and a check that is in flight
-    // must stop being current now, not when its turn comes. Nothing the delivery observed changes here.
-    const known = records.get(id)
-    if (known?.delivery && FENCING_EVENTS.has(event.type)) known.delivery.invalidate()
     let record = records.get(id)
     if (!record) {
       record = { id, delivery: null, lifecycle: null, fire: null, chain: Promise.resolve(), dead: false, closing: null }
@@ -211,7 +195,6 @@ export function createManager(ctx, config, parts, {
   // The event stream broke or restarted: events may be missing, so every observation is stale.
   function reset() {
     for (const record of [...records.values()]) {
-      record.delivery?.invalidate() // fenced on receipt, like a compaction event: the reset itself lands in order below
       record.chain = record.chain.then(() => {
         if (record.dead || !record.delivery) return
         record.delivery.reset() // a read-back is owed now, and asked for at the next event, once the stream has resumed
