@@ -204,10 +204,12 @@ export function createContext(ctx, sessionID, {
   const owed = () => unverified && !closed && !disabled
 
   // Is this binding proved now? A confirmed publish or a read-back proved it at this generation and epoch, and nothing has
-  // moved since: no signal, no gap, no new or withdrawn binding, and no current read that missed the entry. The lifecycle
-  // asks it at the moment it sends a join's first heartbeat.
-  // It reads state only and starts nothing; a tick's own refresh does not take the proof back.
-  const proved = () => !closed && !disabled && proven !== null && proven.binding === generation && proven.epoch === compactions
+  // moved since: no signal, no gap, no new or withdrawn binding, and no current read that missed the entry. A read-back
+  // that is still owed, such as the follow-up a tick asked for while a check ran, may yet miss the entry, so nothing is
+  // proved until it ends. The lifecycle asks it at the moment it sends a join's first heartbeat. It reads state only and
+  // starts nothing.
+  const proved = () => !owed() && !closed && !disabled && proven !== null && proven.binding === generation &&
+    proven.epoch === compactions
 
   // May a read-back start now? Never with nothing published, and one at a time per obligation.
   const askable = () => owed() && published !== null && verifying !== compactions

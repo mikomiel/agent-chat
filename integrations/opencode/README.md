@@ -261,6 +261,9 @@ The service and its host-token provisioning are documented in the product
   that the manager started, or a tick's own. The binding is proved only while
   both are still the current ones. A tick's own read-back does not move them,
   and a gap, a compaction signal, a replaced binding and a withdrawn binding do.
+  Nothing is proved while a read-back is still owed: a tick's own read-back and
+  the follow-up that a tick asks for while a check runs hold the proof back
+  until they end, and a read that fails leaves it owed.
   The manager applies a gap or a compaction signal to an existing binding
   context when it receives it, and queues only the read-back behind the
   session's earlier events. A put at the wrong time is harmless. Every signal that can invalidate the
@@ -408,7 +411,9 @@ unverified, inferred, or a deliberate choice.
   resolved sends nothing. The first heartbeat waits for the join's confirmation
   and then for the proof of anyone: the join's publish, a read-back the manager
   started, or the tick's own. A tick that finds no proof sends the heartbeat
-  when its own read-back settles, and a tick that finds one sends at the tick.
+  when its own read-back and its keepalive settle, and a tick that finds one
+  sends at the tick. That deferred heartbeat is only for the join of its tick,
+  and only while that join has sent no first heartbeat.
   So a join whose confirmation was overtaken sends its first heartbeat at the
   first tick, at most 30 seconds after the join, when a read-back already proved
   the binding, and otherwise as soon as that tick's read-back does. A read of

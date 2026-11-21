@@ -1125,7 +1125,7 @@ test("a worker that exits while the first proof is pending fails closed", async 
 // 90 seconds with no request. Each tick of a shut gate sends it one read-only `receipts` request instead, so it never idles
 // out while the first proof is pending. The real worker module over a child double that answers every request; the test
 // holds a `receipts` answer when it asks to, and chooses the heartbeat's answer.
-function gatedRig({ receipts = () => ({ receipts: [] }), heartbeat = () => ({ result: {} }) } = {}) {
+function gatedRig({ receipts = () => ({ result: { receipts: [] } }), heartbeat = () => ({ result: {} }) } = {}) {
   const bus = fakeBus()
   const rig = { bus, proof: false, refreshes: [], disabled: 0, notices: [], children: [], tick: null, retry: null, hold: false, held: [] }
   rig.native = {
@@ -1148,7 +1148,7 @@ function gatedRig({ receipts = () => ({ receipts: [] }), heartbeat = () => ({ re
         if (frame.op === "join") setImmediate(() => reply(frame, { result: joined }))
         if (frame.op === "heartbeat") setImmediate(() => reply(frame, heartbeat(frame)))
         if (frame.op === "receipts") {
-          const answer = () => reply(frame, { result: receipts(frame) })
+          const answer = () => reply(frame, receipts(frame))
           if (rig.hold) rig.held.push(answer)
           else setImmediate(answer)
         }
@@ -1246,7 +1246,7 @@ test("a proof later than the server lease: the first heartbeat gets STALE_INSTAN
 
 test("a receipts keepalive that the worker refuses changes nothing", async () => {
   // The worker's own failure answer for receipts is a `refused` result: an answer, so it is ignored.
-  const rig = gatedRig({ receipts: () => ({ refused: "SERVICE_UNAVAILABLE" }) })
+  const rig = gatedRig({ receipts: () => ({ result: { refused: "SERVICE_UNAVAILABLE" } }) })
   await settle()
   for (let index = 0; index < 3; index++) await rig.beat()
   assert.deepEqual(rig.ops(), ["receipts", "receipts", "receipts"])
@@ -1300,3 +1300,101 @@ for (const [label, rejection, rejoins] of [
     }
   })
 }
+
+// Review 6006961709: a keepalive whose answer is delayed defers its tick's heartbeat past the read-back that tick started.
+// The read-back of an earlier tick proves the binding while the follow-up that this tick asked for is still pending. The
+// binding is not proved while a read-back is owed, so the delayed heartbeat sends nothing; the follow-up then misses the
+// entry, and the gate stays shut until a later read proves the binding.
+function holdReceipts(rig) {
+  const answers = []
+  const request = rig.worker.request
+  rig.worker.request = (op, fields) => {
+    if (op !== "receipts") return request(op, fields)
+    rig.worker.requests.push({ op, fields })
+    return new Promise(resolve => { answers.push(() => resolve({ receipts: [] })) })
+  }
+  return answers
+}
+
+test("a delayed keepalive and a pending negative follow-up read give no first heartbeat, and the gate stays shut until a later proof", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
+  rig.held.release() // the join's confirmation was overtaken: the gate is shut
+  await flush()
+  const answers = holdReceipts(rig)
+  let first = null
+  rig.gate = new Promise(resolve => { first = resolve }) // the first read-back's list waits
+  rig.tick() // a keepalive, and a read-back that lists the entry, which is there
+  await flush()
+  answers.shift()() // that keepalive is answered
+  await flush()
+  rig.tick() // its keepalive is held, and its read-back is the follow-up of the one that runs
+  await flush()
+  assert.equal(answers.length, 1)
+  let second = null
+  rig.negative = true // the follow-up's list finds no entry
+  rig.putFails = true // and its put cannot restore it
+  rig.gate = new Promise(resolve => { second = resolve }) // and it waits
+  first() // the first read-back proves the binding, and the follow-up starts
+  await flush()
+  assert.equal(rig.context.owed(), true)
+  assert.equal(rig.context.proved(), false) // the follow-up is owed, so nothing is proved yet
+  answers.shift()() // the delayed keepalive is answered: its tick's heartbeat is asked now
+  await flush()
+  assert.equal(rig.beats(), 0)
+  second() // the follow-up ends negative and withdraws the proof
+  await flush()
+  assert.equal(rig.context.proved(), false)
+  assert.equal(rig.beats(), 0)
+  rig.tick() // a tick whose read cannot restore the entry keeps the gate shut
+  await flush()
+  answers.shift()()
+  await flush()
+  assert.equal(rig.beats(), 0)
+  rig.gate = null
+  rig.negative = false
+  rig.putFails = false
+  rig.tick() // a later read finds the entry: the proof, and the first heartbeat
+  await flush()
+  answers.shift()()
+  await flush()
+  assert.equal(rig.context.proved(), true)
+  assert.equal(rig.beats(), 1)
+})
+
+// The deferred heartbeat belongs to its tick's join, and only while that join has sent no first heartbeat. A later tick
+// that finds the proof sends the first heartbeat itself; the earlier tick's deferred heartbeat then sends nothing more.
+test("a deferred heartbeat whose join has already sent its first heartbeat sends nothing", async () => {
+  const rig = gatedRig()
+  await settle()
+  rig.tick() // the gate is shut: a keepalive, and a read-back that is still pending
+  await settle()
+  rig.proof = true
+  rig.tick() // proved at the tick: the first heartbeat is sent there
+  await settle()
+  assert.deepEqual(rig.ops(), ["receipts", "heartbeat"])
+  rig.refreshes[0]() // the first tick's read-back ends: its deferred heartbeat is for a join that already sent one
+  await settle()
+  assert.deepEqual(rig.ops(), ["receipts", "heartbeat"])
+  rig.refreshes[1]()
+  await settle()
+  assert.equal(rig.disabled, 0)
+})
+
+// The same for a rejoin: a tick of the old join whose read-back ends after the new join started sends nothing for it.
+test("a deferred heartbeat of a join that was replaced sends nothing for the new join", async () => {
+  const rig = gatedRig({ receipts: () => ({ error: { code: "REQUEST_UNCERTAIN" } }) })
+  await settle()
+  rig.tick() // the keepalive fails with a rejoin code; the read-back of this tick is still pending
+  await settle()
+  assert.equal(typeof rig.retry, "function", rig.notices.join(" | "))
+  rig.retry() // the new join publishes, and its gate is shut
+  await settle()
+  assert.equal(rig.children.length, 2)
+  rig.proof = true
+  rig.refreshes[0]() // the old tick's read-back ends: its deferred heartbeat is not for the new join
+  await settle()
+  assert.equal(rig.count("heartbeat", rig.children[1]), 0)
+  assert.equal(rig.disabled, 0)
+})

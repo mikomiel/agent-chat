@@ -1324,13 +1324,13 @@ test("a proof by a read-back counts, whoever started it", async () => {
   assert.equal(context.proved(), true)
 })
 
-test("a tick's own refresh does not take the proof back, and a signal does", async () => {
+test("a tick's own refresh holds the proof back until its read ends, and a signal takes it back", async () => {
   const { context } = make()
   await context.context("binding")
   const refresh = context.refresh()
-  assert.equal(context.proved(), true) // the epoch did not move: a read-back in flight is no change
+  assert.equal(context.proved(), false) // the read-back it owes may yet miss the entry
   await refresh
-  assert.equal(context.proved(), true)
+  assert.equal(context.proved(), true) // the epoch did not move, and the read found the entry
   compacted(context)
   assert.equal(context.proved(), false)
 })
@@ -1405,12 +1405,17 @@ test("a read that misses the entry and cannot restore it leaves the proof withdr
   assert.equal(context.owed(), true)
 })
 
-test("a read that changed text withdraws the proof, and a read that fails withdraws nothing", async () => {
+test("a read that changed text withdraws the proof, and a read that fails proves nothing until one succeeds", async () => {
   const { ctx, context } = make()
   await context.context("binding")
+  const list = ctx.session.instructions.entry.list
   ctx.session.instructions.entry.list = () => Promise.reject(new Error("unavailable"))
   assert.equal(await context.refresh(), false)
-  assert.equal(context.proved(), true) // nothing was found out
+  assert.equal(context.proved(), false) // nothing was found out, and the read-back is still owed
+  assert.equal(context.owed(), true)
+  ctx.session.instructions.entry.list = list
+  assert.equal(await context.refresh(), true)
+  assert.equal(context.proved(), true) // the next read that succeeds proves it again
   ctx.session.instructions.entry.list = async () => [{ key: BINDING_KEY, value: "another text" }]
   ctx.session.instructions.entry.put = () => Promise.reject(new Error("unavailable"))
   assert.equal(await context.refresh(), false)

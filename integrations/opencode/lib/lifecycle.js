@@ -196,11 +196,13 @@ export function createLifecycle(bus, native, config, {
   // While the gate is shut, a heartbeat that finds no proof is asked once more when this tick's keepalive and read-back
   // have settled, so a tick that proves the binding also opens the gate. A tick that finds the gate open sends once,
   // there, and sends no keepalive.
+  // The deferred heartbeat is for this tick's join only, and only while that join has sent no first heartbeat.
   function tick() {
     const shut = gateShut()
+    const record = live
     const sent = shut ? keepAlive() : heartbeat()
     const readBack = refreshContext()
-    if (shut) void Promise.all([sent, readBack]).then(() => heartbeat())
+    if (shut) void Promise.all([sent, readBack]).then(() => { if (live === record && !record.opened) return heartbeat() })
   }
 
   // A retry asks the host once before it starts a replacement worker: the session can be deleted during the backoff with
