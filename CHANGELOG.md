@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/mikomiel/agent-chat/compare/v0.8.0...v0.9.0) (2026-11-21)
+
+
+### Features
+
+* **integrations:** add the Claude Code plugin package ([#124](https://github.com/mikomiel/agent-chat/issues/124)) ([50e3de4](https://github.com/mikomiel/agent-chat/commit/50e3de4b4fa997005e40388d6e008baff0292d1f)), closes [#123](https://github.com/mikomiel/agent-chat/issues/123)
+* **integrations:** one tested notice contract for peer message bodies ([#140](https://github.com/mikomiel/agent-chat/issues/140)) ([9b59c80](https://github.com/mikomiel/agent-chat/commit/9b59c805c3ff7552afb1991371ca4e219839b9f6)), closes [#129](https://github.com/mikomiel/agent-chat/issues/129)
+* **integrations:** OpenCode server plugin for Agent Chat (join and binding context) ([#142](https://github.com/mikomiel/agent-chat/issues/142)) ([07bb7a6](https://github.com/mikomiel/agent-chat/commit/07bb7a690b45f16010ec126a367856137d976fab)), closes [#137](https://github.com/mikomiel/agent-chat/issues/137)
+* **release:** ship every harness integration with each release ([#139](https://github.com/mikomiel/agent-chat/issues/139)) ([5f6af4d](https://github.com/mikomiel/agent-chat/commit/5f6af4d5aa42db61cdcdd3ba1733766c8b0cd41e)), closes [#135](https://github.com/mikomiel/agent-chat/issues/135)
+
+
+### Bug Fixes
+
+* **core:** discard the instance file even when the end fails ([#149](https://github.com/mikomiel/agent-chat/issues/149)) ([4f3fffa](https://github.com/mikomiel/agent-chat/commit/4f3fffab0d4122838885fbc90824ad2d6af2916d))
+* **integrations:** keep DeepSeek eligibility working without roots() ([#138](https://github.com/mikomiel/agent-chat/issues/138)) ([f3bbb2f](https://github.com/mikomiel/agent-chat/commit/f3bbb2f24297248522e224fd660b2a36e17a5ab1)), closes [#134](https://github.com/mikomiel/agent-chat/issues/134)
+* **integrations:** rejoin after a worker request timeout ([#145](https://github.com/mikomiel/agent-chat/issues/145)) ([489ca28](https://github.com/mikomiel/agent-chat/commit/489ca28d920bfced2914b4c4cd172d3cae1ca8e8)), closes [#144](https://github.com/mikomiel/agent-chat/issues/144)
+* **integrations:** retry a brief outage on the next tick, not rejoin ([#147](https://github.com/mikomiel/agent-chat/issues/147)) ([0037f00](https://github.com/mikomiel/agent-chat/commit/0037f00de5d6ebed6b0b860cf9f2e60bd15fd408)), closes [#146](https://github.com/mikomiel/agent-chat/issues/146)
+
 ## [0.8.0](https://github.com/mikomiel/agent-chat/compare/v0.7.0...v0.8.0) (2026-11-18)
 
 
