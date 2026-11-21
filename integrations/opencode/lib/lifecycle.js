@@ -151,14 +151,9 @@ export function createLifecycle(bus, native, config, {
   // the join's publish.
   const unproved = () => typeof native.proved === "function" && !native.proved()
 
-  // Has this join's worker begun to end? `null` while it serves, "idle" once it said it ends for idleness, "stopped" for
-  // any other end (see `lib/worker.js`). A worker without `ending()` says nothing, so it is taken as serving.
-  const endingOf = record => (typeof record.worker.ending === "function" ? record.worker.ending() ?? null : null)
-
   // The gate guards a join's first heartbeat only. `opened` records that one was sent: after it the heartbeat goes on, and
   // a later gap or signal is healed by the tick's read-back, as it was before the gate. A rejoin is a new join, so a new gate.
-  // A worker that has begun to end never gets a first heartbeat: its exit decides what happens next (see `connect`).
-  const gateShut = () => live !== null && !live.opened && (endingOf(live) !== null || unproved())
+  const gateShut = () => live !== null && !live.opened && unproved()
 
   // One heartbeat at a time: the worker takes one request at a time, and a tick that finds one in flight is dropped.
   // The next tick is the retry. A `refused` answer is the worker's brief-outage reply: it keeps the binding alive and
@@ -183,14 +178,29 @@ export function createLifecycle(bus, native, config, {
     try { return Promise.resolve(native.refresh?.()).catch(() => {}) } catch { return Promise.resolve() /* advisory */ }
   }
 
-  // While the gate is shut, a heartbeat that finds no proof is asked once more when this tick's read-back settles, so a
-  // tick that proves the binding also opens the gate. A tick that is proved at the tick, or that finds the gate open,
-  // sends once, there.
+  // While the gate is shut no heartbeat reaches the worker, and a worker that reads no request for its idle time (90
+  // seconds) ends its instance. So each tick of a shut gate sends the worker one `receipts` request instead: a read-only,
+  // advisory read that marks nothing delivered and never ends the worker. Its answer, a `refused` one included, is
+  // ignored. A request that rejects is a worker error, handled as a rejected heartbeat is: a rejoin code rejoins, and
+  // anything else turns chat off. It takes the heartbeat's turn, so the two never overlap.
+  async function keepAlive() {
+    if (!live || !joined || closed || disabled || beating) return
+    beating = true
+    try {
+      await request("receipts")
+    } catch (error) {
+      handleFailure(requestFailure(error, error?.operation))
+    } finally { beating = false }
+  }
+
+  // While the gate is shut, a heartbeat that finds no proof is asked once more when this tick's keepalive and read-back
+  // have settled, so a tick that proves the binding also opens the gate. A tick that finds the gate open sends once,
+  // there, and sends no keepalive.
   function tick() {
     const shut = gateShut()
-    void heartbeat()
+    const sent = shut ? keepAlive() : heartbeat()
     const readBack = refreshContext()
-    if (shut) void readBack.then(() => heartbeat())
+    if (shut) void Promise.all([sent, readBack]).then(() => heartbeat())
   }
 
   // A retry asks the host once before it starts a replacement worker: the session can be deleted during the backoff with
@@ -217,13 +227,8 @@ export function createLifecycle(bus, native, config, {
       // Watched from here, not from the first heartbeat: the publish below may wait behind a slow removal, and a worker
       // that exits meanwhile must withdraw its binding before the publish makes a put for an instance that is gone.
       worker.closed.then(() => {
-        if (live !== record || closed || disabled) return
-        // A worker that said it ends for idleness while its join waits for the first proof (the publish settled, no
-        // heartbeat sent yet) has ended its instance: a rejoin is the answer, not a shutdown. Every other exit, a broken
-        // protocol or a crash in that wait included, turns this session's chat off.
-        if (heartbeatTimer !== null && !record.opened && endingOf(record) === "idle")
-          return handleFailure(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "STALE_INSTANCE", operation: "end" }))
-        failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
+        if (live === record && !closed && !disabled)
+          failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
       })
       joined = result
       policy.succeeded()

@@ -1,7 +1,7 @@
 // The product's stdin/stdout lifecycle worker, driven by an OpenCode plugin.
 //
 // This module owns process lifetime, one in-flight request and frame validation.
-// It owns no chat policy: join, heartbeat, pending, claim and settle are the
+// It owns no chat policy: join, heartbeat, receipts, pending, claim and settle are the
 // product's `agent_chat.instance_worker` requests. Nothing starts on import.
 import { spawn } from "node:child_process"
 import { isAbsolute } from "node:path"
@@ -9,7 +9,7 @@ import { isAbsolute } from "node:path"
 const MAX_FRAME = 128 * 1024
 const REQUEST_MS = 22_000 // the worker's 20s I/O deadline plus exit/IPC margin
 const CLOSE_MS = 5000
-const OPERATIONS = new Set(["join", "heartbeat", "status", "end", "pending", "claim", "settle"])
+const OPERATIONS = new Set(["join", "heartbeat", "status", "receipts", "end", "pending", "claim", "settle"])
 
 const failure = (code, operation) => Object.assign(new Error(code), operation === undefined ? { code } : { code, operation })
 
@@ -52,7 +52,6 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "openco
   let sequence = 0
   let stopping = false
   let exited = false
-  let idle = false // the worker said it is ending because no request came within its idle time
   let termTimer = null
   let killTimer = null
   let resolveClosed
@@ -83,7 +82,7 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "openco
     // No pipes were made, so nothing can be asked and no `close` will come: the start failed, and nothing is left to end.
     exited = true
     resolveClosed({ code: null, signal: null })
-    return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, stop, closed, ending: () => "stopped" }
+    return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, stop, closed }
   }
   child.stdin.on("error", () => { rejectPending("CHAT_REQUEST_UNCERTAIN"); void stop() })
   child.on("close", (code, signal) => {
@@ -103,17 +102,9 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "openco
     // One request in flight. A trailing or unsolicited frame is not a receipt.
     let workerCode
     try {
-      if (newline !== buffer.length - 1) throw failure("CHAT_PROTOCOL_INVALID")
+      if (!pending || newline !== buffer.length - 1) throw failure("CHAT_PROTOCOL_INVALID")
       const frame = JSON.parse(buffer.subarray(0, newline).toString("utf8"))
       buffer = Buffer.alloc(0)
-      if (!pending) {
-        // With nothing asked, the worker writes one frame only: when its idle time runs out while it waits for the next
-        // request, it answers that request's id with REQUEST_UNCERTAIN, then ends its instance and exits. Any other
-        // unsolicited frame breaks the protocol. Either way the worker is ending.
-        idle = isIdleExpiry(frame, sequence)
-        void stop()
-        return
-      }
       if (!frame || frame.id !== pending.id) throw failure("CHAT_PROTOCOL_INVALID")
       if (frame.error) {
         if (!frame.result && SAFE_CODES.has(frame.error.code)) workerCode = frame.error.code
@@ -155,10 +146,6 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "openco
     })
   }
 
-  // Has this worker begun to end? `null` while it serves, "idle" once it said it ends for idleness, "stopped" for any
-  // other end: a stop, a broken protocol, an error or an exit. Read synchronously; it never goes back to `null`.
-  const ending = () => (idle ? "idle" : stopping || exited ? "stopped" : null)
-
   const ready = request("join", {
     enabled: config.enabled !== false,
     directory: config.directory,
@@ -168,12 +155,5 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "openco
     boot_id: bootId,
     harness,
   })
-  return { ready, request, stop, closed, ending }
+  return { ready, request, stop, closed }
 }
-
-// The idle-expiry frame of `agent_chat.instance_worker`: exactly the error REQUEST_UNCERTAIN, under the id of the request
-// the parent would send next. The same bytes come from a SIGINT, a SIGTERM or a stdin error during that wait; each also
-// ends the instance before the worker exits.
-const isIdleExpiry = (frame, nextId) => frame !== null && typeof frame === "object" && !Array.isArray(frame) &&
-  Object.keys(frame).length === 2 && frame.id === nextId && frame.error !== null && typeof frame.error === "object" &&
-  Object.keys(frame.error).length === 1 && frame.error.code === "REQUEST_UNCERTAIN"

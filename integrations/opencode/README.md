@@ -286,21 +286,13 @@ The service and its host-token provisioning are documented in the product
   worker that dies or breaks the protocol still turns that session's chat off.
   That holds from the moment the worker is ready, so a worker that exits while
   its binding waits behind a slow removal withdraws that binding, and the
-  queued publish makes no put. One exception: the worker's own idle expiry
-  after its join's publish settled and before its first heartbeat was sent,
-  because the binding is still unproved. With no request pending, the worker
-  writes one frame only at its idle expiry: the error `REQUEST_UNCERTAIN` under
-  the id of the request the plugin would send next. It then ends its instance
-  and exits. That frame and then the exit are a lapsed instance, so the exit
-  rejoins as `STALE_INSTANCE` does, with the host asked first, and no heartbeat
-  was sent for the old instance. A `SIGINT`, a `SIGTERM` from outside the
-  plugin or a stdin error during that wait writes the same frame and also ends
-  the instance, so it rejoins too. In that wait, every other end turns the chat
-  off: any other unsolicited frame, a frame that is not JSON, a crash, a kill
-  and an exit with no frame. Once the worker sent its idle frame or is
-  stopping, no first heartbeat is attempted on it, even when a read-back proves
-  the binding before the exit, so that exit still rejoins. An exit after the
-  first heartbeat turns the chat off as above. A spawn that fails after it returned, such as
+  queued publish makes no put. While a join waits for its first proof, each
+  heartbeat tick sends the worker one read-only `receipts` request in the
+  heartbeat's turn, ignores its answer, handles a rejection as a heartbeat's,
+  and so keeps the worker from its 90-second idle end; a proof that comes after
+  the server lease gets
+  `STALE_INSTANCE` at the first heartbeat, which rejoins as above. A spawn that
+  fails after it returned, such as
   `EMFILE`, leaves no pipes and also turns that session's chat off. Before a
   retry starts a replacement worker, it asks the host once for the session's
   entry list, with the same 10-second limit, because the session can be deleted
@@ -426,8 +418,7 @@ unverified, inferred, or a deliberate choice.
   or a gap takes the proof back when the manager receives it, for a session
   whose binding context exists, so a first heartbeat whose continuation was
   already queued sends nothing. Only the read-back it owes waits for the
-  session's other events. A worker that has begun to end gets no first
-  heartbeat (see "Rejoin"). The gate guards only
+  session's other events. The gate guards only
   that first heartbeat. Once it is sent, the lifecycle asks no more: a later gap
   or compaction signal is healed by the tick's read-back while the heartbeat
   goes on, as before. A rejoin is a new join with a new gate.
@@ -514,6 +505,6 @@ failover and handoff, a spawn that makes no pipes,
 per-session fault isolation, the binding publish, replace and fail-closed
 context, the repair after a compaction signal or a gap with its currency rule
 and call time limit, the read-back at each heartbeat tick, the gate on a
-join's first heartbeat (a signal or a gap applied when it is received, and a
-worker that ends for idleness or for any other reason while the gate is
-shut), the `unknown` heartbeat state, and the pinned rejoin constants.
+join's first heartbeat (a signal or a gap applied when it is received, the
+`receipts` keepalive while the gate is shut, and a proof later than the
+lease), the `unknown` heartbeat state, and the pinned rejoin constants.

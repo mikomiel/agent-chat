@@ -50,15 +50,11 @@ function fakeNative() {
 function fakeWorker({ ready = Promise.resolve(joined), answer = () => ({}) } = {}) {
   const requests = []
   let close
-  let idle = false
   const closed = new Promise(resolve => { close = resolve })
   return {
     ready, closed, requests,
     request(op, fields) { requests.push({ op, fields }); return Promise.resolve(answer(op, fields)) },
     stop() { close({ code: 0, signal: null }); return closed },
-    // The worker's own idle expiry, as `lib/worker.js` reports it: it said it ends for idleness, then it exits.
-    ending: () => (idle ? "idle" : null),
-    expire() { idle = true; close({ code: 1, signal: null }) },
   }
 }
 
@@ -1097,35 +1093,6 @@ test("a follow-up read that finds the entry missing and cannot restore it withdr
   assert.equal(rig.beats(), 0) // the first heartbeat that was deferred behind them sends nothing
 })
 
-// Review 6006555010, finding 2: the worker idles out at the server lease while the gate waits for its first proof. That is
-// a lapsed instance, so the join is retried through the rejoin path, with the host asked first. Nothing is sent meanwhile.
-test("a worker that exits while the first proof is pending rejoins, and the new join opens its gate once the host answers", async () => {
-  const rig = overtakenJoin()
-  await flush()
-  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
-  rig.listFails = true // the host cannot be read, so nothing is proved
-  rig.held.release() // the join's confirmation was overtaken: the gate is shut
-  await flush()
-  rig.tick()
-  await flush()
-  rig.tick()
-  await flush()
-  const first = rig.worker
-  assert.equal(rig.beats(), 0)
-  first.expire() // the worker ran out of its idle time without a heartbeat
-  await flush()
-  assert.equal(typeof rig.retry, "function") // a rejoin is scheduled
-  assert.ok(rig.notices.some(text => /reconnecting \(STALE_INSTANCE\)/.test(text)), rig.notices.join(" | "))
-  assert.equal(rig.notices.some(text => /stopped/.test(text)), false, rig.notices.join(" | ")) // and chat is still on
-  assert.equal(first.requests.length, 0) // nothing was ever sent for the first instance
-  rig.listFails = false // the host answers again
-  rig.retry()
-  await flush()
-  assert.equal(rig.starts, 2)
-  assert.equal(rig.beats(), 1) // the new join confirmed its binding and opened its gate
-  assert.notEqual(rig.worker, first)
-})
-
 test("a worker that exits after the gate opened fails closed, as before", async () => {
   const rig = overtakenJoin()
   await flush()
@@ -1139,12 +1106,28 @@ test("a worker that exits after the gate opened fails closed, as before", async 
   assert.equal(rig.starts, 1)
 })
 
-// Review 6006715460, findings 1 and 2. The real worker module over a child double, with the gate shut: the publish settled
-// and the binding is not proved, so no first heartbeat went out. Only the worker's own idle expiry (its idle frame, then
-// its exit) is an expected end there, and it rejoins. Every other end fails closed.
-function gatedRig() {
+test("a worker that exits while the first proof is pending fails closed", async () => {
+  const rig = overtakenJoin()
+  await flush()
+  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
+  rig.listFails = true
+  rig.held.release() // the gate is shut
+  await flush()
+  assert.equal(rig.beats(), 0)
+  void rig.worker.stop()
+  await flush()
+  assert.equal(rig.retry, null)
+  assert.match(rig.notices.at(-1), /Agent Chat stopped \(end:CHAT_WORKER_EXITED\)/)
+  assert.equal(rig.starts, 1)
+})
+
+// Review 6006886494: while a join's gate is shut nothing else reaches the worker, and the worker ends its instance after
+// 90 seconds with no request. Each tick of a shut gate sends it one read-only `receipts` request instead, so it never idles
+// out while the first proof is pending. The real worker module over a child double that answers every request; the test
+// holds a `receipts` answer when it asks to, and chooses the heartbeat's answer.
+function gatedRig({ receipts = () => ({ receipts: [] }), heartbeat = () => ({ result: {} }) } = {}) {
   const bus = fakeBus()
-  const rig = { bus, proof: false, refreshes: [], disabled: 0, notices: [], children: [], tick: null, retry: null }
+  const rig = { bus, proof: false, refreshes: [], disabled: 0, notices: [], children: [], tick: null, retry: null, hold: false, held: [] }
   rig.native = {
     context() {},
     proved: () => rig.proof,
@@ -1157,14 +1140,22 @@ function gatedRig() {
     child.stdout = new PassThrough()
     child.kill = () => {}
     child.frames = []
+    const reply = (frame, answer) => child.stdout.write(`${JSON.stringify({ id: frame.id, ...answer })}\n`)
     child.stdin.on("data", chunk => {
       for (const line of chunk.toString().split("\n").filter(Boolean)) {
         const frame = JSON.parse(line)
         child.frames.push(frame)
-        if (frame.op === "join") setImmediate(() => child.stdout.write(`${JSON.stringify({ id: frame.id, result: joined })}\n`))
+        if (frame.op === "join") setImmediate(() => reply(frame, { result: joined }))
+        if (frame.op === "heartbeat") setImmediate(() => reply(frame, heartbeat(frame)))
+        if (frame.op === "receipts") {
+          const answer = () => reply(frame, { result: receipts(frame) })
+          if (rig.hold) rig.held.push(answer)
+          else setImmediate(answer)
+        }
       }
     })
-    child.say = frame => child.stdout.write(typeof frame === "string" ? frame : `${JSON.stringify(frame)}\n`)
+    // The process exits when it sees the end of its stdin, as the real worker does.
+    child.stdin.on("end", () => setImmediate(() => child.emit("close", 0, null)))
     rig.children.push(child)
     return startWorker(workerConfig, identity, { spawnImpl: () => child })
   }
@@ -1177,109 +1168,135 @@ function gatedRig() {
     setIntervalImpl: fn => { rig.tick = fn; return 1 },
     notice: text => rig.notices.push(text),
   })
-  rig.beats = child => child.frames.filter(frame => frame.op === "heartbeat").length
+  rig.ops = (child = rig.children.at(-1)) => child.frames.map(frame => frame.op).filter(op => op !== "join")
+  rig.count = (op, child) => rig.ops(child).filter(name => name === op).length
+  // One heartbeat tick, its read-back answered with the proof as the test set it.
+  rig.beat = async () => {
+    rig.tick()
+    await settle()
+    rig.refreshes.at(-1)()
+    await settle()
+  }
   bus.fire("session_start", { nativeSessionId: "native-1" })
   return rig
 }
 
 const settle = async () => { for (let turn = 0; turn < 8; turn++) await flush() }
-const IDLE_FRAME = { id: 1, error: { code: "REQUEST_UNCERTAIN" } } // the request id the parent would send next
 
-const gatedEnds = {
-  "its idle frame, then its exit": { rejoins: true, run: child => { child.say(IDLE_FRAME); child.emit("close", 1, null) } },
-  "an unsolicited frame that is not the idle frame": { rejoins: false, run: child => { child.say({ id: 1, result: {} }); child.emit("close", 1, null) } },
-  "an idle code under the join's id": { rejoins: false, run: child => { child.say({ id: 0, error: { code: "REQUEST_UNCERTAIN" } }); child.emit("close", 1, null) } },
-  "a frame that is not JSON": { rejoins: false, run: child => { child.say("{\n"); child.emit("close", 1, null) } },
-  "a crash with no frame": { rejoins: false, run: child => child.emit("close", 1, null) },
-  "a kill by a signal": { rejoins: false, run: child => child.emit("close", null, "SIGKILL") },
-  "a clean exit with no frame": { rejoins: false, run: child => child.emit("close", 0, null) },
-}
-
-for (const [label, { rejoins, run }] of Object.entries(gatedEnds)) {
-  test(`a worker end while the first proof is pending (${label}) ${rejoins ? "rejoins" : "fails closed"}`, async () => {
-    const rig = gatedRig()
-    await settle()
-    const [child] = rig.children
-    assert.equal(typeof rig.tick, "function") // the publish settled
-    assert.equal(rig.beats(child), 0) // and the gate is shut
-    run(child)
-    await settle()
-    assert.equal(rig.beats(child), 0)
-    if (rejoins) {
-      assert.equal(typeof rig.retry, "function", rig.notices.join(" | "))
-      assert.ok(rig.notices.some(text => /reconnecting \(STALE_INSTANCE\)/.test(text)), rig.notices.join(" | "))
-      assert.equal(rig.disabled, 0)
-    } else {
-      assert.equal(rig.retry, null, rig.notices.join(" | "))
-      assert.equal(rig.disabled, 1)
-      assert.match(rig.notices.at(-1), /Agent Chat stopped \(end:CHAT_WORKER_EXITED\)/)
-    }
-  })
-}
-
-// Finding 2: the worker said it ends for idleness, and then a read-back proves the binding before the child closes. The
-// heartbeat that waited for that read-back is not attempted on the ending worker and does not open the gate, so the exit
-// still takes the rejoin path.
-test("a proof that lands between the worker's idle frame and its exit sends no first heartbeat, and the exit rejoins", async () => {
+test("while the gate is shut each tick sends exactly one receipts request and no heartbeat, and none overlaps another request", async () => {
   const rig = gatedRig()
   await settle()
-  const [child] = rig.children
-  rig.tick() // the gate is shut, so the heartbeat waits for this tick's read-back
+  assert.equal(typeof rig.tick, "function") // the publish settled, and the gate is shut
+  assert.deepEqual(rig.ops(), [])
+  for (let index = 1; index <= 3; index++) {
+    await rig.beat()
+    assert.deepEqual(rig.ops(), Array(index).fill("receipts"), `tick ${index}`)
+  }
+  // A receipts answer that is still pending when the next tick's read-back proves the binding: that tick sends nothing,
+  // and the heartbeat waits for the answer instead of meeting a busy worker.
+  rig.hold = true
+  rig.tick()
   await settle()
-  assert.equal(rig.refreshes.length, 1)
-  child.say(IDLE_FRAME) // the worker's idle time ran out
+  assert.equal(rig.held.length, 1)
+  rig.hold = false
+  rig.refreshes.at(-1)() // this tick's read-back proves nothing
   await settle()
-  rig.proof = true // the read-back proves the binding
-  rig.refreshes[0]()
+  rig.tick() // the next tick: the keepalive before it is still in flight
   await settle()
-  assert.equal(rig.beats(child), 0) // no heartbeat for the ending worker
-  assert.equal(rig.disabled, 0)
-  rig.tick() // a tick in the same window attempts nothing either
+  rig.proof = true
   rig.refreshes.at(-1)()
   await settle()
-  assert.equal(rig.beats(child), 0)
-  child.emit("close", 1, null)
+  assert.deepEqual(rig.ops(), ["receipts", "receipts", "receipts", "receipts"]) // no second keepalive, no heartbeat yet
+  rig.held.shift()()
   await settle()
+  assert.deepEqual(rig.ops(), ["receipts", "receipts", "receipts", "receipts", "heartbeat"]) // after the answer
   assert.equal(rig.disabled, 0)
-  assert.equal(typeof rig.retry, "function", rig.notices.join(" | ")) // a rejoin is scheduled
+  assert.deepEqual(rig.notices.filter(text => !/joined as/.test(text)), [])
+})
+
+test("once the gate has opened, a tick sends heartbeats and no receipts keepalive", async () => {
+  const rig = gatedRig()
+  rig.proof = true
+  await settle()
+  assert.deepEqual(rig.ops(), ["heartbeat"]) // the join's own first heartbeat opened the gate
+  for (let index = 0; index < 3; index++) await rig.beat()
+  assert.deepEqual(rig.ops(), ["heartbeat", "heartbeat", "heartbeat", "heartbeat"])
+  rig.proof = false // a later gap takes the proof back: the gate guards the first heartbeat only
+  await rig.beat()
+  assert.equal(rig.count("receipts"), 0)
+  assert.equal(rig.count("heartbeat"), 5)
+})
+
+// The server lease (90 seconds) can run out while the proof is pending, since a keepalive does not renew it. The first
+// heartbeat then meets STALE_INSTANCE, which is a rejoin code of the existing path: chat stays on.
+test("a proof later than the server lease: the first heartbeat gets STALE_INSTANCE and a rejoin is scheduled, not a disable", async () => {
+  const rig = gatedRig({ heartbeat: () => ({ error: { code: "STALE_INSTANCE" } }) })
+  await settle()
+  for (let index = 0; index < 4; index++) await rig.beat() // 120 seconds of ticks: longer than the lease
+  const [first] = rig.children
+  assert.deepEqual(rig.ops(first), ["receipts", "receipts", "receipts", "receipts"])
+  rig.proof = true
+  await rig.beat()
+  assert.equal(rig.count("heartbeat", first), 1)
+  assert.equal(typeof rig.retry, "function", rig.notices.join(" | "))
   assert.ok(rig.notices.some(text => /reconnecting \(STALE_INSTANCE\)/.test(text)), rig.notices.join(" | "))
+  assert.equal(rig.disabled, 0)
   assert.equal(rig.notices.some(text => /stopped/.test(text)), false, rig.notices.join(" | "))
 })
 
-// The changed trigger of "a worker that exits while the first proof is pending rejoins" has its twin without the signal.
-test("a worker that exits while the first proof is pending without saying it is idle fails closed", async () => {
-  const rig = overtakenJoin()
-  await flush()
-  rig.context.observe({ type: "session.compaction.ended", data: { sessionID: "ses_synthetic0001" } })
-  rig.listFails = true
-  rig.held.release() // the gate is shut
-  await flush()
-  assert.equal(rig.beats(), 0)
-  void rig.worker.stop() // an exit with no idle frame
-  await flush()
+test("a receipts keepalive that the worker refuses changes nothing", async () => {
+  // The worker's own failure answer for receipts is a `refused` result: an answer, so it is ignored.
+  const rig = gatedRig({ receipts: () => ({ refused: "SERVICE_UNAVAILABLE" }) })
+  await settle()
+  for (let index = 0; index < 3; index++) await rig.beat()
+  assert.deepEqual(rig.ops(), ["receipts", "receipts", "receipts"])
+  rig.proof = true
+  await rig.beat()
+  assert.deepEqual(rig.ops(), ["receipts", "receipts", "receipts", "heartbeat"]) // proved at the tick: no keepalive
+  assert.equal(rig.disabled, 0)
   assert.equal(rig.retry, null)
-  assert.match(rig.notices.at(-1), /Agent Chat stopped \(end:CHAT_WORKER_EXITED\)/)
-  assert.equal(rig.starts, 1)
+  assert.deepEqual(rig.notices.filter(text => !/joined as/.test(text)), [])
 })
 
-// The same window when the worker ends for any other reason: it is stopping, so no first heartbeat is attempted on it either,
-// and its exit fails closed as an exit, not as a heartbeat refused by a closed worker.
-test("a proof that lands between another unsolicited frame and the exit sends no first heartbeat, and the exit fails closed", async () => {
-  const rig = gatedRig()
-  await settle()
-  const [child] = rig.children
-  rig.tick()
-  await settle()
-  child.say({ id: 1, result: {} }) // not the idle frame: the worker is stopped
-  await settle()
-  rig.proof = true
-  rig.refreshes[0]()
-  await settle()
-  assert.equal(rig.beats(child), 0)
-  assert.equal(rig.disabled, 0)
-  child.emit("close", 1, null)
-  await settle()
-  assert.equal(rig.disabled, 1)
-  assert.equal(rig.retry, null)
-  assert.match(rig.notices.at(-1), /Agent Chat stopped \(end:CHAT_WORKER_EXITED\)/)
-})
+// A keepalive whose request rejects takes the path of a rejected heartbeat: a rejoin code rejoins, anything else fails closed.
+for (const [label, rejection, rejoins] of [
+  ["REQUEST_UNCERTAIN", { code: "REQUEST_UNCERTAIN" }, true],
+  ["a worker refusal with STALE_INSTANCE", { code: "CHAT_WORKER_REFUSED", workerCode: "STALE_INSTANCE" }, true],
+  ["a broken protocol", { code: "CHAT_PROTOCOL_INVALID" }, false],
+]) {
+  test(`a receipts keepalive that rejects with ${label} ${rejoins ? "rejoins" : "fails closed"}, as the same heartbeat rejection would`, async () => {
+    const bus = fakeBus()
+    const notices = []
+    let tick = null
+    let retry = null
+    let disabled = 0
+    const native = { context() {}, proved: () => false, refresh: () => Promise.resolve(), disable() { disabled += 1 } }
+    const worker = fakeWorker()
+    worker.request = (op, fields) => {
+      worker.requests.push({ op, fields })
+      return op === "receipts"
+        ? Promise.reject(Object.assign(new Error(rejection.code), { ...rejection, operation: "receipts" }))
+        : Promise.resolve({})
+    }
+    createLifecycle(bus, native, config, {
+      ...timers, startProcess: () => worker, now: () => 1000, random: () => 0,
+      setTimeoutImpl: fn => { retry = fn; return 1 },
+      setIntervalImpl: fn => { tick = fn; return 1 },
+      notice: text => notices.push(text),
+    })
+    bus.fire("session_start", { nativeSessionId: "native-1" })
+    await settle()
+    tick()
+    await settle()
+    assert.deepEqual(worker.requests.map(row => row.op), ["receipts"])
+    if (rejoins) {
+      assert.equal(typeof retry, "function", notices.join(" | "))
+      assert.equal(disabled, 0)
+      assert.equal(notices.some(text => /stopped/.test(text)), false, notices.join(" | "))
+    } else {
+      assert.equal(retry, null, notices.join(" | "))
+      assert.equal(disabled, 1)
+      assert.match(notices.at(-1), /Agent Chat stopped \(receipts:CHAT_PROTOCOL_INVALID\)/)
+    }
+  })
+}
