@@ -554,10 +554,24 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             if (text === null) result = { outcome: "deferred", reason: "offline" }
             else {
               // The claim and the status call took time: the add is sent only if nothing newer than the clearing read arrived.
+              // The fresh reading takes time too, and a mute is the ledger's state: `ready` asks the status again after it,
+              // as a hook asks right before its write. A failure of that request is handled as the first one's would be, once
+              // the wake has returned: nothing was sent.
+              let readyFailure = null
+              const ready = async () => {
+                let again
+                try {
+                  again = await ask("status")
+                  if (live !== record || closed || failure) return "offline"
+                  if (check(again, "status")) return "unknown"
+                } catch (error) { readyFailure = error; return "offline" }
+                return again.muted === false ? null : again.muted === true ? "muted" : "unknown"
+              }
               result = await thread.wake({
-                text, attemptId: grant.attempt_id, until: started + reservation, wallUntil: startedWall + reservation,
+                text, attemptId: grant.attempt_id, until: started + reservation, wallUntil: startedWall + reservation, ready,
                 proceed: fresh => wakeStale(record, cleared, fresh),
               })
+              if (readyFailure) throw readyFailure
               // The settle says what the wire proved, whatever the state is now. Only the local state waits on it: a hook event
               // since the clearing read is newer than the confirmation (the queued turn's own prompt hook usually is), so its
               // state stays. Otherwise the wake is the latest word: busy until the next Stop reports idle.

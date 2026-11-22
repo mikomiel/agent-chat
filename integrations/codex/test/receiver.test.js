@@ -3199,6 +3199,60 @@ for (const [label, wallStep, sent] of [
   })
 }
 
+// ---- a mute that commits during the wake's fresh reading -----------------------------------------------------------
+// Mute is the ledger's state, and the wake's fresh reading can take seconds. The wake asks the status again after it, as a
+// hook asks right before its write, so a mute committed meanwhile sends no add. The thread is the real one, built from the
+// options the receiver opens it with, against a control socket that commits the mute while it answers the fresh reading.
+for (const [label, mute] of [
+  ["a mute committed during the wake's fresh reading sends no add and settles deferred as muted", true],
+  ["a wake with no mute asks the status exactly twice and is handed", false],
+]) {
+  test(label, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acm-"))
+    const path = join(dir, "s.sock")
+    const queued = []
+    let muted = false
+    let statuses = 0
+    let reading = false
+    const base = controlSocket(false, queued)
+    const server = await fakeAppServer(path, message => {
+      if (reading && message.method === "thread/turns/list") { reading = false; if (mute) muted = true } // the fresh reading
+      return base(message)
+    })
+    let real = null
+    const opened = []
+    const thread = new Proxy({}, {
+      get(_target, key) {
+        if (key === "opened") return opened
+        real ??= createThread(opened[0])
+        const value = real[key]
+        return typeof value === "function" ? value.bind(real) : value
+      },
+    })
+    try {
+      let armedNow = false
+      const r = await rig({
+        thread, config: { appServer: `unix://${path}` },
+        handlers: deliverable({ status: () => {
+          if (armedNow) { statuses += 1; if (statuses === 1) reading = true } // the next turns/list is the wake's fresh reading
+          return { muted }
+        } }),
+      })
+      await eventually(() => r.worker.bootIds.length === 1, "the join, after a real bind")
+      await idleSession(r)
+      armedNow = true
+      await r.clock.advance(WAKE_POLL_MS)
+      await eventually(() => r.worker.ops("settle").length === 1, "the wake's settle")
+      assert.equal(statuses, 2, "one status before the wake and one after its fresh reading")
+      assert.equal(server.methods().filter(method => method === "thread/queue/add").length, mute ? 0 : 1)
+      assert.deepEqual(r.worker.ops("settle")[0].result, mute ? { outcome: "deferred", reason: "muted" } : { outcome: "handed", reason: null })
+    } finally {
+      await server.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
 // ---- the wake poll after a session start ---------------------------------------------------------------------------
 // The server answers `pending` with nothing while the published native_state is `unknown` (agent_chat/deliveries.py). A start
 // resets the state to unknown and drops the read, so a poll that only asked `pending` would find nothing until the 30 s tick

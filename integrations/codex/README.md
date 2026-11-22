@@ -267,7 +267,9 @@ sends its request: it does not wait for the worker to end its instance.
   claims; asks the status (a muted session is deferred; a reservation that has
   500 ms or less left, before the status request or after it, settles `failed`,
   since nothing was sent); takes a fresh reading on
-  a second connection; checks that the configured path, resolved again through
+  a second connection; asks the status again, since the reading can take
+  seconds and a mute is the ledger's state (muted, or a status it cannot
+  read, defers the batch and sends nothing); checks that the configured path, resolved again through
   the whole trust check, still names the socket of the add connection;
   checks, in the same turn, that the reservation still has the settlement
   margin and 500 ms left on both the monotonic and the wall clock, each
@@ -360,7 +362,9 @@ sends its request: it does not wait for the worker to end its instance.
   [notice contract](../README.md#notice-contract) lists what framing and
   packing do not cover.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
-  nothing.
+  nothing. A hook asks the status right before its write; a wake asks it once
+  before it starts and again after its fresh reading, right before its last
+  checks and the add.
 - **Delegated sessions.** A session that is not the main thread never joins:
   - A hook payload that carries `agent_id` is ignored: no join, no claim, no
     output.
@@ -661,6 +665,10 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
 - **A release without `thread/items/list`.** The confirmation needs
   `thread/items/list`. A release that refuses it (-32601) makes every
   dispatched wake `uncertain`, never `handed`, and nothing is sent again.
+- **A mute right before the write or the add.** A mute that the ledger commits
+  after the last status reply is not seen: for a hook, between that reply and
+  the write to its output; for a wake, between that reply and the add frame.
+  Both gaps are a local request and a few synchronous checks, milliseconds.
 - **A suspend during a hook's claim.** Only the wake checks the wall clock.
   The hook path measures its reservation and its deadline on the monotonic
   clock alone, which on Linux does not count time spent suspended, so a hook
@@ -918,7 +926,7 @@ The suite covers config refusal, the worker join frame, frame validation and req
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
 the notice limits at the smallest bound, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included, and a directory named with doubled or trailing separators or a `.` name), the hook and the client against a real receiver socket
 on trusted and untrusted paths, the state directory resolved once behind a link and handed to the receiver, which refuses a directory that resolves differently, the WebSocket client against a
-fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff, a heartbeat that counts as published only once it is confirmed), the wake text (the fixed line and the rows, no binding, and a claim sized by the same renderer), a wake's reservation that is too short (`failed`, nothing sent), a suspend before the add measured on the wall clock (and a wall clock stepped back), the budget after the add after a suspend, a prompt that takes over from a wake poll that has not claimed and does not wait for one on its refresh read,
+fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff, a heartbeat that counts as published only once it is confirmed), the wake text (the fixed line and the rows, no binding, and a claim sized by the same renderer), a wake's reservation that is too short (`failed`, nothing sent), a suspend before the add measured on the wall clock (and a wall clock stepped back), the budget after the add after a suspend, a wake's second status after its fresh reading (a mute committed meanwhile), a prompt that takes over from a wake poll that has not claimed and does not wait for one on its refresh read,
 settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
 hint), the plugin shape that Codex reads, and runs of the real hook and

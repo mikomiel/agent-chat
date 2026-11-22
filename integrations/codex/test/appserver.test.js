@@ -2175,6 +2175,37 @@ test("the add is the next request after the last read of the wake, and a failed 
   assert.deepEqual(result, { outcome: "deferred", reason: "unknown" }, "a refused newest-turn lookup reads the state as unknown")
   assert.equal(failed.includes("thread/queue/add"), false)
 })
+// `ready` is the caller's own check after the reading (the receiver asks the ledger for the mute again). It sends nothing to
+// the app-server, so the add is still the next request after the last read; a reason from it, or a throw, sends no add.
+test("a wake awaits ready after its reading and before the add: null goes on, a reason defers, a throw fails, and none sends to the app-server", async () => {
+  for (const [label, ready, expected] of [
+    ["null", async () => null, null],
+    ["muted", async () => "muted", { outcome: "deferred", reason: "muted" }],
+    ["a throw", async () => { throw new Error("x") }, { outcome: "failed", reason: "native_unavailable" }],
+  ]) {
+    const gate = armed({})
+    await withServer(gate.handler, async (path, server) => {
+      const ticks = clock()
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+      await bound.bind()
+      gate.arm()
+      server.log.length = 0
+      let seenAtReady = null
+      const result = await bound.wake({
+        text: "t", attemptId: "attempt-9", until: ticks.now() + 5000,
+        ready: () => { seenAtReady = server.methods(); return ready() },
+      })
+      assert.deepEqual(seenAtReady, [...OPENS, ...READS], `${label}: ready is asked once the reading is done`)
+      if (expected === null) {
+        assert.deepEqual(server.methods().slice(0, 7), [...OPENS, ...READS, "thread/queue/add"], `${label}: the add is still the next request`)
+      } else {
+        assert.deepEqual(result, expected, label)
+        assert.deepEqual(server.methods(), [...OPENS, ...READS], `${label}: nothing more went to the app-server`)
+      }
+    })
+  }
+})
+
 // ---- the app-server socket is trusted before each connect (the rule itself is tested in trust.test.js) ---------------
 
 const untrusted = { code: "CHAT_APPSERVER_UNTRUSTED" }

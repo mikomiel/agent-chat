@@ -516,7 +516,11 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     // monotonic clock stops while the host is suspended and the server's reservation does not, so right before the add the
     // wake also asks the wall clock, and the larger of the two elapsed times counts. A wall clock that was stepped back
     // extends nothing: the monotonic check still holds. Without `wallUntil` the wall clock is never read.
-    async wake({ text, attemptId, until, wallUntil = null, proceed = fresh => (fresh.reason === "child" ? "offline" : fresh.reason) }) {
+    // `ready`, when given, is awaited once after the reading and before those last checks: the caller's own late checks
+    // that need a request of theirs (the receiver asks the ledger whether the session is muted). It sends nothing to the
+    // app-server. It answers null to go on or a `deferred` reason; one that throws sends nothing and settles `failed`. Its
+    // time counts: the two-clock check after it refuses an add that it left too late.
+    async wake({ text, attemptId, until, wallUntil = null, ready = null, proceed = fresh => (fresh.reason === "child" ? "offline" : fresh.reason) }) {
       const clientUserMessageId = `${CLIENT_ID_PREFIX}${attemptId}`
       const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
       const limit = until - SETTLE_MS
@@ -539,6 +543,11 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
         try {
           fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })
         } catch { return { outcome: "failed", reason: "native_unavailable" } }
+        if (ready) {
+          let held
+          try { held = await ready() } catch { return { outcome: "failed", reason: "native_unavailable" } }
+          if (held !== null) return { outcome: "deferred", reason: held }
+        }
         // The path is checked first and the time after it: the check makes synchronous file system calls that can stall. The
         // time is checked on both clocks, in this turn, so a suspend since the claim sends nothing. `end` is the tighter of the
         // two budgets, derived once here: the add, the fence and the confirmation all end by it, so a wake that resumes from a
