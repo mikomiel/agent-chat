@@ -195,8 +195,8 @@ for (const missing of ["stdin", "stdout"]) {
     await assert.rejects(worker.ready, { code: "CHAT_WORKER_UNAVAILABLE", operation: "join" })
     await new Promise(resolve => setImmediate(resolve)) // the error event is emitted, and nothing is unhandled
     assert.equal(child.listenerCount("error"), 1)
-    assert.deepEqual(await worker.closed, { code: null, signal: null }) // it settles: no `close` event will come
+    assert.deepEqual(await worker.closed, { code: null, signal: null, started: false }) // it settles: no `close` event will come
     await assert.rejects(worker.request("heartbeat", {}), { code: "CHAT_WORKER_CLOSED" })
-    assert.deepEqual(await worker.stop(), { code: null, signal: null }) // nothing to end
+    assert.deepEqual(await worker.stop(), { code: null, signal: null, started: false }) // nothing to end
   })
 }

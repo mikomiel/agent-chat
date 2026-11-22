@@ -379,7 +379,8 @@ test("a spawn that makes no pipes fails that session's chat closed, and its end 
   assert.match(notices.at(-1), /Agent Chat stopped \(join:CHAT_WORKER_UNAVAILABLE\)/)
   assert.equal(native.calls.disable, 1)
   assert.deepEqual(native.calls.context.filter(text => text !== null), []) // no binding for a worker that never joined
-  await lifecycle.stop() // settles
+  // A worker that never started leaves nothing to wait for: the disposal is proved.
+  assert.deepEqual(await lifecycle.stop(), { code: 0, signal: null })
 })
 
 // The closed watcher is registered as soon as the worker is ready, so a retryable failure of the first heartbeat must still

@@ -758,5 +758,6 @@ test("a spawn that makes no pipes fails chat closed, and its end settles", async
   assert.equal(delivery.calls.disable, 1)
   assert.equal(lifecycle.state(), "offline")
   assert.deepEqual(delivery.calls.context.filter(text => text !== null), []) // no binding for a worker that never joined
-  await lifecycle.stop() // settles
+  // A worker that never started leaves nothing to wait for: the disposal is proved, so a replacement may start.
+  assert.deepEqual(await lifecycle.stop(), { code: 0, signal: null })
 })
