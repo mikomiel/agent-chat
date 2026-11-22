@@ -685,6 +685,14 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   whose host was suspended after its claim can still write after the server's
   reservation expired; the ledger closes an attempt whose reservation expired
   as `uncertain` (`claim_expired`, `agent_chat/deliveries.py`).
+- **A suspend while a request is outstanding.** Node timers, like the
+  monotonic clock, do not count time spent suspended. A wake's two-clock
+  budget is taken when each request starts, so a request that is outstanding
+  across a suspend can still wait out its timer after the resume when the
+  app-server or the worker stalls. The wake then sends no add, but it can settle
+  after the reservation expired, and the ledger closes the attempt as
+  `uncertain`. A hook's requests behave the same way. Tracked in
+  [#160](https://github.com/mikomiel/agent-chat/issues/160).
 - **The wake holds the worker queue.** A claim holds the worker queue for up to
   its 30-second reservation, so a heartbeat that a start asks for during a wake
   goes out after it (inside the 90-second lease).
