@@ -543,7 +543,13 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
         try {
           fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })
         } catch { return { outcome: "failed", reason: "native_unavailable" } }
+        // What is left of the reservation: the tighter of the monotonic and the wall-clock budgets.
+        const left = () => Math.min(limit - now(), wallUntil === null ? Infinity : wallUntil - SETTLE_MS - wall())
         if (ready) {
+          // `ready` is not started without the time for an add after it, so a wake that resumes from a suspend near its end
+          // sends nothing more and settles in time. Its own request has no timer: the worker serves one request at a time, so
+          // an abandoned one would collide with the settle. The check after it refuses an add that it left too late.
+          if (left() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
           let held
           try { held = await ready() } catch { return { outcome: "failed", reason: "native_unavailable" } }
           if (held !== null) return { outcome: "deferred", reason: held }
@@ -555,7 +561,7 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
         // back later extends nothing.
         if (!link.same()) return { outcome: "failed", reason: "native_unavailable" }
         const checked = now()
-        const end = checked + Math.min(limit - checked, wallUntil === null ? Infinity : wallUntil - SETTLE_MS - wall())
+        const end = checked + left()
         if (end - checked < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
         const stale = proceed(fresh)
         if (stale !== null) return { outcome: "deferred", reason: stale }

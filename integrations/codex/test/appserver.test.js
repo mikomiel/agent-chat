@@ -2206,6 +2206,43 @@ test("a wake awaits ready after its reading and before the add: null goes on, a 
   }
 })
 
+// `ready` is not started without the time for an add after it: a suspend during the reading (wall +45 s, monotonic +1 s)
+// fails the wake before the status is asked again. With the clocks in step, `ready` is called exactly once.
+for (const [label, wallStep, calls] of [
+  ["a suspend during the reading fails the wake before ready is asked, and nothing follows the reads", 45_000, 0],
+  ["with the clocks in step, ready is asked exactly once", 1_000, 1],
+]) {
+  test(label, async () => {
+    const gate = armed({})
+    const ticks = clock()
+    let wallTime = 1_800_000_000_000
+    let reading = false
+    const handler = (message, connection) => {
+      if (reading && message.method === "thread/turns/list") { reading = false; ticks.time.now += 1_000; wallTime += wallStep }
+      return gate.handler(message, connection)
+    }
+    await withServer(handler, async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+      await bound.bind()
+      gate.arm()
+      reading = true
+      server.log.length = 0
+      let asked = 0
+      const result = await bound.wake({
+        text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + 5_000,
+        ready: async () => { asked += 1; return null },
+      })
+      assert.equal(asked, calls, label)
+      if (calls === 0) {
+        assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+        assert.deepEqual(server.methods(), [...OPENS, ...READS], "nothing follows the reads")
+      } else {
+        assert.equal(server.methods().filter(method => method === "thread/queue/add").length, 1)
+      }
+    })
+  })
+}
+
 // ---- the app-server socket is trusted before each connect (the rule itself is tested in trust.test.js) ---------------
 
 const untrusted = { code: "CHAT_APPSERVER_UNTRUSTED" }

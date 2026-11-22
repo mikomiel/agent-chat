@@ -669,6 +669,11 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   after the last status reply is not seen: for a hook, between that reply and
   the write to its output; for a wake, between that reply and the add frame.
   Both gaps are a local request and a few synchronous checks, milliseconds.
+  The status request has no timer of its own (the worker serves one request
+  at a time): a status reply that is itself slower than the rest of the
+  reservation, with no suspend, can still make the settlement late, for a
+  hook's single status call as for a wake's; the clock checks bound
+  everything else.
 - **A suspend during a hook's claim.** Only the wake checks the wall clock.
   The hook path measures its reservation and its deadline on the monotonic
   clock alone, which on Linux does not count time spent suspended, so a hook
