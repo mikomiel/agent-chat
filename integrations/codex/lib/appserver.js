@@ -59,7 +59,8 @@ const failure = (code, extra = {}) => Object.assign(new Error(code), { code, ...
 
 // The default clock of the receiver and of its thread. A claim's reservation, the deadlines of a wake and the rejoin
 // policy's waits are durations, so an adjustable wall clock must not move them: a step back would let a wake start after
-// its reservation ran out. What is compared with a file's mtime (lib/ipc.js) stays on `Date.now`.
+// its reservation ran out. What is compared with a file's mtime (lib/ipc.js) stays on `Date.now`. On Linux this clock does
+// not count time spent suspended, so the wake also takes the wall clock as a second check before its add (`wallUntil`).
 export const monotonic = () => performance.now()
 
 function encode(opcode, payload) {
@@ -305,8 +306,9 @@ const STATUS = Object.assign(Object.create(null), { idle: "idle", active: "busy"
 const statusOf = record => (typeof record.status?.type === "string" ? STATUS[record.status.type] : undefined) ?? "unknown"
 
 // The thread behind one hook session. `open` is replaceable so tests can run a fake server on a real socket; `now` and `sleep`
-// are the clock of a wake's deadlines, and `lstat` is the file system that `replaced` looks at, for tests.
-export function createThread({ path, threadId, open = openAppServer, now = monotonic, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), lstat = lstatSync }) {
+// are the clock of a wake's deadlines, `wall` the wall clock of its `wallUntil` check, and `lstat` is the file system that
+// `replaced` looks at, for tests.
+export function createThread({ path, threadId, open = openAppServer, now = monotonic, wall = () => Date.now(), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), lstat = lstatSync }) {
   let provider = null // the provider of the bound thread: what each later record is compared with, whatever socket it comes from
   // What the queue probe answered, and on which socket: { route, dev, ino }. `route` is true when the documented answer came
   // back and false when it did not. A probe says what the app-server behind one socket does, so it counts only for the socket
@@ -510,8 +512,11 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     // settles `failed`.
     // `proceed` returns null to go on, or the `deferred` reason that the reading and the receiver's state now give: nothing
     // is sent then. Without one, the reading alone decides. `until` is the end of the reservation, and every request
-    // stops SETTLE_MS before it.
-    async wake({ text, attemptId, until, proceed = fresh => (fresh.reason === "child" ? "offline" : fresh.reason) }) {
+    // stops SETTLE_MS before it. `wallUntil`, when given, is the same end on the wall clock (`wall`), taken at the claim: the
+    // monotonic clock stops while the host is suspended and the server's reservation does not, so right before the add the
+    // wake also asks the wall clock, and the larger of the two elapsed times counts. A wall clock that was stepped back
+    // extends nothing: the monotonic check still holds. Without `wallUntil` the wall clock is never read.
+    async wake({ text, attemptId, until, wallUntil = null, proceed = fresh => (fresh.reason === "child" ? "offline" : fresh.reason) }) {
       const clientUserMessageId = `${CLIENT_ID_PREFIX}${attemptId}`
       const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
       const limit = until - SETTLE_MS
@@ -534,8 +539,10 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
         try {
           fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })
         } catch { return { outcome: "failed", reason: "native_unavailable" } }
-        // The path is checked first and the time after it: the check makes synchronous file system calls that can stall.
-        if (!link.same() || limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
+        // The path is checked first and the time after it: the check makes synchronous file system calls that can stall. The
+        // time is checked on both clocks, in this turn, so a suspend since the claim sends nothing.
+        const wallLeft = () => (wallUntil === null ? Infinity : wallUntil - SETTLE_MS - wall())
+        if (!link.same() || limit - now() < MIN_ADD_MS || wallLeft() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
         const stale = proceed(fresh)
         if (stale !== null) return { outcome: "deferred", reason: stale }
         let added

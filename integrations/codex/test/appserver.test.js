@@ -1393,6 +1393,43 @@ test("by default the wake runs on the monotonic clock: a wall clock that steps b
   assert.equal(wall.mock.callCount(), 0, "no deadline of the thread was measured on the wall clock")
 })
 
+// On Linux performance.now() does not count time spent suspended, while the server's reservation runs on. The wake takes the
+// wall-clock end of the reservation too (`wallUntil`) and, right before the add, counts the larger of the two elapsed times.
+// Here the clocks move while the reading is out: the last read before the add. Of a 5-second reservation, SETTLE_MS and
+// MIN_ADD_MS must be left on both clocks.
+for (const [label, monotonicStep, wallStep, sent] of [
+  ["a suspend (the wall clock 45 s on, the monotonic clock 1 s) sends no add and settles failed", 1_000, 45_000, false],
+  ["a wall clock stepped back an hour does not stop a wake that the monotonic clock allows", 1_000, -3_600_000, true],
+  ["a wall clock stepped back an hour does not revive a reservation that the monotonic clock used up", 4_000, -3_600_000, false],
+  ["the wall clock keeps the settlement margin: 400 ms left after it sends no add", 1_000, 3_600, false],
+  ["a wall clock that moves with the monotonic one leaves the wake as it was", 1_000, 1_000, true],
+]) {
+  test(`before the add, ${label}`, async () => {
+    const gate = armed({
+      "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: `${CLIENT_ID_PREFIX}attempt-9` } }], nextCursor: null }),
+    })
+    const ticks = clock()
+    let wallTime = 1_800_000_000_000
+    let stepped = false
+    let reading = false // the bind's reads are not the wake's
+    const handler = (message, connection) => {
+      if (reading && !stepped && message.method === "thread/turns/list") { stepped = true; ticks.time.now += monotonicStep; wallTime += wallStep }
+      return gate.handler(message, connection)
+    }
+    await withServer(handler, async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+      await bound.bind()
+      gate.arm()
+      reading = true
+      server.log.length = 0
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + 5_000 })
+      assert.equal(stepped, true, "the clocks moved during the reading")
+      assert.equal(server.methods().includes("thread/queue/add"), sent)
+      assert.deepEqual(result, sent ? { outcome: "handed", reason: null } : { outcome: "failed", reason: "native_unavailable" })
+    })
+  })
+}
+
 // The fence deletes only the submission that this attempt queued. codex-cli 0.171.0 echoes `clientUserMessageId` exactly inside
 // `queuedSubmission`; a reply that does not tie its submission to this attempt may name another turn, and a delete of it could
 // remove that turn. So without the echo the wake is uncertain at once: no delete, no confirmation, and the add is not resent.

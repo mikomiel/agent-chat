@@ -61,6 +61,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
   openThread = createThread,
   now = monotonic,
+  wall = () => Date.now(), // only for a wake's second check before its add: the monotonic clock stops during a suspend
   random = Math.random,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
@@ -74,8 +75,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   const policy = createRejoinPolicy({ now, random })
   const socket = appServerPath(config.appServer)
   // The hook session id is looked up in the app-server's loaded threads before it is trusted as a thread id. The thread
-  // measures a wake's deadlines on this receiver's clock, the one that times the reservation.
-  const thread = socket ? openThread({ path: socket, threadId: sessionId, now }) : null
+  // measures a wake's deadlines on this receiver's clock, the one that times the reservation, and checks them on its wall clock.
+  const thread = socket ? openThread({ path: socket, threadId: sessionId, now, wall }) : null
   let live = null // { worker } while a worker runs
   let joined = null
   let bootId = null
@@ -102,7 +103,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let rejoinTimer = null
   let watchTimer = null
   let wakeTimer = null
-  let polling = false // a wake poll is running: polls never overlap
+  let waking = null // the wake poll that runs, if any: { claimed, done }. Polls never overlap; a hook may wait for one that has not claimed
   let tail = Promise.resolve()
   let firstAttempt
   const attempted = new Promise(resolve => { firstAttempt = resolve })
@@ -519,6 +520,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         // Only a server that offers more rows than one wake can carry gets here for a wake: the poll waits, not spins.
         if (!claimIds.length) { if (wake) wakeAfter = now() + WAKE_RETRY_MS; return false }
         const started = now()
+        const startedWall = wake ? wall() : null // the claim on the wall clock too, for the wake's check before its add
+        if (wake && waking) waking.claimed = true // a hook no longer waits for this wake: it claims now
         const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
         if (live !== record || check(grant, "claim")) return false
         if (grant.dispatch !== true || typeof grant.attempt_id !== "string") return false
@@ -549,7 +552,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             else {
               // The claim and the status call took time: the add is sent only if nothing newer than the clearing read arrived.
               result = await thread.wake({
-                text, attemptId: grant.attempt_id, until: started + reservation,
+                text, attemptId: grant.attempt_id, until: started + reservation, wallUntil: startedWall + reservation,
                 proceed: fresh => wakeStale(record, cleared, fresh),
               })
               // The settle says what the wire proved, whatever the state is now. Only the local state waits on it: a hook event
@@ -586,8 +589,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // the next poll sends it again, whether or not it reads. Polls never overlap: an overlap would start a newer read each
   // time, and with an app-server slower than the period no read, the tick's included, would ever be current.
   async function wakePoll() {
-    if (polling || !thread || thread.route !== true || !threadBound || !live || !joined || closed || failure || inflight || delivering || now() < wakeAfter) return
-    polling = true
+    if (waking || !thread || thread.route !== true || !threadBound || !live || !joined || closed || failure || inflight || delivering || now() < wakeAfter) return
+    let finish
+    waking = { claimed: false, done: new Promise(resolve => { finish = resolve }) }
     try {
       const record = live
       if (observed === null && native === "unknown" && !stopped) {
@@ -598,7 +602,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       if (!(await report())) { wakeAfter = now() + WAKE_RETRY_MS; return }
       await guard(deliver({ wake: true }))
       await report()
-    } finally { polling = false }
+    } finally {
+      waking = null
+      finish()
+    }
   }
 
   async function announceOnly(link, announce) {
@@ -649,8 +656,17 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const from = shown // and the start generation it arrived in: a receipt for this turn's announcement counts only under it
     setNative(request, "busy", request.event)
     if (failure) return link.send(disabledReply())
+    // A wake poll that holds the worker queue before its claim (its pending request, its clearing read) would make this hook
+    // skip delivery. The busy state set above makes that wake stop before it claims, so the hook waits for the poll once,
+    // within its own time less CLAIM_MARGIN_MS, and then delivers as usual: a turn with no tool call has no later hook. A
+    // wake that has claimed, or a poll still running when the wait ends, is not waited for, and a poll that holds no queue
+    // slot (its refresh read) needs no wait. Only a hook that may claim waits: in Plan Mode, stopped or unknown it delivers
+    // nothing, and an unknown state does not stop a wake.
+    const patience = deadline - now() - CLAIM_MARGIN_MS
+    const wake = inflight && eligible(false) && waking !== null && !waking.claimed && patience > 0 ? waking : null
+    if (wake) await within(wake.done, patience)
     let replied = false
-    if (inflight) void report() // a slow request never stacks up behind every tool call
+    if (inflight || (wake && waking === wake)) void report() // a slow request never stacks up behind every tool call
     else {
       await report()
       replied = (await guard(deliver({ link, announce: announcement({ from }), deadline }))) === true

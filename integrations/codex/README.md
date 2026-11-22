@@ -244,7 +244,15 @@ sends its request: it does not wait for the worker to end its instance.
   comes before the reservation check, so a write that cannot happen settles
   retryable even when the reservation ran out too. The reply is printed as `additionalContext`
   and settled `handed` only after the hook confirms it wrote and flushed the
-  output.
+  output. A hook that arrives while the worker queue is busy does not claim
+  (a slow request never stacks up behind every tool call), with one exception:
+  a wake poll that holds the queue before its claim (its pending request or
+  its clearing read). The busy state that the hook sets makes that wake stop
+  before it claims, so a hook that may claim (the session is busy, not in
+  Plan Mode, stopped or unknown) waits for the poll once, for at most its own
+  time less the 2.5-second claim margin, and then delivers as usual; a turn
+  with no tool call has no later hook to deliver. A hook never waits for a
+  wake that has claimed, and one whose wait runs out answers without a claim.
 - **Idle wake.** With `appServer`, every 2 seconds the receiver may wake an
   idle session by queueing one user turn through the app-server (no config key
   of its own). It tries only while the newest bind's queue probe answered as
@@ -256,7 +264,12 @@ sends its request: it does not wait for the worker to end its instance.
   500 ms or less left, before the status request or after it, settles `failed`,
   since nothing was sent); takes a fresh reading on
   a second connection; checks that the configured path, resolved again through
-  the whole trust check, still names the socket of the add connection; asks the
+  the whole trust check, still names the socket of the add connection;
+  checks, in the same turn, that the reservation still has the settlement
+  margin and 500 ms left on both the monotonic and the wall clock, each
+  measured from the claim (the larger elapsed time counts: the monotonic clock
+  does not count a suspend, and a wall clock that was stepped back extends
+  nothing); asks the
   receiver once more, with nothing awaited before the add, whether anything
   newer arrived since the clearing read (a hook event refuses it as the state
   now says, or `busy`; a newer read or a bind that unbound the thread refuses it
@@ -302,7 +315,8 @@ sends its request: it does not wait for the worker to end its instance.
   queue could remove another turn. A failure before the add frame is written
   settles `failed`, and so does a reservation too short for a wake, before or
   after the status request: the wake was not started, so nothing reached the
-  app-server. The add is never sent twice. The ledger, not the adapter,
+  app-server. So does a wake whose reservation the wall clock shows used up
+  right before the add (a suspend since the claim), with nothing sent. The add is never sent twice. The ledger, not the adapter,
   offers a `failed` or `deferred` batch again as a new attempt after a backoff,
   at most three attempts in all; an `uncertain` batch is not offered again.
 - **Output budget.** Codex sends a hook's `additionalContext` to the model
@@ -640,6 +654,12 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
 - **A release without `thread/items/list`.** The confirmation needs
   `thread/items/list`. A release that refuses it (-32601) makes every
   dispatched wake `uncertain`, never `handed`, and nothing is sent again.
+- **A suspend during a hook's claim.** Only the wake checks the wall clock.
+  The hook path measures its reservation and its deadline on the monotonic
+  clock alone, which on Linux does not count time spent suspended, so a hook
+  whose host was suspended after its claim can still write after the server's
+  reservation expired; the ledger closes an attempt whose reservation expired
+  as `uncertain` (`claim_expired`, `agent_chat/deliveries.py`).
 - **The wake holds the worker queue.** A claim holds the worker queue for up to
   its 30-second reservation, so a heartbeat that a start asks for during a wake
   goes out after it (inside the 90-second lease).
@@ -891,7 +911,7 @@ The suite covers config refusal, the worker join frame, frame validation and req
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
 the notice limits at the smallest bound, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included, and a directory named with doubled or trailing separators or a `.` name), the hook and the client against a real receiver socket
 on trusted and untrusted paths, the state directory resolved once behind a link and handed to the receiver, which refuses a directory that resolves differently, the WebSocket client against a
-fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff, a heartbeat that counts as published only once it is confirmed), the wake text (the fixed line and the rows, no binding, and a claim sized by the same renderer), a wake's reservation that is too short (`failed`, nothing sent),
+fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff, a heartbeat that counts as published only once it is confirmed), the wake text (the fixed line and the rows, no binding, and a claim sized by the same renderer), a wake's reservation that is too short (`failed`, nothing sent), a suspend before the add measured on the wall clock (and a wall clock stepped back), a prompt that takes over from a wake poll that has not claimed,
 settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
 hint), the plugin shape that Codex reads, and runs of the real hook and

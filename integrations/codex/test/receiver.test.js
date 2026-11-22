@@ -135,7 +135,8 @@ function hookDouble({ events, receipt = "written", answer = true, sendOk = true 
 
 // `skew` returns milliseconds added to the receiver's clock, so a test can move the policy's time without moving the timers.
 // `start` replaces the worker double's `startProcess`, to run the real worker wrapper over a fake child process.
-async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread, skew = () => 0, start } = {}) {
+// `wall` is the receiver's wall clock, read only for a wake's check before its add.
+async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread, skew = () => 0, start, wall } = {}) {
   const clock = scheduler()
   const events = []
   const worker = workerDouble({ events, handlers, gate, joinErrors })
@@ -144,6 +145,7 @@ async function rig({ handlers, gate, joinErrors, alive = () => true, startTime =
     startProcess: start ?? worker.startProcess,
     openThread: options => { thread?.opened.push(options); return thread },
     now: () => clock.now() + skew(),
+    ...(wall ? { wall } : {}),
     random: () => 0.5,
     setTimeoutImpl: clock.setTimeoutImpl,
     clearTimeoutImpl: clock.clearTimeoutImpl,
@@ -1178,7 +1180,7 @@ test("the delivery vocabulary is the core's, and every reason this package can s
   ]) assert.ok(settleVocabulary(result), JSON.stringify(result))
 })
 
-test("with no clock injected the receiver runs on the monotonic clock, and the wall clock is never read", t => {
+test("with no clock injected the receiver runs on the monotonic clock, and nothing but a wake reads the wall clock", t => {
   const wall = t.mock.method(Date, "now", () => 0) // a wall clock that was stepped back to the epoch
   createReceiver({ ...baseConfig, appServer: APP_SERVER }, { sessionId: "session-1", ownerPid: 4242 }, {
     openThread: () => threadDouble(),
@@ -2269,7 +2271,7 @@ test("the thread is handed the receiver's own clock, so the reservation and the 
   assert.equal(handed.now(), r.clock.now() + 123_456, "it is the clock that the receiver itself reads")
 })
 
-test("with no clock injected the receiver and its thread run on the monotonic clock, and the wall clock is never read", t => {
+test("with no clock injected the receiver and its thread run on the monotonic clock, and nothing but a wake reads the wall clock", t => {
   const wall = t.mock.method(Date, "now", () => 0) // a wall clock that was stepped back to the epoch
   const thread = wakeDouble()
   createReceiver({ ...baseConfig, appServer: APP_SERVER }, { sessionId: "session-1", ownerPid: 4242 }, {
@@ -3145,6 +3147,58 @@ test("a queue probe that was negative on one socket is decided again when the pa
   }
 })
 
+// ---- a suspend between the claim and the add ------------------------------------------------------------------------
+// The receiver takes the claim on both of its clocks and hands the thread its wall clock and the wall-clock end of the
+// reservation; the real thread checks both right before the add. Here the thread is built from exactly the options that the
+// receiver opens it with, and the status call is where the host is suspended: the wall clock jumps 45 s, the monotonic 1 s.
+for (const [label, wallStep, sent] of [
+  ["a suspend between the status call and the add sends no add and settles failed", 45_000, false],
+  ["a wall clock stepped back an hour between the status call and the add does not block the wake", -3_600_000, true],
+  ["a wall clock that moves with the monotonic one between the status call and the add leaves the wake as it was", 1_000, true],
+]) {
+  test(label, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "acs-"))
+    const path = join(dir, "s.sock")
+    const queued = []
+    const server = await fakeAppServer(path, controlSocket(false, queued))
+    let wallTime = 1_800_000_000_000
+    let skewMs = 0
+    let armedNow = false
+    let real = null
+    const opened = []
+    const thread = new Proxy({}, {
+      get(_target, key) {
+        if (key === "opened") return opened
+        real ??= createThread(opened[0])
+        const value = real[key]
+        return typeof value === "function" ? value.bind(real) : value
+      },
+    })
+    try {
+      const r = await rig({
+        thread, config: { appServer: `unix://${path}` }, skew: () => skewMs, wall: () => wallTime,
+        handlers: deliverable({ status: () => {
+          if (armedNow) { armedNow = false; skewMs += 1_000; wallTime += wallStep }
+          return { muted: false }
+        } }),
+      })
+      await eventually(() => r.worker.bootIds.length === 1, "the join, after a real bind")
+      assert.equal(thread.route, true)
+      assert.equal(opened[0].wall(), wallTime, "the thread reads the receiver's wall clock")
+      await idleSession(r)
+      armedNow = true
+      await r.clock.advance(WAKE_POLL_MS)
+      await eventually(() => r.worker.ops("settle").length === 1, "the wake's settle")
+      assert.equal(armedNow, false, "the clocks moved at the status call")
+      assert.equal(queued.length, sent ? 1 : 0, sent ? "the add went out" : "no add went out")
+      assert.deepEqual(r.worker.ops("settle")[0].result, sent ? { outcome: "handed", reason: null } : { outcome: "failed", reason: "native_unavailable" })
+    } finally {
+      await server.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}
+
 // ---- the wake poll after a session start ---------------------------------------------------------------------------
 // The server answers `pending` with nothing while the published native_state is `unknown` (agent_chat/deliveries.py). A start
 // resets the state to unknown and drops the read, so a poll that only asked `pending` would find nothing until the 30 s tick
@@ -3295,6 +3349,127 @@ test("a state that a heartbeat confirmed is not sent again by later reports, nor
   release()
   await settle()
   assert.deepEqual(r.worker.ops("heartbeat").map(entry => entry.state.native_state), ["idle", "busy", "idle"], "one heartbeat for the two reports")
+})
+
+// ---- a hook that arrives while a wake poll has not claimed -----------------------------------------------------------
+// A wake poll holds the worker queue while its pending request is out. A prompt that arrives then makes the session busy, so
+// the wake stops before it claims; the prompt waits for it once and delivers, or a turn with no tool call would never get
+// the message. `held` holds the wake's request `op` (the hook's own requests pass) until `release`.
+function holdWake(op) {
+  const state = { armed: false, held: false, release: null }
+  const hold = answer => (fields => {
+    if (!state.armed || state.held) return answer(fields)
+    state.held = true
+    return new Promise(resolve => { state.release = () => resolve(answer(fields)) })
+  })
+  const base = deliverable()
+  state.handlers = { ...base, [op]: hold(base[op]) }
+  return state
+}
+
+test("a prompt that arrives while the wake's pending request is out gets the message as hook context: no add, one claim", async () => {
+  const gate = holdWake("pending")
+  const thread = wakeDouble()
+  const r = await rig({ thread, handlers: gate.handlers })
+  await idleSession(r)
+  gate.armed = true
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.equal(r.worker.ops("pending").length, 1, "the wake's pending request is out")
+  const hook = hookDouble({ events: r.events })
+  let answered = false
+  const prompt = r.receiver.handle(turn(), hook).then(() => { answered = true })
+  await settle()
+  assert.equal(answered, false, "the prompt waits for the wake that has not claimed")
+  gate.release()
+  await prompt
+  assert.deepEqual(thread.wakes, [], "the wake saw the prompt's busy state and stopped before it claimed")
+  assert.equal(r.worker.ops("claim").length, 1, "one claim: the hook's")
+  assert.ok(hook.sent[0].context.includes(CHAT_PREFIX), "the message went to the prompt as hook context")
+  assert.match(hook.sent[0].context, new RegExp(`"id":"${uid(1)}"`))
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+})
+
+test("a prompt that arrives after a wake has claimed does not wait for it, and the wake settles deferred as busy", async () => {
+  const gate = holdWake("claim")
+  const thread = wakeDouble()
+  const r = await rig({ thread, handlers: gate.handlers })
+  await idleSession(r)
+  gate.armed = true
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.equal(r.worker.ops("claim").length, 1, "the wake's claim is out")
+  const hook = hookDouble({ events: r.events })
+  let answered = false
+  void r.receiver.handle(turn(), hook).then(() => { answered = true })
+  await settle()
+  assert.equal(answered, true, "the prompt answers with the claim still out")
+  assert.deepEqual(hook.sent, [{ context: null }], "as before: nothing to deliver while a claim holds the queue")
+  gate.release()
+  await settle()
+  assert.deepEqual(thread.adds, [], "the prompt since the clearing read refuses the add")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "busy" }])
+  assert.equal(r.worker.ops("claim").length, 1)
+})
+
+// A hook that could not claim anyway (no permission mode, so the state is unknown; Plan Mode) does not wait for the wake.
+test("a prompt that cannot claim, with no permission mode or in Plan Mode, does not wait for a wake that has not claimed", async () => {
+  for (const request of [turn({ permission_mode: undefined }), turn({ permission_mode: "plan" })]) {
+    const gate = holdWake("pending")
+    const thread = wakeDouble()
+    const r = await rig({ thread, handlers: gate.handlers })
+    await idleSession(r)
+    gate.armed = true
+    await r.clock.advance(WAKE_POLL_MS)
+    let answered = false
+    void r.receiver.handle(request, hookDouble({ events: r.events })).then(() => { answered = true })
+    await settle()
+    assert.equal(answered, true, `${request.permission_mode}: the prompt answers with the wake's pending still out`)
+    gate.release()
+    await settle()
+  }
+})
+
+// The poll's refresh read after a start runs outside the worker queue: a prompt then delivers at once, as it always did.
+test("a prompt during the wake poll's refresh read does not wait for the poll, and delivers at once", async () => {
+  let release
+  const thread = wakeDouble({ observation: () => new Promise(resolve => { release = () => resolve(IDLE) }) })
+  const r = await rig({ thread, handlers: deliverable() })
+  await r.begin()
+  await r.clock.advance(WAKE_POLL_MS) // the refresh read is out
+  assert.equal(typeof release, "function")
+  const hook = hookDouble({ events: r.events })
+  let answered = false
+  void r.receiver.handle(turn(), hook).then(() => { answered = true })
+  await settle()
+  assert.equal(answered, true, "the prompt answered with the read still out")
+  assert.match(hook.sent[0].context, new RegExp(`"id":"${uid(1)}"`), "and delivered")
+  release()
+  await settle()
+  assert.deepEqual(thread.wakes, [])
+  assert.equal(r.worker.ops("claim").length, 1)
+})
+
+test("a wake whose pending request outlives the prompt's patience leaves the prompt answering in time", async () => {
+  const gate = holdWake("pending")
+  const thread = wakeDouble()
+  const r = await rig({ thread, handlers: gate.handlers })
+  await idleSession(r)
+  gate.armed = true
+  await r.clock.advance(WAKE_POLL_MS)
+  const hook = hookDouble({ events: r.events })
+  let answered = false
+  const prompt = r.receiver.handle(turn({ patience_ms: 6000 }), hook).then(() => { answered = true })
+  await r.clock.advance(3_400)
+  assert.equal(answered, false, "the wait lasts the patience less the claim margin")
+  await r.clock.advance(100)
+  await settle()
+  assert.equal(answered, true, "3.5 seconds in, with the claim margin left")
+  await prompt
+  assert.deepEqual(hook.sent, [{ context: null }], "nothing claimed")
+  assert.deepEqual(r.worker.ops("claim"), [])
+  gate.release()
+  await settle()
+  assert.deepEqual(thread.wakes, [], "the wake stops once its pending answers: the session is busy")
+  assert.deepEqual(r.worker.ops("claim"), [])
 })
 
 // The queued turn runs like any other: its own prompt hook arrives (live, +78 ms after the add), and the turn ends with a Stop.
