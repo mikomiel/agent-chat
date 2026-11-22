@@ -502,11 +502,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       try {
         // A wake never carries bodies, whatever the config says: a queued submission is a user turn.
         const bodies = !wake && config.noticeBodies === true
-        // The bytes a hook's notice may use: the announcement and the delivery line go first. Known before the claim. A
-        // wake's text is renderWake's, which bounds it whole.
-        const prefix = (announce ? `${announce.text}\n\n` : "") + CHAT_PREFIX
+        // In bodies mode the pending request asks for the sizes and the retry marker, for a wake too (the flag adds nothing
+        // else: the bodies come only with a claim that asks for them, and a wake's claim never does).
+        const sizing = config.noticeBodies === true
+        // The bytes a hook's notice may use: the announcement and the delivery line go first. Known before the claim. A wake
+        // is sized for the hook that would arrive now, with the announcement that hook would carry; its own text is
+        // renderWake's, which bounds it whole.
+        const carried = wake ? announcement() : announce
+        const prefix = (carried ? `${carried.text}\n\n` : "") + CHAT_PREFIX
         const bound = MAX_OUTPUT_BYTES - bytes(prefix)
-        const candidates = await ask("pending", bodies ? { bodies: true } : {})
+        const candidates = await ask("pending", sizing ? { bodies: true } : {})
         if (live !== record || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link?.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
@@ -515,11 +520,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
         // Metadata mode gets no retry marker, so it claims the candidates whole, and only when their widest rendering fits
         // beside an announcement still to be shown; otherwise nothing is claimed and the binding goes alone (see onTurn),
-        // and the next hook, with more room, is offered the batch whole, no attempt spent. A wake claims the candidates
-        // whole too, only when renderWake fits them at their widest.
-        const claimIds = bodies
+        // and the next hook, with more room, is offered the batch whole, no attempt spent.
+        // A wake claims what that hook would claim, and only when renderWake fits it at its widest: a batch that a wake
+        // claims and then defers is offered again whole, as a retry, and the next hook must be able to deliver it with
+        // bodies. A retry batch it claims whole or not at all, as a hook does: the server refuses any other set for it.
+        const packed = sizing
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound })
-          : (wake ? wakeFits(ids.length) : metadataFits(ids.length, bound)) ? ids : []
+          : ids
+        const claimIds = bodies || (wake ? wakeFits(packed.length) : metadataFits(packed.length, bound)) ? packed : []
         // Only a server that offers more rows than one wake can carry gets here for a wake: the poll waits, not spins.
         if (!claimIds.length) { if (wake) wakeAfter = now() + WAKE_RETRY_MS; return false }
         const started = now()

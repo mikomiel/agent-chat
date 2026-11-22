@@ -355,7 +355,11 @@ sends its request: it does not wait for the worker to end its instance.
   at their widest fit than the 16 ids a conforming server offers. The
   claim is sized with the same renderer, on rows at their widest, so a batch
   that is claimed always renders; a larger batch is not claimed, and the poll
-  waits 10 seconds.
+  waits 10 seconds. In bodies mode a wake also claims no more rows than a hook
+  arriving then would claim for the same candidates, sizes and announcement:
+  a batch that a wake claims and then defers is offered again whole, and the
+  next hook must deliver it with its bodies. A retry batch is claimed whole or
+  not at all, by a wake as by a hook.
 - **Notice.** `lib/notice.js` is a byte-identical copy of the shared notice
   renderer, [`../shared/notice.js`](../shared/notice.js). A body sits between
   two marker lines that carry a random nonce, every body line starts with `> `,
