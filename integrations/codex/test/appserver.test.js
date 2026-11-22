@@ -1,10 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createThread, isChildThread, openAppServer } from "../lib/appserver.js"
+import { CLIENT_ID_PREFIX, createThread, isChildThread, MIN_ADD_MS, monotonic, openAppServer, SETTLE_MS } from "../lib/appserver.js"
 import { fakeAppServer, serverFrame } from "./fake-app-server.js"
 
 const THREAD = "thread-1"
@@ -26,6 +26,8 @@ function main(over = {}) {
     "thread/read": () => ok({ thread: thread() }),
     "thread/turns/list": () => ok({ data: [{ id: "t1", status: "completed" }], nextCursor: null }),
     "thread/resume": () => ok({ thread: thread(), collaborationMode: { mode: "default", settings: {} } }),
+    // Live, codex-cli 0.171.0: a delete of an id that was never queued (the bind's probe) answers { deleted: false }.
+    "thread/queue/delete": () => ok({ deleted: false }),
     ...over,
   }
   return (message, connection) => {
@@ -422,14 +424,18 @@ test("a thread is a child when it has a parent, a role, is ephemeral, or comes f
   ]) assert.equal(isChildThread(thread(extra)), true, JSON.stringify(extra))
 })
 
-// ---- bind --------------------------------------------------------------------------------------------------
+// ---- bind and probe --------------------------------------------------------------------------------------------
 
-test("bind finds the thread and fixes the provider, and asks nothing past the read", async () => {
+test("bind finds the thread, fixes the provider, and probes the queue with an id nobody queued", async () => {
   await withServer(main(), async (path, server) => {
     const bound = createThread({ path, threadId: THREAD })
     assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.route, true)
     assert.equal(bound.provider, "openai")
-    assert.deepEqual(server.methods(), ["initialize", "thread/loaded/list", "thread/read"])
+    assert.deepEqual(server.methods(), ["initialize", "thread/loaded/list", "thread/read", "thread/queue/delete"])
+    const probe = server.log.at(-1).params
+    assert.equal(probe.threadId, THREAD)
+    assert.match(probe.queuedSubmissionId, /^[0-9a-f-]{36}$/)
   })
 })
 
@@ -476,6 +482,43 @@ test("a bind with nobody listening is unavailable", async () => {
   assert.equal(gone.provider, null)
 })
 
+test("any probe answer but the documented one turns the route off", async () => {
+  for (const answer of [
+    () => ({ error: { code: -32601, message: "method not found" } }),
+    () => ({ error: { code: -32600, message: "invalid" } }),
+    () => ok({ deleted: true }), // never observed live
+    () => ok({}),
+    () => ok({ deleted: "no" }),
+  ]) {
+    await withServer(main({ "thread/queue/delete": answer }), async path => {
+      const bound = createThread({ path, threadId: THREAD })
+      assert.deepEqual(await bound.bind(), { status: "bound" })
+      assert.equal(bound.route, false)
+    })
+  }
+})
+
+test("a probe that cannot be completed leaves the route undecided: the read still found a main thread, as `unprobed`", async () => {
+  await withServer(main({ "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }), async path => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "unprobed" })
+    assert.equal(bound.route, null, "a transport failure is not an answer: the probe runs again at the next bind")
+  })
+  const gone = createThread({ path: join(dir, "absent.sock"), threadId: THREAD })
+  assert.deepEqual(await gone.bind(), { status: "unavailable" })
+  assert.equal(gone.route, null)
+})
+
+test("a probe that does not answer is `unprobed` within a second, so it cannot use up the bind's time", async () => {
+  await withServer(main({ "thread/queue/delete": () => undefined }), async path => {
+    const started = Date.now()
+    const bound = createThread({ path, threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "unprobed" })
+    assert.ok(Date.now() - started < 2000, "the whole bind stays well inside the receiver's 3 seconds")
+    assert.equal(bound.route, null)
+  })
+})
+
 test("the provider is recorded only for a loaded thread that is not a child", async () => {
   const cases = [
     ["not loaded", main({ "thread/loaded/list": () => ok({ data: ["other"], nextCursor: null }) })],
@@ -489,6 +532,33 @@ test("the provider is recorded only for a loaded thread that is not a child", as
       const bound = createThread({ path, threadId: THREAD })
       await bound.bind()
       assert.equal(bound.provider, null, label)
+    })
+  }
+})
+
+test("a bind whose probe fails still fixes the provider: the read found a main thread", async () => {
+  await withServer(main({ "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }), async path => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "unprobed" })
+    assert.equal(bound.provider, "openai")
+    assert.equal(bound.route, null)
+  })
+})
+
+// A thread that the read does not show as a main one is never probed: the probe is the last step of a bind that found one.
+test("a bind probes the queue only after it read a main thread: not for an unloaded, notLoaded, child or incomplete record", async () => {
+  for (const [label, over] of [
+    ["not loaded", { "thread/loaded/list": () => ok({ data: [], nextCursor: null }) }],
+    ["notLoaded", { "thread/read": () => ok({ thread: thread({ status: { type: "notLoaded" } }) }) }],
+    ["a child", { "thread/read": () => ok({ thread: thread({ parentThreadId: "p" }) }) }],
+    ["no origin", { "thread/read": () => ok({ thread: without("source") }) }],
+    ["no provider", { "thread/read": () => ok({ thread: without("modelProvider") }) }],
+  ]) {
+    await withServer(main(over), async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD })
+      assert.notEqual((await bound.bind()).status, "bound", label)
+      assert.equal(server.methods().includes("thread/queue/delete"), false, `${label}: no probe`)
+      assert.equal(bound.route, null, label)
     })
   }
 })
@@ -524,9 +594,10 @@ test("nothing from an earlier bind verifies a later one: a thread that is no lon
   })
 })
 
-// ---- the deadline of a bind and the call's own token -----------------------------------------------------------
-// The caller's time is for the thread read. `signal` is the call's token: once aborted, nothing the call reads afterwards is
-// recorded. `owns` is the same for a caller that stopped being the owner of the answer.
+// ---- the two deadlines of a bind and the call's own token ------------------------------------------------------
+// The caller's time is for the thread read: `onRead` says it is over, and the queue probe then has PROBE_MS of its own.
+// `signal` is the call's token: once aborted, nothing the call reads afterwards is recorded. `owns` is the same for a caller
+// that stopped being the owner of the answer.
 
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
 async function eventually(check, what) {
@@ -579,6 +650,102 @@ test("a bind whose owner is gone while its read is out records no provider: the 
     assert.equal(bound.provider, "other")
   })
 })
+
+test("the read is reported done before the probe starts, and the probe runs on its own limit, not on what the read left", async () => {
+  const events = []
+  await withServer(main({
+    "thread/read": async () => { await pause(1200); events.push("read"); return ok({ thread: thread() }) },
+    "thread/queue/delete": () => { events.push("probe") }, // silent
+  }), async path => {
+    const started = Date.now()
+    const bound = createThread({ path, threadId: THREAD })
+    let readAt = null
+    const result = await bound.bind({ onRead: () => { readAt = Date.now() - started; events.push("onRead") } })
+    const finished = Date.now() - started
+    assert.deepEqual(result, { status: "unprobed" })
+    assert.deepEqual(events, ["read", "onRead", "probe"])
+    assert.ok(readAt >= 1100, "the read took 1.2 seconds")
+    assert.ok(finished - readAt >= 900 && finished - readAt < 2000, `the probe had about its own second after the read: ${finished - readAt} ms`)
+    assert.equal(bound.provider, "openai")
+    assert.equal(bound.route, null)
+  })
+})
+
+test("a bind that the caller timed out while it was probing cannot record a late negative answer: the next bind probes again", async () => {
+  let probes = 0
+  await withServer(main({
+    "thread/queue/delete": async () => { probes += 1; await pause(300); return probes === 1 ? ok({ deleted: true }) : ok({ deleted: false }) }, // deleted:true: never observed live
+  }), async path => {
+    const bound = createThread({ path, threadId: THREAD })
+    const attempt = new AbortController()
+    const first = bound.bind({ signal: attempt.signal })
+    await eventually(() => probes === 1, "the first probe request")
+    attempt.abort() // the caller stopped waiting; the answer is still on its way, and it is not the documented one
+    assert.deepEqual(await first, { status: "unavailable" })
+    assert.equal(bound.route, null, "a late negative answer is not recorded as the route")
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.route, true)
+    assert.equal(probes, 2, "the later bind probed instead of trusting the expired one")
+  })
+})
+
+// A thread can leave the loaded list between the list request and the read. observe() already reads that as offline.
+// What a call reads is committed once, at the end, after the last look at its signal.
+for (const [label, probe] of [
+  ["answers the documented way", async () => { await pause(300); return ok({ deleted: false }) }],
+  ["fails", async (_message, { socket }) => { await pause(300); socket.destroy() }],
+]) {
+  test(`a bind that the caller timed out while its probe ${label} records neither the provider nor the route`, async () => {
+    let reads = 0
+    let probes = 0
+    await withServer(main({
+      "thread/read": () => ok({ thread: thread({ modelProvider: ++reads === 1 ? "openai" : "other" }) }),
+      "thread/queue/delete": (message, connection) => (++probes === 1 ? probe(message, connection) : ok({ deleted: false })),
+    }), async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD })
+      const attempt = new AbortController()
+      let reported = 0
+      const first = bound.bind({ signal: attempt.signal, onRead: () => { reported += 1 } })
+      await eventually(() => server.methods().includes("thread/queue/delete"), "the probe request")
+      attempt.abort()
+      assert.deepEqual(await first, { status: "unavailable" })
+      assert.equal(reported, 1, "the read was reported done before the probe, as always")
+      assert.equal(bound.provider, null, "the aborted call fixed no provider")
+      assert.equal(bound.route, null)
+      assert.deepEqual(await bound.bind(), { status: "bound" }, "so the next bind is not stale against a provider nobody committed")
+      assert.equal(bound.route, true)
+      assert.equal(bound.provider, "other")
+    })
+  })
+}
+
+// `owns` is the caller's other way to stop owning an answer: the worker it binds for was retired. It is asked at the same
+// checks as the signal, and the last one is the commit's own turn.
+for (const [label, probe] of [
+  ["answers the documented way", async () => { await pause(300); return ok({ deleted: false }) }],
+  ["answers with something else", async () => { await pause(300); return ok({ deleted: true }) }], // never observed live
+]) {
+  test(`a bind whose owner is gone when its probe ${label} records neither the provider nor the route`, async () => {
+    let reads = 0
+    let probes = 0
+    await withServer(main({
+      "thread/read": () => ok({ thread: thread({ modelProvider: ++reads === 1 ? "openai" : "other" }) }),
+      "thread/queue/delete": (message, connection) => (++probes === 1 ? probe(message, connection) : ok({ deleted: false })),
+    }), async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD })
+      let owner = true
+      const first = bound.bind({ owns: () => owner })
+      await eventually(() => server.methods().includes("thread/queue/delete"), "the probe request")
+      owner = false
+      assert.deepEqual(await first, { status: "unavailable" })
+      assert.equal(bound.provider, null)
+      assert.equal(bound.route, null)
+      assert.deepEqual(await bound.bind({ owns: () => true }), { status: "bound" }, "the next owner binds against nothing the first one left")
+      assert.equal(bound.route, true)
+      assert.equal(bound.provider, "other")
+    })
+  })
+}
 
 test("a bind whose owner is gone when its read comes back records nothing and says unavailable", async () => {
   await withServer(main(), async path => {
@@ -755,6 +922,9 @@ test("a thread status that is a property name of every object is unknown, not a 
     assert.deepEqual(viaRead.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: null } }, `read: ${type}`)
     const viaResume = await observeWith({ "thread/resume": () => ok({ thread: thread({ status: { type } }), collaborationMode: { mode: "default", settings: {} } }) })
     assert.deepEqual(viaResume.result, { reason: "unknown", observed: { status: "unknown", stopped: false, plan: false } }, `resume: ${type}`)
+    const woken = await wakeWith({ "thread/read": () => ok({ thread: thread({ status: { type } }) }) })
+    assert.deepEqual(woken.result, { outcome: "deferred", reason: "unknown" }, `wake: ${type}`)
+    assert.equal(woken.methods.includes("thread/queue/add"), false)
   }
 })
 
@@ -794,8 +964,9 @@ test("a child or a changed provider found by a later read is refused by name", a
 })
 
 // Only a provider that a record names shows a change. After a bind that fixed the provider, a read record with no provider,
-// an empty one or one that is not a string is no stale binding: the read goes on, and the resume record decides as it does
-// for any record (here complete: the thread is clear; incomplete: unknown).
+// an empty one or one that is not a string is no stale binding. It is an incomplete record, though: an idle read of it says
+// nothing about the thread, so the read ends there as unknown and the resume is not asked. A complete read record with such
+// a resume record is unknown too.
 test("a read record whose provider is missing or invalid is no provider change", async () => {
   for (const modelProvider of [undefined, "", 7, null]) {
     const weak = thread()
@@ -806,11 +977,14 @@ test("a read record whose provider is missing or invalid is no provider change",
     await withServer(main({
       "thread/read": () => ok({ thread: record }),
       "thread/resume": () => ok({ thread: resumed, collaborationMode: { mode: "default", settings: {} } }),
-    }), async path => {
+    }), async (path, server) => {
       const bound = createThread({ path, threadId: THREAD })
       assert.deepEqual(await bound.bind(), { status: "bound" })
       record = weak
-      assert.deepEqual(await bound.observe(), { reason: null, observed: { status: "idle", stopped: false, plan: false } }, String(modelProvider))
+      server.log.length = 0
+      assert.deepEqual(await bound.observe(), { reason: "unknown", observed: { status: "idle", stopped: false, plan: null } }, String(modelProvider))
+      assert.deepEqual(server.methods(), ["initialize", "thread/loaded/list", "thread/read"], `the read ends at the incomplete record: ${String(modelProvider)}`)
+      record = thread()
       resumed = weak
       assert.equal((await bound.observe()).reason, "unknown", `an incomplete resume record too: ${String(modelProvider)}`)
     })
@@ -822,6 +996,1298 @@ test("a server that cannot be reached, or that sends a malformed answer, is offl
   assert.equal((await gone.observe()).reason, "offline")
   const { result } = await observeWith({ "thread/loaded/list": () => ok({ data: "x" }) })
   assert.equal(result.reason, "offline")
+})
+
+// A confirmation page that shows this attempt's userMessage, as codex-cli 0.171.0 lists it.
+const confirmedItems = { "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) }
+
+// The newest turn is looked up after the mode. A lookup that fails, or answers in a way that is not the documented one, reads
+// the running state as unknown, so the wake is refused as unknown and nothing is queued.
+test("a lookup of the newest turn that fails or is malformed refuses the wake and adds nothing", async () => {
+  for (const [label, answer] of [
+    ["an error reply", () => ({ error: { code: -32000, message: "no" } })],
+    ["data that is not a list", () => ok({ data: "none", nextCursor: null })],
+    ["no data", () => ok({})],
+    ["a connection that drops", (message, connection) => { connection.socket.destroy(); return undefined }],
+  ]) {
+    const { result: woken, methods } = await wakeWith({ "thread/turns/list": answer })
+    assert.deepEqual(woken, { outcome: "deferred", reason: "unknown" }, `${label}: the wake is refused and adds nothing`)
+    assert.equal(methods.includes("thread/queue/add"), false, label)
+    assert.equal(methods.at(-1), "thread/turns/list", `${label}: the lookup was the last request`)
+  }
+})
+// ---- wake ------------------------------------------------------------------------------------------------------
+
+function clock(start = 1_000_000) {
+  const time = { now: start }
+  return { time, now: () => time.now, sleep: async ms => { time.now += ms } }
+}
+// What a wake reads before it adds: the thread as it is now, the interruption check last. It reads on a connection of its own, so the
+// log shows two `initialize` frames: the connection that will carry the add, opened first, and the one for the reading.
+const READS = ["thread/loaded/list", "thread/read", "thread/resume", "thread/turns/list"]
+const OPENS = ["initialize", "initialize"]
+// The queue as codex-cli 0.171.0 answered it live: the add reply echoes `clientUserMessageId` inside `queuedSubmission`, a
+// delete of any id that is not queued (the bind's probe, and the fence once the turn has left the queue) answers
+// { deleted: false }, and a dispatched item shows in thread/items/list as { turnId, item } with the client id as `item.clientId`.
+const queueServer = (over = {}) => main({
+  "thread/queue/add": message => ok({ queuedSubmission: { id: "q1", input: message.params.input, clientUserMessageId: message.params.clientUserMessageId } }),
+  "thread/queue/delete": () => ok({ deleted: false }),
+  "thread/items/list": () => ok({ data: [], nextCursor: null }),
+  ...over,
+})
+// The receiver wakes only a thread whose bind probed this socket, and a wake probes any socket the bind did not. So a wake
+// test binds first, against a thread that is healthy, and only then arms `over`: the bind's probe is not what a test replaces.
+function armed(over) {
+  const healthy = queueServer()
+  const changed = queueServer(over)
+  let on = false
+  return { handler: (message, connection) => (on ? changed : healthy)(message, connection), arm: () => { on = true } }
+}
+async function wakeWith(over, { reservation = 5000, text = "queued text", proceed } = {}) {
+  const gate = armed(over)
+  return withServer(gate.handler, async (path, server) => {
+    const ticks = clock()
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    const result = await bound.wake({ text, attemptId: "attempt-9", until: ticks.now() + reservation, ...(proceed ? { proceed } : {}) })
+    return { result, log: server.log, methods: server.methods(), ticks, server }
+  })
+}
+
+test("a path check that stalls past the settlement cutoff sends no add: the time is read after the check", async () => {
+  const gate = armed({})
+  await withServer(gate.handler, async (path, server) => {
+    const ticks = clock()
+    let stalled = false
+    const lstat = name => { // once the reading is over, the next look at the path takes the whole reservation
+      if (!stalled && server.log.some(entry => entry.method === "thread/turns/list")) { stalled = true; ticks.time.now += 10_000 }
+      return lstatSync(name)
+    }
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, open: (name, options) => openAppServer(name, { ...options, lstat }) })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    const result = await bound.wake({ text: "queued text", attemptId: "attempt-9", until: ticks.now() + 5000 })
+    assert.equal(stalled, true)
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.equal(server.methods().includes("thread/queue/add"), false)
+  })
+})
+
+test("the add carries the client id and the text, then the fence deletes by the submission id", async () => {
+  const seen = []
+  const { log, methods } = await wakeWith({
+    "thread/items/list": message => {
+      seen.push(message.params)
+      return ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i1", clientId: `${CLIENT_ID_PREFIX}attempt-9`, content: [] } }], nextCursor: null })
+    },
+  })
+  assert.deepEqual(methods, [...OPENS, ...READS, "thread/queue/add", "thread/queue/delete", "thread/items/list"])
+  const add = log.find(entry => entry.method === "thread/queue/add").params
+  assert.deepEqual(add, { threadId: THREAD, clientUserMessageId: "agent-chat:attempt-9", input: [{ type: "text", text: "queued text", text_elements: [] }] })
+  assert.deepEqual(log.find(entry => entry.method === "thread/queue/delete").params, { threadId: THREAD, queuedSubmissionId: "q1" })
+  assert.deepEqual(seen[0], { threadId: THREAD, limit: 20, sortDirection: "desc" }, "the newest page: an old item order would miss the queued turn on a long thread")
+})
+
+// `thread/resume` subscribes the connection that asks, and the connection that carries the add, the fence and the
+// confirmation must not be one that the thread's events are pushed to. So the reading is taken on a second connection that
+// is closed before the add goes out, and the connection for the add is opened first, so no connect sits between the last answer and the add.
+test("the reading before the add is taken on a connection of its own, closed before the add goes out on the first", async () => {
+  const events = []
+  let opened = 0
+  const traced = async (target, options) => {
+    const link = await openAppServer(target, options)
+    const number = opened++
+    events.push(`open ${number}`)
+    return { identity: link.identity, same: link.same, request: (method, ...rest) => { events.push(`${number} ${method}`); return link.request(method, ...rest) }, close: () => { events.push(`close ${number}`); link.close() } }
+  }
+  const handler = queueServer({
+    "thread/items/list": message => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i1", clientId: `${CLIENT_ID_PREFIX}attempt-9`, content: [] } }], nextCursor: null }),
+  })
+  await withServer(handler, async (path, server) => {
+    const ticks = clock()
+    const bound = createThread({ path, threadId: THREAD, open: traced, now: ticks.now, sleep: ticks.sleep })
+    const result = await bound.wake({ text: "queued text", attemptId: "attempt-9", until: ticks.now() + 5000 })
+    assert.deepEqual(result, { outcome: "handed", reason: null })
+    assert.deepEqual(events, [
+      "open 0", "0 thread/queue/delete", "open 1", ...READS.map(method => `1 ${method}`), "close 1",
+      "0 thread/queue/add", "0 thread/queue/delete", "0 thread/items/list", "close 0",
+    ])
+    await eventually(() => server.state.open === 0, "both connections to close")
+    assert.equal(server.state.connections, 2, "the reading and the add each had one")
+  })
+})
+
+// deleted:true was never observed live: the one run answered the fence { deleted: false } before the turn dispatched.
+test("deleted:true means it never dispatched: deferred, and no confirmation is asked for", async () => {
+  const { result, methods } = await wakeWith({ "thread/queue/delete": () => ok({ deleted: true }) })
+  assert.deepEqual(result, { outcome: "deferred", reason: "busy" })
+  assert.equal(methods.includes("thread/items/list"), false)
+})
+
+// A fence reply that is read as `deleted: true` is the one thing that settles a wake `deferred`, so a frame that must not be read
+// can never be allowed to say it: with a reserved bit set, a length spelled in a longer form than it needs, FIN=0, an opcode
+// that is not text, or text that is not UTF-8, the connection fails, and a failed fence is uncertain.
+test("a fence reply in a frame that is not well formed is not read: the wake is uncertain, never deferred", async () => {
+  const fenced = (bit, form = "short") => (message, connection) => {
+    connection.socket.write(framed(form, JSON.stringify({ id: message.id, result: { deleted: true } }), bit))
+    return undefined
+  }
+  const fencedWith = build => (message, connection) => {
+    connection.socket.write(build(message))
+    return undefined
+  }
+  const deleted = message => JSON.stringify({ id: message.id, result: { deleted: true } })
+  const control = await wakeWith({ "thread/queue/delete": fenced(0) }) // deleted:true: never observed live
+  assert.deepEqual(control.result, { outcome: "deferred", reason: "busy" }, "control: the same reply, well formed, proves the removal")
+  for (const [label, handler] of [
+    ["0x40", fenced(0x40)], ["0x20", fenced(0x20)], ["0x10", fenced(0x10)],
+    ["a short payload with a 16-bit length", fenced(0, 16)],
+    ["a short payload with a 64-bit length", fenced(0, 64)],
+    ["FIN=0", fencedWith(message => wire(0x1, deleted(message), { fin: false }))],
+    ["a binary frame", fencedWith(message => wire(0x2, deleted(message)))],
+    ["text that is not UTF-8", fencedWith(message => wire(0x1, Buffer.concat([
+      Buffer.from(`{"id":${message.id},"result":{"deleted":true,"note":"`), Buffer.from([0xff]), Buffer.from('"}}'),
+    ])))],
+  ]) {
+    const { result, methods } = await wakeWith({ "thread/queue/delete": handler })
+    assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, label)
+    assert.equal(methods.filter(method => method === "thread/queue/add").length, 1, "nothing is retried")
+  }
+})
+
+test("deleted:false with the userMessage in the items is handed", async () => {
+  const { result } = await wakeWith({
+    "thread/items/list": () => ok({ data: [
+      { turnId: "t", item: { type: "agentMessage", id: "a" } },
+      { turnId: "t", item: { type: "userMessage", id: "i1", clientId: "agent-chat:attempt-9", content: [] } },
+    ], nextCursor: null }),
+  })
+  assert.deepEqual(result, { outcome: "handed", reason: null })
+})
+
+test("deleted:false is confirmed by polling until the item shows up", async () => {
+  let polls = 0
+  const { result } = await wakeWith({
+    "thread/items/list": () => ok({ data: ++polls < 3 ? [] : [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }),
+  })
+  assert.equal(polls, 3)
+  assert.equal(result.outcome, "handed")
+})
+
+test("a userMessage with another client id, or none, is never a confirmation: uncertain once the reservation runs out", async () => {
+  let polls = 0
+  const { result, methods, ticks } = await wakeWith({
+    "thread/items/list": () => { polls += 1; return ok({ data: [
+      { turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-8" } },
+      { turnId: "t", item: { type: "userMessage", id: "j", clientId: null } },
+      { turnId: "t", item: { type: "agentMessage", id: "k", clientId: "agent-chat:attempt-9" } },
+    ], nextCursor: null }) },
+  })
+  assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+  assert.ok(polls > 1)
+  assert.equal(methods.filter(method => method === "thread/queue/add").length, 1, "nothing is retried")
+  assert.ok(ticks.time.now <= 1_000_000 + 5000, "the loop stops inside the reservation")
+})
+
+test("an error after the add frame was written is uncertain, at every step", async () => {
+  const uncertain = { outcome: "uncertain", reason: "transport_ambiguous" }
+  for (const over of [
+    { "thread/queue/add": () => ({ error: { code: -32600, message: "queue full" } }) },
+    { "thread/queue/add": () => ok({ queuedSubmission: {} }) },
+    { "thread/queue/add": () => ok({}) },
+    { "thread/queue/delete": () => ({ error: { code: -32600, message: "x" } }) },
+    { "thread/queue/delete": () => ok({}) },
+    { "thread/items/list": () => ({ error: { code: -32601, message: "not supported yet" } }) },
+  ]) {
+    const { result, methods } = await wakeWith(over)
+    assert.deepEqual(result, uncertain, JSON.stringify(Object.keys(over)))
+    assert.equal(methods.filter(method => method === "thread/queue/add").length, 1)
+  }
+})
+
+test("an add that gets no answer is uncertain, and is never sent twice", async () => {
+  const { result, methods } = await wakeWith({ "thread/queue/add": () => undefined }, { reservation: SETTLE_MS + 700 })
+  assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+  assert.equal(methods.filter(method => method === "thread/queue/add").length, 1)
+  assert.equal(methods.includes("thread/queue/delete"), false)
+})
+
+test("a failure before the add frame is written is failed, and under half a second left after the margin sends nothing", async () => {
+  const absent = createThread({ path: join(dir, "absent.sock"), threadId: THREAD })
+  assert.deepEqual(await absent.wake({ text: "t", attemptId: "a", until: monotonic() + 5000 }), { outcome: "failed", reason: "native_unavailable" })
+  assert.equal(MIN_ADD_MS, 500)
+  const { result, methods } = await wakeWith({}, { reservation: SETTLE_MS + MIN_ADD_MS - 1 })
+  assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+  assert.deepEqual(methods, ["initialize"], "no add frame")
+  const exactly = await wakeWith({}, { reservation: SETTLE_MS + MIN_ADD_MS })
+  assert.ok(exactly.methods.includes("thread/queue/add"), "half a second left after the margin is enough")
+})
+
+test("the settlement margin comes off the reservation first: with less than the margin and half a second left, nothing is sent", async () => {
+  assert.equal(SETTLE_MS, 1000)
+  for (const reservation of [MIN_ADD_MS + 200, SETTLE_MS, 0, -1]) {
+    const { result, methods } = await wakeWith({}, { reservation })
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" }, `${reservation} ms`)
+    assert.equal(methods.includes("thread/queue/add"), false, `${reservation} ms: no add frame`) // a connection that ran out of time never reached initialize
+  }
+})
+
+test("the add is not sent when the receiver says the state changed: deferred with its reason, no add frame", async () => {
+  const asked = []
+  const stale = await wakeWith({}, { proceed: fresh => { asked.push(fresh); return "stopped" } })
+  assert.deepEqual(stale.result, { outcome: "deferred", reason: "stopped" })
+  assert.deepEqual(stale.methods, [...OPENS, ...READS], "the reads, and no add frame")
+  assert.deepEqual(asked, [{ reason: null, observed: { status: "idle", stopped: false, plan: false } }], "asked once, with the reading taken on this connection")
+  const clear = await wakeWith({}, { proceed: () => null })
+  assert.deepEqual(clear.methods.slice(0, 7), [...OPENS, ...READS, "thread/queue/add"])
+})
+
+// A reply that comes later than the reservation allows: real time, because the point is where the wake gives up. One
+// test per step, so each shows up by name.
+const slowReplies = {
+  "thread/queue/add": message => ok({ queuedSubmission: { id: "q1", input: message.params.input, clientUserMessageId: message.params.clientUserMessageId } }),
+  "thread/queue/delete": () => ok({ deleted: false }),
+  "thread/items/list": () => ok({ data: [], nextCursor: null }),
+}
+for (const slow of Object.keys(slowReplies)) {
+  test(`a slow ${slow} reply ends the wake SETTLE_MS before the reservation, so the result can still be recorded`, async () => {
+    const gate = armed({ [slow]: async (...args) => { await new Promise(resolve => setTimeout(resolve, 1500)); return slowReplies[slow](...args) } })
+    await withServer(gate.handler, async path => {
+      const bound = createThread({ path, threadId: THREAD })
+      await bound.bind()
+      gate.arm()
+      const until = monotonic() + SETTLE_MS + 600
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until })
+      const left = until - monotonic()
+      assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+      assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
+    })
+  })
+}
+
+// The reading before the add runs on the same cutoff: each of its requests gets only what is left before it, so a slow read
+// ends the wake in time to settle, with nothing sent. One test per read.
+for (const slow of READS) {
+  test(`a slow ${slow} reply in the reading before the add ends the wake SETTLE_MS before the reservation, with nothing sent`, async () => {
+    const answer = queueServer()
+    const gate = armed({ [slow]: async (...args) => { await pause(1500); return answer(...args) } })
+    await withServer(gate.handler, async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD })
+      await bound.bind()
+      gate.arm()
+      server.log.length = 0
+      const until = monotonic() + SETTLE_MS + 600
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until })
+      const left = until - monotonic()
+      assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+      assert.ok(server.methods().includes(slow), `the reading got as far as ${slow}`)
+      assert.equal(server.methods().includes("thread/queue/add"), false, "no add frame")
+      assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
+    })
+  })
+}
+
+test("the reading's own connection is bounded by the settlement cutoff, as the add connection is", async () => {
+  const given = []
+  const gate = armed({})
+  await withServer(gate.handler, async path => {
+    const ticks = clock()
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, open: (target, options) => { given.push(options); return openAppServer(target, options) } })
+    await bound.bind()
+    gate.arm()
+    given.length = 0
+    await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + SETTLE_MS + 600 })
+    assert.equal(given.length, 2, "the add connection and the reading's")
+    assert.deepEqual(given.map(options => options.connectMs), [600, 600], "each connect ends by the cutoff")
+  })
+})
+
+// `sent: false` comes only from a frame that never left: here the add connection is closed in the turn before the add.
+test("an add whose frame never left, because its connection closed first, is failed: nothing was sent", async () => {
+  let first = null
+  const open = async (target, options) => { const link = await openAppServer(target, options); first ??= link; return link }
+  await withServer(queueServer(confirmedItems), async (path, server) => {
+    const ticks = clock()
+    const bound = createThread({ path, threadId: THREAD, open, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    first = null // the next connection opened is the wake's add connection
+    server.log.length = 0
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + 5000, proceed: () => { first.close(); return null } })
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), [...OPENS, ...READS], "the reads, and no add frame")
+  })
+})
+
+// Only `deleted: false` lets the confirmation run. Any other fence reply proves neither removal nor dispatch, so the wake is
+// uncertain even when the matching userMessage would already show, and no confirmation is asked for.
+test("a fence reply that is neither deleted:true nor deleted:false is uncertain, though the userMessage already shows", async () => {
+  for (const reply of [{ deleted: null }, {}, { deleted: "false" }, { deleted: 0 }]) {
+    const { result, methods } = await wakeWith({ ...confirmedItems, "thread/queue/delete": () => ok(reply) })
+    assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, JSON.stringify(reply))
+    assert.equal(methods.includes("thread/items/list"), false, `${JSON.stringify(reply)}: no confirmation is asked for`)
+  }
+})
+
+// CONFIRM_MARGIN_MS (300 ms): a confirmation poll starts only with more than that left before the settlement cutoff, so its
+// request has time to be answered. The fake clock moves only by the confirm waits (CONFIRM_MS, 250 ms).
+test("the confirmation polls until CONFIRM_MARGIN_MS before the settlement cutoff, and starts no poll after that", async () => {
+  const ticks = clock()
+  const at = []
+  const gate = armed({ "thread/items/list": () => { at.push(ticks.now()); return ok({ data: [], nextCursor: null }) } })
+  await withServer(gate.handler, async path => {
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    gate.arm()
+    const until = ticks.now() + 5000
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until }), { outcome: "uncertain", reason: "transport_ambiguous" })
+    const left = until - SETTLE_MS - at.at(-1)
+    assert.ok(at.length > 1)
+    assert.ok(left > 300, `the last poll started ${left} ms before the cutoff`)
+    assert.ok(left <= 300 + 250, `and no poll that fitted was skipped (${left} ms left)`)
+  })
+})
+
+// An empty answer that comes in just before `end` leaves no room for another poll: the wake settles at once, not after one
+// more CONFIRM_MS wait past its end.
+test("an empty confirmation that answers 20 ms before the end returns uncertain by the end, with no wait after it", async () => {
+  const ticks = clock()
+  let end = null
+  const gate = armed({ "thread/items/list": () => { ticks.time.now = end - 20; return ok({ data: [], nextCursor: null }) } })
+  await withServer(gate.handler, async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    const until = ticks.now() + 5000
+    end = until - SETTLE_MS
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until }), { outcome: "uncertain", reason: "transport_ambiguous" })
+    assert.equal(server.methods().filter(method => method === "thread/items/list").length, 1)
+    assert.ok(ticks.now() <= end, `returned ${ticks.now() - end} ms after the end`)
+  })
+})
+
+test("a connection that never finishes ends the wake SETTLE_MS before the reservation too, with nothing sent", async () => {
+  await withServer(() => undefined, async (path, server) => {
+    const until = monotonic() + SETTLE_MS + 600
+    const result = await createThread({ path, threadId: THREAD }).wake({ text: "t", attemptId: "attempt-9", until })
+    const left = until - monotonic()
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), ["initialize"], "nothing past initialize was sent")
+    assert.ok(left >= SETTLE_MS / 2, `${left} ms of the reservation were left to settle`)
+  }, { initialize: false })
+})
+
+test("the wake connection is closed when it is done", async () => {
+  const gate = armed({ "thread/queue/delete": () => ok({ deleted: true }) }) // never observed live
+  await withServer(gate.handler, async (path, server) => {
+    const ticks = clock()
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    gate.arm()
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "a", until: ticks.now() + 5000 }), { outcome: "deferred", reason: "busy" }, "the wake went as far as the fence")
+    for (let waited = 0; server.state.open && waited < 1000; waited += 10) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(server.state.open, 0)
+  })
+})
+
+// The default clock is the monotonic one, because a reservation is a duration: a wall clock that is stepped back (an NTP
+// correction, an operator) must not give a wake more time than it has. Here every read of the wall clock steps it back an hour.
+test("by default the wake runs on the monotonic clock: a wall clock that steps back is never read, and cannot revive an expired reservation", async t => {
+  let wallTime = 1_800_000_000_000
+  const wall = t.mock.method(Date, "now", () => (wallTime -= 3_600_000))
+  const gate = armed({ "thread/queue/delete": () => ok({ deleted: true }) }) // never observed live
+  await withServer(gate.handler, async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "a", until: monotonic() + 5000 }), { outcome: "deferred", reason: "busy" }, "a live reservation goes as far as the fence")
+    server.log.length = 0
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "b", until: monotonic() - 1 }), { outcome: "failed", reason: "native_unavailable" }, "an expired one sends nothing")
+    assert.equal(server.methods().includes("thread/queue/add"), false)
+  })
+  assert.equal(wall.mock.callCount(), 0, "no deadline of the thread was measured on the wall clock")
+})
+
+// On Linux performance.now() does not count time spent suspended, while the server's reservation runs on. The wake takes the
+// wall-clock end of the reservation too (`wallUntil`) and, right before the add, counts the larger of the two elapsed times.
+// Here the clocks move while the reading is out: the last read before the add. Of a 5-second reservation, SETTLE_MS and
+// MIN_ADD_MS must be left on both clocks.
+for (const [label, monotonicStep, wallStep, sent] of [
+  ["a suspend (the wall clock 45 s on, the monotonic clock 1 s) sends no add and settles failed", 1_000, 45_000, false],
+  ["a wall clock stepped back an hour does not stop a wake that the monotonic clock allows", 1_000, -3_600_000, true],
+  ["a wall clock stepped back an hour does not revive a reservation that the monotonic clock used up", 4_000, -3_600_000, false],
+  ["the wall clock keeps the settlement margin: 400 ms left after it sends no add", 1_000, 3_600, false],
+  ["a wall clock that moves with the monotonic one leaves the wake as it was", 1_000, 1_000, true],
+]) {
+  test(`before the add, ${label}`, async () => {
+    const gate = armed({
+      "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: `${CLIENT_ID_PREFIX}attempt-9` } }], nextCursor: null }),
+    })
+    const ticks = clock()
+    let wallTime = 1_800_000_000_000
+    let stepped = false
+    let reading = false // the bind's reads are not the wake's
+    const handler = (message, connection) => {
+      if (reading && !stepped && message.method === "thread/turns/list") { stepped = true; ticks.time.now += monotonicStep; wallTime += wallStep }
+      return gate.handler(message, connection)
+    }
+    await withServer(handler, async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+      await bound.bind()
+      gate.arm()
+      reading = true
+      server.log.length = 0
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + 5_000 })
+      assert.equal(stepped, true, "the clocks moved during the reading")
+      assert.equal(server.methods().includes("thread/queue/add"), sent)
+      assert.deepEqual(result, sent ? { outcome: "handed", reason: null } : { outcome: "failed", reason: "native_unavailable" })
+    })
+  })
+}
+
+// After the add check, the requests that follow (the add reply, the fence, the confirmation) end by the tighter of the two
+// budgets, derived once at that check. A host that slept 25 s of a 30 s reservation passes the check with about 4 s of
+// wall time left after the settlement margin, so the confirmation that never sees its item gives up within that, not
+// within the 28 s the monotonic clock would allow. The budget is not read again: a wall clock stepped back an hour during the
+// confirmation extends nothing. The control leg, with no suspend, keeps the monotonic budget.
+for (const [label, wallStep, budget, stepBack] of [
+  ["after a suspend, the confirmation ends by the wall-clock budget derived at the add check", 25_000, 4_000, false],
+  ["after a suspend, a wall clock stepped back during the confirmation does not extend its budget", 25_000, 4_000, true],
+  ["with no suspend, the confirmation keeps the monotonic budget", 1_000, 28_000, false],
+]) {
+  test(label, async () => {
+    const gate = armed({}) // the fence answers deleted:false and thread/items/list never shows the item
+    const ticks = clock()
+    let wallTime = 1_800_000_000_000
+    let reading = false
+    let checkedAt = null
+    const handler = (message, connection) => {
+      if (reading && checkedAt === null && message.method === "thread/turns/list") { ticks.time.now += 1_000; wallTime += wallStep; checkedAt = ticks.now() }
+      if (stepBack && message.method === "thread/items/list") wallTime -= 3_600_000
+      return gate.handler(message, connection)
+    }
+    await withServer(handler, async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+      await bound.bind()
+      gate.arm()
+      reading = true
+      server.log.length = 0
+      const until = ticks.now() + 30_000
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until, wallUntil: wallTime + 30_000 })
+      assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+      assert.ok(server.methods().includes("thread/queue/add"), "the add passed its check")
+      const elapsed = ticks.now() - checkedAt
+      // The last poll starts within CONFIRM_MARGIN_MS + CONFIRM_MS (550 ms) of the end, and no wait follows it.
+      assert.ok(elapsed <= budget && elapsed >= budget - 550, `the confirmation polled for ${elapsed} ms of a ${budget} ms budget`)
+    })
+  })
+}
+
+// The fence deletes only the submission that this attempt queued. codex-cli 0.171.0 echoes `clientUserMessageId` exactly inside
+// `queuedSubmission`; a reply that does not tie its submission to this attempt may name another turn, and a delete of it could
+// remove that turn. So without the echo the wake is uncertain at once: no delete, no confirmation, and the add is not resent.
+for (const [label, echo] of [
+  ["echoes another attempt's client id", { clientUserMessageId: `${CLIENT_ID_PREFIX}attempt-8` }],
+  ["has no client id", {}],
+  ["has a client id that is not a string", { clientUserMessageId: 9 }],
+  ["echoes a different id for the same attempt number", { clientUserMessageId: "attempt-9" }],
+]) {
+  test(`an add reply whose submission ${label} is uncertain, and nothing is deleted or confirmed`, async () => {
+    const { result, methods } = await wakeWith({
+      "thread/queue/add": message => ok({ queuedSubmission: { id: "q1", input: message.params.input, ...echo } }),
+    })
+    assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+    assert.deepEqual(methods, [...OPENS, ...READS, "thread/queue/add"], "the add was the last request: no thread/queue/delete, no thread/items/list")
+    assert.equal(methods.filter(method => method === "thread/queue/add").length, 1, "one add only")
+  })
+}
+
+// Live, codex-cli 0.171.0 pushed `thread/status/changed` (active) to the connection that queued the turn 3 ms after it answered
+// the fence. A notification is not an answer: the client sends nothing for it, and the wake goes on to the confirmation.
+const ACTIVE_NOTICE = { method: "thread/status/changed", params: { threadId: THREAD, status: { type: "active", activeFlags: [] } } }
+for (const [label, when] of [
+  ["right after the fence reply, as seen live", "after"],
+  ["before the fence reply (not observed live)", "before"],
+]) {
+  test(`a thread/status/changed notification ${label} is ignored: no request for it, and the wake is still handed`, async () => {
+    const { result, methods, server } = await wakeWith({
+      ...confirmedItems,
+      "thread/queue/delete": (_message, { send }) => {
+        if (when === "before") send(ACTIVE_NOTICE)
+        else setImmediate(() => send(ACTIVE_NOTICE))
+        return ok({ deleted: false })
+      },
+    })
+    assert.deepEqual(result, { outcome: "handed", reason: null })
+    assert.deepEqual(methods, [...OPENS, ...READS, "thread/queue/add", "thread/queue/delete", "thread/items/list"], "no request was added for the notification")
+    assert.deepEqual(server.state.replies, [], "and nothing answered it")
+  })
+}
+
+// Live, the userMessage item showed on the third poll (+583 ms). Each poll that does not show it waits CONFIRM_MS (250 ms).
+test("an item that shows on the third poll is handed after two confirm waits, with three thread/items/list requests", async () => {
+  let polls = 0
+  const { result, methods, ticks } = await wakeWith({
+    "thread/items/list": () => ok({ data: ++polls < 3 ? [] : confirmedItems["thread/items/list"]().result.data, nextCursor: null }),
+  })
+  assert.deepEqual(result, { outcome: "handed", reason: null })
+  assert.equal(methods.filter(method => method === "thread/items/list").length, 3)
+  assert.equal(ticks.time.now - 1_000_000, 2 * 250, "two waits of CONFIRM_MS on the virtual clock, and nothing else moved it")
+})
+
+// Live, codex-cli 0.171.0 answers thread/items/list with -32601 (not supported yet) on a thread before its first user message.
+// A build that answers so on a dispatched wake gives no proof of dispatch: uncertain, never handed, and nothing is sent again.
+test("a confirmation that thread/items/list refuses as -32601 is uncertain, never handed, and nothing is resent", async () => {
+  const { result, methods } = await wakeWith({ "thread/items/list": () => ({ error: { code: -32601, message: "not supported yet" } }) })
+  assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+  assert.deepEqual(methods, [...OPENS, ...READS, "thread/queue/add", "thread/queue/delete", "thread/items/list"])
+})
+
+// Before the first user message codex-cli 0.171.0 answers thread/resume and thread/turns/list with -32600 and
+// thread/items/list with -32601. Whether loaded/list and read answer on such a thread is not in the probe facts; here they do.
+// So that session reads unknown, and a wake is never its first message.
+test("a thread before its first user message, as codex-cli answers it, is never woken: deferred unknown, no add", async () => {
+  const { result, methods } = await wakeWith({
+    "thread/resume": () => ({ error: { code: -32600, message: "no rollout found" } }),
+    "thread/turns/list": () => ({ error: { code: -32600, message: "not materialized yet" } }),
+    "thread/items/list": () => ({ error: { code: -32601, message: "not supported yet" } }),
+  })
+  assert.deepEqual(result, { outcome: "deferred", reason: "unknown" })
+  assert.deepEqual(methods, [...OPENS, ...READS.slice(0, 3)], "the refused resume ends the reading, and no add frame")
+})
+
+// ---- a wake acts on the newest reading of the thread ------------------------------------------------------------
+
+const active = { "thread/read": () => ok({ thread: thread({ status: { type: "active", activeFlags: [] } }) }) }
+
+// The resume answer is a record of its own: it must be complete (id, status, origin, ephemeral flag and model provider),
+// show the thread idle in default mode, and agree with the read and the bound provider. It ends the reading when it refuses.
+// The newest turn is read after every resume answer that is a usable record and not busy, so a leg whose refusal comes from the
+// mode (Plan Mode, no mode, a mode that is not known) reads all four.
+for (const [label, over, reason, reads = 3] of [
+  ["the resume answer shows the thread active", resumeWith({ thread: thread({ status: { type: "active", activeFlags: [] } }) }), "busy"],
+  ["the resume answer shows the thread in Plan Mode", resumeWith({ thread: thread() }, { mode: "plan", settings: {} }), "plan", 4],
+  ["the resume answer has no collaboration mode", { "thread/resume": () => ok({ thread: thread() }) }, "unknown", 4],
+  ["the resume answer has a mode that is not known", resumeWith({ thread: thread() }, { mode: "future-mode" }), "unknown", 4],
+  ["the resume answer has no thread record", resumeWith({}), "unknown"],
+  ["the resume answer is another thread's record", resumeWith({ thread: thread({ id: "thread-2" }) }), "unknown"],
+  ["the resume answer has a record without a status", resumeWith({ thread: { id: THREAD } }), "unknown"],
+  ["the resume answer lacks the origin (source)", resumeWith({ thread: without("source") }), "unknown"],
+  ["the resume answer lacks the ephemeral flag", resumeWith({ thread: without("ephemeral") }), "unknown"],
+  ["the resume answer lacks the model provider", resumeWith({ thread: without("modelProvider") }), "unknown"],
+  ["the resume answer has an empty model provider", resumeWith({ thread: thread({ modelProvider: "" }) }), "unknown"],
+  ["the resume answer has an origin that is not a string or an object", resumeWith({ thread: thread({ source: 7 }) }), "unknown"],
+  ["the resume answer shows a status the read did not", resumeWith({ thread: thread({ status: { type: "systemError" } }) }), "unknown"],
+  ["the resume request is refused", { "thread/resume": () => ({ error: { code: -32600, message: "no rollout found" } }) }, "unknown"],
+  ["the resume answer shows a child", resumeWith({ thread: thread({ parentThreadId: "p" }) }), "offline"],
+]) {
+  test(`a wake whose reads are idle but where ${label} sends no add, and defers as ${reason}`, async () => {
+    const { result, methods } = await wakeWith(over)
+    assert.deepEqual(result, { outcome: "deferred", reason })
+    assert.deepEqual(methods, [...OPENS, ...READS.slice(0, reads)], "the reads up to the answer that ends the reading, and no add frame")
+  })
+}
+
+test("a wake whose resume answer shows another provider than the bound one is refused as stale_binding", async () => {
+  await withServer(queueServer(resumeWith({ thread: thread({ modelProvider: "other" }) })), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    await bound.bind()
+    server.log.length = 0
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 }), { outcome: "deferred", reason: "stale_binding" })
+    assert.equal(server.methods().includes("thread/queue/add"), false)
+  })
+})
+
+// The reading before the add is taken on the wake's own connection, now: nothing the receiver cached or an earlier call
+// read counts.
+for (const [label, over, reason] of [
+  ["the thread has become active", active, "busy"],
+  ["its newest turn was interrupted", { "thread/turns/list": () => ok({ data: [{ id: "t1", status: "interrupted" }], nextCursor: null }) }, "stopped"],
+  ["it is no longer in the loaded list", { "thread/loaded/list": () => ok({ data: [], nextCursor: null }) }, "offline"],
+  ["it reads as notLoaded", { "thread/read": () => ok({ thread: thread({ status: { type: "notLoaded" } }) }) }, "offline"],
+  ["it has become a child", { "thread/read": () => ok({ thread: thread({ parentThreadId: "p" }) }) }, "offline"],
+  ["its status is one the plugin does not know", { "thread/read": () => ok({ thread: thread({ status: { type: "systemError" } }) }) }, "unknown"],
+]) {
+  test(`a wake whose fresh read finds that ${label} sends no add, and defers as ${reason}`, async () => {
+    const { result, methods } = await wakeWith(over)
+    assert.deepEqual(result, { outcome: "deferred", reason })
+    assert.equal(methods.includes("thread/queue/add"), false, "no add frame")
+  })
+}
+
+test("the reading before an add is taken afresh by every wake: the thread that was idle for the last one is busy for this one", async () => {
+  let busy = false
+  await withServer(queueServer({
+    "thread/read": () => ok({ thread: thread({ status: { type: busy ? "active" : "idle", ...(busy ? { activeFlags: [] } : {}) } }) }),
+    "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }),
+  }), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    await bound.bind()
+    assert.equal((await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 })).outcome, "handed")
+    busy = true
+    server.log.length = 0
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 }), { outcome: "deferred", reason: "busy" })
+    assert.equal(server.methods().includes("thread/queue/add"), false)
+  })
+})
+
+// The interruption is the one change that the status and the mode cannot show: the thread is idle after it too. So the
+// newest turn is read last, after the resume answer, and an interruption that lands between them is seen.
+test("an interruption that lands after the resume answer is seen: the newest turn is read last", async () => {
+  let interrupted = false
+  const { result, methods } = await wakeWith({
+    "thread/resume": () => { interrupted = true; return ok({ thread: thread(), collaborationMode: { mode: "default", settings: {} } }) },
+    "thread/turns/list": () => ok({ data: [{ id: "t1", status: interrupted ? "interrupted" : "completed" }], nextCursor: null }),
+  })
+  assert.deepEqual(result, { outcome: "deferred", reason: "stopped" })
+  assert.deepEqual(methods, [...OPENS, ...READS], "all four reads, the turn list last, and no add frame")
+})
+
+// Only a newest turn that is known to be finished clears the thread, and the one finished status that the plugin knows is
+// `completed`. A running turn is busy, an interrupted one is stopped, and anything else says nothing about the thread: no
+// turn, a turn without a status, a status that is not a string or is not known (a failed turn included, which the
+
+for (const [label, data, reason] of NEWEST) {
+  test(`a wake whose newest turn is ${label} sends no add, and defers as ${reason}`, async () => {
+    const { result, methods } = await wakeWith({ "thread/turns/list": () => ok({ data, nextCursor: null }) })
+    assert.deepEqual(result, { outcome: "deferred", reason })
+    assert.deepEqual(methods, [...OPENS, ...READS], "all four reads, and no add frame")
+  })
+}
+
+// A status type that is not a string is no status, in the read record or the resume record: a wake never goes through on it.
+test("a status type that is not a string never lets a wake through, in the read record or in the resume record", async () => {
+  for (const type of [["idle"], ["active"], ["notLoaded"], [["idle"]], 7, {}, { idle: true }, null, true]) {
+    for (const over of [
+      { "thread/read": () => ok({ thread: thread({ status: { type } }) }) },
+      { "thread/resume": () => ok({ thread: thread({ status: { type } }), collaborationMode: { mode: "default", settings: {} } }) },
+    ]) {
+      const woken = await wakeWith(over)
+      assert.deepEqual(woken.result, { outcome: "deferred", reason: "unknown" }, `${Object.keys(over)[0]}: ${JSON.stringify(type)}`)
+      assert.equal(woken.methods.includes("thread/queue/add"), false, "no add frame")
+    }
+  }
+})
+
+// ---- an idle read record must be complete before the reading goes on ---------------------------------------------------
+// A bind requires the origin, the `ephemeral` flag and a named provider of the read record; a later idle read requires the
+// same before it goes on to the resume. Each leg has a complete resume record and a completed newest turn, so only the read
+// record can be the cause. `observeArmed` binds against a healthy thread first, so the provider is fixed.
+async function observeArmed(over) {
+  const gate = armed(over)
+  return withServer(gate.handler, async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    gate.arm()
+    server.log.length = 0
+    return { result: await bound.observe(), methods: server.methods() }
+  })
+}
+const readRecord = record => ({ "thread/read": () => ok({ thread: record }) })
+for (const [label, record] of [
+  ["no origin (source)", without("source")],
+  ["an origin that is a number", thread({ source: 7 })],
+  ["an origin that is an empty array", thread({ source: [] })],
+  ["an empty origin", thread({ source: "" })],
+  ["no ephemeral flag", without("ephemeral")],
+  ["no model provider", without("modelProvider")],
+  ["an empty model provider", thread({ modelProvider: "" })],
+]) {
+  test(`an idle read record with ${label} is unknown: the resume is not asked, and a wake sends no add`, async () => {
+    const { result, methods } = await observeArmed(readRecord(record))
+    assert.deepEqual(result, { reason: "unknown", observed: { status: "idle", stopped: false, plan: null } })
+    assert.deepEqual(methods, ["initialize", "thread/loaded/list", "thread/read"], "the resume request is never sent")
+    const woken = await wakeWith(readRecord(record))
+    assert.deepEqual(woken.result, { outcome: "deferred", reason: "unknown" })
+    assert.deepEqual(woken.methods, [...OPENS, "thread/loaded/list", "thread/read"], "the resume request is never sent, and no add frame")
+  })
+}
+
+// The completeness check comes last of the read record's checks: a child, a changed named provider and a thread that is not
+// idle are answered as they were, whatever else the record lacks.
+test("an incomplete read record still answers child, stale_binding, offline and busy first: only an idle one is unknown", async () => {
+  const bare = { id: THREAD, status: { type: "idle" } }
+  for (const [label, record, reason, wakeReason] of [
+    ["a parent", thread({ parentThreadId: "p" }), "child", "offline"],
+    ["a parent and nothing else", { ...bare, parentThreadId: "p" }, "child", "offline"],
+    ["notLoaded and nothing else", { id: THREAD, status: { type: "notLoaded" } }, "offline", "offline"],
+    ["no provider", without("modelProvider"), "unknown", "unknown"],
+    ["another named provider and no origin", { ...without("source"), modelProvider: "other" }, "stale_binding", "stale_binding"],
+    ["an active status and no origin", { ...without("source"), status: { type: "active", activeFlags: [] } }, "busy", "busy"],
+  ]) {
+    const { result } = await observeArmed(readRecord(record))
+    assert.equal(result.reason, reason, label)
+    const woken = await wakeWith(readRecord(record))
+    assert.deepEqual(woken.result, { outcome: "deferred", reason: wakeReason }, `wake: ${label}`)
+    assert.equal(woken.methods.includes("thread/resume"), false, `${label}: the read record ended the reading`)
+    assert.equal(woken.methods.includes("thread/queue/add"), false, `${label}: no add frame`)
+  }
+})
+
+// Both connections of a wake must reach the one socket that was checked: the same device and inode.
+// A wake on a thread that no bind has probed asks the probe first, on the add connection, before it opens the reading's.
+const PROBE = "thread/queue/delete"
+const swapping = (socket, inodes, field = "ino") => path => {
+  const info = lstatSync(path)
+  return path === socket ? Object.create(info, { [field]: { value: inodes() } }) : info
+}
+async function wakeOverSwapping(inodes, proceed, field) {
+  const confirmed = { "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) }
+  return withServer(queueServer(confirmed), async (path, server) => {
+    let calls = 0
+    const lstat = swapping(realpathSync(path), () => inodes(++calls), field)
+    const bound = createThread({ path, threadId: THREAD, open: (target, options) => openAppServer(target, { ...options, lstat }) })
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000, proceed })
+    return { result, methods: server.methods(), connections: server.state.connections }
+  })
+}
+
+test("a socket replaced between the two connects is refused: the reading is not taken, and no add is sent", async () => {
+  const { result, methods, connections } = await wakeOverSwapping(call => (call === 1 ? 100 : 200))
+  assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+  assert.deepEqual(methods, ["initialize", PROBE], "only the add connection was made, and it asked only the probe")
+  assert.equal(connections, 1, "the second connection was refused before it was made")
+})
+
+test("a socket replaced after the reading, before the add frame, sends no add and does not ask the receiver", async () => {
+  let asked = 0
+  const { result, methods } = await wakeOverSwapping(call => (call <= 2 ? 100 : 200), () => { asked += 1; return null })
+  assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+  assert.deepEqual(methods, ["initialize", PROBE, "initialize", ...READS], "the probe and the reads were made, and no add frame")
+  assert.equal(asked, 0, "the receiver is not asked to adopt a reading from a socket that is gone")
+})
+
+test("a socket that is the same for the add connection, the reading and the add frame is used", async () => {
+  const { result, methods } = await wakeOverSwapping(() => 100)
+  assert.deepEqual(methods.slice(0, 8), ["initialize", PROBE, "initialize", ...READS, "thread/queue/add"])
+  assert.deepEqual(result, { outcome: "handed", reason: null })
+})
+// A socket is its device and its inode together: the same inode on another device is another socket.
+test("a socket on another device with the same inode is another socket: refused between the connects, and before the add", async () => {
+  const between = await wakeOverSwapping(call => (call === 1 ? 100 : 200), undefined, "dev")
+  assert.deepEqual(between.result, { outcome: "failed", reason: "native_unavailable" })
+  assert.deepEqual(between.methods, ["initialize", PROBE], "the second connection was refused before it was made")
+  const after = await wakeOverSwapping(call => (call <= 2 ? 100 : 200), () => null, "dev")
+  assert.deepEqual(after.result, { outcome: "failed", reason: "native_unavailable" })
+  assert.deepEqual(after.methods, ["initialize", PROBE, "initialize", ...READS], "the reads, and no add frame")
+  const same = await wakeOverSwapping(() => 100, undefined, "dev")
+  assert.deepEqual(same.result, { outcome: "handed", reason: null }, "control: one device throughout is the same socket")
+})
+
+test("a probe taken on one device does not count for the same inode on another: replaced() says so, and the wake probes again", async () => {
+  await withServer(queueServer(handedItems), async (path, server) => {
+    const socket = realpathSync(path)
+    let moved = false
+    const lstat = name => {
+      const info = lstatSync(name)
+      return moved && name === socket ? Object.create(info, { dev: { value: info.dev + 1 } }) : info
+    }
+    const bound = createThread({ path, threadId: THREAD, lstat, open: (target, options) => openAppServer(target, { ...options, lstat }) })
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.replaced(), false, "control: the probed socket")
+    moved = true
+    assert.equal(bound.replaced(), true)
+    server.log.length = 0
+    assert.deepEqual(await wakeNow(bound), { outcome: "handed", reason: null })
+    assert.deepEqual(server.methods().slice(0, 3), ["initialize", PROBE, "initialize"], "the wake probed it before the reading")
+  })
+})
+
+// The wake's own probe has PROBE_MS, like a bind's, however much of the reservation is left.
+test("a wake's own probe that gets no answer gives up within PROBE_MS, and nothing is sent", async () => {
+  await withServer(queueServer({ [PROBE]: () => undefined }), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    const started = monotonic()
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: started + 6000 })
+    const took = monotonic() - started
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), ["initialize", PROBE])
+    assert.ok(took < 2500, `the probe gave up after ${took} ms`)
+    assert.equal(bound.route, null, "no answer is recorded")
+  })
+})
+// ---- the configured path is checked again before the add ---------------------------------------------------------------
+
+// The check before the add resolves the configured path again, from its first name, through the whole trust rule. It is not
+// enough that the canonical path of the add connection still holds the same socket: a link in the configured path may have
+// moved, and the path then selects another listener while the old socket is still there.
+// `<base>/current/app/control.sock` goes through the link `current`, which names `a`; `b` holds another app-server. Both answer a
+// wake the same way, and confirm its add.
+async function throughLink() {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "acr-")))
+  const handler = queueServer({ "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) })
+  const listen = async name => {
+    for (const path of [join(base, name), join(base, name, "app")]) {
+      mkdirSync(path, { mode: 0o700 })
+      chmodSync(path, 0o700)
+    }
+    return fakeAppServer(join(base, name, "app", "control.sock"), handler)
+  }
+  const old = await listen("a")
+  const next = await listen("b")
+  symlinkSync(join(base, "a"), join(base, "current"))
+  return {
+    base, old, next, path: join(base, "current", "app", "control.sock"),
+    // A new link renamed over the old one, as an operator switches `current`.
+    retarget() {
+      symlinkSync(join(base, "b"), join(base, "current.new"))
+      renameSync(join(base, "current.new"), join(base, "current"))
+    },
+    async close() { await old.close(); await next.close(); rmSync(base, { recursive: true, force: true }) },
+  }
+}
+
+// An `open` for `createThread` that calls `after` once the connection with this number (counted from 0) has closed. A wake opens
+// the connection for the add first and the reading's second, and closes the reading's before it checks the path and adds.
+function afterClose(number, after) {
+  let opened = 0
+  return async (target, options) => {
+    const link = await openAppServer(target, options)
+    const mine = opened++
+    return { identity: link.identity, same: link.same, request: link.request, close() { link.close(); if (mine === number) after() } }
+  }
+}
+const addsTo = server => server.methods().filter(method => method === "thread/queue/add").length
+
+test("a link in the configured path that moves after the reading sends no add, though the socket that was reached is still there", async () => {
+  const w = await throughLink()
+  try {
+    const wake = async moved => {
+      let asked = 0
+      const bound = createThread({ path: w.path, threadId: THREAD, open: afterClose(1, moved) })
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000, proceed: () => { asked += 1; return null } })
+      return { result, asked }
+    }
+    assert.deepEqual(await wake(() => {}), { result: { outcome: "handed", reason: null }, asked: 1 }, "control: with the link where it was, the same wake is handed")
+    assert.equal(addsTo(w.old), 1)
+    w.old.log.length = 0
+    assert.deepEqual(await wake(() => w.retarget()), { result: { outcome: "failed", reason: "native_unavailable" }, asked: 0 }, "the reading's connection closed, then the link moved")
+    assert.equal(addsTo(w.old), 0, "the old socket, which is still there, was sent nothing")
+    assert.equal(w.next.state.connections, 0, "and the new one was never connected to")
+  } finally { await w.close() }
+})
+
+test("the configured path must still pass the whole trust rule before the add: a directory that others can write by then sends no add", async () => {
+  const w = await throughLink()
+  try {
+    const bound = createThread({ path: w.path, threadId: THREAD, open: afterClose(1, () => chmodSync(join(w.base, "a", "app"), 0o777)) })
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 })
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.equal(addsTo(w.old), 0, "the socket is the same one, but its directory is no longer one that nobody else can change")
+  } finally { await w.close() }
+})
+// ---- the probe belongs to the socket it was taken on -----------------------------------------------------------------
+
+const handedItems = { "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) }
+// Another listener takes over `path` without that path ever being bound twice: it listens under a second name and is renamed
+// over the first, so the two sockets have different inodes and the first one is still alive.
+async function replaceSocket(path, handler) {
+  const spare = `${path}.next`
+  const next = await fakeAppServer(spare, handler)
+  renameSync(spare, path)
+  return next
+}
+const wakeNow = bound => bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 })
+
+test("a probe taken on one socket does not count on another: the wake probes the replacement on its add connection before any add", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.route, true)
+    assert.equal((await wakeNow(bound)).outcome, "handed")
+    assert.deepEqual(first.methods().slice(4), [...OPENS, ...READS, "thread/queue/add", "thread/queue/delete", "thread/items/list"], "control: on the socket that was probed, the wake does not probe again")
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.route, true, "the cached answer is still the one for the first socket")
+    assert.deepEqual(await wakeNow(bound), { outcome: "handed", reason: null })
+    assert.deepEqual(second.methods(), ["initialize", "thread/queue/delete", "initialize", ...READS, "thread/queue/add", "thread/queue/delete", "thread/items/list"], "the probe is the first request after the add connection opens, before the reading and the add")
+    assert.match(second.log[1].params.queuedSubmissionId, /^[0-9a-f-]{36}$/, "it is the probe: an id nobody queued")
+    assert.equal(first.methods().filter(method => method === "thread/queue/add").length, 1, "the first socket was not asked again")
+    second.log.length = 0
+    await wakeNow(bound)
+    assert.deepEqual(second.methods().slice(0, 3), [...OPENS, "thread/loaded/list"], "the replacement is probed once: the next wake on it does not probe")
+  } finally { await first.close(); await second?.close() }
+})
+
+test("a replacement that does not answer the probe as documented gets no add: the wake fails and the route is off", async () => {
+  for (const answer of [() => ok({ deleted: true }) /* never observed live */, () => ({ error: { code: -32601, message: "method not found" } }), () => ok({})]) {
+    const path = socketPath()
+    const first = await fakeAppServer(path, queueServer(handedItems))
+    const bound = createThread({ path, threadId: THREAD })
+    let second
+    try {
+      assert.equal((await bound.bind()).status, "bound")
+      second = await replaceSocket(path, queueServer({ ...handedItems, "thread/queue/delete": answer }))
+      assert.deepEqual(await wakeNow(bound), { outcome: "failed", reason: "native_unavailable" })
+      assert.deepEqual(second.methods(), ["initialize", "thread/queue/delete"], "only the probe was sent: no reading, no add")
+      assert.equal(first.methods().includes("thread/queue/add"), false)
+      assert.equal(bound.route, false, "the answer for the socket that is there now")
+    } finally { await first.close(); await second?.close() }
+  }
+})
+
+test("a replacement that cannot complete the probe gets no add either, and nothing is recorded for it", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    await bound.bind()
+    second = await replaceSocket(path, queueServer({ ...handedItems, "thread/queue/delete": (_message, { socket }) => { socket.destroy() } }))
+    assert.deepEqual(await wakeNow(bound), { outcome: "failed", reason: "native_unavailable" })
+    assert.equal(second.methods().includes("thread/queue/add"), false)
+    assert.equal(bound.route, true, "a transport failure is not an answer: the cached route is untouched")
+  } finally { await first.close(); await second?.close() }
+})
+
+test("a bind on a replaced socket probes it again, and a bind on the same socket does not", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    await bound.bind()
+    first.log.length = 0
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.route, true)
+    assert.equal(first.methods().includes("thread/queue/delete"), false, "the same socket is not probed twice")
+    second = await replaceSocket(path, queueServer({ ...handedItems, "thread/queue/delete": () => ok({ deleted: true }) })) // never observed live
+    assert.deepEqual(await bound.bind(), { status: "bound" }, "the replacement was probed, and answered differently")
+    assert.equal(bound.route, false)
+    assert.equal(second.methods().includes("thread/queue/delete"), true)
+  } finally { await first.close(); await second?.close() }
+})
+
+// The receiver asks this at each heartbeat while the route is off: the configured path through the trust check, no connection.
+test("the thread tells whether its path still names the socket of its newest probe, and nothing is connected to", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  const bound = createThread({ path, threadId: THREAD })
+  let second
+  try {
+    assert.equal(bound.replaced(), false, "nothing was probed, so there is no socket to compare with")
+    await bound.bind()
+    assert.equal(bound.replaced(), false, "the probed socket is still there")
+    const connections = first.state.connections
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.replaced(), true, "the path names another socket now")
+    assert.equal(first.state.connections + second.state.connections, connections, "asking connected to nothing")
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.route, true)
+    assert.equal(bound.replaced(), false, "the replacement was probed: it is the socket that counts now")
+    renameSync(path, `${path}.gone`)
+    assert.equal(bound.replaced(), false, "a path that names nothing has no other socket to probe")
+  } finally { await first.close(); await second?.close() }
+})
+
+// Only another socket that passes the trust check is a replacement. Whatever else the path names or fails to name (a regular file,
+// a directory that became a file, an unreadable path, another user's socket), there is nothing to probe: the receiver does not
+// bind again, and the heartbeat's ordinary read goes on and reports the thread offline.
+// A thread that has probed a live socket in a directory of its own, for the task to change what the path names.
+async function probedAt(task, options = {}) {
+  const base = mkdtempSync(join(dir, "r-"))
+  const parent = join(base, "d")
+  mkdirSync(parent, { mode: 0o700 })
+  chmodSync(parent, 0o700)
+  const path = join(parent, "s.sock")
+  const server = await fakeAppServer(path, queueServer(handedItems))
+  try {
+    const bound = createThread({ path, threadId: THREAD, ...options })
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.route, true)
+    return await task({ bound, path, parent })
+  } finally { await server.close() }
+}
+
+test("replaced() is false when a regular file took the path: it is not a socket, so there is nothing to probe", async () => {
+  await probedAt(async ({ bound, path }) => {
+    assert.equal(bound.replaced(), false, "control: the probed socket is still there")
+    renameSync(path, `${path}.moved`)
+    writeFileSync(path, "")
+    assert.equal(bound.replaced(), false)
+  })
+})
+
+test("replaced() is false when a directory above the socket became a file (ENOTDIR)", async () => {
+  await probedAt(async ({ bound, path, parent }) => {
+    renameSync(parent, `${parent}.moved`)
+    writeFileSync(parent, "")
+    assert.throws(() => lstatSync(path), { code: "ENOTDIR" }, "control: this is what the path gives")
+    assert.equal(bound.replaced(), false)
+  })
+})
+
+test("replaced() is false whatever else the lstat fails with, not only ENOENT: a loop of links (ELOOP), EACCES, an error with no code", async () => {
+  await probedAt(async ({ bound, path, parent }) => {
+    renameSync(parent, `${parent}.moved`)
+    symlinkSync(parent, parent) // the name of the directory is a link to itself
+    assert.throws(() => lstatSync(path), { code: "ELOOP" }, "control: this is what the path gives")
+    assert.equal(bound.replaced(), false)
+  })
+  for (const code of ["EACCES", "ENAMETOOLONG", undefined]) {
+    const failing = () => { throw Object.assign(new Error("lstat failed"), code === undefined ? {} : { code }) }
+    await probedAt(async ({ bound }) => assert.equal(bound.replaced(), false, String(code)), { lstat: failing })
+  }
+})
+
+test("replaced() is true only for another socket of the current user: another user's socket is refused at a bind, not probed", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  let second
+  try {
+    let owner = process.geteuid() + 1
+    const bound = createThread({ path, threadId: THREAD, lstat: target => Object.create(lstatSync(target), { uid: { value: owner } }) })
+    await bound.bind()
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.replaced(), false, "another socket took the path, but another user owns it")
+    owner = process.geteuid()
+    assert.equal(bound.replaced(), true, "control: seen as the current user's, the same socket is a replacement")
+  } finally { await first.close(); await second?.close() }
+})
+
+test("replaced() looks at nothing before a probe has finished, and afterwards only through the trust check, connecting to nothing", async () => {
+  const path = socketPath()
+  const first = await fakeAppServer(path, queueServer(handedItems))
+  let calls = 0
+  const bound = createThread({ path, threadId: THREAD, lstat: target => { calls += 1; return lstatSync(target) } })
+  let second
+  try {
+    assert.equal(bound.replaced(), false)
+    assert.equal(calls, 0, "no probe has finished: the path is not looked at")
+    await bound.bind()
+    const connections = first.state.connections
+    assert.equal(bound.replaced(), false, "the socket that was probed, unchanged")
+    assert.ok(calls > 0, "the path was walked")
+    second = await replaceSocket(path, queueServer(handedItems))
+    assert.equal(bound.replaced(), true, "another socket")
+    renameSync(path, `${path}.gone`)
+    assert.equal(bound.replaced(), false, "no socket")
+    assert.equal(first.state.connections + second.state.connections, connections, "asking connected to nothing")
+  } finally { await first.close(); await second?.close() }
+})
+
+// No bind has probed the socket, so no cached answer can count: the receiver does not wake such a thread (its route is not
+
+// ---- the live layout: the configured path is a link whose final name links to the socket ---------------------------------
+// `codex app-server --listen unix://PATH` (codex-cli 0.171.0) leaves PATH as a symlink to a socket in a private directory of
+// its own. The probe, `replaced()` and `same()` all judge the socket at the end of the link. A raw lstat of PATH sees a link,
+// not a socket, and could never tell that the link now names another one. Real files, since the injected lstat fakes lstat only.
+async function finalLink() {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), "acl-")))
+  const listen = async name => {
+    mkdirSync(join(base, name), { mode: 0o700 })
+    chmodSync(join(base, name), 0o700)
+    return fakeAppServer(join(base, name, "h.sock"), queueServer(handedItems))
+  }
+  const one = await listen("one")
+  const two = await listen("two")
+  const path = join(base, "control.sock")
+  symlinkSync(join(base, "one", "h.sock"), path)
+  return {
+    one, two, path,
+    // A new link renamed over the old one, as a restarted app-server leaves it.
+    retarget() {
+      symlinkSync(join(base, "two", "h.sock"), `${path}.new`)
+      renameSync(`${path}.new`, path)
+    },
+    async close() { await one.close(); await two.close(); rmSync(base, { recursive: true, force: true }) },
+  }
+}
+
+test("through a final link, the bind probes the socket, replaced() is false, and it is true once the link names another socket", async () => {
+  const w = await finalLink()
+  try {
+    const bound = createThread({ path: w.path, threadId: THREAD })
+    assert.equal(lstatSync(w.path).isSymbolicLink(), true, "control: the configured path is a link")
+    assert.deepEqual(await bound.bind(), { status: "bound" })
+    assert.equal(bound.route, true)
+    assert.ok(w.one.methods().includes("thread/queue/delete"), "the probe went to the socket at the end of the link")
+    assert.equal(bound.replaced(), false, "the link still names the probed socket")
+    const connections = w.one.state.connections
+    w.retarget()
+    assert.equal(bound.replaced(), true, "the link now names another socket")
+    assert.equal(w.two.state.connections, 0, "asking connected to nothing")
+    assert.equal(w.one.state.connections, connections)
+  } finally { await w.close() }
+})
+
+test("through a final link a wake is handed, and a link retargeted between the reading and the add sends no add", async () => {
+  const w = await finalLink()
+  try {
+    const wake = async moved => {
+      let asked = 0
+      const bound = createThread({ path: w.path, threadId: THREAD, open: afterClose(1, moved) })
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000, proceed: () => { asked += 1; return null } })
+      return { result, asked }
+    }
+    assert.deepEqual(await wake(() => {}), { result: { outcome: "handed", reason: null }, asked: 1 }, "control: through the link, the wake is handed")
+    assert.equal(addsTo(w.one), 1)
+    assert.deepEqual(await wake(() => w.retarget()), { result: { outcome: "failed", reason: "native_unavailable" }, asked: 0 }, "same() saw the link move")
+    assert.equal(addsTo(w.one), 1, "the socket that was reached was sent no second add")
+    assert.equal(w.two.state.connections, 0, "and the new one was never connected to")
+  } finally { await w.close() }
+})
+
+// No bind has probed the socket, so no cached answer can count: the receiver does not wake such a thread (its route is not
+// true), and `wake` itself still adds only after a positive probe on the very socket it will use.
+test("a wake on a thread that no bind has probed asks the probe first, and a probe that is not positive sends no add", async () => {
+  for (const answer of [() => ok({ deleted: true }) /* never observed live */, () => ok({}), () => ({ error: { code: -32600, message: "unknown queue entry" } })]) {
+    await withServer(queueServer({ "thread/queue/delete": answer }), async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD })
+      assert.deepEqual(await wakeNow(bound), { outcome: "failed", reason: "native_unavailable" })
+      assert.deepEqual(server.methods(), ["initialize", PROBE], "the probe, and nothing after it")
+      assert.equal(bound.route, false, "what the wake learned is kept for this socket")
+    })
+  }
+  await withServer(queueServer(handedItems), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    assert.equal(bound.route, null)
+    assert.equal((await wakeNow(bound)).outcome, "handed")
+    assert.equal(server.methods().filter(method => method === PROBE).length, 2, "the probe, and the fence")
+    server.log.length = 0
+    assert.equal((await wakeNow(bound)).outcome, "handed")
+    assert.equal(server.methods().filter(method => method === PROBE).length, 1, "the answer is cached for this socket: the fence only")
+  })
+})
+
+// A reply that is not a JSON object is a protocol error that arrives after the frame was written: it settles `uncertain`,
+// and never reaches the code that reads the reply as a record.
+test("a reply that is not an object, to the add or to the fence, is uncertain and is not an exception", async () => {
+  for (const method of ["thread/queue/add", "thread/queue/delete"]) {
+    for (const reply of [null, [], "text", 7]) {
+      const { result, methods } = await wakeWith({ [method]: () => ok(reply) })
+      assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" }, `${method} answered ${JSON.stringify(reply)}`)
+      assert.equal(methods.filter(name => name === "thread/queue/add").length, 1, "the add is not repeated")
+    }
+  }
+})
+
+test("the add is the next request after the last read of the wake, and a failed read sends none", async () => {
+  const { methods } = await wakeWith({})
+  assert.deepEqual(methods.slice(0, 7), [...OPENS, ...READS, "thread/queue/add"], "nothing is asked between the last answer and the add")
+  const { result, methods: failed } = await wakeWith({ "thread/turns/list": () => ({ error: { code: -32600, message: "x" } }) })
+  assert.deepEqual(result, { outcome: "deferred", reason: "unknown" }, "a refused newest-turn lookup reads the state as unknown")
+  assert.equal(failed.includes("thread/queue/add"), false)
+})
+// `ready` is the caller's own check after the reading (the receiver asks the ledger for the mute again). It sends nothing to
+// the app-server, so the add is still the next request after the last read; a reason from it, or a throw, sends no add.
+test("a wake awaits ready after its reading and before the add: null goes on, a reason defers, a throw fails, and none sends to the app-server", async () => {
+  for (const [label, ready, expected] of [
+    ["null", async () => null, null],
+    ["muted", async () => "muted", { outcome: "deferred", reason: "muted" }],
+    ["a throw", async () => { throw new Error("x") }, { outcome: "failed", reason: "native_unavailable" }],
+  ]) {
+    const gate = armed({})
+    await withServer(gate.handler, async (path, server) => {
+      const ticks = clock()
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+      await bound.bind()
+      gate.arm()
+      server.log.length = 0
+      let seenAtReady = null
+      const result = await bound.wake({
+        text: "t", attemptId: "attempt-9", until: ticks.now() + 5000,
+        ready: () => { seenAtReady = server.methods(); return ready() },
+      })
+      assert.deepEqual(seenAtReady, [...OPENS, ...READS], `${label}: ready is asked once the reading is done`)
+      if (expected === null) {
+        assert.deepEqual(server.methods().slice(0, 7), [...OPENS, ...READS, "thread/queue/add"], `${label}: the add is still the next request`)
+      } else {
+        assert.deepEqual(result, expected, label)
+        assert.deepEqual(server.methods(), [...OPENS, ...READS], `${label}: nothing more went to the app-server`)
+      }
+    })
+  }
+})
+
+// `ready` is not started without the time for an add after it: a suspend during the reading (wall +45 s, monotonic +1 s)
+// fails the wake before the status is asked again. With the clocks in step, `ready` is called exactly once.
+for (const [label, wallStep, calls] of [
+  ["a suspend during the reading fails the wake before ready is asked, and nothing follows the reads", 45_000, 0],
+  ["with the clocks in step, ready is asked exactly once", 1_000, 1],
+]) {
+  test(label, async () => {
+    const gate = armed({})
+    const ticks = clock()
+    let wallTime = 1_800_000_000_000
+    let reading = false
+    const handler = (message, connection) => {
+      if (reading && message.method === "thread/turns/list") { reading = false; ticks.time.now += 1_000; wallTime += wallStep }
+      return gate.handler(message, connection)
+    }
+    await withServer(handler, async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+      await bound.bind()
+      gate.arm()
+      reading = true
+      server.log.length = 0
+      let asked = 0
+      const result = await bound.wake({
+        text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + 5_000,
+        ready: async () => { asked += 1; return null },
+      })
+      assert.equal(asked, calls, label)
+      if (calls === 0) {
+        assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+        assert.deepEqual(server.methods(), [...OPENS, ...READS], "nothing follows the reads")
+      } else {
+        assert.equal(server.methods().filter(method => method === "thread/queue/add").length, 1)
+      }
+    })
+  })
+}
+
+// The first check after the connect counts the wall clock too: a wake that starts with 300 ms of wall budget (a suspend
+// between the claim and the wake) reads nothing.
+test("a wake that starts with too little wall budget fails after its connect and reads nothing", async () => {
+  const gate = armed({})
+  await withServer(gate.handler, async (path, server) => {
+    const ticks = clock()
+    const wallTime = 1_800_000_000_000
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + SETTLE_MS + 300 })
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), ["initialize"], "the add connection opened, and nothing was read")
+  })
+})
+
+// Every request of the fresh reading is bounded by the two-clock budget, asked again for each one. Here only the wall clock
+// moves, between the `thread/read` answer and the `thread/resume` request (a suspend there), leaving 100 ms of wall budget,
+// and the app-server never answers the resume: the request gives up within that budget (the monotonic clock alone would
+// allow REQUEST_MS, 3 s), and the wake fails with nothing more sent.
+test("a suspend between two reads of the wake bounds the next read by the wall budget, and the wake fails within it", async () => {
+  const gate = armed({})
+  const ticks = clock()
+  let wallTime = 1_800_000_000_000
+  let reading = false
+  const handler = (message, connection) => {
+    if (reading && message.method === "thread/resume") return undefined // never answered
+    const answer = gate.handler(message, connection)
+    if (reading && message.method === "thread/read") wallTime += 3_900 // the host sleeps once the read is answered
+    return answer
+  }
+  await withServer(handler, async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+    await bound.bind()
+    gate.arm()
+    reading = true
+    server.log.length = 0
+    const started = performance.now()
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + 5_000 })
+    const waited = performance.now() - started
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), [...OPENS, "thread/loaded/list", "thread/read", "thread/resume"], "nothing after the unanswered resume")
+    assert.ok(waited < 1_000, `the resume waited ${Math.round(waited)} ms, not the monotonic REQUEST_MS`)
+  })
 })
 
 // ---- the app-server socket is trusted before each connect (the rule itself is tested in trust.test.js) ---------------
@@ -925,6 +2391,22 @@ test("an untrusted socket is refused before any connection: the bind says untrus
       assert.deepEqual(await bound.bind(), { status: "untrusted" })
       assert.equal(bound.provider, null)
       assert.equal((await bound.observe()).reason, "offline")
+      assert.equal(server.state.connections, 0, "not one connection was made")
+    } finally { await server.close() }
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("an untrusted socket gets no wake: the wake fails before any connection, and chat is not touched", async () => {
+  const base = mkdtempSync(join(tmpdir(), "acu-"))
+  try {
+    const where = mkdtempSync(join(base, "d-"))
+    chmodSync(where, 0o777)
+    const path = join(where, "s.sock")
+    const server = await fakeAppServer(path, queueServer())
+    try {
+      const bound = createThread({ path, threadId: THREAD })
+      assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until: monotonic() + 5000 }), { outcome: "failed", reason: "native_unavailable" })
+      assert.equal(bound.route, null)
       assert.equal(server.state.connections, 0, "not one connection was made")
     } finally { await server.close() }
   } finally { rmSync(base, { recursive: true, force: true }) }
