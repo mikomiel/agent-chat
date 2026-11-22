@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -265,6 +267,69 @@ def test_worker_initial_partial_frame_has_whole_process_deadline(tmp_path):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=3)
+
+
+def _pipe_size(fd: int, size: int) -> None:
+    """Set a pipe's capacity where Linux allows it. A refusal (the per-user pipe quota, say) keeps the default."""
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, size)
+    except (AttributeError, OSError):
+        pass
+
+
+@pytest.mark.parametrize("delivery_enabled", [True])
+def test_a_parent_that_keeps_stdout_open_but_never_reads_cannot_hold_the_worker_past_its_deadline(join_frame, db):
+    # Issue #150. An empty pending answer inside the worker's own backoff needs no request, so these replies come
+    # at once and overfill the 64 KiB stdout pipe. The stalled write, the one-second error reply and the end request
+    # each run under a deadline, and nothing may be left buffered for the interpreter to flush at exit.
+    limit = 1.0
+    requests = [join_frame] + [{"id": index, "op": "pending"} for index in range(1, 2501)]
+    payload = "".join(json.dumps(request) + "\n" for request in requests).encode()
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import agent_chat.instance_worker as worker; "
+            f"worker.REQUEST_SECONDS = {limit}; "
+            "raise SystemExit(worker.main())",
+        ],
+        cwd=ROOT,
+        env={},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as process:
+        assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+        stdin = process.stdin.fileno()
+        # Known capacities before the worker writes anything: stdout fills at 64 KiB, and stdin holds every request.
+        _pipe_size(process.stdout.fileno(), 64 * 1024)
+        _pipe_size(stdin, len(payload))
+
+        def feed() -> None:
+            # Past the Python buffer, so closing stdin afterwards flushes nothing. A worker that has exited ends it.
+            view = memoryview(payload)
+            try:
+                while view:
+                    view = view[os.write(stdin, view) :]
+            except BrokenPipeError:
+                pass
+
+        # A thread, so that a worker which stops reading stdin cannot keep the parent from its deadline.
+        writer = threading.Thread(target=feed, daemon=True)
+        try:
+            started = time.monotonic()
+            writer.start()
+            # Stdin stays open, so only the stalled write can end the worker before its 90-second idle limit.
+            assert process.wait(timeout=2 * limit + 1 + 3) == 1
+            assert time.monotonic() - started >= limit + 1  # both writes stalled: the pipe was full
+            assert process.stderr.read() == b""
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+            writer.join(timeout=3)  # the dead worker's pipe ends the write
+    assert not writer.is_alive()
+    assert db.execute("SELECT ended_at FROM agent_chat.instances").fetchone()["ended_at"] is not None
 
 
 def _timed_worker(
