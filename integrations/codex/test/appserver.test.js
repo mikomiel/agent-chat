@@ -1350,6 +1350,25 @@ test("the confirmation polls until CONFIRM_MARGIN_MS before the settlement cutof
   })
 })
 
+// An empty answer that comes in just before `end` leaves no room for another poll: the wake settles at once, not after one
+// more CONFIRM_MS wait past its end.
+test("an empty confirmation that answers 20 ms before the end returns uncertain by the end, with no wait after it", async () => {
+  const ticks = clock()
+  let end = null
+  const gate = armed({ "thread/items/list": () => { ticks.time.now = end - 20; return ok({ data: [], nextCursor: null }) } })
+  await withServer(gate.handler, async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    const until = ticks.now() + 5000
+    end = until - SETTLE_MS
+    assert.deepEqual(await bound.wake({ text: "t", attemptId: "attempt-9", until }), { outcome: "uncertain", reason: "transport_ambiguous" })
+    assert.equal(server.methods().filter(method => method === "thread/items/list").length, 1)
+    assert.ok(ticks.now() <= end, `returned ${ticks.now() - end} ms after the end`)
+  })
+})
+
 test("a connection that never finishes ends the wake SETTLE_MS before the reservation too, with nothing sent", async () => {
   await withServer(() => undefined, async (path, server) => {
     const until = monotonic() + SETTLE_MS + 600
@@ -1462,7 +1481,8 @@ for (const [label, wallStep, budget, stepBack] of [
       assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
       assert.ok(server.methods().includes("thread/queue/add"), "the add passed its check")
       const elapsed = ticks.now() - checkedAt
-      assert.ok(elapsed <= budget && elapsed > budget - 500, `the confirmation polled for ${elapsed} ms of a ${budget} ms budget`)
+      // The last poll starts within CONFIRM_MARGIN_MS + CONFIRM_MS (550 ms) of the end, and no wait follows it.
+      assert.ok(elapsed <= budget && elapsed >= budget - 550, `the confirmation polled for ${elapsed} ms of a ${budget} ms budget`)
     })
   })
 }

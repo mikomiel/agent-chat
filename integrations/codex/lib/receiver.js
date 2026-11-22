@@ -602,6 +602,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (!settleRead(record, result)) return
         if (!result.current || observed === null) wakeAfter = now() + WAKE_RETRY_MS
       }
+      // The read took time: a poll whose start condition no longer holds (another request took the worker queue meanwhile,
+      // or the worker went) queues nothing, so it never waits behind that request and no hook waits behind it. The next poll
+      // tries again.
+      if (live !== record || closed || failure || inflight || delivering) return
       waking.queued = true // from here to the end, the poll's report and deliver hold the worker queue
       if (!(await report())) { wakeAfter = now() + WAKE_RETRY_MS; return }
       await guard(deliver({ wake: true }))

@@ -572,6 +572,7 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
             const seen = Array.isArray(page.data) && page.data.some(entry => entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId)
             if (seen) return { outcome: "handed", reason: null }
           } catch { return UNCERTAIN }
+          if (now() + CONFIRM_MS >= end - CONFIRM_MARGIN_MS) return UNCERTAIN // no other poll fits: do not wait past `end`
           await sleep(CONFIRM_MS)
         }
         return UNCERTAIN

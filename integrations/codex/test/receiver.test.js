@@ -3481,6 +3481,45 @@ test("a prompt during a slow refresh read, while a heartbeat holds the worker qu
   await settle()
 })
 
+// The refresh read comes back while another request (the periodic heartbeat) holds the worker queue: the poll queues nothing
+// behind it, so a prompt that arrives next answers at once on the usual path, and no claim happens until the queue is free
+// and a later poll runs.
+test("a refresh read that returns while a heartbeat holds the worker queue queues nothing, and a prompt then answers at once", async () => {
+  let releaseRead
+  let reads = 0
+  let releaseBeat = null
+  let holdBeat = false
+  const thread = wakeDouble({ observation: () => {
+    reads += 1
+    return reads === 1 ? new Promise(resolve => { releaseRead = () => resolve(IDLE) }) : IDLE
+  } })
+  const r = await rig({ thread, handlers: deliverable({
+    heartbeat: () => (holdBeat ? new Promise(resolve => { holdBeat = false; releaseBeat = () => resolve({}) }) : {}),
+  }) })
+  await r.begin()
+  await r.clock.advance(WAKE_POLL_MS) // the poll's refresh read is out
+  holdBeat = true
+  await r.clock.advance(30_000 - WAKE_POLL_MS) // the periodic tick reads and sends its heartbeat, which stays out
+  assert.equal(typeof releaseBeat, "function", "the heartbeat holds the worker queue")
+  const beats = r.worker.ops("heartbeat").length
+  releaseRead() // the refresh read returns first
+  await settle()
+  assert.equal(r.worker.ops("heartbeat").length, beats, "the poll queued no report behind the heartbeat")
+  const hook = hookDouble({ events: r.events })
+  let answered = false
+  void r.receiver.handle(turn(), hook).then(() => { answered = true })
+  await settle()
+  assert.equal(answered, true, "the prompt answers at once")
+  assert.deepEqual(hook.sent, [{ context: null }], "on the usual path for a busy queue: no claim")
+  releaseBeat()
+  await settle()
+  assert.deepEqual(r.worker.ops("pending"), [], "nothing asked pending while the heartbeat held the queue")
+  assert.deepEqual(r.worker.ops("claim"), [])
+  await r.op({ op: "stop", permission_mode: "default" })
+  await r.clock.advance(10_000) // past the backoff of the overtaken refresh read: a later poll runs
+  assert.equal(thread.adds.length, 1, "a later poll wakes once the queue is free")
+})
+
 test("a wake whose pending request outlives the prompt's patience leaves the prompt answering in time", async () => {
   const gate = holdWake("pending")
   const thread = wakeDouble()
