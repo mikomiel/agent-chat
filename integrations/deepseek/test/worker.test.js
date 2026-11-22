@@ -122,3 +122,30 @@ test("a request that outlives the parent-side deadline rejects with the core's R
   clock.fire(22_000)
   await assert.rejects(heartbeat, { code: "REQUEST_UNCERTAIN", operation: "heartbeat" })
 })
+
+// Issue #153: a spawn that fails after it returned (EMFILE, ENFILE) makes no pipes and emits `error` on the next tick.
+// The handler is installed first, so that error is never unhandled, and the missing pipes are a start failure.
+function pipelessChild(missing) {
+  const child = new EventEmitter()
+  child.stdin = missing === "stdin" ? null : new PassThrough()
+  child.stdout = missing === "stdout" ? null : new PassThrough()
+  child.kill = () => {}
+  return child
+}
+
+for (const missing of ["stdin", "stdout"]) {
+  test(`a spawn with no ${missing} that then emits an error is a start failure, and the error is handled`, async () => {
+    const child = pipelessChild(missing)
+    const spawnImpl = () => {
+      process.nextTick(() => child.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" })))
+      return child
+    }
+    const worker = startWorker(config, identity, { spawnImpl }) // does not throw
+    await assert.rejects(worker.ready, { code: "CHAT_WORKER_UNAVAILABLE", operation: "join" })
+    await new Promise(resolve => setImmediate(resolve)) // the error event is emitted, and nothing is unhandled
+    assert.equal(child.listenerCount("error"), 1)
+    assert.deepEqual(await worker.closed, { code: null, signal: null, started: false }) // it settles: no `close` event will come
+    await assert.rejects(worker.request("heartbeat", {}), { code: "CHAT_WORKER_CLOSED" })
+    assert.deepEqual(await worker.stop(), { code: null, signal: null, started: false }) // nothing to end
+  })
+}

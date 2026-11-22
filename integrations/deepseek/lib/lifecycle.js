@@ -386,7 +386,8 @@ export function createLifecycle(bus, delivery, config, {
   }
 
   function exitProved(result) {
-    return result === null || result === undefined || (result.code === 0 && !result.signal)
+    // A worker that never started (no pipes: EMFILE, ENFILE) sent nothing and left no process: nothing to wait for.
+    return result === null || result === undefined || result.started === false || (result.code === 0 && !result.signal)
   }
 
   function finishExit() {
