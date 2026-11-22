@@ -266,7 +266,8 @@ sends its request: it does not wait for the worker to end its instance.
   find the thread idle, its read record complete and Plan Mode known to be off;
   claims; asks the status (a muted session is deferred; a reservation that has
   500 ms or less left, before the status request or after it, settles `failed`,
-  since nothing was sent); takes a fresh reading on
+  since nothing was sent; for a wake that time is measured on both clocks);
+  takes a fresh reading on
   a second connection; asks the status again, since the reading can take
   seconds and a mute is the ledger's state (muted, or a status it cannot
   read, defers the batch and sends nothing); checks that the configured path, resolved again through
@@ -278,7 +279,11 @@ sends its request: it does not wait for the worker to end its instance.
   nothing), and takes the tighter of the two remaining budgets, once, as the
   end of every later request (the add, the fence and the confirmation), so a
   wake that resumes from a suspend does not hold the worker queue for the
-  monotonic rest of its reservation; asks the
+  monotonic rest of its reservation. Every step of a wake, from the claim to
+  the end of the confirmation, is bounded by the tighter of the two clocks:
+  each check between the claim and the add, the connects, the probe, every
+  request of the fresh reading and the second status call's start, and after
+  the add the end taken at that check; asks the
   receiver once more, with nothing awaited before the add, whether anything
   newer arrived since the clearing read (a hook event refuses it as the state
   now says, or `busy`; a newer read or a bind that unbound the thread refuses it

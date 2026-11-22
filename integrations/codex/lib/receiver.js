@@ -536,17 +536,20 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         // A reservation too short to write inside: a hook's write settles uncertain, as #143 has it. A wake has sent nothing
         // to the app-server yet (thread.wake is not called), so the batch settles failed and can be offered again.
         const tooShort = wake ? NOT_WRITTEN : UNCERTAIN
+        // The time since the claim. A wake counts the wall clock too, the larger elapsed time (a suspend stops the monotonic
+        // clock, not the server's reservation; a wall clock stepped back extends nothing). A hook counts the monotonic clock.
+        const elapsed = () => (wake ? Math.max(now() - started, wall() - startedWall) : now() - started)
         let result
         let replied = false
         if (unreachable()) result = NOT_WRITTEN
-        else if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = tooShort
+        else if (!(reservation - elapsed() > MIN_RESERVATION_MS)) result = tooShort
         else {
           const state = await ask("status")
           if (live !== record) return false
           if (check(state, "status")) result = { outcome: "deferred", reason: "unknown" }
           else if (unreachable()) result = NOT_WRITTEN
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
-          else if (started + reservation - now() <= MIN_RESERVATION_MS) result = tooShort // the status call used the reservation
+          else if (reservation - elapsed() <= MIN_RESERVATION_MS) result = tooShort // the status call used the reservation
           else if (wake) {
             // A wake's text is the fixed line and the four server-issued identifiers of each row, strictly checked: a row
             // that carries anything else is not queued.

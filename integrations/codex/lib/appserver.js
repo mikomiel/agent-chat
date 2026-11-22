@@ -321,12 +321,14 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     try { return await task(link) } finally { link.close() }
   }
 
-  // The time one request may take: the usual limit, or what is left before `deadline` when there is one.
-  const allowed = deadline => Math.max(1, Math.min(REQUEST_MS, deadline - now()))
+  // The time one request may take: the usual limit, or what `left` says is left when there is a budget. `left` is asked
+  // again for each request, so a wake's budget, which counts the wall clock too, bounds every one of them.
+  const allowed = left => Math.max(1, Math.min(REQUEST_MS, left()))
+  const unbounded = () => Infinity
 
-  async function loaded(link, deadline = Infinity) {
+  async function loaded(link, left = unbounded) {
     for (let cursor = null, page = 0; page < 10; page += 1) {
-      const answer = await link.request("thread/loaded/list", cursor ? { cursor } : {}, allowed(deadline))
+      const answer = await link.request("thread/loaded/list", cursor ? { cursor } : {}, allowed(left))
       if (!Array.isArray(answer.data)) throw failure("APP_SERVER_PROTOCOL")
       if (answer.data.includes(threadId)) return true
       if (typeof answer.nextCursor !== "string") return false
@@ -335,8 +337,8 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     return false
   }
 
-  async function read(link, deadline = Infinity) {
-    const answer = await link.request("thread/read", { threadId }, allowed(deadline))
+  async function read(link, left = unbounded) {
+    const answer = await link.request("thread/read", { threadId }, allowed(left))
     const thread = answer.thread
     if (thread === null || typeof thread !== "object" || thread.id !== threadId) throw failure("APP_SERVER_PROTOCOL")
     return thread
@@ -378,12 +380,12 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
   // other answers cannot show: the thread is idle after it too. The read record must be complete too before an idle read
   // goes on (the origin, the `ephemeral` flag and a named provider, as a bind requires); a child, an offline thread and a
   // thread that is not idle are answered before that, as they are. Nothing is written to the thread. Every request ends
-  // by `deadline`.
+  // within `left`, the budget that the caller gives (none for the heartbeat's read).
   // observed: { status, stopped, plan }; `reason` is null only when the thread is clear: idle, finished and not in Plan Mode.
-  async function evaluate(link, deadline = Infinity) {
+  async function evaluate(link, left = unbounded) {
     const observed = { status: "unknown", stopped: false, plan: null }
-    if (!(await loaded(link, deadline))) return { reason: "offline", observed: { ...observed, status: "offline" } }
-    const thread = await read(link, deadline)
+    if (!(await loaded(link, left))) return { reason: "offline", observed: { ...observed, status: "offline" } }
+    const thread = await read(link, left)
     const refusal = refusing(thread)
     if (refusal) return { reason: refusal, observed }
     observed.status = statusOf(thread)
@@ -391,7 +393,7 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     if (!complete(thread)) return { reason: "unknown", observed } // an idle read record that cannot show the origin or the provider
     // thread/resume subscribes this connection; the connection closes as soon as the reading ends.
     let resumed = null
-    try { resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(deadline)) } catch (error) { if (error?.code !== "APP_SERVER_ERROR") throw error }
+    try { resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(left)) } catch (error) { if (error?.code !== "APP_SERVER_ERROR") throw error }
     const record = resumed?.thread
     if (record === null || typeof record !== "object" || record.id !== threadId || typeof record.status?.type !== "string") {
       return { reason: "unknown", observed } // no record of its own: nothing newer than the read, and nothing to check it against
@@ -407,7 +409,7 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     // The mode is known from here on. A newest-turn lookup that fails (an error reply, a dropped connection) or answers in
     // a shape that is not the documented one keeps it: the running state is unknown, and the read is not offline.
     let turns = null
-    try { turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(deadline)) } catch { /* unknown */ }
+    try { turns = await link.request("thread/turns/list", { threadId, limit: 1, sortDirection: "desc" }, allowed(left)) } catch { /* unknown */ }
     // Only a newest turn that is known to be finished clears the thread. A turn that is running is busy; an interrupted one is
     // stopped; no turn, a turn without a status and a status that is not known say nothing, and an unknown state is not idle.
     const newest = Array.isArray(turns?.data) ? turns.data[0]?.status : undefined
@@ -524,27 +526,29 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
       const clientUserMessageId = `${CLIENT_ID_PREFIX}${attemptId}`
       const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
       const limit = until - SETTLE_MS
+      // What is left of the reservation: the tighter of the monotonic and the wall-clock budgets. The monotonic clock does not
+      // count a suspend and the server's reservation does, and a wall clock stepped back extends nothing. Every time decision
+      // and every request of the wake up to the add check takes this; the add and what follows it end by `end`, derived once.
+      const left = () => Math.min(limit - now(), wallUntil === null ? Infinity : wallUntil - SETTLE_MS - wall())
       let link
       // The connection, the upgrade and `initialize` end by the limit too: nothing has been sent yet when they fail.
-      try { link = await open(path, { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())) }) } catch { return { outcome: "failed", reason: "native_unavailable" } }
+      try { link = await open(path, { connectMs: Math.max(1, Math.min(CONNECT_MS, left())) }) } catch { return { outcome: "failed", reason: "native_unavailable" } }
       try {
-        if (limit - now() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
+        if (left() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
         // The probe says what the app-server behind one socket does, so only a positive answer taken on this very socket (its
         // device and inode) counts. Without one, because no bind has probed, the socket is another one or the answer was negative,
         // the wake probes it now, on the connection that will carry the add, and adds only on a positive answer. This is the one
         // request before the reading. (The receiver wakes a thread only when its bind probed positive, so this is a second guard.)
         if (probedOn(link.identity) !== true) {
           let route
-          try { route = await probe(link, Math.max(1, Math.min(PROBE_MS, limit - now()))) } catch { return { outcome: "failed", reason: "native_unavailable" } }
+          try { route = await probe(link, Math.max(1, Math.min(PROBE_MS, left()))) } catch { return { outcome: "failed", reason: "native_unavailable" } }
           probed = { route, dev: link.identity.dev, ino: link.identity.ino }
           if (!route) return { outcome: "failed", reason: "native_unavailable" }
         }
         let fresh
         try {
-          fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })
+          fresh = await withConnection(seen => evaluate(seen, left), { connectMs: Math.max(1, Math.min(CONNECT_MS, left())), expect: link.identity })
         } catch { return { outcome: "failed", reason: "native_unavailable" } }
-        // What is left of the reservation: the tighter of the monotonic and the wall-clock budgets.
-        const left = () => Math.min(limit - now(), wallUntil === null ? Infinity : wallUntil - SETTLE_MS - wall())
         if (ready) {
           // `ready` is not started without the time for an add after it, so a wake that resumes from a suspend near its end
           // sends nothing more and settles in time. Its own request has no timer: the worker serves one request at a time, so

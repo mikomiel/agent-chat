@@ -2416,6 +2416,27 @@ test("a wake granted a reservation too short to start settles failed, asks no st
 
 test("a wake whose status call uses up the reservation settles failed, calls no wake and is offered again", () => tooShortWake("status"))
 
+// The reservation checks between the claim and thread.wake count the wall clock for a wake: a suspend during the first
+// status call (wall +45 s, monotonic unchanged) leaves too little, so thread.wake is never called and the batch settles
+// failed, to be offered again.
+test("a suspend during a wake's first status call settles failed before thread.wake, and the batch is offered again", async () => {
+  let wallTime = 1_800_000_000_000
+  let armed = false
+  const thread = wakeDouble()
+  const r = await rig({ thread, wall: () => wallTime, handlers: deliverable({
+    status: () => { if (armed) { armed = false; wallTime += 45_000 } return { muted: false } },
+  }) })
+  await idleSession(r)
+  armed = true
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.equal(r.worker.ops("status").length, 1)
+  assert.deepEqual(thread.wakes, [], "thread.wake is never called")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+  await r.clock.advance(10_000)
+  assert.equal(r.worker.ops("claim").length, 2, "the batch is offered and claimed again")
+  assert.equal(thread.adds.length, 1, "and woken")
+})
+
 // A handed wake has no backoff: once its turn ends, the next poll wakes for the next message.
 test("after a handed wake and the Stop of its turn, the next poll wakes at once", async () => {
   const thread = wakeDouble()

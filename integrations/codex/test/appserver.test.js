@@ -2243,6 +2243,53 @@ for (const [label, wallStep, calls] of [
   })
 }
 
+// The first check after the connect counts the wall clock too: a wake that starts with 300 ms of wall budget (a suspend
+// between the claim and the wake) reads nothing.
+test("a wake that starts with too little wall budget fails after its connect and reads nothing", async () => {
+  const gate = armed({})
+  await withServer(gate.handler, async (path, server) => {
+    const ticks = clock()
+    const wallTime = 1_800_000_000_000
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+    await bound.bind()
+    gate.arm()
+    server.log.length = 0
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + SETTLE_MS + 300 })
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), ["initialize"], "the add connection opened, and nothing was read")
+  })
+})
+
+// Every request of the fresh reading is bounded by the two-clock budget, asked again for each one. Here only the wall clock
+// moves, between the `thread/read` answer and the `thread/resume` request (a suspend there), leaving 100 ms of wall budget,
+// and the app-server never answers the resume: the request gives up within that budget (the monotonic clock alone would
+// allow REQUEST_MS, 3 s), and the wake fails with nothing more sent.
+test("a suspend between two reads of the wake bounds the next read by the wall budget, and the wake fails within it", async () => {
+  const gate = armed({})
+  const ticks = clock()
+  let wallTime = 1_800_000_000_000
+  let reading = false
+  const handler = (message, connection) => {
+    if (reading && message.method === "thread/resume") return undefined // never answered
+    const answer = gate.handler(message, connection)
+    if (reading && message.method === "thread/read") wallTime += 3_900 // the host sleeps once the read is answered
+    return answer
+  }
+  await withServer(handler, async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+    await bound.bind()
+    gate.arm()
+    reading = true
+    server.log.length = 0
+    const started = performance.now()
+    const result = await bound.wake({ text: "t", attemptId: "attempt-9", until: ticks.now() + 5_000, wallUntil: wallTime + 5_000 })
+    const waited = performance.now() - started
+    assert.deepEqual(result, { outcome: "failed", reason: "native_unavailable" })
+    assert.deepEqual(server.methods(), [...OPENS, "thread/loaded/list", "thread/read", "thread/resume"], "nothing after the unanswered resume")
+    assert.ok(waited < 1_000, `the resume waited ${Math.round(waited)} ms, not the monotonic REQUEST_MS`)
+  })
+})
+
 // ---- the app-server socket is trusted before each connect (the rule itself is tested in trust.test.js) ---------------
 
 const untrusted = { code: "CHAT_APPSERVER_UNTRUSTED" }
