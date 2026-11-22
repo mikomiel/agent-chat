@@ -2373,6 +2373,47 @@ test("a wake that settles anything but handed is not tried again inside WAKE_RET
   }
 })
 
+// The two reservation checks of a claim come before thread.wake is called, so for a wake nothing reached the app-server:
+// the batch settles failed and the ledger can offer it again, never uncertain. A hook's write keeps #143's results (see "a
+// reservation too short to write inside is uncertain and asks for no status"). Like any wake that did not hand, the receiver
+// waits WAKE_RETRY_MS before the next one. `leg` picks the check that the first wake attempt meets.
+async function tooShortWake(leg) {
+  let skewMs = 0
+  let armed = false
+  let claims = 0
+  const thread = wakeDouble()
+  const r = await rig({ thread, skew: () => skewMs, handlers: deliverable({
+    claim: fields => {
+      if (armed) claims += 1
+      const short = armed && claims === 1 && leg === "claim"
+      return { dispatch: true, attempt_id: `attempt-${claims}`, reservation_ms: short ? 400 : 30_000, messages: fields.messages.map(id => validRow(id)) }
+    },
+    status: () => {
+      if (armed && claims === 1 && leg === "status") skewMs += 29_600 // 400 ms of the reservation left after the status call
+      return { muted: false }
+    },
+  }) })
+  await idleSession(r)
+  armed = true
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.equal(r.worker.ops("claim").length, 1)
+  assert.equal(r.worker.ops("status").length, leg === "claim" ? 0 : 1, "the status is asked only with time left")
+  assert.deepEqual(thread.wakes, [], "thread.wake is never called")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+  await r.clock.advance(8_000)
+  assert.equal(r.worker.ops("claim").length, 1, "no claim inside WAKE_RETRY_MS")
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.equal(r.worker.ops("claim").length, 2, "the batch is offered and claimed again")
+  assert.equal(thread.adds.length, 1, "the second attempt wakes")
+  const results = r.worker.ops("settle").map(entry => entry.result)
+  assert.deepEqual(results, [{ outcome: "failed", reason: "native_unavailable" }, { outcome: "handed", reason: null }])
+  assert.ok(results.every(settleVocabulary))
+}
+
+test("a wake granted a reservation too short to start settles failed, asks no status, calls no wake and is offered again", () => tooShortWake("claim"))
+
+test("a wake whose status call uses up the reservation settles failed, calls no wake and is offered again", () => tooShortWake("status"))
+
 // A handed wake has no backoff: once its turn ends, the next poll wakes for the next message.
 test("after a handed wake and the Stop of its turn, the next poll wakes at once", async () => {
   const thread = wakeDouble()
@@ -2482,6 +2523,50 @@ test("a refusal before the claim spends no attempt, settles nothing and waits be
     assert.deepEqual(thread.calls, reason === "stale_binding" ? ["observe"] : ["observe", "observe"], reason)
   }
 })
+// The queued turn carries the fixed line and the rows, and nothing of the binding: the hooks show that.
+test("a wake's text is WAKE_PREFIX and the claimed rows only: no interpreter path, no instance file, no binding line", async () => {
+  const thread = wakeDouble()
+  const r = await rig({ thread, handlers: deliverable() })
+  await idleSession(r)
+  await r.clock.advance(WAKE_POLL_MS)
+  const [{ text }] = thread.wakes
+  assert.equal(text, `${WAKE_PREFIX}[{"id":"${uid(1)}","kind":"question","room_id":"${ROOM}","history_after":"1234"}]`)
+  assert.equal(text.includes(baseConfig.python), false, "no interpreter path")
+  assert.equal(text.includes(baseConfig.directory), false, "no instance file")
+  assert.doesNotMatch(text, /instance_file|Binding|AGENT_CHAT_INSTANCE_FILE|agent_chat\.cli/)
+})
+
+// The claim is sized by the wake's own renderer, with every row at its widest, so a batch it claims always renders. The
+// count is worked out here from the bytes alone.
+test("a wake claims a batch that fits its text at the widest, and claims nothing for one row more", async () => {
+  const widest = id => validRow(id, { kind: "consultation", history_after: "9".repeat(19) })
+  const width = bytes(JSON.stringify({ id: uid(1), kind: "consultation", room_id: ROOM, history_after: "9".repeat(19) }))
+  const size = count => bytes(WAKE_PREFIX) + 2 + count * width + (count - 1)
+  let most = 1
+  while (size(most + 1) <= MAX_OUTPUT_BYTES) most += 1
+  for (const count of [most, most + 1]) {
+    const ids = Array.from({ length: count }, (_, index) => uid(index + 1))
+    const thread = wakeDouble()
+    const r = await rig({ thread, handlers: deliverable({
+      pending: () => ({ messages: ids }),
+      claim: fields => ({ dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(widest) }),
+    }) })
+    await idleSession(r)
+    await r.clock.advance(WAKE_POLL_MS)
+    if (count === most) {
+      assert.equal(r.worker.ops("claim")[0]?.messages.length, most, "the batch at the bound is claimed whole")
+      assert.equal(thread.adds.length, 1, "and woken")
+      assert.equal(bytes(thread.adds[0].text), size(most))
+      assert.ok(bytes(thread.adds[0].text) <= MAX_OUTPUT_BYTES)
+      assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+    } else {
+      assert.deepEqual(r.worker.ops("claim"), [], "one row over is not claimed")
+      assert.deepEqual(r.worker.ops("settle"), [], "so nothing is claimed and then refused")
+      assert.deepEqual(thread.wakes, [])
+    }
+  }
+})
+
 // A conforming server offers at most 16 ids, and 16 rows at their widest fit the wake's bound at any binding the join admits.
 // Only a server that breaks that cap offers a batch that does not fit: the wake claims nothing and waits, it does not ask again
 // at every poll.
@@ -3148,6 +3233,68 @@ test("polls that fire while a slow refresh read is out make one read: the poll i
   release()
   await settle()
   assert.equal(r.receiver.state(), null, "the one read answered, and it is kept")
+})
+
+// A heartbeat that the worker did not confirm published nothing: the server still holds the state before it. The poll asks
+// for pending only once the current state is confirmed, and the next report sends it again instead of taking it as sent.
+// The gate's server keeps the last state that it accepted.
+test("a heartbeat after a start that answers SERVICE_UNAVAILABLE asks no pending, and the next poll publishes idle without waiting for the periodic heartbeat", async () => {
+  const gate = { published: null, ids: [], outage: false }
+  const handlers = deliverable({
+    heartbeat: fields => {
+      if (gate.outage) return { refused: "SERVICE_UNAVAILABLE" }
+      gate.published = fields.state.native_state
+      return {}
+    },
+    pending: () => ({ messages: gate.published === "unknown" ? [] : gate.ids }),
+  })
+  const thread = wakeDouble()
+  const r = await rig({ thread, handlers })
+  await r.begin()
+  assert.equal(gate.published, "unknown", "the start published the reset")
+  thread.calls.length = 0
+  gate.outage = true
+  gate.ids = [uid(1)]
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.deepEqual(thread.calls, ["observe"], "the poll read the thread")
+  assert.deepEqual(r.events, ["heartbeat:idle"], "and tried to publish idle, which the worker refused")
+  assert.equal(gate.published, "unknown", "the server keeps unknown")
+  assert.deepEqual(r.worker.ops("pending"), [], "so the poll asks for no pending")
+  gate.outage = false
+  await r.clock.advance(8_000)
+  assert.deepEqual(r.events, ["heartbeat:idle"], "the refused publication backs off WAKE_RETRY_MS")
+  await r.clock.advance(WAKE_POLL_MS) // 12 s after the start, well before the 30 s heartbeat
+  assert.deepEqual(r.events.slice(0, 3), ["heartbeat:idle", "heartbeat:idle", "pending"], "the next poll sends idle again before it asks")
+  assert.equal(thread.adds.length, 1, "and wakes")
+  assert.deepEqual(thread.calls, ["observe", "observe", "wake"], "one refresh read, then the clearing read and the wake")
+  assert.ok(r.events.includes("settle:handed"))
+})
+
+// The cache still saves heartbeats: a state that the worker confirmed is not sent again by a report, whether the report
+// comes after the confirmation or waits behind the heartbeat that carries it.
+test("a state that a heartbeat confirmed is not sent again by later reports, nor by one that waited behind that heartbeat", async () => {
+  let hold = null
+  const thread = wakeDouble()
+  const r = await rig({ thread, handlers: { heartbeat: () => (hold ? hold.promise : {}) } })
+  await r.begin()
+  await r.clock.advance(WAKE_POLL_MS) // the poll publishes idle
+  assert.deepEqual(r.events, ["heartbeat:idle", "pending"])
+  await r.clock.advance(3 * WAKE_POLL_MS)
+  assert.deepEqual(r.events, ["heartbeat:idle", "pending", "pending", "pending", "pending"], "the polls send no heartbeat for a state already published")
+  await r.op({ op: "stop", permission_mode: "default" })
+  assert.equal(r.worker.ops("heartbeat").length, 1, "nor does a Stop that leaves the state idle")
+  await r.op(turn())
+  assert.equal(r.worker.ops("heartbeat").length, 2, "a turn reports busy")
+  let release
+  hold = { promise: new Promise(resolve => { release = () => resolve({}) }) }
+  void r.receiver.handle({ op: "stop", permission_mode: "default" }, hookDouble()) // idle is out, unconfirmed
+  await settle()
+  void r.receiver.handle({ op: "stop", permission_mode: "default" }, hookDouble()) // the same state, asked while it is out
+  await settle()
+  hold = null
+  release()
+  await settle()
+  assert.deepEqual(r.worker.ops("heartbeat").map(entry => entry.state.native_state), ["idle", "busy", "idle"], "one heartbeat for the two reports")
 })
 
 // The queued turn runs like any other: its own prompt hook arrives (live, +78 ms after the add), and the turn ends with a Stop.

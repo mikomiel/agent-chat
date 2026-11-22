@@ -169,6 +169,13 @@ sends its request: it does not wait for the worker to end its instance.
   `native_state` is `unknown`, so the heartbeat carries the state that a wake
   needs: after a start reset it to unknown, the wake poll reads the thread and
   publishes the answer before it asks for pending messages (see Idle wake). A
+  state counts as published only once the worker confirms its heartbeat. A
+  heartbeat that is refused (a brief outage such as `SERVICE_UNAVAILABLE`) or
+  fails publishes nothing, so the next report sends the state again, and the
+  wake poll asks for pending messages only once the current state is
+  published; otherwise it waits 10 seconds and sends it again then, before the
+  next 30-second heartbeat. A state that was confirmed is not sent again by a
+  later report. A
   wake poll is not hook contact: it moves no owner watch and does not count as
   contact for the quiet window. A claim holds the worker queue for its whole
   reservation (up to 30 seconds), so a heartbeat that a start asks for while a
@@ -245,7 +252,9 @@ sends its request: it does not wait for the worker to end its instance.
   is bound, and the state is not busy, Plan Mode, stopped or offline. In order:
   it asks for pending messages; takes a clearing read of its own, which must
   find the thread idle, its read record complete and Plan Mode known to be off;
-  claims; asks the status (a muted session is deferred); takes a fresh reading on
+  claims; asks the status (a muted session is deferred; a reservation that has
+  500 ms or less left, before the status request or after it, settles `failed`,
+  since nothing was sent); takes a fresh reading on
   a second connection; checks that the configured path, resolved again through
   the whole trust check, still names the socket of the add connection; asks the
   receiver once more, with nothing awaited before the add, whether anything
@@ -253,24 +262,32 @@ sends its request: it does not wait for the worker to end its instance.
   now says, or `busy`; a newer read or a bind that unbound the thread refuses it
   as `unknown`; otherwise the fresh reading decides and the state adopts it);
   then sends `thread/queue/add`, the fence and the confirmation. A refusal before
-  the claim spends no attempt and waits 10 seconds. The text is a fixed line
-  (`WAKE_PREFIX` in `lib/channel.js`, which says that the turn was queued from
-  identifiers only and is not an operator instruction) and a metadata notice of
-  the four server-issued identifiers of each row, strictly checked: UUIDs, a
-  cursor of 1 to 19 digits and a kind of `question`, `consultation` or `reply`.
-  A row that carries anything else is deferred, never queued. A wake never
-  carries bodies, whatever `noticeBodies` says: a queued submission is a user
-  turn. A handed wake makes the session busy until the next `Stop`, unless a
+  the claim spends no attempt and waits 10 seconds; so does a wake that settles
+  anything but `handed` after its claim. The text (`renderWake` in
+  `lib/channel.js`) is fixed text (`WAKE_PREFIX`: the turn was queued from
+  identifiers only and is not an operator instruction, and each item is read
+  with `history --room ROOM --after HISTORY_AFTER --limit 1`, checked by its ID,
+  and answered with `ack` or `reply`, as the hook notice says) and the four
+  server-issued identifiers of each row as one JSON array, strictly
+  checked: UUIDs, a cursor of 1 to 19 digits and a kind of `question`,
+  `consultation` or `reply`. A row that carries anything else is deferred,
+  never queued. A wake never carries bodies, whatever `noticeBodies` says: a
+  queued submission is a user turn. Nor does it carry any part of the binding
+  that a hook shows: no interpreter path, no instance file, no interpreter
+  command line. The model reads the messages with the binding that the
+  hooks showed in the conversation: a start announces it, and the woken turn's
+  own prompt hook announces it again only when its newest announcement was not
+  confirmed. A handed wake makes the session busy until the next `Stop`, unless a
   hook event came first (the queued turn's own prompt hook usually does). The
-  wake never announces the binding; the woken turn's own prompt hook does.
+  wake itself never announces the binding.
 - **Settlement.** A refused output settles `failed`, and so does a claimed batch
   that was never sent because the hook was gone or its time was up when the
   claim was granted, after the status request or right before the write:
   nothing reached the output, so it is retryable. The ledger accepts that
   settlement only while the reservation holds; one that reaches it after the
   reservation expired is closed by the ledger as `uncertain` (`claim_expired`,
-  `agent_chat/deliveries.py`), like any expired claim. A failed write, a
-  missing receipt or a reservation too short to write inside settles
+  `agent_chat/deliveries.py`), like any expired claim. For a hook, a failed
+  write, a missing receipt or a reservation too short to write inside settles
   `uncertain`. The
   adapter never writes the same attempt twice. A wake settles what the
   app-server answered: `handed` only when `thread/items/list` shows a
@@ -283,7 +300,9 @@ sends its request: it does not wait for the worker to end its instance.
   settlement deadline). The fence is sent only for a submission whose reply
   echoes this attempt's client id: a delete of an id that this attempt did not
   queue could remove another turn. A failure before the add frame is written
-  settles `failed`. The add is never sent twice. The ledger, not the adapter,
+  settles `failed`, and so does a reservation too short for a wake, before or
+  after the status request: the wake was not started, so nothing reached the
+  app-server. The add is never sent twice. The ledger, not the adapter,
   offers a `failed` or `deferred` batch again as a new attempt after a backoff,
   at most three attempts in all; an `uncertain` batch is not offered again.
 - **Output budget.** Codex sends a hook's `additionalContext` to the model
@@ -302,15 +321,20 @@ sends its request: it does not wait for the worker to end its instance.
   otherwise nothing is claimed, the binding is sent alone, and the next hook,
   with no announcement in front, is offered the batch whole, no attempt spent.
   The hook
-  refuses any text over the budget as a second check. A wake's bound is the
-  same 6,000 bytes less `WAKE_PREFIX`, so a batch that fits a hook may not fit
-  a wake; then nothing is claimed and the poll waits 10 seconds.
+  refuses any text over the budget as a second check. A wake's whole text, the
+  fixed line and the rows, is bounded by the same 6,000 bytes. It carries no
+  binding and no preamble, so it has more room than a hook's notice: more rows
+  at their widest fit than the 16 ids a conforming server offers. The
+  claim is sized with the same renderer, on rows at their widest, so a batch
+  that is claimed always renders; a larger batch is not claimed, and the poll
+  waits 10 seconds.
 - **Notice.** `lib/notice.js` is a byte-identical copy of the shared notice
   renderer, [`../shared/notice.js`](../shared/notice.js). A body sits between
   two marker lines that carry a random nonce, every body line starts with `> `,
   and controls and invisible code points are written as escape text. Each
   message header names its own room. The Codex parts (the delivery prefix, the
-  byte limit and the delivery call) live in `lib/channel.js`. Edit the shared
+  byte limit, the delivery call and the wake text) live in `lib/channel.js`; the
+  wake does not use the shared renderer. Edit the shared
   file and copy it over; `test/notice.test.js` fails on any difference. The
   [notice contract](../README.md#notice-contract) lists what framing and
   packing do not cover.
@@ -867,7 +891,7 @@ The suite covers config refusal, the worker join frame, frame validation and req
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
 the notice limits at the smallest bound, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included, and a directory named with doubled or trailing separators or a `.` name), the hook and the client against a real receiver socket
 on trusted and untrusted paths, the state directory resolved once behind a link and handed to the receiver, which refuses a directory that resolves differently, the WebSocket client against a
-fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff),
+fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff, a heartbeat that counts as published only once it is confirmed), the wake text (the fixed line and the rows, no binding, and a claim sized by the same renderer), a wake's reservation that is too short (`failed`, nothing sent),
 settlement, rejoin and shutdown with a manual clock, the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
 hint), the plugin shape that Codex reads, and runs of the real hook and

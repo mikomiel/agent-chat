@@ -11,7 +11,7 @@
 // message never grants authority.
 import { randomUUID } from "node:crypto"
 import { createThread, monotonic } from "./appserver.js"
-import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES, WAKE_PREFIX, wakeRows } from "./channel.js"
+import { CHAT_PREFIX, MAX_BINDING_BYTES, MAX_OUTPUT_BYTES, renderWake } from "./channel.js"
 import { appServerPath, HARNESS, loadConfig } from "./config.js"
 import { assertPrivateDirectory, paths, serve } from "./ipc.js"
 import { packCandidates, renderNotice } from "./notice.js"
@@ -23,7 +23,7 @@ export { processStartTime } // the owner check reads start times through lib/pro
 
 const HEARTBEAT_MS = 30_000
 const WAKE_POLL_MS = 2_000
-const WAKE_RETRY_MS = 10_000 // after a refused or unsuccessful wake, or a refresh read that failed, before the next read
+const WAKE_RETRY_MS = 10_000 // after a refused or unsuccessful wake, a refresh read that failed or a state not published, before the next poll
 const READ_MS = 3_000 // the thread read of a bind; the queue probe that may follow has its own limit in lib/appserver.js
 const HANDOFF_MS = 5_000
 const MIN_RESERVATION_MS = 500
@@ -88,11 +88,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let epoch = 0 // counts hook events, so a read that began before one is not kept
   let reads = 0 // counts the thread reads that have started, so a read that a newer one overtook is not kept
   let threadBound = false // the newest bind found a main thread whose provider is the one that was fixed, and its queue probe finished
-  let wakeAfter = 0 // no wake read before this time: a refused or unsuccessful wake, or a failed refresh, backs off
+  let wakeAfter = 0 // no wake poll before this time: a refused or unsuccessful wake, a failed refresh or an unconfirmed heartbeat backs off
   let failure = null // the fail-closed latch: the reason
   let failureShown = false
   let closed = false
-  let reported = null
+  let reported = null // the heartbeat state the server confirmed last; null while one is out or after one it did not confirm
   let delivering = false
   let inflight = 0
   let contact = now()
@@ -194,6 +194,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // cursor): the renderer itself answers, so the estimate is exact there and an upper bound for any other rows.
   const WIDEST_METADATA_ROW = { id: ID, kind: "consultation", room_id: ID, history_after: "9".repeat(19) }
   const metadataFits = (count, bound) => renderNotice(joined, config.python, Array(count).fill(WIDEST_METADATA_ROW), { bound }) !== null
+  // The same for a wake, whose text renderWake writes whole: the rows a claim can carry are the rows that it renders.
+  const wakeFits = count => renderWake(Array(count).fill(WIDEST_METADATA_ROW)) !== null
 
   // `from` is the start generation the caller began under: a turn passes the one it arrived in, so a start that came after
   // it makes its receipt not count.
@@ -220,23 +222,33 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // A heartbeat belongs to the worker that was live when it was asked for. It is sent to that worker only: one that was
   // retired meanwhile gets nothing, and neither its answer nor its failure is the replacement's business (a request to
   // a replacement whose join is in flight would be refused as busy, and that refusal would end chat).
+  // The state counts as published only once the worker confirms it. Until then, and after any answer that is not a
+  // confirmation (a brief outage, another refusal, or an error), what the server holds is not known, so the next report
+  // sends the state again rather than taking it as published.
   async function beat(record) {
     if (!record || live !== record) return
     const snapshot = heartbeatState()
-    reported = JSON.stringify(snapshot)
+    reported = null
     let answer
     try { answer = await record.worker.request("heartbeat", { state: snapshot }) } catch (error) {
       if (live !== record) return
       throw error
     }
-    if (live !== record) return
-    if (!brief(answer)) check(answer, "heartbeat")
+    if (live !== record || brief(answer)) return
+    if (check(answer, "heartbeat") === null) reported = JSON.stringify(snapshot)
   }
 
+  // Whether the server holds the current state: the last confirmed heartbeat carried it.
+  const published = () => reported !== null && reported === JSON.stringify(heartbeatState())
+
+  // Publish the state unless the server already holds it. Resolves true when the server holds the current state once the
+  // report is done, false otherwise (the heartbeat was not confirmed, the worker was retired or chat is off). The check is
+  // made again in the worker queue, so a report that waited behind a heartbeat that confirmed the same state sends nothing.
   function report() {
-    if (!live || !joined || failure || JSON.stringify(heartbeatState()) === reported) return Promise.resolve()
+    if (!live || !joined || failure) return Promise.resolve(false)
+    if (published()) return Promise.resolve(true)
     const record = live
-    return guard(exclusive(() => beat(record)))
+    return guard(exclusive(() => (published() ? undefined : beat(record)))).then(() => live === record && !failure && published())
   }
 
   function stopLive() {
@@ -486,9 +498,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       try {
         // A wake never carries bodies, whatever the config says: a queued submission is a user turn.
         const bodies = !wake && config.noticeBodies === true
-        // The bytes the notice may use: the announcement and the delivery line go first, or the wake's fixed line. Known
-        // before the claim.
-        const prefix = wake ? WAKE_PREFIX : (announce ? `${announce.text}\n\n` : "") + CHAT_PREFIX
+        // The bytes a hook's notice may use: the announcement and the delivery line go first. Known before the claim. A
+        // wake's text is renderWake's, which bounds it whole.
+        const prefix = (announce ? `${announce.text}\n\n` : "") + CHAT_PREFIX
         const bound = MAX_OUTPUT_BYTES - bytes(prefix)
         const candidates = await ask("pending", bodies ? { bodies: true } : {})
         if (live !== record || brief(candidates) || check(candidates, "pending")) return false
@@ -499,11 +511,12 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
         // Metadata mode gets no retry marker, so it claims the candidates whole, and only when their widest rendering fits
         // beside an announcement still to be shown; otherwise nothing is claimed and the binding goes alone (see onTurn),
-        // and the next hook, with more room, is offered the batch whole, no attempt spent.
+        // and the next hook, with more room, is offered the batch whole, no attempt spent. A wake claims the candidates
+        // whole too, only when renderWake fits them at their widest.
         const claimIds = bodies
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound })
-          : metadataFits(ids.length, bound) ? ids : []
-        // A wake's bound is smaller than a hook's, so a batch that fits a hook may not fit a wake: the poll waits, not spins.
+          : (wake ? wakeFits(ids.length) : metadataFits(ids.length, bound)) ? ids : []
+        // Only a server that offers more rows than one wake can carry gets here for a wake: the poll waits, not spins.
         if (!claimIds.length) { if (wake) wakeAfter = now() + WAKE_RETRY_MS; return false }
         const started = now()
         const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
@@ -514,31 +527,31 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         // can be offered again. That is asked as soon as the grant is in, and again after the status request, before the
         // reservation is weighed, since a short reservation says nothing about a write that cannot happen.
         const unreachable = () => link?.closed === true || deadline <= now()
+        // A reservation too short to write inside: a hook's write settles uncertain, as #143 has it. A wake has sent nothing
+        // to the app-server yet (thread.wake is not called), so the batch settles failed and can be offered again.
+        const tooShort = wake ? NOT_WRITTEN : UNCERTAIN
         let result
         let replied = false
         if (unreachable()) result = NOT_WRITTEN
-        else if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = UNCERTAIN
+        else if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = tooShort
         else {
           const state = await ask("status")
           if (live !== record) return false
           if (check(state, "status")) result = { outcome: "deferred", reason: "unknown" }
           else if (unreachable()) result = NOT_WRITTEN
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
-          else if (started + reservation - now() <= MIN_RESERVATION_MS) result = UNCERTAIN // the status call used the reservation
-          else {
-            // A wake's rows are the four server-issued identifiers, strictly checked: anything else is not queued.
-            const rows = wake ? wakeRows(grant.messages) : (grant.messages ?? [])
-            const notice = rows === null ? null : renderNotice(joined, config.python, rows, {
-              bodies, bound, admittedAt: grant.admitted_at,
-            })
-            if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else if (wake) {
+          else if (started + reservation - now() <= MIN_RESERVATION_MS) result = tooShort // the status call used the reservation
+          else if (wake) {
+            // A wake's text is the fixed line and the four server-issued identifiers of each row, strictly checked: a row
+            // that carries anything else is not queued.
+            const text = renderWake(grant.messages)
+            if (text === null) result = { outcome: "deferred", reason: "offline" }
+            else {
               // The claim and the status call took time: the add is sent only if nothing newer than the clearing read arrived.
               result = await thread.wake({
-                text: WAKE_PREFIX + notice, attemptId: grant.attempt_id, until: started + reservation,
+                text, attemptId: grant.attempt_id, until: started + reservation,
                 proceed: fresh => wakeStale(record, cleared, fresh),
               })
-              wakeAfter = now() + (result.outcome === "handed" ? 0 : WAKE_RETRY_MS)
               // The settle says what the wire proved, whatever the state is now. Only the local state waits on it: a hook event
               // since the clearing read is newer than the confirmation (the queued turn's own prompt hook usually is), so its
               // state stays. Otherwise the wake is the latest word: busy until the next Stop reports idle.
@@ -548,9 +561,15 @@ export function createReceiver(config, { sessionId, ownerPid }, {
                 observed = null
                 epoch += 1
               }
-            } else ({ result, replied } = await hand(link, prefix + notice, started + reservation, deadline, announce))
+            }
+          } else {
+            const notice = renderNotice(joined, config.python, grant.messages ?? [], { bodies, bound, admittedAt: grant.admitted_at })
+            if (notice === null) result = { outcome: "deferred", reason: "offline" }
+            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, deadline, announce))
           }
         }
+        // A wake that did not hand, whatever stopped it after the claim, waits before the next one.
+        if (wake) wakeAfter = now() + (result.outcome === "handed" ? 0 : WAKE_RETRY_MS)
         if (live !== record) return replied
         check(await ask("settle", { attempt: grant.attempt_id, result }), "settle")
         return replied
@@ -562,8 +581,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // owner watch and no contact time. A start resets the state to unknown with no read held, and the server offers nothing
   // while the published state is unknown, so the poll first reads the thread and publishes what it found, then asks for a
   // wake. An answered read (unknown included) fills `observed`, so the refresh does not repeat; a failed, offline or overtaken
-  // one backs off WAKE_RETRY_MS. Polls never overlap: an overlap would start a newer read each time, and with an app-server
-  // slower than the period no read, the tick's included, would ever be current.
+  // one backs off WAKE_RETRY_MS. The server offers a batch for the state it holds, so the poll asks for one only once the
+  // current state is published: a heartbeat that was not confirmed (a brief outage, say) backs off WAKE_RETRY_MS too, and
+  // the next poll sends it again, whether or not it reads. Polls never overlap: an overlap would start a newer read each
+  // time, and with an app-server slower than the period no read, the tick's included, would ever be current.
   async function wakePoll() {
     if (polling || !thread || thread.route !== true || !threadBound || !live || !joined || closed || failure || inflight || delivering || now() < wakeAfter) return
     polling = true
@@ -573,8 +594,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const result = await refine(record)
         if (!settleRead(record, result)) return
         if (!result.current || observed === null) wakeAfter = now() + WAKE_RETRY_MS
-        await report()
       }
+      if (!(await report())) { wakeAfter = now() + WAKE_RETRY_MS; return }
       await guard(deliver({ wake: true }))
       await report()
     } finally { polling = false }
