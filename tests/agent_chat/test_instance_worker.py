@@ -267,6 +267,43 @@ def test_worker_initial_partial_frame_has_whole_process_deadline(tmp_path):
                 process.wait(timeout=3)
 
 
+@pytest.mark.parametrize("delivery_enabled", [True])
+def test_a_parent_that_keeps_stdout_open_but_never_reads_cannot_hold_the_worker_past_its_deadline(join_frame, db):
+    # Issue #150. An empty pending answer inside the worker's own backoff needs no request, so these replies come
+    # at once and overfill the 64 KiB pipe. The stalled write, the one-second error reply and the end request each
+    # run under a deadline, and nothing may be left buffered for the interpreter to flush at exit.
+    limit = 1.0
+    requests = [join_frame] + [{"id": index, "op": "pending"} for index in range(1, 2501)]
+    with subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import agent_chat.instance_worker as worker; "
+            f"worker.REQUEST_SECONDS = {limit}; "
+            "raise SystemExit(worker.main())",
+        ],
+        cwd=ROOT,
+        env={},
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as process:
+        try:
+            assert process.stdin is not None and process.stderr is not None
+            started = time.monotonic()
+            # Stdin stays open, so only the stalled write can end the worker before its 90-second idle limit.
+            process.stdin.write("".join(json.dumps(request) + "\n" for request in requests).encode())
+            process.stdin.flush()
+            assert process.wait(timeout=2 * limit + 1 + 3) == 1
+            assert time.monotonic() - started >= limit + 1  # both writes stalled: the pipe was full
+            assert process.stderr.read() == b""
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+    assert db.execute("SELECT ended_at FROM agent_chat.instances").fetchone()["ended_at"] is not None
+
+
 def _timed_worker(
     monkeypatch: pytest.MonkeyPatch,
     script: list[tuple[float, dict[str, Any]]],

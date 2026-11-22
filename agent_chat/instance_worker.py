@@ -59,8 +59,17 @@ def _write(frame: dict[str, Any], credentials: tuple[str, ...]) -> None:
     data = (rendered + "\n").encode("ascii")
     if len(data) > MAX_FRAME:
         raise ChatError("INVALID_RESPONSE")
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
+    # Write past the buffer, straight to the stdout descriptor: a buffered byte that the alarm strands would be
+    # flushed again at interpreter exit with no deadline, against a parent that no longer reads. The alarm may
+    # interrupt a write after part of the frame; that frame is abandoned, because the stream is already broken.
+    stdout = sys.stdout.buffer
+    out = getattr(stdout, "raw", stdout)  # the unbuffered file; an in-memory stream has no buffer to bypass
+    view = memoryview(data)
+    while view:
+        written = out.write(view)
+        if not written:
+            raise OSError("stdout accepted no bytes")
+        view = view[written:]
 
 
 def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
