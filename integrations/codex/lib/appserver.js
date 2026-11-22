@@ -540,16 +540,21 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
           fresh = await withConnection(seen => evaluate(seen, limit), { connectMs: Math.max(1, Math.min(CONNECT_MS, limit - now())), expect: link.identity })
         } catch { return { outcome: "failed", reason: "native_unavailable" } }
         // The path is checked first and the time after it: the check makes synchronous file system calls that can stall. The
-        // time is checked on both clocks, in this turn, so a suspend since the claim sends nothing.
-        const wallLeft = () => (wallUntil === null ? Infinity : wallUntil - SETTLE_MS - wall())
-        if (!link.same() || limit - now() < MIN_ADD_MS || wallLeft() < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
+        // time is checked on both clocks, in this turn, so a suspend since the claim sends nothing. `end` is the tighter of the
+        // two budgets, derived once here: the add, the fence and the confirmation all end by it, so a wake that resumes from a
+        // suspend with little wall time left does not hold the worker queue for the monotonic rest, and a wall clock stepped
+        // back later extends nothing.
+        if (!link.same()) return { outcome: "failed", reason: "native_unavailable" }
+        const checked = now()
+        const end = checked + Math.min(limit - checked, wallUntil === null ? Infinity : wallUntil - SETTLE_MS - wall())
+        if (end - checked < MIN_ADD_MS) return { outcome: "failed", reason: "native_unavailable" }
         const stale = proceed(fresh)
         if (stale !== null) return { outcome: "deferred", reason: stale }
         let added
         try {
           added = await link.request("thread/queue/add", {
             threadId, clientUserMessageId, input: [{ type: "text", text, text_elements: [] }],
-          }, limit - now())
+          }, end - now())
         } catch (error) { return error?.sent === false ? { outcome: "failed", reason: "native_unavailable" } : UNCERTAIN }
         // The fence deletes only a submission that the reply ties to this attempt: codex-cli 0.171.0 echoes the client id
         // inside `queuedSubmission`. Without the echo the id may be another turn's, and nothing is deleted.
@@ -557,13 +562,13 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
         const id = submission?.id
         if (typeof id !== "string" || !id || submission.clientUserMessageId !== clientUserMessageId) return UNCERTAIN
         let fence
-        try { fence = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: id }, limit - now()) }
+        try { fence = await link.request("thread/queue/delete", { threadId, queuedSubmissionId: id }, end - now()) }
         catch { return UNCERTAIN }
         if (fence.deleted === true) return { outcome: "deferred", reason: "busy" }
         if (fence.deleted !== false) return UNCERTAIN
-        while (now() < limit - CONFIRM_MARGIN_MS) {
+        while (now() < end - CONFIRM_MARGIN_MS) {
           try {
-            const page = await link.request("thread/items/list", { threadId, limit: PAGE, sortDirection: "desc" }, limit - now())
+            const page = await link.request("thread/items/list", { threadId, limit: PAGE, sortDirection: "desc" }, end - now())
             const seen = Array.isArray(page.data) && page.data.some(entry => entry?.item?.type === "userMessage" && entry.item.clientId === clientUserMessageId)
             if (seen) return { outcome: "handed", reason: null }
           } catch { return UNCERTAIN }

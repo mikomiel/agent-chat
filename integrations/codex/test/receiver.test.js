@@ -3448,6 +3448,39 @@ test("a prompt during the wake poll's refresh read does not wait for the poll, a
   assert.equal(r.worker.ops("claim").length, 1)
 })
 
+// The poll's refresh read runs outside the worker queue, so another request can hold the queue meanwhile: here the periodic
+// heartbeat. A prompt that arrives then does not wait for the poll: it takes today's path (state report queued, no claim)
+// and answers at once.
+test("a prompt during a slow refresh read, while a heartbeat holds the worker queue, does not wait for the poll", async () => {
+  let releaseRead
+  let reads = 0
+  let releaseBeat = null
+  let holdBeat = false
+  const thread = wakeDouble({ observation: () => {
+    reads += 1
+    return reads === 1 ? new Promise(resolve => { releaseRead = () => resolve(IDLE) }) : IDLE
+  } })
+  const r = await rig({ thread, handlers: deliverable({
+    heartbeat: () => (holdBeat ? new Promise(resolve => { holdBeat = false; releaseBeat = () => resolve({}) }) : {}),
+  }) })
+  await r.begin()
+  await r.clock.advance(WAKE_POLL_MS) // the poll's refresh read is out, and stays out
+  assert.equal(reads, 1)
+  holdBeat = true
+  await r.clock.advance(30_000 - WAKE_POLL_MS) // the periodic tick reads and sends its heartbeat, which stays out
+  assert.equal(typeof releaseBeat, "function", "the heartbeat holds the worker queue")
+  const hook = hookDouble({ events: r.events })
+  let answered = false
+  void r.receiver.handle(turn(), hook).then(() => { answered = true })
+  await settle()
+  assert.equal(answered, true, "the prompt answers without waiting for the refresh read or the heartbeat")
+  assert.deepEqual(hook.sent, [{ context: null }], "as for any busy queue: no claim")
+  assert.deepEqual(r.worker.ops("claim"), [])
+  releaseBeat()
+  releaseRead()
+  await settle()
+})
+
 test("a wake whose pending request outlives the prompt's patience leaves the prompt answering in time", async () => {
   const gate = holdWake("pending")
   const thread = wakeDouble()

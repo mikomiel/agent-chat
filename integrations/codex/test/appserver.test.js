@@ -1430,6 +1430,43 @@ for (const [label, monotonicStep, wallStep, sent] of [
   })
 }
 
+// After the add check, the requests that follow (the add reply, the fence, the confirmation) end by the tighter of the two
+// budgets, derived once at that check. A host that slept 25 s of a 30 s reservation passes the check with about 4 s of
+// wall time left after the settlement margin, so the confirmation that never sees its item gives up within that, not
+// within the 28 s the monotonic clock would allow. The budget is not read again: a wall clock stepped back an hour during the
+// confirmation extends nothing. The control leg, with no suspend, keeps the monotonic budget.
+for (const [label, wallStep, budget, stepBack] of [
+  ["after a suspend, the confirmation ends by the wall-clock budget derived at the add check", 25_000, 4_000, false],
+  ["after a suspend, a wall clock stepped back during the confirmation does not extend its budget", 25_000, 4_000, true],
+  ["with no suspend, the confirmation keeps the monotonic budget", 1_000, 28_000, false],
+]) {
+  test(label, async () => {
+    const gate = armed({}) // the fence answers deleted:false and thread/items/list never shows the item
+    const ticks = clock()
+    let wallTime = 1_800_000_000_000
+    let reading = false
+    let checkedAt = null
+    const handler = (message, connection) => {
+      if (reading && checkedAt === null && message.method === "thread/turns/list") { ticks.time.now += 1_000; wallTime += wallStep; checkedAt = ticks.now() }
+      if (stepBack && message.method === "thread/items/list") wallTime -= 3_600_000
+      return gate.handler(message, connection)
+    }
+    await withServer(handler, async (path, server) => {
+      const bound = createThread({ path, threadId: THREAD, now: ticks.now, sleep: ticks.sleep, wall: () => wallTime })
+      await bound.bind()
+      gate.arm()
+      reading = true
+      server.log.length = 0
+      const until = ticks.now() + 30_000
+      const result = await bound.wake({ text: "t", attemptId: "attempt-9", until, wallUntil: wallTime + 30_000 })
+      assert.deepEqual(result, { outcome: "uncertain", reason: "transport_ambiguous" })
+      assert.ok(server.methods().includes("thread/queue/add"), "the add passed its check")
+      const elapsed = ticks.now() - checkedAt
+      assert.ok(elapsed <= budget && elapsed > budget - 500, `the confirmation polled for ${elapsed} ms of a ${budget} ms budget`)
+    })
+  })
+}
+
 // The fence deletes only the submission that this attempt queued. codex-cli 0.171.0 echoes `clientUserMessageId` exactly inside
 // `queuedSubmission`; a reply that does not tie its submission to this attempt may name another turn, and a delete of it could
 // remove that turn. So without the echo the wake is uncertain at once: no delete, no confirmation, and the add is not resent.

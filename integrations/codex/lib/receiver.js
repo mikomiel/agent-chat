@@ -103,7 +103,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let rejoinTimer = null
   let watchTimer = null
   let wakeTimer = null
-  let waking = null // the wake poll that runs, if any: { claimed, done }. Polls never overlap; a hook may wait for one that has not claimed
+  // The wake poll that runs, if any: { queued, claimed, done }. Polls never overlap. `queued` is set once the poll's own report
+  // and claim sequence holds the worker queue (its refresh read does not), `claimed` once it claims: a hook waits only for a
+  // poll that is queued and has not claimed.
+  let waking = null
   let tail = Promise.resolve()
   let firstAttempt
   const attempted = new Promise(resolve => { firstAttempt = resolve })
@@ -591,7 +594,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   async function wakePoll() {
     if (waking || !thread || thread.route !== true || !threadBound || !live || !joined || closed || failure || inflight || delivering || now() < wakeAfter) return
     let finish
-    waking = { claimed: false, done: new Promise(resolve => { finish = resolve }) }
+    waking = { queued: false, claimed: false, done: new Promise(resolve => { finish = resolve }) }
     try {
       const record = live
       if (observed === null && native === "unknown" && !stopped) {
@@ -599,6 +602,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (!settleRead(record, result)) return
         if (!result.current || observed === null) wakeAfter = now() + WAKE_RETRY_MS
       }
+      waking.queued = true // from here to the end, the poll's report and deliver hold the worker queue
       if (!(await report())) { wakeAfter = now() + WAKE_RETRY_MS; return }
       await guard(deliver({ wake: true }))
       await report()
@@ -656,14 +660,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const from = shown // and the start generation it arrived in: a receipt for this turn's announcement counts only under it
     setNative(request, "busy", request.event)
     if (failure) return link.send(disabledReply())
-    // A wake poll that holds the worker queue before its claim (its pending request, its clearing read) would make this hook
-    // skip delivery. The busy state set above makes that wake stop before it claims, so the hook waits for the poll once,
-    // within its own time less CLAIM_MARGIN_MS, and then delivers as usual: a turn with no tool call has no later hook. A
-    // wake that has claimed, or a poll still running when the wait ends, is not waited for, and a poll that holds no queue
-    // slot (its refresh read) needs no wait. Only a hook that may claim waits: in Plan Mode, stopped or unknown it delivers
-    // nothing, and an unknown state does not stop a wake.
+    // A wake poll that holds the worker queue before its claim (its report, its pending request, its clearing read) would
+    // make this hook skip delivery. The busy state set above makes that wake stop before it claims, so the hook waits for the
+    // poll once, within its own time less CLAIM_MARGIN_MS, and then delivers as usual: a turn with no tool call has no later
+    // hook. A wake that has claimed, or a poll still running when the wait ends, is not waited for, and neither is a poll that
+    // does not hold the queue (its refresh read): whatever holds it then is another request, and this hook is not delayed for
+    // a read that it would not get past anyway. Only a hook that may claim waits: in Plan Mode, stopped or unknown it delivers
+    // nothing, and an unknown state does not stop a wake. A queued poll always has a request in the queue, so `inflight` is
+    // implied.
     const patience = deadline - now() - CLAIM_MARGIN_MS
-    const wake = inflight && eligible(false) && waking !== null && !waking.claimed && patience > 0 ? waking : null
+    const wake = eligible(false) && waking !== null && waking.queued && !waking.claimed && patience > 0 ? waking : null
     if (wake) await within(wake.done, patience)
     let replied = false
     if (inflight || (wake && waking === wake)) void report() // a slow request never stacks up behind every tool call
