@@ -81,7 +81,7 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "openco
   if (!child.stdin || !child.stdout) {
     // No pipes were made, so nothing can be asked and no `close` will come: the start failed, and nothing is left to end.
     exited = true
-    resolveClosed({ code: null, signal: null })
+    resolveClosed({ code: null, signal: null, started: false })
     return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, stop, closed }
   }
   child.stdin.on("error", () => { rejectPending("CHAT_REQUEST_UNCERTAIN"); void stop() })

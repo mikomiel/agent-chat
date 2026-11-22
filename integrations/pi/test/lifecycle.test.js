@@ -663,3 +663,25 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   assert.doesNotMatch(lifecycle.binding(), /boot-1\.json/)
   assert.notEqual(lifecycle.state(), "offline")
 })
+
+// Issue #153: a worker that never started fails closed like any other worker-start failure.
+test("a spawn that makes no pipes fails chat closed, and its end settles", async t => {
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] }) // a disable would otherwise leak into later tests
+  const child = new EventEmitter()
+  child.stdin = null
+  child.stdout = null
+  child.kill = () => {}
+  const spawnImpl = () => { process.nextTick(() => child.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" }))); return child }
+  const { pi, emit, ctx, notices } = fakePi()
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers,
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    now: () => 0,
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  assert.match(notices.at(-1), /Agent Chat stopped \(join:CHAT_WORKER_UNAVAILABLE\)/)
+  assert.equal(lifecycle.state(), "offline")
+  assert.equal(lifecycle.binding(), null) // no binding for a worker that never joined
+  await lifecycle.disconnect() // settles
+})
