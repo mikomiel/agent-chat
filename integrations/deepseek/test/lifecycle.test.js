@@ -735,3 +735,28 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   assert.notEqual(lifecycle.state(), "offline")
   assert.equal(delivery.calls.disable, 0)
 })
+
+// Issue #153: a worker that never started fails closed like any other worker-start failure.
+test("a spawn that makes no pipes fails chat closed, and its end settles", async () => {
+  const bus = fakeBus()
+  const notices = []
+  const child = new EventEmitter()
+  child.stdin = null
+  child.stdout = null
+  child.kill = () => {}
+  const spawnImpl = () => { process.nextTick(() => child.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" }))); return child }
+  const delivery = fakeDelivery()
+  const lifecycle = createLifecycle(bus, delivery, config, {
+    ...timers,
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    now: () => 0,
+    notice: text => notices.push(text),
+  })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  assert.match(notices.at(-1), /Agent Chat stopped \(join:CHAT_WORKER_UNAVAILABLE\)/)
+  assert.equal(delivery.calls.disable, 1)
+  assert.equal(lifecycle.state(), "offline")
+  assert.deepEqual(delivery.calls.context.filter(text => text !== null), []) // no binding for a worker that never joined
+  await lifecycle.stop() // settles
+})

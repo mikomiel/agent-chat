@@ -1020,3 +1020,37 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   assert.match(hook.sent[0].context, /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/, "the new binding is published")
   assert.notEqual(receiver.state(), "offline")
 })
+
+// Issue #153: a worker that never started fails closed like any other worker-start failure.
+test("a spawn that makes no pipes latches chat off, and the receiver's end settles", async () => {
+  const clock = scheduler()
+  const child = new EventEmitter()
+  child.stdin = null
+  child.stdout = null
+  child.kill = () => {}
+  const spawnImpl = () => { process.nextTick(() => child.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" }))); return child }
+  let exitCode
+  const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
+    startProcess: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }),
+    now: clock.now,
+    random: () => 0.5,
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    setIntervalImpl: clock.setIntervalImpl,
+    clearIntervalImpl: clock.clearIntervalImpl,
+    alive: () => true,
+    startTime: () => null,
+    exit: code => { exitCode = code },
+  })
+  void receiver.start()
+  await settle()
+  assert.equal(receiver.state(), "offline")
+  const hook = hookDouble()
+  await receiver.handle({ op: "start", wait_ms: 5000 }, hook)
+  assert.deepEqual(hook.sent, [{
+    disabled: true,
+    message: "Agent Chat stopped (join:CHAT_WORKER_UNAVAILABLE); the Claude Code session is unchanged.",
+  }]) // no binding for a worker that never joined
+  await receiver.shutdown() // settles
+  assert.equal(exitCode, 0)
+})

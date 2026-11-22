@@ -74,8 +74,18 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "pi" },
     return closed
   }
 
-  child.stdin.on("error", () => { rejectPending("CHAT_REQUEST_UNCERTAIN"); void stop() })
+  // Installed before anything touches the pipes: a spawn that fails after it
+  // returned (EMFILE, ENFILE) emits `error` on the next tick, and an `error` with
+  // no listener would end the Pi process.
   child.on("error", () => { rejectPending("CHAT_WORKER_UNAVAILABLE"); void stop() })
+  if (!child.stdin || !child.stdout) {
+    // No pipes were made, so nothing can be asked and no `close` will come: the
+    // start failed, and nothing is left to end.
+    exited = true
+    resolveClosed({ code: null, signal: null })
+    return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, stop, closed }
+  }
+  child.stdin.on("error", () => { rejectPending("CHAT_REQUEST_UNCERTAIN"); void stop() })
   child.on("close", (code, signal) => {
     exited = true
     clearTimeout(termTimer)

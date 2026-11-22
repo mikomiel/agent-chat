@@ -817,7 +817,25 @@ test("a worker that exits with a heartbeat in flight latches chat off and starts
   assert.equal(workers.children.length, 1, "no rejoin")
 })
 
-const joinRefusal = workerCode => Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", workerCode, operation: "join" })
+// Issue #153: a worker that never started fails closed like any other worker-start failure.
+test("a spawn that makes no pipes latches chat off, and the receiver's end settles", async () => {
+  const child = new EventEmitter()
+  child.stdin = null
+  child.stdout = null
+  child.kill = () => {}
+  const spawnImpl = () => { process.nextTick(() => child.emit("error", Object.assign(new Error("spawn EMFILE"), { code: "EMFILE" }))); return child }
+  const r = await rig({ start: (workerConfig, identity) => startWorker(workerConfig, identity, { spawnImpl }) })
+  assert.equal(r.receiver.state(), "offline")
+  const first = await r.op({ op: "start", wait_ms: 5000 })
+  assert.deepEqual(first.sent, [{
+    disabled: true,
+    message: "Agent Chat stopped (join:CHAT_WORKER_UNAVAILABLE); the Codex session is unchanged.",
+  }]) // no binding for a worker that never joined
+  await r.receiver.shutdown() // settles
+  assert.equal(r.exitCode, 0)
+})
+
+const joinRefusal =workerCode => Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", workerCode, operation: "join" })
 
 test("a join conflict is the previous lease and rejoins; any other conflict fails closed", async () => {
   const r = await rig({ joinErrors: [joinRefusal("BINDING_CONFLICT")] })
