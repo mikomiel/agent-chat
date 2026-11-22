@@ -3520,6 +3520,39 @@ test("a refresh read that returns while a heartbeat holds the worker queue queue
   assert.equal(thread.adds.length, 1, "a later poll wakes once the queue is free")
 })
 
+// The periodic heartbeat is queued while the wake's pending request is out; pending answers empty and the poll's trailing
+// report waits behind that heartbeat. No claim is left to take over, so a prompt that arrives then does not wait.
+test("a prompt that arrives after the wake's deliver ended, while its trailing report waits behind a heartbeat, does not wait", async () => {
+  let releasePending = null
+  let holdPending = false
+  let releaseBeat = null
+  let holdBeat = false
+  const thread = wakeDouble()
+  const r = await rig({ thread, handlers: deliverable({
+    pending: () => (holdPending ? new Promise(resolve => { holdPending = false; releasePending = () => resolve({ messages: [] }) }) : { messages: [] }),
+    heartbeat: () => (holdBeat ? new Promise(resolve => { holdBeat = false; releaseBeat = () => resolve({}) }) : {}),
+  }) })
+  await idleSession(r)
+  holdPending = true
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.equal(typeof releasePending, "function", "the wake's pending request is out")
+  holdBeat = true
+  await r.clock.advance(30_000 - WAKE_POLL_MS) // the periodic tick reads and queues its heartbeat behind the wake
+  assert.equal(releaseBeat, null, "the heartbeat waits behind the wake")
+  releasePending() // pending answers empty: the wake's deliver ends, the heartbeat goes out, and the trailing report waits behind it
+  await settle()
+  assert.equal(typeof releaseBeat, "function", "the heartbeat holds the worker queue")
+  const hook = hookDouble({ events: r.events })
+  let answered = false
+  void r.receiver.handle(turn(), hook).then(() => { answered = true })
+  await settle()
+  assert.equal(answered, true, "the prompt answers at once: no takeover wait")
+  assert.deepEqual(hook.sent, [{ context: null }], "on the usual path for a busy queue")
+  assert.deepEqual(r.worker.ops("claim"), [])
+  releaseBeat()
+  await settle()
+})
+
 test("a wake whose pending request outlives the prompt's patience leaves the prompt answering in time", async () => {
   const gate = holdWake("pending")
   const thread = wakeDouble()

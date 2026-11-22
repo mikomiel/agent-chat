@@ -246,9 +246,10 @@ sends its request: it does not wait for the worker to end its instance.
   and settled `handed` only after the hook confirms it wrote and flushed the
   output. A hook that arrives while the worker queue is busy does not claim
   (a slow request never stacks up behind every tool call), with one exception:
-  a wake poll that holds the queue before its claim (its pending request or
-  its clearing read). The busy state that the hook sets makes that wake stop
-  before it claims, so a hook that may claim (the session is busy, not in
+  a wake poll that holds the queue before its claim (its state report, its
+  pending request or its clearing read, not the report after its delivery
+  ended). The busy state that the hook sets makes that wake stop before it
+  claims, so a hook that may claim (the session is busy, not in
   Plan Mode, stopped or unknown) waits for the poll once, for at most its own
   time less the 2.5-second claim margin, and then delivers as usual; a turn
   with no tool call has no later hook to deliver. A hook never waits for a

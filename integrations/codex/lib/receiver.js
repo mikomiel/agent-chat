@@ -103,9 +103,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let rejoinTimer = null
   let watchTimer = null
   let wakeTimer = null
-  // The wake poll that runs, if any: { queued, claimed, done }. Polls never overlap. `queued` is set once the poll's own report
-  // and claim sequence holds the worker queue (its refresh read does not), `claimed` once it claims: a hook waits only for a
-  // poll that is queued and has not claimed.
+  // The wake poll that runs, if any: { queued, claimed, done }. Polls never overlap. `queued` is set while the poll's own report
+  // and deliver hold the worker queue (not its refresh read, not its trailing report), `claimed` once it claims: a hook waits
+  // only for a poll that is queued and has not claimed. A hook already waiting waits on `done`, the end of the whole poll.
   let waking = null
   let tail = Promise.resolve()
   let firstAttempt
@@ -606,9 +606,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       // or the worker went) queues nothing, so it never waits behind that request and no hook waits behind it. The next poll
       // tries again.
       if (live !== record || closed || failure || inflight || delivering) return
-      waking.queued = true // from here to the end, the poll's report and deliver hold the worker queue
+      waking.queued = true // from here until its deliver ends, the poll's report and deliver hold the worker queue
       if (!(await report())) { wakeAfter = now() + WAKE_RETRY_MS; return }
       await guard(deliver({ wake: true }))
+      waking.queued = false // no claim is left to take over: a hook that arrives during the trailing report does not wait
       await report()
     } finally {
       waking = null
