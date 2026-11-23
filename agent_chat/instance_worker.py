@@ -107,8 +107,9 @@ def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
         host_token=request["host_token"],
         harness=request["harness"],
         enabled=request["enabled"],
-        # The alarm armed before the join frame stays the outer bound; this one bounds the lookup itself.
-        resolve_by=monotonic() + REQUEST_SECONDS,
+        # The lookup and its cleanup share what is left of the alarm armed before the join frame, not a fresh
+        # budget, so a resolver whose death signal is refused cannot outlive the join's own deadline.
+        resolve_by=monotonic() + (signal.getitimer(signal.ITIMER_REAL)[0] or REQUEST_SECONDS),
     )
 
 

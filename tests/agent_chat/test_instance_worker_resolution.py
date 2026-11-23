@@ -209,7 +209,9 @@ def test_a_hanging_resolver_at_join_is_bounded_by_the_join_deadline(
     # The code that a failed connection has, which every integration's rejoin policy already handles.
     assert error.value.code == "TRANSPORT_UNAVAILABLE"
     assert len(children) == 1 and children[0].poll() is not None
-    assert list(directory.iterdir()) == []  # no record is left: the one this join created is discarded
+    # The lookup used up the deadline, so the removal is not attempted inside it: the record stays for the next
+    # start's stale sweep rather than outlive the worker limit on a stalled filesystem.
+    assert [path.name for path in directory.iterdir()] == [f"{frame['boot_id']}.json"]
 
 
 def test_the_worker_alarm_cuts_a_hanging_join_lookup_short_as_a_transport_refusal(
@@ -247,7 +249,40 @@ def test_the_worker_alarm_cuts_a_hanging_join_lookup_short_as_a_transport_refusa
     # Not REQUEST_UNCERTAIN, which a bare timeout escaping the join would become.
     assert error.value.code == "TRANSPORT_UNAVAILABLE"
     assert len(children) == 1 and children[0].poll() is not None
-    assert list(directory.iterdir()) == []  # no record is left
+    # The alarm used up the join's budget, which leaves no time to remove the record without a bound.
+    assert [path.name for path in directory.iterdir()] == [f"{frame['boot_id']}.json"]
+
+
+def test_the_join_lookup_gets_what_is_left_of_the_worker_alarm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fails on the old code: the lookup got a fresh REQUEST_SECONDS after the frame, past the worker's deadline."""
+    seen: dict[str, float] = {}
+
+    def capture(*_args: Any, resolve_by: float, **_kwargs: Any) -> Any:
+        seen["left"] = resolve_by - time.monotonic()
+        raise ChatError("TRANSPORT_UNAVAILABLE")
+
+    monkeypatch.setattr(instance_client, "join_instance", capture)
+    frame = {
+        "id": 0,
+        "op": "join",
+        "enabled": True,
+        "directory": "/nonexistent-binding",
+        "native_session_id": "budget-native",
+        "boot_id": str(uuid4()),
+        "server_origin": f"https://{HOSTNAME}:8443",
+        "host_token": HOST_TOKEN,
+        "harness": "pi",
+    }
+    previous = signal.signal(signal.SIGALRM, instance_worker._interrupt)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 5)
+        time.sleep(0.2)  # the parent is slow to send the frame
+        with pytest.raises(ChatError):
+            instance_worker._join(frame)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    assert 0 < seen["left"] <= 4.85
 
 
 def _join_with_refused_addresses(

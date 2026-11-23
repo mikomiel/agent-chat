@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 from typing import Any, Literal
 from uuid import UUID
 
@@ -17,6 +18,11 @@ from .client import Address, Client, resolve_origin
 from .instance_file import InstanceSecret, _prepare_instance, discard_instance
 from .models import RECEIPT_FEED_LIMIT, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 from .protocol import cursor, token_digest
+
+# The least time left before `resolve_by` for which a join removes the record it created. With less, the caller's
+# deadline could fire inside the removal, or have fired already and left it unbounded; the record then stays for
+# the next start's stale sweep.
+DISCARD_RESERVE_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -79,9 +85,10 @@ def join_instance(
     checks. The registration and every later request of the binding connect only to those addresses.
 
     `TRANSPORT_UNAVAILABLE` here means nothing was sent: the lookup failed or no address accepted a connection. No
-    instance can exist that the record would recover, so a record this call created is discarded. A record that
-    was already there, from an attempt that may have registered, stays for the next retry, as on every other
-    failure.
+    instance can exist that the record would recover, so a record this call created is discarded while at least
+    `DISCARD_RESERVE_SECONDS` remain before `resolve_by`; with less, it stays for the next start's stale sweep. A
+    record that was already there, from an attempt that may have registered, stays for the next retry, as on every
+    other failure.
     """
     if enabled is not True:
         raise ChatError("INTEGRATION_DISABLED")
@@ -106,7 +113,11 @@ def join_instance(
             },
         )
     except ChatError as error:
-        if created and error.code == "TRANSPORT_UNAVAILABLE":
+        if (
+            created
+            and error.code == "TRANSPORT_UNAVAILABLE"
+            and (resolve_by is None or monotonic() < resolve_by - DISCARD_RESERVE_SECONDS)
+        ):
             discard_instance(directory, boot_id)
         raise
     try:
