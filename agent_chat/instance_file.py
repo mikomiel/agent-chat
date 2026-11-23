@@ -109,13 +109,6 @@ def prepare_instance(directory: Path, native_session_id: str, boot_id: UUID, *, 
     A retry must match native identity, boot and destination. Partial/older-format
     files fail closed and are not overwritten. The CLI is only a reader.
     """
-    return _prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)[0]
-
-
-def _prepare_instance(
-    directory: Path, native_session_id: str, boot_id: UUID, *, server_origin: str
-) -> tuple[InstanceSecret, bool]:
-    """`prepare_instance`, and whether its exclusive open created the record (False: an earlier attempt's record)."""
     validate_origin(server_origin)
     token = secrets.token_hex(32)
     registration = Registration(
@@ -131,7 +124,7 @@ def _prepare_instance(
             if record.native_session_id != native_session_id or record.server_origin != server_origin:
                 raise ChatError("BINDING_FILE_CONFLICT") from exc
             os.fsync(directory_fd)
-            return record, False
+            return record
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             os.fchmod(stream.fileno(), 0o600)
             json.dump(
@@ -146,7 +139,7 @@ def _prepare_instance(
             stream.flush()
             os.fsync(stream.fileno())
         os.fsync(directory_fd)
-        return InstanceSecret(native_session_id, registration.boot_id, token, server_origin), True
+        return InstanceSecret(native_session_id, registration.boot_id, token, server_origin)
     finally:
         os.close(directory_fd)
 

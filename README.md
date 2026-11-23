@@ -171,8 +171,9 @@ limit kills. The child also arms its own alarm for that limit, rounded up to a
 whole second, so a worker killed during the lookup leaves no process behind
 past it; on Linux the child dies with the worker at once. A join that sends
 nothing, because the lookup fails or no address accepts a connection, fails
-with `TRANSPORT_UNAVAILABLE` and removes the record it created. An IP-literal
-origin is not resolved. Every later request of that
+with `TRANSPORT_UNAVAILABLE`. Its record stays, for a retry of the same boot or
+for the next start's stale sweep. An IP-literal origin is not resolved. Every
+later request of that
 binding connects only to the addresses found at join, in the resolver's order,
 and performs no name resolution. TLS still verifies the server's host name,
 and the `Host` header still carries it. When none of the addresses accepts a

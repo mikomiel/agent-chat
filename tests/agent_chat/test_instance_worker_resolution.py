@@ -209,8 +209,7 @@ def test_a_hanging_resolver_at_join_is_bounded_by_the_join_deadline(
     # The code that a failed connection has, which every integration's rejoin policy already handles.
     assert error.value.code == "TRANSPORT_UNAVAILABLE"
     assert len(children) == 1 and children[0].poll() is not None
-    # The lookup used up the deadline, so the removal is not attempted inside it: the record stays for the next
-    # start's stale sweep rather than outlive the worker limit on a stalled filesystem.
+    # The join never removes its record: it stays for a retry of the same boot or the next start's stale sweep.
     assert [path.name for path in directory.iterdir()] == [f"{frame['boot_id']}.json"]
 
 
@@ -249,7 +248,7 @@ def test_the_worker_alarm_cuts_a_hanging_join_lookup_short_as_a_transport_refusa
     # Not REQUEST_UNCERTAIN, which a bare timeout escaping the join would become.
     assert error.value.code == "TRANSPORT_UNAVAILABLE"
     assert len(children) == 1 and children[0].poll() is not None
-    # The alarm used up the join's budget, which leaves no time to remove the record without a bound.
+    # The join never removes its record: it stays for a retry of the same boot or the next start's stale sweep.
     assert [path.name for path in directory.iterdir()] == [f"{frame['boot_id']}.json"]
 
 
@@ -285,6 +284,65 @@ def test_the_join_lookup_gets_what_is_left_of_the_worker_alarm(monkeypatch: pyte
     assert 0 < seen["left"] <= 4.85
 
 
+@pytest.mark.parametrize(
+    ("cause", "expected"),
+    [("deadline", (ChatError, "CLI_INTERRUPTED")), ("alarm", (client.Interrupted, None))],
+)
+def test_a_resolver_that_cannot_be_reaped_is_abandoned_within_two_seconds_of_the_deadline(
+    cause: str, expected: tuple[type[Exception], str | None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fails on a1ce007: the kill was followed by a wait with no bound, and so was the context manager's exit.
+
+    The child stands for one stuck in uninterruptible I/O: the kill reaches it and it stays alive. An unbounded wait
+    would hold the worker past its deadline for as long as the child stays stuck.
+    """
+    created: list[Any] = []
+
+    class Unreapable:
+        returncode = None
+
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            self.stdout = io.BytesIO()
+            self.killed = False
+            created.append(self)
+
+        def __enter__(self) -> Unreapable:
+            return self
+
+        def __exit__(self, *_exception: object) -> None:
+            self.stdout.close()
+            self.wait()  # as the exit of a real Popen does, with no bound
+
+        def communicate(self, timeout: float | None = None) -> Any:
+            assert timeout is not None
+            time.sleep(timeout)  # the lookup is still pending when its time is up
+            if cause == "alarm":
+                raise client.Interrupted("worker interrupted")
+            raise subprocess.TimeoutExpired("resolver", timeout)
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            self.killed = True
+
+        def wait(self, timeout: float | None = None) -> int:
+            assert timeout is not None, "an unbounded wait on a child that stays alive"
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired("resolver", timeout)
+
+    monkeypatch.setattr(subprocess, "Popen", Unreapable)
+    deadline = time.monotonic() + 0.3
+    with pytest.raises((ChatError, client.Interrupted)) as raised:
+        client._resolve(HOSTNAME, 443, deadline=deadline)
+    assert time.monotonic() - deadline < 2
+    # What the caller sees is what it saw before: the deadline is CLI_INTERRUPTED, and the alarm stays the alarm.
+    assert (type(raised.value), getattr(raised.value, "code", None)) == expected
+    (resolver,) = created
+    assert resolver.killed
+    assert resolver.stdout.closed
+
+
 def _join_with_refused_addresses(
     monkeypatch: pytest.MonkeyPatch, directory: Path, boot_id: UUID
 ) -> instance_client.JoinedInstance:
@@ -303,31 +361,79 @@ def _join_with_refused_addresses(
     )
 
 
-def test_a_registration_that_reaches_no_address_leaves_no_record(
-    children: list[subprocess.Popen[bytes]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("earlier", [False, True], ids=["created-by-this-join", "left-by-an-earlier-attempt"])
+def test_a_registration_that_reaches_no_address_keeps_the_record(
+    earlier: bool, children: list[subprocess.Popen[bytes]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Fails on f00a0a7: the record that the join created stayed behind after a request that was never sent."""
-    directory = tmp_path / "binding"
-    directory.mkdir(mode=0o700)
-    with pytest.raises(ChatError) as error:
-        _join_with_refused_addresses(monkeypatch, directory, uuid4())
-    assert error.value.code == "TRANSPORT_UNAVAILABLE"
-    assert len(children) == 1 and children[0].returncode == 0  # the lookup itself succeeded
-    assert list(directory.iterdir()) == []
+    """Fails on a1ce007 for a record that this join created: the join removed it after a request it never sent.
 
-
-def test_a_retried_registration_that_reaches_no_address_keeps_the_earlier_record(
-    children: list[subprocess.Popen[bytes]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Passes on f00a0a7 too. A record from an earlier attempt that may have registered is the retry's only proof."""
+    A retry of the same boot may already use the record, so the join leaves it, whoever wrote it. A record from an
+    earlier attempt that may have registered is the retry's only proof; it stays too, and keeps its token.
+    """
     directory = tmp_path / "binding"
     directory.mkdir(mode=0o700)
     boot_id = uuid4()
-    earlier = prepare_instance(directory, "refused-native", boot_id, server_origin=f"https://{HOSTNAME}:8443")
+    saved = None
+    if earlier:
+        saved = prepare_instance(directory, "refused-native", boot_id, server_origin=f"https://{HOSTNAME}:8443")
     with pytest.raises(ChatError) as error:
         _join_with_refused_addresses(monkeypatch, directory, boot_id)
     assert error.value.code == "TRANSPORT_UNAVAILABLE"
-    assert read_instance(directory / f"{boot_id}.json").token == earlier.token
+    assert len(children) == 1 and children[0].returncode == 0  # the lookup itself succeeded
+    assert [path.name for path in directory.iterdir()] == [f"{boot_id}.json"]
+    if saved is not None:
+        assert read_instance(directory / f"{boot_id}.json").token == saved.token
+
+
+def test_a_failed_join_leaves_the_record_that_a_retry_of_the_same_boot_registered_with(
+    server: _Server, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fails on a1ce007: the first join removed the record, though the retry had registered with its token.
+
+    The owner repeats the exact boot while the first join is still looking the host up. The retry reads the saved
+    token and registers. When the first join then fails, a removal would leave a registered instance that no later
+    join of this boot could recover: each would write a new token and meet BINDING_CONFLICT. The retry runs inside the
+    first join's lookup, so the interleaving is exact, and the first join has plenty of time left.
+    """
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    boot_id = uuid4()
+    origin = f"http://127.0.0.1:{server.port}"
+    retries: list[instance_client.JoinedInstance] = []
+
+    def lookup_during_which_the_retry_runs(_origin: str, *, deadline: float) -> tuple[client.Address, ...]:
+        # The retry takes no `resolve_by`: it registers by a plain request to the server.
+        retries.append(
+            instance_client.join_instance(
+                directory,
+                "race-native",
+                boot_id,
+                server_origin=origin,
+                host_token=HOST_TOKEN,
+                harness="pi",
+                enabled=True,
+            )
+        )
+        # The first join's lookup then lists one address, and it refuses the connection.
+        return ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", _refused_port())),)
+
+    monkeypatch.setattr(instance_client, "resolve_origin", lookup_during_which_the_retry_runs)
+    with pytest.raises(ChatError) as error:
+        instance_client.join_instance(
+            directory,
+            "race-native",
+            boot_id,
+            server_origin=origin,
+            host_token=HOST_TOKEN,
+            harness="pi",
+            enabled=True,
+            resolve_by=time.monotonic() + 60,
+        )
+    assert error.value.code == "TRANSPORT_UNAVAILABLE"
+    assert [path for path, _host in server.hosts] == ["/v1/sessions"]  # only the retry registered
+    path = directory / f"{boot_id}.json"
+    assert path.exists(), "the first join removed the record of the instance that the retry registered"
+    assert read_instance(path).token == retries[0].binding.token
 
 
 def test_an_alarm_in_the_record_step_ends_the_join_and_keeps_the_earlier_record(

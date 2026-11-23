@@ -59,15 +59,21 @@ _DIE_WITH_PARENT = (
     "except (ImportError, OSError, AttributeError): pass\n"
     "if os.getppid()!=int(sys.argv[3]): os._exit(1)\n"
 )
+#: The longest that `_resolve` waits for a child it has killed. A child that is still alive then, such as one stuck in
+#: uninterruptible I/O, is abandoned. The worker exits soon after and init reaps the child; in a longer-lived caller
+#: the subprocess module reaps it once it ends.
+_REAP_SECONDS = 1.0
 
 
 def _resolve(hostname: str, port: int, *, deadline: float) -> list[Address]:
-    """Resolve in a private stdlib-only child that is killed and reaped at the deadline.
+    """Resolve in a private stdlib-only child that is killed at the deadline.
 
-    getaddrinfo has no cancellation API. A child can be killed and reaped; abandoning a resolver thread would leave
-    expired work behind. The child receives only the destination, never the credential. A caller killed while the
-    lookup is pending leaves no process behind for long: the child's own alarm ends it at the deadline, rounded up
-    to a whole second, and on Linux it also ends with its parent.
+    getaddrinfo has no cancellation API. A child can be killed; abandoning a resolver thread would leave expired work
+    behind. The child receives only the destination, never the credential. The kill is followed by a wait of at most
+    `_REAP_SECONDS`; a child that is still alive then is abandoned, so one stuck in uninterruptible I/O cannot hold
+    the caller past its deadline. The pipe is closed on every path. A caller killed while the lookup is pending leaves
+    no process behind for long: the child's own alarm ends it at the deadline, rounded up to a whole second, and on
+    Linux it also ends with its parent.
     """
     left = _time_left(deadline)
     source = (
@@ -75,12 +81,14 @@ def _resolve(hostname: str, port: int, *, deadline: float) -> list[Address]:
         + (_DIE_WITH_PARENT if sys.platform.startswith("linux") else "")
         + _RESOLVER
     )
-    with subprocess.Popen(
+    # Not a context manager: its exit waits for the child with no bound.
+    resolver = subprocess.Popen(
         [sys.executable, "-I", "-S", "-c", source, hostname, str(port), str(os.getpid()), repr(left)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-    ) as resolver:
+    )
+    try:
         try:
             output, _ = resolver.communicate(timeout=_time_left(deadline))
         except subprocess.TimeoutExpired:
@@ -88,9 +96,15 @@ def _resolve(hostname: str, port: int, *, deadline: float) -> list[Address]:
         finally:
             if resolver.poll() is None:
                 resolver.kill()
-                resolver.wait()
-        if resolver.returncode:
-            raise OSError("hostname resolution failed")
+                try:
+                    resolver.wait(timeout=_REAP_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass  # still alive: abandoned, as `_REAP_SECONDS` says
+    finally:
+        if resolver.stdout is not None:
+            resolver.stdout.close()
+    if resolver.returncode:
+        raise OSError("hostname resolution failed")
     return [(family, kind, protocol, tuple(sockaddr)) for family, kind, protocol, _, sockaddr in json.loads(output)]
 
 
@@ -180,7 +194,7 @@ def resolve_origin(server_origin: str, *, deadline: float) -> tuple[Address, ...
     try:
         addresses = tuple(_resolve(hostname, port, deadline=deadline))
     except (ChatError, OSError, ValueError, TypeError):
-        # OSError includes the caller's alarm cutting the wait short; the child is already killed and reaped.
+        # OSError includes the caller's alarm cutting the wait short; `_resolve` kills the child on its way out.
         raise ChatError("TRANSPORT_UNAVAILABLE") from None
     if not addresses:
         raise ChatError("TRANSPORT_UNAVAILABLE")

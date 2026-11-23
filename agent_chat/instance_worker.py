@@ -7,10 +7,10 @@ nothing.
 
 The join resolves the server host once, after the binding record is written, in a child process that
 the join's deadline bounds, that arms its own alarm for that deadline and that, on Linux, dies with the
-worker. A join that sends nothing removes the record it created. Every later request connects only to
-those addresses, in order, and performs no name resolution; TLS still verifies the host name. When none
-of them accepts a connection the request fails with TRANSPORT_UNAVAILABLE. Only the next join, the
-parent's rejoin, resolves again.
+worker. A join that sends nothing keeps its record, for a retry of the same boot or for the next start's
+stale sweep. Every later request connects only to those addresses, in order, and performs no name
+resolution; TLS still verifies the host name. When none of them accepts a connection the request fails
+with TRANSPORT_UNAVAILABLE. Only the next join, the parent's rejoin, resolves again.
 """
 
 import json
@@ -107,8 +107,8 @@ def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
         host_token=request["host_token"],
         harness=request["harness"],
         enabled=request["enabled"],
-        # The lookup and its cleanup share what is left of the alarm armed before the join frame, not a fresh
-        # budget, so a resolver whose death signal is refused cannot outlive the join's own deadline.
+        # The lookup gets what is left of the alarm armed before the join frame, not a fresh budget, so a resolver
+        # whose death signal is refused cannot outlive the join's own deadline.
         resolve_by=monotonic() + (signal.getitimer(signal.ITIMER_REAL)[0] or REQUEST_SECONDS),
     )
 

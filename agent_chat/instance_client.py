@@ -10,19 +10,13 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from time import monotonic
 from typing import Any, Literal
 from uuid import UUID
 
 from .client import Address, Client, resolve_origin
-from .instance_file import InstanceSecret, _prepare_instance, discard_instance
+from .instance_file import InstanceSecret, prepare_instance
 from .models import RECEIPT_FEED_LIMIT, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 from .protocol import cursor, token_digest
-
-# The least time left before `resolve_by` for which a join removes the record it created. With less, the caller's
-# deadline could fire inside the removal, or have fired already and left it unbounded; the record then stays for
-# the next start's stale sweep.
-DISCARD_RESERVE_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -84,42 +78,30 @@ def join_instance(
     With `resolve_by`, a monotonic time, the server host is resolved once before that time, after the record's own
     checks. The registration and every later request of the binding connect only to those addresses.
 
-    `TRANSPORT_UNAVAILABLE` here means nothing was sent: the lookup failed or no address accepted a connection. No
-    instance can exist that the record would recover, so a record this call created is discarded while at least
-    `DISCARD_RESERVE_SECONDS` remain before `resolve_by`; with less, it stays for the next start's stale sweep. A
-    record that was already there, from an attempt that may have registered, stays for the next retry, as on every
-    other failure.
+    `TRANSPORT_UNAVAILABLE` here means nothing was sent: the lookup failed or no address accepted a connection. The
+    record stays, as on every other failure, and this call never removes it. A retry of the same boot may already
+    use it, so a removal here could take it from a live registration. The retry reuses it, or the stale sweep of the
+    next start removes it.
     """
     if enabled is not True:
         raise ChatError("INTEGRATION_DISABLED")
     if harness not in ("pi", "codex", "claude", "deepseek", "opencode"):
         raise ChatError("INVALID_REQUEST")
     registration_client = Client(server_origin, host_token, deadline=deadline)
-    # Whether the exclusive open made the record, never a separate existence probe: an alarm inside a probe that
-    # swallows OSError would read as "absent" and mark an earlier attempt's recoverable record for removal.
-    secret, created = _prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
+    secret = prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
     addresses: tuple[Address, ...] = ()
-    try:
-        if resolve_by is not None:
-            addresses = resolve_origin(server_origin, deadline=resolve_by)
-            registration_client = Client(server_origin, host_token, deadline=deadline, addresses=addresses)
-        result = registration_client.request(
-            "POST",
-            "/v1/sessions",
-            {
-                "native_session_id": secret.native_session_id,
-                "boot_id": str(secret.boot_id),
-                "instance_token_hash": token_digest(secret.token),
-            },
-        )
-    except ChatError as error:
-        if (
-            created
-            and error.code == "TRANSPORT_UNAVAILABLE"
-            and (resolve_by is None or monotonic() < resolve_by - DISCARD_RESERVE_SECONDS)
-        ):
-            discard_instance(directory, boot_id)
-        raise
+    if resolve_by is not None:
+        addresses = resolve_origin(server_origin, deadline=resolve_by)
+        registration_client = Client(server_origin, host_token, deadline=deadline, addresses=addresses)
+    result = registration_client.request(
+        "POST",
+        "/v1/sessions",
+        {
+            "native_session_id": secret.native_session_id,
+            "boot_id": str(secret.boot_id),
+            "instance_token_hash": token_digest(secret.token),
+        },
+    )
     try:
         if (
             not isinstance(result, dict)
