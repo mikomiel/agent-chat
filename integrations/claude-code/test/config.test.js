@@ -121,3 +121,36 @@ test("a FIFO is refused without blocking the hook", () => {
     assert.ok(Date.now() - started < 1000)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
+
+// Issue #131: the tool route is one optional key with a closed enum. Absent means "cli".
+test("toolRoute is optional and takes exactly cli, mcp or mcp-with-cli-fallback", () => {
+  assert.equal(withConfig(base).toolRoute, undefined)
+  for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
+    assert.deepEqual(withConfig({ ...base, toolRoute }), { ...base, toolRoute })
+  }
+})
+
+test("any other toolRoute keeps chat off and logs nothing", () => {
+  const writes = []
+  const saved = { error: console.error, warn: console.warn, log: console.log, stderr: process.stderr.write, stdout: process.stdout.write }
+  try {
+    console.error = console.warn = console.log = (...args) => { writes.push(args) }
+    for (const toolRoute of ["MCP", "CLI", "Mcp", "", "http", "mcp-with-fallback", " mcp", null, 1, 0, true, false, ["mcp"], {}]) {
+      process.stderr.write = process.stdout.write = chunk => { writes.push(chunk); return true }
+      const loaded = withConfig({ ...base, toolRoute })
+      process.stderr.write = saved.stderr
+      process.stdout.write = saved.stdout
+      assert.equal(loaded, null, JSON.stringify(toolRoute))
+    }
+  } finally {
+    Object.assign(console, { error: saved.error, warn: saved.warn, log: saved.log })
+    process.stderr.write = saved.stderr
+    process.stdout.write = saved.stdout
+  }
+  assert.deepEqual(writes, [])
+})
+
+test("a valid toolRoute does not open the key set: an unknown sibling key still keeps chat off", () => {
+  assert.equal(withConfig({ ...base, toolRoute: "mcp", toolRouteFallback: "cli" }), null)
+  assert.equal(withConfig({ ...base, toolRoute: "cli", mcpServer: "agent-chat" }), null)
+})

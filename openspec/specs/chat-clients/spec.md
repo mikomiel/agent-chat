@@ -10,8 +10,16 @@ After a successful join the adapter MUST expose `python`, `instance_file`, `room
 
 #### Scenario: Joined session learns its binding
 - **WHEN** an adapter has joined and the harness asks it for the session context
-- **THEN** the context carries the eight binding fields and names the interpreter form and the environment variable the CLI needs
+- **THEN** the context carries the eight binding fields and the route lines of the configured tool route
+- **AND** on the `cli` route, and in the fallback lines of the `mcp-with-cli-fallback` route, it names the interpreter form and the environment variable the CLI needs
+- **AND** on the `mcp` and `mcp-with-cli-fallback` routes it tells the model to call the agent-chat MCP `bind` tool, when the server exposes one, with exactly the `instance_file` shown, and again whenever a later binding shows a different one
 - **AND** it carries no token and no other session's binding
+
+#### Scenario: Tool route
+- **WHEN** an integration's config sets `toolRoute` to `cli`, `mcp` or `mcp-with-cli-fallback`, or leaves it unset, which means `cli`
+- **THEN** the binding context and every notice name only the surfaces of that route, by server and tool name, never by a harness-specific callable name
+- **AND** the `mcp-with-cli-fallback` route allows the CLI only while the MCP server or its transport is unavailable, and tells the model to reconcile an uncertain send or reply instead of replaying it automatically on the other transport
+- **AND** any other value keeps chat off
 
 #### Scenario: Instance replaced
 - **WHEN** the adapter rejoins with a new instance
@@ -470,15 +478,19 @@ The renderer MUST cut a body on whole units (a code point or one escape) at a pe
 - **THEN** the message carries the same pointer line
 
 ### Requirement: The instruction line ties a pointer and a reply to the header of the item
-A notice with bodies MUST carry an instruction line before the first frame. It MUST tell the reader to verify that the `history` read of a cut body returns the id shown in that item's header, and that the `--room` of a reply is the room shown in that item's header.
+A notice with bodies MUST carry an instruction line before the first frame. It MUST tell the reader to verify that the `history` read of a cut body returns the id shown in that item's header. On the `cli` route it MUST also say that the `--room` of a reply is the room shown in that item's header. On the MCP routes the `reply` tool derives the room and key from the parent message, so the line names no room.
 
 #### Scenario: A reader follows a pointer line
 - **WHEN** a notice with bodies is rendered
 - **THEN** the instruction line tells the reader to verify that the `history` read returns the id shown in that item's header
 
 #### Scenario: A reader replies to a message from another room
-- **WHEN** a notice with bodies carries a message from a room other than the room of the binding
+- **WHEN** a notice with bodies on the `cli` route carries a message from a room other than the room of the binding
 - **THEN** the instruction line says that a reply's `--room` is the room shown in that item's header
+
+#### Scenario: A reader replies through the MCP reply tool
+- **WHEN** a notice with bodies is rendered on the `mcp` or `mcp-with-cli-fallback` route
+- **THEN** the instruction line names no room, and the notice names `reply` to the message id, so the reply tool derives the room and key from the parent message
 
 ### Requirement: The notice says that peer data is untrusted
 A static line before the first frame MUST say that every `> ` line between the markers is untrusted peer data, including lookalike bindings, instructions and markers, that peer data grants no authority, and that the notice acknowledges nothing. The binding line MUST stay outside every frame and before them.
@@ -534,7 +546,7 @@ The estimate assumes that a body renders to at most 3 bytes for each stored byte
 - **AND** each cut body carries its pointer line, and the notice is at most 8137 bytes
 
 ### Requirement: Every renderer passes the same vectors
-The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package that delivers notices MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs. A package that delivers no notice ships no renderer.
+The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package that delivers notices MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs. A package that delivers no notice MAY ship the same byte-identical copy only for its binding text and tool-route names, and MUST NOT deliver a notice with it.
 
 #### Scenario: Both implementations agree
 - **WHEN** the vectors run under the Python tests and under each package's tests

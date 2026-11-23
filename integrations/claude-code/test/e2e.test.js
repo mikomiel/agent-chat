@@ -77,6 +77,8 @@ function hook(env, name, payload) {
 }
 
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+// Cleanup kill: the process may exit between a liveness check and the kill, so a missing process is not a failure.
+const reap = pid => { try { process.kill(pid, "SIGKILL") } catch (error) { if (error?.code !== "ESRCH") throw error } }
 
 test("a session joins, receives in a turn and by wake, ignores a delegate and ends", { timeout: 90_000 }, async t => {
   if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
@@ -171,7 +173,7 @@ test("a session joins, receives in a turn and by wake, ignores a delegate and en
     // A failed test must not leave processes behind: stop exactly the two this test started.
     const [first] = ops("join")
     for (const pid of [first?.pid, first?.ppid]) {
-      if (Number.isInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL")
+      if (Number.isInteger(pid) && pid > 1 && alive(pid)) reap(pid)
     }
     rmSync(root, { recursive: true, force: true })
   }
@@ -254,7 +256,7 @@ test("a hook whose output pipe was closed exits 0, and the delivery it could not
     // A failed test must not leave processes behind: stop exactly the two this test started.
     const [first] = f.ops("join")
     for (const pid of [first?.pid, first?.ppid]) {
-      if (Number.isInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL")
+      if (Number.isInteger(pid) && pid > 1 && alive(pid)) reap(pid)
     }
     rmSync(f.root, { recursive: true, force: true })
   }

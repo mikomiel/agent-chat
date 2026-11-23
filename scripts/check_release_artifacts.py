@@ -108,7 +108,7 @@ def package_directories(root: Path) -> list[Path]:
     """Every ``integrations/<harness>/`` directory, found by listing, never from a fixed list.
 
     The one named exception is ``SOURCE_ONLY``: ``integrations/shared`` holds the notice renderer
-    that each delivering package keeps a byte-identical copy of, so it ships inside those tarballs, never alone.
+    that each package keeps a byte-identical copy of, so it ships inside those tarballs, never alone.
     """
     base = root / INTEGRATIONS
     return sorted(path for path in base.iterdir() if path.is_dir() and path.name not in SOURCE_ONLY)
