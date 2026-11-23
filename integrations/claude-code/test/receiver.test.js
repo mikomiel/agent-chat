@@ -1190,14 +1190,14 @@ test("route: each route leaves the documented room for interpreter and state pat
 // After a rejoin the new binding is still to be shown. The hook claims as it did before #131. When the binding and the
 // notice fit together, both go out; when they do not, the notice goes alone (every notice is self-contained), the batch
 // is handed, and the binding stays to be shown for the next hook (review of #165). Before, such a batch was deferred.
-async function afterRejoin(config, handlers) {
+async function afterRejoin(config, handlers, { once = true } = {}) {
   let refuse = true
   let claimed = false
   const r = await rig({
     config,
     handlers: {
       ...handlers,
-      pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : claimed ? { messages: [] } : handlers.pending(fields)),
+      pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : claimed && once ? { messages: [] } : handlers.pending(fields)),
       claim: fields => { claimed = true; return handlers.claim(fields) },
     },
   })
@@ -1261,6 +1261,41 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
     for (const row of rows) assert.ok(reply.context.includes(`message ${row.id} kind question`), row.id)
     assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "the binding was shown")
   })
+}
+
+// A second large batch waits behind the first: the hook after a notice that went out alone shows the binding alone and
+// claims nothing, so the binding is not postponed again; the hook after that claims the second batch (review of #165).
+for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
+  for (const noticeBodies of [false, true]) {
+    test(`route: on ${toolRoute} after a ${noticeBodies ? "bodies" : "metadata"} notice went out alone, the next hook shows the binding before it claims the next batch`, async () => {
+      const room = BINDING_PATH_ROOM[toolRoute] - baseConfig.directory.length + (63 - "synthetic-host".length) + (36 - "session-1".length)
+      const batches = [0, 1].map(batch => Array.from({ length: 16 }, (_, index) => uuid(100 * batch + index + 1)))
+      const queue = [...batches]
+      const rowOf = id => (noticeBodies
+        ? { ...bodyRow(Number(id.slice(-12)), "r".repeat(4096)), id }
+        : { id, kind: "consultation", room_id: ROOM, history_after: "9".repeat(19) })
+      const r = await afterRejoin({ toolRoute, noticeBodies, python: `/${"p".repeat(noticeBodies ? 1399 : room - 101)}`, ...(noticeBodies ? { directory: `/${"d".repeat(799)}` } : {}) }, {
+        pending: fields => (!queue.length ? { messages: [] } : fields.bodies === true
+          ? { messages: queue[0], sizes: Object.fromEntries(queue[0].map(id => [id, 4096])), retry: true } : { messages: queue[0] }),
+        claim: fields => {
+          queue.shift()
+          return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, admitted_at: ADMITTED, messages: fields.messages.map(rowOf) }
+        },
+      }, { once: false })
+      const [first] = (await r.op(turn({ event: "PostToolUse" }))).sent
+      assert.ok(first.context.startsWith(CHAT_PREFIX), "the first batch goes out alone")
+      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]])
+      const [second] = (await r.op(turn({ event: "PostToolUse" }))).sent
+      assert.match(second.context, /^Agent Chat is available to this session/, "the next hook shows the binding")
+      assert.ok(!second.context.includes(CHAT_PREFIX))
+      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
+      const [third] = (await r.op(turn({ event: "PostToolUse" }))).sent
+      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), batches, "the hook after it claims the second batch")
+      assert.ok(third.context.startsWith(CHAT_PREFIX), "with no binding left to show")
+      for (const id of batches[1]) assert.ok(third.context.includes(id), id)
+      assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }, { outcome: "handed", reason: null }])
+    })
+  }
 }
 
 for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {

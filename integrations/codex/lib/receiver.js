@@ -81,6 +81,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let joined = null
   let bootId = null
   let announced = null // the boot id whose binding the model has been shown
+  // Set when a notice went out alone beside a binding still to be shown: the next hook shows that binding alone and
+  // claims nothing, so a run of large batches cannot keep postponing it. Cleared once the binding is shown.
+  let bindingFirst = false
   let shown = 0 // counts the starts that dropped the earlier receipt; a receipt for text sent before the newest one is not kept
   let native = "unknown" // idle | busy | unknown: the running state from the last hook event
   let planHint = false // the last hook payload said permission_mode "plan"
@@ -207,7 +210,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return text === null || (!always && announced === bootId) ? null : { text, boot: bootId, shown: from }
   }
   // A confirmed write of `announce` counts only while no start has dropped the receipts since it was made.
-  const confirm = announce => { if (announce.shown === shown) announced = announce.boot }
+  const confirm = announce => { if (announce.shown === shown) { announced = announce.boot; bindingFirst = false } }
 
   function ask(operation, fields) {
     if (!live) return Promise.reject(Object.assign(new Error("CHAT_WORKER_CLOSED"), { code: "CHAT_WORKER_CLOSED", operation }))
@@ -604,6 +607,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             }
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
             else ({ result, replied } = await hand(link, (shown ? prefix : CHAT_PREFIX) + notice, started + reservation, deadline, shown))
+            if (announce && !shown && result.outcome === "handed") bindingFirst = true
           }
         }
         // A wake that did not hand, whatever stopped it after the claim, waits before the next one.
@@ -710,7 +714,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (wake) await within(wake.done, patience)
     let replied = false
     if (inflight || (wake && waking === wake)) void report() // a slow request never stacks up behind every tool call
-    else {
+    else if (bindingFirst && announcement({ from })) {
+      bindingFirst = false // the binding goes alone below, once, before the next claim
+      await report()
+    } else {
       await report()
       replied = (await guard(deliver({ link, announce: announcement({ from }), deadline }))) === true
     }

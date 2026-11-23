@@ -3994,6 +3994,45 @@ for (const toolRoute of ROUTES) {
   })
 }
 
+// A second large batch waits behind the first: the hook after a notice that went out alone shows the binding alone and
+// claims nothing, so the binding is not postponed again; the hook after that claims the second batch (review of #165).
+for (const toolRoute of ROUTES) {
+  test(`route: on ${toolRoute} after a notice went out alone, the next hook shows the binding before it claims the next batch`, async () => {
+    const batches = [0, 1].map(batch => Array.from({ length: 12 }, (_, index) => uid(100 * batch + index + 1)))
+    const queue = [...batches]
+    let refuse = true
+    const r = await rig({ config: { noticeBodies: true, toolRoute, python: `/${"p".repeat(399)}` }, handlers: deliverable({
+      pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : !queue.length ? { messages: [] } : fields.bodies === true
+        ? { messages: queue[0], sizes: Object.fromEntries(queue[0].map(id => [id, 1])), retry: true } : { messages: queue[0] }),
+      claim: fields => {
+        queue.shift()
+        return {
+          dispatch: true, attempt_id: `attempt-${r.worker.ops("claim").length}`, reservation_ms: 30_000, admitted_at: ADMITTED,
+          messages: fields.messages.map(id => validRow(id, { body: "q" })),
+        }
+      },
+    }) })
+    await r.begin()
+    await r.op(turn())
+    refuse = false
+    await r.clock.advance(3750)
+    assert.equal(r.worker.bootIds.length, 2, "rejoined")
+    r.worker.log.length = 0
+    const [first] = (await r.op(turn({ event: "tool" }))).sent
+    assert.ok(first.context.startsWith(CHAT_PREFIX), "the first batch goes out alone")
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]])
+    const [second] = (await r.op(turn({ event: "tool" }))).sent
+    assert.match(second.context, /^Agent Chat is available to this session/, "the next hook shows the binding")
+    assert.doesNotMatch(second.context, /AGENT-CHAT-BODY/)
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
+    const [third] = (await r.op(turn({ event: "tool" }))).sent
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), batches, "the hook after it claims the second batch")
+    assert.ok(third.context.startsWith(CHAT_PREFIX), "with no binding left to show")
+    for (const id of batches[1]) assert.ok(third.context.includes(`message ${id} kind question`), id)
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }, { outcome: "handed", reason: null }])
+  })
+}
+
 for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
   test(`route: a rejoin on ${toolRoute} announces the new instance_file, the supersede sentence and bind again, never the old file`, async () => {
     let refuse = true

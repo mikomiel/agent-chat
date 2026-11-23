@@ -82,6 +82,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let joined = null
   let bootId = null
   let announced = null // the boot id whose binding the model has been shown
+  // Set when a notice went out alone beside a binding still to be shown: the next hook shows that binding alone and
+  // claims nothing, so a run of large batches cannot keep postponing it. Cleared once the binding is shown.
+  let bindingFirst = false
   let native = "unknown" // idle | busy | plan | unknown, from the last hook event
   let stopped = true // clears on the first turn event; Claude Code reports no stop
   let failure = null // the fail-closed latch: the reason
@@ -158,6 +161,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     ].join("\n")
     return bytes(text) <= MAX_BINDING_BYTES ? text : null
   }
+
+  const confirm = announce => { announced = announce.boot; bindingFirst = false }
 
   const announcement = ({ always = false } = {}) => {
     const text = bindingText()
@@ -277,7 +282,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
     if (isDone(done, "written")) {
-      if (announce) announced = announce.boot
+      if (announce) confirm(announce)
       if (wake) native = "busy" // the notice starts a turn; the next Stop reports idle
       return { result: { outcome: "handed", reason: null }, replied: true }
     }
@@ -334,6 +339,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             }
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
             else ({ result, replied } = await hand(link, (shown ? prefix : CHAT_PREFIX) + notice, started + reservation, wake, shown))
+            if (announce && !shown && result.outcome === "handed") bindingFirst = true
           }
         }
         if (!live) return replied
@@ -356,7 +362,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   async function announceOnly(link, announce) {
     await link.send({ context: announce.text, ack: true })
-    if (isDone(await link.next(2_000), "written")) announced = announce.boot
+    if (isDone(await link.next(2_000), "written")) confirm(announce)
   }
 
   const disabledReply = () => {
@@ -373,7 +379,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const message = announce ? `Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.` : undefined
     if (!announce) return link.send({ context: null })
     await link.send({ context: announce.text, ack: true, message })
-    if (isDone(await link.next(2_000), "written")) announced = announce.boot
+    if (isDone(await link.next(2_000), "written")) confirm(announce)
   }
 
   function setNative(request, running) {
@@ -388,7 +394,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (failure) return link.send(disabledReply())
     let replied = false
     if (inflight) void report() // a slow request never stacks up behind every tool call
-    else {
+    else if (bindingFirst && announcement()) {
+      bindingFirst = false // the binding goes alone below, once, before the next claim
+      await report()
+    } else {
       await report()
       replied = (await guard(deliver({
         link, wake: false, announce: announcement(), deadline: now() + clamp(request.patience_ms, 30_000),
