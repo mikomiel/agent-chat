@@ -2701,6 +2701,10 @@ test("in bodies mode a wake claims no more than a hook would, and after a prompt
   ])
 })
 
+// A wake may go out while a binding is still to be shown (a rejoin while idle, say): a wake is a queued user turn,
+// and that turn's own UserPromptSubmit hook carries the pending binding in the same turn, so the model never acts
+// on a stale binding. That is why the claim is sized with the announcement that hook will carry, and why no wake
+// waits for a hook to show the binding first: that would only delay an idle wake after a rejoin.
 test("in bodies mode a wake sizes its claim with the announcement that a hook would still carry", async () => {
   const ids = Array.from({ length: 16 }, (_, index) => uid(index + 1))
   const counts = {}
@@ -4006,10 +4010,12 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       await r.begin()
       const context = (await r.op(turn())).sent[0].context
       assert.ok(context.startsWith(CHAT_PREFIX), "the binding was announced already")
-      assert.match(context, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
-      const cli = context.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI line")
-      assert.equal(context.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
+      assert.match(context, /Use agent-chat MCP: bind instance_file below first if new; ack or reply to MESSAGE_ID\./)
+      const cli = context.split("\n").filter(line => /--room|--key|--after|--limit|stdin/.test(line))
+      assert.deepEqual(cli, [], "the notice names no CLI argument")
+      // The fallback notice names its own CLI, so it does not depend on a binding the model may not have seen.
+      assert.equal(context.includes("Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports."), toolRoute !== "mcp")
+      assert.equal(context.includes("agent_chat.cli"), toolRoute !== "mcp")
       if (noticeBodies) assert.ok(context.includes(`Body cut. Read all of it with history: room=${ROOM}, after=1234, limit=1`))
       assert.ok(bytes(context) <= MAX_OUTPUT_BYTES)
       assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "handed", reason: null })

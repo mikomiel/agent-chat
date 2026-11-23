@@ -876,10 +876,12 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       await lifecycle.poll()
       assert.equal(delivery.calls.deliver.length, 1, `noticeBodies ${noticeBodies}`)
       const content = delivery.calls.deliver[0].batch.content
-      assert.match(content, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
-      const cli = content.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI line")
-      assert.equal(content.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
+      assert.match(content, /Use agent-chat MCP: bind instance_file below first if new; ack or reply to MESSAGE_ID\./)
+      const cli = content.split("\n").filter(line => /--room|--key|--after|--limit|stdin/.test(line))
+      assert.deepEqual(cli, [], "the notice names no CLI argument")
+      // The fallback notice names its own CLI, so it does not depend on a binding the model may not have seen.
+      assert.equal(content.includes("Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports."), toolRoute !== "mcp")
+      assert.equal(content.includes("agent_chat.cli"), toolRoute !== "mcp")
       if (noticeBodies) assert.ok(content.includes(`Body cut. Read all of it with history: room=${joined.room_id}, after=101, limit=1`))
       assert.ok(whole(delivery) <= MAX_CONTEXT_BYTES)
     }

@@ -76,17 +76,21 @@ const MCP_BIND = "Use the agent-chat MCP tools. If the agent-chat MCP server exp
 const MCP_USE = "Use who with room and online=true to find peers, history with room for coordination, and send with room, recipients, a UUID key and body to publish."
 // The notice lines of the mcp routes. A notice is rendered after the claim, and a stored retry batch is claimed whole,
 // so no route may take more notice bytes than "cli": in each mode every route's own lines, and its pointer line, are
-// at most the cli route's. Then any batch that fits on cli fits on every route. The CLI fallback (the instance-file
-// variable and the interpreter form) and the full retry rule are in the binding; the fallback notice points at them
-// and keeps the no-replay clause.
+// at most the cli route's. Then any batch that fits on cli fits on every route. A notice is also self-contained: it
+// may be the first Agent Chat text a model sees (a Claude Code idle wake right after a join), so the fallback notice
+// names the instance-file variable and the interpreter form itself, from the binding line below it, and keeps the
+// no-replay clause. The full retry rule is in the binding.
+const NOTICE_MCP_USE = "Use agent-chat MCP: bind instance_file below first if new; ack or reply to MESSAGE_ID."
 const NOTICE_MCP = {
-  read: "Read each item with history: room=ROOM, after=HISTORY_AFTER, limit=1; verify its ID.",
+  read: "Read each: history room=ROOM after=HISTORY_AFTER limit=1; verify its ID.",
   bodies: "Each item below carries its body; a cut body has a pointer line with the history arguments for the rest. Verify the read returns the ID in its header.",
-  head: ["Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply (body) on message=MESSAGE_ID."],
+  head: [NOTICE_MCP_USE],
   tail: [],
   pointer: (room, after) => `Body cut. Read all of it with history: room=${room}, after=${after}, limit=1`,
 }
-// The fallback line of a notice and a wake: it points at the binding's CLI line and keeps the no-replay clause.
+const NOTICE_FALLBACK_CLI = "Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports."
+// The fallback line of a wake: a wake carries no binding, and the queued turn's own prompt hook shows a binding still
+// to be shown in that turn, so it points at the binding's CLI line and keeps the no-replay clause.
 const FALLBACK_POINTER = "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."
 // A wake has the least room of any text here (the Codex wake prefix stays under 800 bytes), so its MCP text is short
 // and its fallback points at the binding's CLI line but keeps the no-replay clause.
@@ -123,9 +127,10 @@ const ROUTES = {
       "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli.",
       RETRY,
     ],
+    // One line for the tools and the CLI: a notice line costs its newline too, and the metadata notice has 2 bytes left.
     notice: {
       ...NOTICE_MCP,
-      tail: [FALLBACK_POINTER],
+      head: [`${NOTICE_MCP_USE} ${NOTICE_FALLBACK_CLI}`],
     },
     wake: `${WAKE_MCP} ${FALLBACK_POINTER}`,
   },

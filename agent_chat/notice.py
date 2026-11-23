@@ -107,28 +107,26 @@ _CLI_ROUTE = _RouteText(
     ),
     pointer="Body cut. Read all of it with: history --room {room} --after {after} --limit 1",
 )
+_MCP_USE = "Use agent-chat MCP: bind instance_file below first if new; ack or reply to MESSAGE_ID."
+# A notice is self-contained: the fallback notice names the instance-file variable and the interpreter form itself.
+_FALLBACK_CLI = (
+    "Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); "
+    "never auto-replay an uncertain send or reply across transports."
+)
 _MCP_ROUTE = _RouteText(
-    read="Read each item with history: room=ROOM, after=HISTORY_AFTER, limit=1; verify its ID.",
+    read="Read each: history room=ROOM after=HISTORY_AFTER limit=1; verify its ID.",
     bodies=(
         "Each item below carries its body; a cut body has a pointer line with the history arguments for the rest. "
         "Verify the read returns the ID in its header."
     ),
-    head=(
-        "Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply (body) on "
-        "message=MESSAGE_ID.",
-    ),
+    head=(_MCP_USE,),
     tail=(),
     pointer="Body cut. Read all of it with history: room={room}, after={after}, limit=1",
 )
 _ROUTES = {
     "cli": _CLI_ROUTE,
     "mcp": _MCP_ROUTE,
-    "mcp-with-cli-fallback": _MCP_ROUTE._replace(
-        tail=(
-            "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically "
-            "on the other transport.",
-        ),
-    ),
+    "mcp-with-cli-fallback": _MCP_ROUTE._replace(head=(f"{_MCP_USE} {_FALLBACK_CLI}",)),
 }
 
 

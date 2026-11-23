@@ -534,6 +534,67 @@ test("an idle waiter wakes the session with an addressed batch, then settles han
   await waiting
 })
 
+// A first join fails, the turn ends and the waiter registers, then the join succeeds: no hook has shown the binding yet.
+// The waiter's output is the first Agent Chat text the model sees, so the pending binding goes in front of the notice,
+// and on the fallback route the notice names its own CLI as well (review of #165).
+const FALLBACK_NOTICE_CLI = "Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports."
+async function waiterBeforeBinding(config, handlers) {
+  const r = await rig({ joinErrors: [joinRefusal("BINDING_CONFLICT")], config, handlers })
+  assert.deepEqual((await r.op({ op: "start", wait_ms: 0 })).sent, [{ context: null }], "the start had no binding to show")
+  await r.op(turn())
+  await r.op({ op: "stop", permission_mode: "default" })
+  const wake = hookDouble({ events: r.events })
+  const waiting = r.receiver.handle({ op: "wait" }, wake)
+  await r.clock.advance(3750)
+  assert.equal(r.worker.bootIds.length, 2, "the join succeeds while the waiter is registered")
+  return { r, wake, waiting }
+}
+
+for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
+  test(`route: on ${toolRoute} a waiter registered before the join succeeded wakes the session with the binding in front of the notice`, async () => {
+    let queued = []
+    const { r, wake, waiting } = await waiterBeforeBinding({ toolRoute }, { pending: () => ({ messages: queued }) })
+    queued = ["m1"]
+    await r.clock.advance(2000)
+    assert.equal(wake.sent.length, 1)
+    const { context } = wake.sent[0]
+    assert.ok(context.startsWith("Agent Chat is available to this session."), "the binding leads")
+    assert.ok(context.includes(`"instance_file":"/tmp/agent-chat-state/${r.worker.bootIds[1]}.json"`))
+    const notice = context.slice(context.indexOf(CHAT_PREFIX))
+    assert.match(notice, /"id":"m1"/)
+    if (toolRoute === "mcp-with-cli-fallback") assert.ok(notice.includes(FALLBACK_NOTICE_CLI), "the notice alone names the CLI")
+    assert.ok(bytes(context) <= MAX_OUTPUT_BYTES)
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+    wake.close()
+    await waiting
+    // The binding was shown with the notice: the next turn does not announce it again.
+    queued = []
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }])
+  })
+}
+
+// Beside a binding still to be shown, a waiter claims a bodies batch only when it fits there at its widest. One that
+// does not is not claimed and spends no attempt; the waiter cannot send the binding alone, so the session is not woken
+// for it, and the next hook shows the binding and takes the batch after it.
+test("a waiter beside a binding still to be shown claims no bodies batch that does not fit there, and spends no attempt", async () => {
+  const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "r".repeat(4096)))
+  const ready = bodiesHandlers(rows, { retry: true })
+  const { r, wake, waiting } = await waiterBeforeBinding(
+    { noticeBodies: true, python: `/${"p".repeat(999)}`, directory: `/${"d".repeat(799)}` }, ready)
+  await r.clock.advance(10_000)
+  assert.ok(r.worker.ops("pending").length > 0, "the waiter polls")
+  assert.deepEqual(r.worker.ops("claim"), [], "nothing is claimed beside the binding")
+  assert.deepEqual(wake.sent, [], "the waiter does not wake the session")
+  wake.close()
+  await waiting
+  const first = (await r.op(turn({ event: "PostToolUse" }))).sent
+  assert.match(first[0].context, /^Agent Chat is available to this session/)
+  assert.deepEqual(r.worker.ops("claim"), [])
+  await r.op(turn({ event: "PostToolUse" }))
+  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [rows.map(row => row.id)])
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+})
+
 test("an idle waiter in Plan Mode never claims", async () => {
   const r = await rig({ handlers: { pending: () => ({ messages: ["m1"] }) } })
   await r.begin()
@@ -1203,10 +1264,12 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       const context = (await r.op(turn())).sent[0].context
       assert.ok(context.startsWith(CHAT_PREFIX), "the binding was announced already")
       const notice = context.slice(CHAT_PREFIX.length)
-      assert.match(notice, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
-      const cli = notice.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI line")
-      assert.equal(notice.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
+      assert.match(notice, /Use agent-chat MCP: bind instance_file below first if new; ack or reply to MESSAGE_ID\./)
+      const cli = notice.split("\n").filter(line => /--room|--key|--after|--limit|stdin/.test(line))
+      assert.deepEqual(cli, [], "the notice names no CLI argument")
+      // The fallback notice names its own CLI, so it does not depend on a binding the model may not have seen.
+      assert.equal(notice.includes("Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports."), toolRoute !== "mcp")
+      assert.equal(notice.includes("agent_chat.cli"), toolRoute !== "mcp")
       assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
     }
   })

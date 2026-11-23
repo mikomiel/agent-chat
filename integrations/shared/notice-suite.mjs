@@ -34,6 +34,9 @@ const ROUTES = ["cli", "mcp", "mcp-with-cli-fallback"]
 const BAD_ROUTES = ["CLI", "MCP", "", "http", "mcp-with-fallback", null, 1, true, ["mcp"], {}]
 // The fallback binding's tool line, then its CLI line: the instance-file variable and the interpreter form only.
 const FALLBACK_TOOLS = "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). "
+// The fallback notice's CLI sentence, and the CLI arguments that no notice of an mcp route names.
+const NOTICE_FALLBACK = "Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports."
+const CLI_ARGUMENTS = /--room|--key|--after|--limit|stdin/
 const FALLBACK_CLI = "Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli."
 const RETRY_RULE = "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport."
 // What only the CLI route may say, and a harness-specific callable name no route may say.
@@ -445,8 +448,8 @@ export function runNoticeSuite(label, notice, copy, { noticeBound } = {}) {
       const lines = text.split("\n")
       assert.equal(lines[1], bodies
         ? "Each item below carries its body; a cut body has a pointer line with the history arguments for the rest. Verify the read returns the ID in its header."
-        : "Read each item with history: room=ROOM, after=HISTORY_AFTER, limit=1; verify its ID.")
-      assert.equal(lines[2], "Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply (body) on message=MESSAGE_ID.")
+        : "Read each: history room=ROOM after=HISTORY_AFTER limit=1; verify its ID.")
+      assert.equal(lines[2], "Use agent-chat MCP: bind instance_file below first if new; ack or reply to MESSAGE_ID.")
       assert.doesNotMatch(text, CLI_TEXT)
       assert.doesNotMatch(text, CALLABLE)
       // Every line but the route lines is the cli notice's: the cli route has its surface line and its ack line where
@@ -459,13 +462,15 @@ export function runNoticeSuite(label, notice, copy, { noticeBound } = {}) {
       else assert.match(lines.at(-1), new RegExp(`"id":"${uuid(2)}","kind":"reply"`))
     })
 
-    test(`${label}: ${mode} notice on the fallback route: the mcp lines, then the binding's CLI only if MCP is unavailable and the no-replay rule`, () => {
+    // A notice may be the first Agent Chat text a model sees, so the fallback notice names its own CLI: the
+    // instance-file variable and the interpreter form, from the binding line below it, and no other CLI argument.
+    test(`${label}: ${mode} notice on the fallback route: the mcp lines, with its own CLI only if MCP is unavailable and the no-replay rule`, () => {
       const lines = shown("mcp-with-cli-fallback").split("\n")
       const mcp = shown("mcp").split("\n")
-      assert.deepEqual(lines.slice(0, 4), mcp.slice(0, 4))
-      assert.equal(lines[4], "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport.")
-      assert.deepEqual(lines.slice(5), mcp.slice(4))
-      assert.doesNotMatch(lines.join("\n"), CLI_TEXT)
+      assert.equal(lines.length, mcp.length)
+      assert.equal(lines[2], `${mcp[2]} ${NOTICE_FALLBACK}`)
+      assert.deepEqual([...lines.slice(0, 2), ...lines.slice(3)], [...mcp.slice(0, 2), ...mcp.slice(3)])
+      assert.doesNotMatch(lines.join("\n"), CLI_ARGUMENTS)
       assert.doesNotMatch(lines.join("\n"), CALLABLE)
     })
 

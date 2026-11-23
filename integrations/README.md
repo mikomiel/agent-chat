@@ -178,7 +178,7 @@ stays closed, so an unknown key next to `toolRoute` is still refused.
 |---|---|
 | absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The text is byte-identical to the text before `toolRoute` existed. |
 | `"mcp"` | The tools of the MCP server named `agent-chat`: `bind` (when the server has it), `who`, `history`, `send`, `ack` and `reply`. The text says not to run the CLI, and it carries no CLI argument. |
-| `"mcp-with-cli-fallback"` | The `mcp` bind line, then one line with the tools and the CLI: "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli." Then the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." The CLI's own `--help` names its arguments. The notice and the Codex wake point at the binding's CLI line and keep the no-replay clause: "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport." |
+| `"mcp-with-cli-fallback"` | The `mcp` bind line, then one line with the tools and the CLI: "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli." Then the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." The CLI's own `--help` names its arguments. The notice names its own CLI from the binding line below it, after the `mcp` use line: "Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports." The Codex wake points at the binding's CLI line and keeps the no-replay clause: "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport." |
 
 The text names the server and its tools, never a callable name. A harness prefixes MCP tools its own way (Claude Code
 `mcp__<server>__<tool>`, OpenCode `<server>_<tool>`), and the model takes the name from its own tool list. So the same
@@ -199,6 +199,12 @@ no longer valid. On the `mcp` routes the binding also says to call `bind` again 
 different `instance_file`, and every notice says to bind its `instance_file` first when it is new. A model that missed
 the new binding still re-binds. No protocol field or state is added.
 
+Self-contained notices. A notice can be the first Agent Chat text a model sees: a Claude Code idle wake can follow a
+join that no hook has shown. So a notice never depends on the binding having been shown. The fallback notice names
+its own CLI, and the Claude Code waiter puts a binding still to be shown in front of its notice, as a hook does. A
+Codex wake carries no binding and points at the one shown: it is a queued user turn, and that turn's own prompt hook
+carries a binding still to be shown in the same turn.
+
 Replies across transports. The CLI `reply` without `--key` and the `reply` tool without `key` derive the same key from
 the session and the parent message, so a one-step reply keeps its key on either transport.
 
@@ -211,17 +217,18 @@ Room. A notice is rendered after the claim, and a stored retry batch is claimed 
 bytes on one route than on `cli` could leave a batch with no notice at all. The rule: in each mode, every route's own
 notice lines, and its pointer line, are at most the `cli` route's. Then any batch that renders on `cli` renders on every
 route, and `WORST_FRAME_BYTES` holds for all of them. The shared suite checks this. The `mcp` notice lines are therefore
-shorter than the binding's, and the fallback notice and wake point at the binding's CLI line instead of repeating it.
+shorter than the binding's. The fallback notice puts its CLI sentence on the `mcp` use line, since every line costs
+its newline too; in metadata mode it has 2 bytes left. The Codex wake points at the binding's CLI line.
 The binding is outside that rule and takes more room on the `mcp` routes; the fallback binding puts the tools and the
 CLI in one line to keep it short. With the test fixtures' short interpreter, state directory and session id, and every
 other field at its widest:
 
 | Budget | `cli` | `mcp` | `mcp-with-cli-fallback` |
 |---|---|---|---|
-| Notice lines before the first frame, metadata mode | 874 | 741 | 870 |
-| Notice lines before the first frame, bodies mode | 1,189 | 982 | 1,111 |
+| Notice lines before the first frame, metadata mode | 874 | 699 | 872 |
+| Notice lines before the first frame, bodies mode | 1,189 | 952 | 1,125 |
 | Pointer line of a cut body | 120 | 116 | 116 |
-| 16 widest frames at cap 0, as rendered, Pi and DeepSeek bound 8,137 | 7,685 | 7,414 | 7,543 |
+| 16 widest frames at cap 0, as rendered, Pi and DeepSeek bound 8,137 | 7,685 | 7,384 | 7,557 |
 | Longest binding (63-character host) in `claude-code`, cap 4,096; `codex` is one byte shorter, cap 2,048 | 1,065 | 1,204 | 1,408 |
 | Codex wake prefix, test limit under 800 | 655 | 608 | 737 |
 
