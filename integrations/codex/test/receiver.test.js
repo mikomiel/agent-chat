@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createThread } from "../lib/appserver.js"
@@ -3930,20 +3931,23 @@ test("route: each route leaves the documented room for interpreter and state pat
   }
 })
 
-// A stored retry batch is claimed whole. Beside a binding still to be shown it is claimed only when it fits there at its
-// widest; otherwise the binding goes alone, no attempt is spent, and the next hook, with no binding, hands the batch whole.
-// The reviewer's case for #165 is a 400-byte interpreter path and ten one-byte questions in bodies mode, after a rejoin;
-// with twelve, a receiver that claimed beside the binding deferred the batch on every route and spent an attempt.
+// A stored retry batch is claimed whole, after a rejoin with the new binding still to be shown. The hook claims as it did
+// before #131. When the binding and the notice fit together, both go out; when they do not, the notice goes alone (every
+// notice is self-contained), the batch is handed, and the binding stays to be shown for the next hook (review of #165).
 async function retryAfterRejoin(toolRoute, { python, count }) {
   const ids = Array.from({ length: count }, (_, index) => uid(index + 1))
   let refuse = true
+  let claimed = false
   const r = await rig({ config: { noticeBodies: true, toolRoute, python }, handlers: deliverable({
-    pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : fields.bodies === true
+    pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : claimed ? { messages: [] } : fields.bodies === true
       ? { messages: ids, sizes: Object.fromEntries(ids.map(id => [id, 1])), retry: true } : { messages: ids }),
-    claim: fields => ({
-      dispatch: true, attempt_id: `attempt-${r.worker.ops("claim").length}`, reservation_ms: 30_000, admitted_at: ADMITTED,
-      messages: fields.messages.map(id => validRow(id, { body: "q" })),
-    }),
+    claim: fields => {
+      claimed = true
+      return {
+        dispatch: true, attempt_id: `attempt-${r.worker.ops("claim").length}`, reservation_ms: 30_000, admitted_at: ADMITTED,
+        messages: fields.messages.map(id => validRow(id, { body: "q" })),
+      }
+    },
   }) })
   await r.begin()
   await r.op(turn())
@@ -3953,32 +3957,40 @@ async function retryAfterRejoin(toolRoute, { python, count }) {
   r.worker.log.length = 0
   return { r, ids }
 }
+// The cli output of the reviewer's case on ff095e0, before #131, with the boot id as BOOT and the nonce as NONCE.
+const PRE_ROUTE_RETRY_OUTPUT = { bytes: 4660, sha256: "0af1a4aec35ceb109b93f03c7c0debe28c5057a7ea3ed430ff91676101392cd6" }
 
 for (const toolRoute of ROUTES) {
-  for (const count of [10, 12]) test(`route: on ${toolRoute} a retry batch of ${count} whose widest rendering does not fit beside the new binding waits for the next hook, which hands it whole`, async () => {
-    const { r, ids } = await retryAfterRejoin(toolRoute, { python: `/${"p".repeat(399)}`, count })
-    const first = (await r.op(turn({ event: "tool" }))).sent
-    assert.deepEqual(r.worker.ops("claim"), [], "nothing is claimed beside the binding")
-    assert.deepEqual(r.worker.ops("settle"), [])
-    assert.equal(first.length, 1)
-    assert.match(first[0].context, /^Agent Chat is available to this session/)
-    assert.ok(first[0].context.includes(`${r.worker.bootIds[1]}.json`))
-    assert.doesNotMatch(first[0].context, /AGENT-CHAT-BODY/)
-    const second = (await r.op(turn({ event: "tool" }))).sent
-    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids], "the next hook claims the batch whole")
-    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
-    assert.doesNotMatch(second[0].context, /Agent Chat is available to this session/)
-    for (const id of ids) assert.ok(second[0].context.includes(`message ${id} kind question`), id)
-    assert.ok(bytes(second[0].context) <= MAX_OUTPUT_BYTES)
-  })
-
-  test(`route: on ${toolRoute} a retry batch whose widest rendering fits beside the new binding still goes out with it`, async () => {
-    const { r, ids } = await retryAfterRejoin(toolRoute, { python: baseConfig.python, count: 2 })
+  test(`route: on ${toolRoute} the reviewer's retry batch after a rejoin goes out with the new binding in the first hook`, async () => {
+    const { r, ids } = await retryAfterRejoin(toolRoute, { python: baseConfig.python, count: 10 })
     const [reply] = (await r.op(turn({ event: "tool" }))).sent
     assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids])
     assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
     assert.match(reply.context, /^Agent Chat is available to this session/)
+    assert.ok(reply.context.includes(`${r.worker.bootIds[1]}.json`))
     for (const id of ids) assert.ok(reply.context.includes(`message ${id} kind question`), id)
+    if (toolRoute === "cli") {
+      const text = reply.context.replaceAll(r.worker.bootIds[1], "BOOT").replace(/[0-9a-f]{16}(?=>>>|\n)/g, "NONCE")
+      assert.deepEqual({ bytes: bytes(text), sha256: createHash("sha256").update(text).digest("hex") }, PRE_ROUTE_RETRY_OUTPUT,
+        "the cli output is the one before #131")
+    }
+    assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], "the binding was shown")
+  })
+
+  test(`route: on ${toolRoute} a retry batch that does not fit beside the new binding goes out alone, and the next hook shows the binding`, async () => {
+    const { r, ids } = await retryAfterRejoin(toolRoute, { python: `/${"p".repeat(399)}`, count: 12 })
+    const [first] = (await r.op(turn({ event: "tool" }))).sent
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids], "the hook claims the batch whole")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+    assert.ok(first.context.startsWith(CHAT_PREFIX), "the notice goes alone")
+    assert.doesNotMatch(first.context, /Agent Chat is available to this session/)
+    for (const id of ids) assert.ok(first.context.includes(`message ${id} kind question`), id)
+    assert.ok(first.context.includes(`${r.worker.bootIds[1]}.json`), "the notice's own binding line names the new instance file")
+    assert.ok(bytes(first.context) <= MAX_OUTPUT_BYTES)
+    const [next] = (await r.op(turn({ event: "tool" }))).sent
+    assert.match(next.context, /^Agent Chat is available to this session/, "the next hook shows the binding")
+    assert.ok(next.context.includes(`${r.worker.bootIds[1]}.json`))
+    assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], "and only once")
   })
 }
 

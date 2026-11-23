@@ -199,15 +199,6 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   const metadataFits = (count, bound) => renderNotice(joined, config.python, Array(count).fill(WIDEST_METADATA_ROW), { bound, route: config.toolRoute }) !== null
   // The same for a wake, whose text renderWake writes whole: the rows a claim can carry are the rows that it renders.
   const wakeFits = count => renderWake(Array(count).fill(WIDEST_METADATA_ROW), config.toolRoute) !== null
-  // Whether a bodies notice of `count` messages fits `bound` at body cap 0 with every frame at its widest (a principal
-  // sender, the oldest send time and so a 12-digit age, a pointer line): renderNotice halves its cap to 0 before it gives
-  // up, so this is an upper bound for any claimed rows.
-  const WIDEST_BODY_ROW = {
-    ...WIDEST_METADATA_ROW, sender_principal_id: ID, created_at: "0001-01-01T00:00:00.000000+00:00", body: "", body_truncated: true,
-  }
-  const bodiesFit = (count, bound) => renderNotice(joined, config.python, Array(count).fill(WIDEST_BODY_ROW), {
-    bodies: true, bound, admittedAt: "9999-12-31T23:59:59.999999+00:00", nonce: "0".repeat(16), cap: 0, route: config.toolRoute,
-  }) !== null
 
   // `from` is the start generation the caller began under: a turn passes the one it arrived in, so a start that came after
   // it makes its receipt not count.
@@ -526,20 +517,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (wake && (!(await clearToWake(record)) || live !== record)) return false
         const cleared = { epoch, reads } // the hook generation and the read sequence that the wake was cleared at
         // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
-        // Metadata mode gets no retry marker, so it claims the candidates whole, and only when their widest rendering fits.
-        // Bodies mode, beside an announcement still to be shown, claims only when the claim fits at body cap 0 with every
-        // frame at its widest. Otherwise nothing is claimed and the binding goes alone (see onTurn), and the next hook,
-        // with more room, is offered the batch whole, no attempt spent. Without an announcement a bodies claim is not held
-        // back: no later hook has more room.
-        // A wake packs what that hook would pack, and claims only when renderWake fits it at its widest: a batch that a
-        // wake claims and then defers is offered again whole, as a retry, and the next hook must be able to deliver it with
-        // bodies (beside an announcement it waits for a hook without one, as above). A retry batch it claims whole or not
-        // at all, as a hook does: the server refuses any other set for it.
+        // Metadata mode gets no retry marker, so it claims the candidates whole, and only when their widest rendering fits
+        // beside an announcement still to be shown; otherwise nothing is claimed and the binding goes alone (see onTurn),
+        // and the next hook, with more room, is offered the batch whole, no attempt spent.
+        // A wake claims what that hook would claim, and only when renderWake fits it at its widest: a batch that a wake
+        // claims and then defers is offered again whole, as a retry, and the next hook must be able to deliver it with
+        // bodies. A retry batch it claims whole or not at all, as a hook does: the server refuses any other set for it.
         const packed = sizing
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound, route: config.toolRoute })
           : ids
-        const fits = bodies ? !carried || bodiesFit(packed.length, bound) : wake ? wakeFits(packed.length) : metadataFits(packed.length, bound)
-        const claimIds = fits ? packed : []
+        const claimIds = bodies || (wake ? wakeFits(packed.length) : metadataFits(packed.length, bound)) ? packed : []
         // Only a server that offers more rows than one wake can carry gets here for a wake: the poll waits, not spins.
         if (!claimIds.length) { if (wake) wakeAfter = now() + WAKE_RETRY_MS; return false }
         const started = now()
@@ -606,9 +593,17 @@ export function createReceiver(config, { sessionId, ownerPid }, {
               }
             }
           } else {
-            const notice = renderNotice(joined, config.python, grant.messages ?? [], { bodies, bound, admittedAt: grant.admitted_at, route: config.toolRoute })
+            const render = limit => renderNotice(joined, config.python, grant.messages ?? [], { bodies, bound: limit, admittedAt: grant.admitted_at, route: config.toolRoute })
+            // An announcement still to be shown goes in front of the notice. When the two do not fit together, the notice
+            // goes alone: every notice is self-contained, and the announcement stays to be shown, so the next hook shows it.
+            let shown = announce
+            let notice = render(bound)
+            if (notice === null && announce) {
+              notice = render(MAX_OUTPUT_BYTES - bytes(CHAT_PREFIX))
+              shown = null
+            }
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, deadline, announce))
+            else ({ result, replied } = await hand(link, (shown ? prefix : CHAT_PREFIX) + notice, started + reservation, deadline, shown))
           }
         }
         // A wake that did not hand, whatever stopped it after the claim, waits before the next one.

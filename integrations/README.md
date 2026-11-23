@@ -136,10 +136,10 @@ Before the claim, `packCandidates` takes the longest prefix of the `pending` can
 fits `bound`, and at least one, from the `sizes` that `pending` reports. The estimate for a message is its header,
 markers and pointer at their longest, plus three bytes for each stored body byte, up to the body cap. A retry batch,
 or a `pending` reply without `sizes`, is claimed whole, because the server refuses any other set for a stored batch.
-A missing or invalid size counts as a full body. `claude-code` and `codex` can show a binding in the same output as a
-notice. Beside a binding still to be shown, they claim a bodies batch only when it fits at cap 0 with every frame at
-its widest. Otherwise the binding goes alone, nothing is claimed and no attempt is spent, and the next hook, with no
-binding, takes the batch whole.
+A missing or invalid size counts as a full body. `claude-code` and `codex` can show a binding still to be shown in
+the same output as a notice. When the two do not fit together, the notice goes alone and the batch is handed: every
+notice is self-contained, and the binding stays to be shown, so the next hook shows it. Only a notice that does not
+fit even alone is deferred.
 
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
 bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line

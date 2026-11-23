@@ -374,12 +374,12 @@ sends its request: it does not wait for the worker to end its instance.
   fit and never falls back to metadata; a batch whose headers, markers and
   pointers alone do not fit is deferred, never partly delivered. In metadata
   mode the pending answer carries no retry marker, so the candidates are
-  claimed whole, and only when their notice fits with every row at its widest.
-  In bodies mode, with an announcement in front, a claim (a retry batch whole
-  included) is made only when it fits at body cap 0 with every frame at its
-  widest. Otherwise nothing is claimed, the binding is sent alone, and the next
-  hook, with no announcement in front, is offered the batch whole, no attempt
-  spent.
+  claimed whole, and only when their notice fits with every row at its widest;
+  otherwise nothing is claimed, the binding is sent alone, and the next hook,
+  with no announcement in front, is offered the batch whole, no attempt spent.
+  A claimed notice that does not fit beside the announcement goes alone and is
+  handed: every notice is self-contained, and the announcement stays to be
+  shown, so the next hook shows it.
   The hook
   refuses any text over the budget as a second check. A wake's whole text, the
   fixed line and the rows, is bounded by the same 6,000 bytes. It carries no
@@ -820,10 +820,10 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   widest. The 6,000-byte output cap leaves 5,945 bytes after the delivery line,
   and 3,895 bytes once the longest binding announcement (2,048 bytes and two
   line feeds) is counted too. Sixteen messages with short bodies also take
-  more than 3,895 bytes, so a full retry batch is not claimed while an
-  announcement of that size is in front of it: the announcement goes alone and
-  the next hook takes the batch whole. A batch that does not fit even with no
-  announcement renders nothing and is deferred. One message at its widest takes 1,598 bytes in the same
+  more than 3,895 bytes, so a full retry batch does not fit beside an
+  announcement of that size: the notice goes alone and the batch is handed, and
+  the next hook shows the announcement. A batch that does not fit even alone
+  renders nothing and is deferred. One message at its widest takes 1,598 bytes in the same
   fixture, which leaves 2,297 bytes at the smallest bound for longer
   interpreter, state and host values, so a packed first claim can be delivered.
   `test/notice.test.js` holds a first claim to that bound.

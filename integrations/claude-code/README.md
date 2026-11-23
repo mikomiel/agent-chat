@@ -245,11 +245,10 @@ or a stop. Only the idle-wake waiter exits 2.
   announcement counted, the 10,000-byte output cap leaves 2,848 bytes for an
   announcement in the first case and 2,224 bytes in the second. The
   announcement is 1,016 bytes in the receiver tests and never more than 4,096.
-  Beside an announcement larger than that room, nothing is claimed: a bodies
-  batch is claimed beside an announcement only when it fits at body cap 0 with
-  every frame at its widest. The announcement goes alone and the next hook, with
-  no announcement in front, takes the batch whole, no attempt spent. A batch
-  that does not fit even then is deferred.
+  When the announcement and the notice do not fit together, in either mode, the
+  notice goes alone and the batch is handed: every notice is self-contained,
+  and the announcement stays to be shown, so the next hook shows it. A batch
+  whose notice does not fit even alone is deferred.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The
