@@ -137,12 +137,12 @@ function hookDouble({ events, receipt = "written", answer = true, sendOk = true 
 // `skew` returns milliseconds added to the receiver's clock, so a test can move the policy's time without moving the timers.
 // `start` replaces the worker double's `startProcess`, to run the real worker wrapper over a fake child process.
 // `wall` is the receiver's wall clock, read only for a wake's check before its add.
-async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread, skew = () => 0, start, wall } = {}) {
+async function rig({ handlers, gate, joinErrors, alive = () => true, startTime = () => null, config = {}, thread, skew = () => 0, start, wall, sessionId = "session-1" } = {}) {
   const clock = scheduler()
   const events = []
   const worker = workerDouble({ events, handlers, gate, joinErrors })
   let exitCode
-  const receiver = createReceiver({ ...baseConfig, ...(thread ? { appServer: APP_SERVER } : {}), ...config }, { sessionId: "session-1", ownerPid: 4242 }, {
+  const receiver = createReceiver({ ...baseConfig, ...(thread ? { appServer: APP_SERVER } : {}), ...config }, { sessionId, ownerPid: 4242 }, {
     startProcess: start ?? worker.startProcess,
     openThread: options => { thread?.opened.push(options); return thread },
     now: () => clock.now() + skew(),
@@ -3875,9 +3875,8 @@ test("route: toolRoute mcp-with-cli-fallback announces the mcp lines, the CLI on
   const r = await rig({ config: { toolRoute: "mcp-with-cli-fallback" } })
   const lines = (await r.op({ op: "start", wait_ms: 5000 })).sent[0].context.split("\n")
   assert.equal(lines[2], ROUTE_LINES.mcp[0])
-  assert.equal(lines[3], ROUTE_LINES.mcp[1].replace(" Do not run the Agent Chat CLI.", ""))
-  assert.match(lines[4], /^Only if the agent-chat MCP server or its transport is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat\.cli/)
-  assert.equal(lines[5], "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport.")
+  assert.equal(lines[3], "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli.")
+  assert.equal(lines[4], "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport.")
 })
 
 // The receiver refuses a config whose longest binding does not fit MAX_BINDING_BYTES. On every route the fixture config
@@ -3904,6 +3903,80 @@ test("route: every route's longest binding fits MAX_BINDING_BYTES, and every rou
     assert.ok(notice(Array(16).fill(widestRow), alone), `${toolRoute}: sixteen widest metadata rows fit with no announcement`)
   }
 })
+
+// The bytes the interpreter path and the state directory may take together before the longest binding passes
+// MAX_BINDING_BYTES, for a Codex session id (a UUID) and plain ASCII paths. The package README states these numbers.
+const BINDING_PATH_ROOM = { cli: 994, mcp: 855, "mcp-with-cli-fallback": 651 }
+test("route: each route leaves the documented room for interpreter and state paths; one byte more refuses with CHAT_BINDING_TOO_LONG", async () => {
+  const sessionId = "019a0000-0000-7000-8000-000000000000"
+  const { directory } = baseConfig // the worker double's instance_file is in this directory
+  const python = length => `/opt/${"p".repeat(length - "/opt/".length)}`
+  for (const toolRoute of ROUTES) {
+    const sized = await rig({ config: { toolRoute }, sessionId })
+    const shown = (await sized.begin()).sent[0].context
+    const fixed = bytes(shown) + (63 - "synthetic-host".length) - baseConfig.python.length - directory.length
+    assert.equal(MAX_BINDING_BYTES - fixed, BINDING_PATH_ROOM[toolRoute], `${toolRoute}: room for the two paths`)
+    const fits = BINDING_PATH_ROOM[toolRoute] - directory.length
+    const joins = await rig({ config: { toolRoute, python: python(fits) }, sessionId })
+    assert.equal(joins.worker.bootIds.length, 1, `${toolRoute}: paths of exactly the room join`)
+    const r = await rig({ config: { toolRoute, python: python(fits + 1) }, sessionId })
+    assert.equal(r.worker.bootIds.length, 0, `${toolRoute}: one byte more starts no worker`)
+    const start = await r.op({ op: "start", wait_ms: 5000 })
+    assert.deepEqual(start.sent, [{ disabled: true, message: "Agent Chat stopped (CHAT_BINDING_TOO_LONG); the Codex session is unchanged." }])
+  }
+})
+
+// A stored retry batch is claimed whole. Beside a binding still to be shown it is claimed only when it fits there at its
+// widest; otherwise the binding goes alone, no attempt is spent, and the next hook, with no binding, hands the batch whole.
+// The reviewer's case for #165 is a 400-byte interpreter path and ten one-byte questions in bodies mode, after a rejoin;
+// with twelve, a receiver that claimed beside the binding deferred the batch on every route and spent an attempt.
+async function retryAfterRejoin(toolRoute, { python, count }) {
+  const ids = Array.from({ length: count }, (_, index) => uid(index + 1))
+  let refuse = true
+  const r = await rig({ config: { noticeBodies: true, toolRoute, python }, handlers: deliverable({
+    pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : fields.bodies === true
+      ? { messages: ids, sizes: Object.fromEntries(ids.map(id => [id, 1])), retry: true } : { messages: ids }),
+    claim: fields => ({
+      dispatch: true, attempt_id: `attempt-${r.worker.ops("claim").length}`, reservation_ms: 30_000, admitted_at: ADMITTED,
+      messages: fields.messages.map(id => validRow(id, { body: "q" })),
+    }),
+  }) })
+  await r.begin()
+  await r.op(turn())
+  refuse = false
+  await r.clock.advance(3750)
+  assert.equal(r.worker.bootIds.length, 2, "rejoined")
+  r.worker.log.length = 0
+  return { r, ids }
+}
+
+for (const toolRoute of ROUTES) {
+  for (const count of [10, 12]) test(`route: on ${toolRoute} a retry batch of ${count} whose widest rendering does not fit beside the new binding waits for the next hook, which hands it whole`, async () => {
+    const { r, ids } = await retryAfterRejoin(toolRoute, { python: `/${"p".repeat(399)}`, count })
+    const first = (await r.op(turn({ event: "tool" }))).sent
+    assert.deepEqual(r.worker.ops("claim"), [], "nothing is claimed beside the binding")
+    assert.deepEqual(r.worker.ops("settle"), [])
+    assert.equal(first.length, 1)
+    assert.match(first[0].context, /^Agent Chat is available to this session/)
+    assert.ok(first[0].context.includes(`${r.worker.bootIds[1]}.json`))
+    assert.doesNotMatch(first[0].context, /AGENT-CHAT-BODY/)
+    const second = (await r.op(turn({ event: "tool" }))).sent
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids], "the next hook claims the batch whole")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+    assert.doesNotMatch(second[0].context, /Agent Chat is available to this session/)
+    for (const id of ids) assert.ok(second[0].context.includes(`message ${id} kind question`), id)
+    assert.ok(bytes(second[0].context) <= MAX_OUTPUT_BYTES)
+  })
+
+  test(`route: on ${toolRoute} a retry batch whose widest rendering fits beside the new binding still goes out with it`, async () => {
+    const { r, ids } = await retryAfterRejoin(toolRoute, { python: baseConfig.python, count: 2 })
+    const [reply] = (await r.op(turn({ event: "tool" }))).sent
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids])
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+    assert.match(reply.context, /^Agent Chat is available to this session/)
+    for (const id of ids) assert.ok(reply.context.includes(`message ${id} kind question`), id)
+  })
+}
 
 for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
   test(`route: a rejoin on ${toolRoute} announces the new instance_file, the supersede sentence and bind again, never the old file`, async () => {
@@ -3935,7 +4008,7 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       assert.ok(context.startsWith(CHAT_PREFIX), "the binding was announced already")
       assert.match(context, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
       const cli = context.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI lines")
+      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI line")
       assert.equal(context.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
       if (noticeBodies) assert.ok(context.includes(`Body cut. Read all of it with history: room=${ROOM}, after=1234, limit=1`))
       assert.ok(bytes(context) <= MAX_OUTPUT_BYTES)

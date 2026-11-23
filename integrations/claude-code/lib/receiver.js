@@ -159,6 +159,18 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return bytes(text) <= MAX_BINDING_BYTES ? text : null
   }
 
+  // Whether a bodies notice of `count` messages fits `bound` at body cap 0 with every frame at its widest (UUIDs, the
+  // longest kind, a principal sender, a 19-digit cursor, the oldest send time and so a 12-digit age, a pointer line):
+  // renderNotice halves its cap to 0 before it gives up, so this is an upper bound for any claimed rows.
+  const ID = "00000000-0000-4000-8000-000000000000"
+  const WIDEST_BODY_ROW = {
+    id: ID, kind: "consultation", room_id: ID, history_after: "9".repeat(19), sender_principal_id: ID,
+    created_at: "0001-01-01T00:00:00.000000+00:00", body: "", body_truncated: true,
+  }
+  const bodiesFit = (count, bound) => renderNotice(joined, config.python, Array(count).fill(WIDEST_BODY_ROW), {
+    bodies: true, bound, admittedAt: "9999-12-31T23:59:59.999999+00:00", nonce: "0".repeat(16), cap: 0, route: config.toolRoute,
+  }) !== null
+
   const announcement = ({ always = false } = {}) => {
     const text = bindingText()
     return text === null || (!always && announced === bootId) ? null : { text, boot: bootId }
@@ -303,9 +315,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (!ids.length || link.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
         // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply
         // without sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
-        const claimIds = bodies
+        // Beside a binding still to be shown, a bodies claim is made only when its widest rendering fits at body cap 0;
+        // otherwise nothing is claimed, the binding goes alone (see onTurn), and the next hook, with more room, is offered
+        // the batch whole, no attempt spent. Without a binding it is not held back: no later hook has more room.
+        const packed = bodies
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound, route: config.toolRoute })
           : ids
+        const claimIds = bodies && announce && !bodiesFit(packed.length, bound) ? [] : packed
+        if (!claimIds.length) return false
         const started = now()
         const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
         if (!live || check(grant, "claim")) return false

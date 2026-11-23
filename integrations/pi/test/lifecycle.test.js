@@ -696,6 +696,11 @@ const ROUTE_LINES = {
     "Use the agent-chat MCP tools. If the agent-chat MCP server exposes bind, call bind with exactly instance_file below before any other Agent Chat tool, and call bind again whenever a later binding gives a different instance_file.",
     "Use who with room and online=true to find peers, history with room for coordination, and send with room, recipients, a UUID key and body to publish. Do not run the Agent Chat CLI.",
   ],
+  "mcp-with-cli-fallback": [
+    "Use the agent-chat MCP tools. If the agent-chat MCP server exposes bind, call bind with exactly instance_file below before any other Agent Chat tool, and call bind again whenever a later binding gives a different instance_file.",
+    "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli.",
+    "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport.",
+  ],
 }
 const BIND_AGAIN = "call bind again whenever a later binding gives a different instance_file"
 const routeBinding = (routeLines, as = joined) => [
@@ -738,8 +743,8 @@ test("route: toolRoute mcp puts the mcp lines in the system prompt section and n
 test("route: toolRoute mcp-with-cli-fallback adds the CLI only if MCP is unavailable, and the retry rule", async () => {
   const lines = (await routeSession("mcp-with-cli-fallback")).lifecycle.binding().split("\n")
   assert.equal(lines[2], ROUTE_LINES.mcp[0])
-  assert.match(lines[4], /^Only if the agent-chat MCP server or its transport is unavailable, set AGENT_CHAT_INSTANCE_FILE/)
-  assert.equal(lines[5], "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport.")
+  assert.equal(lines[3], "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli.")
+  assert.equal(lines[4], "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport.")
   assert.ok(Buffer.byteLength(lines.join("\n"), "utf8") <= MAX_CONTEXT_BYTES)
 })
 
@@ -773,7 +778,7 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
     await flush()
     assert.equal(starts, 2)
     const text = lifecycle.binding()
-    assert.equal(text, routeBinding(toolRoute === "mcp" ? ROUTE_LINES.mcp : text.split("\n").slice(2, 6), rejoined))
+    assert.equal(text, routeBinding(ROUTE_LINES[toolRoute], rejoined))
     assert.match(text, /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
     assert.match(text, /previous instance_file is no longer valid/)
     assert.ok(text.includes(BIND_AGAIN))
@@ -803,7 +808,7 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       const content = sent[0].payload.content
       assert.match(content, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
       const cli = content.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI lines")
+      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI line")
       assert.equal(content.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
       if (noticeBodies) assert.ok(content.includes(`Body cut. Read all of it with history: room=${joined.room_id}, after=101, limit=1`))
       assert.ok(Buffer.byteLength(content, "utf8") <= MAX_CONTEXT_BYTES)

@@ -126,8 +126,11 @@ configuration, outside this package, with write tools for `ack`, `reply` and
 `send`: the product's MCP service needs `enable_writes: true` for them. On a
 rejoin the binding says to call `bind` again with the new `instance_file`.
 
-The longest fallback binding takes 1,596 of the 4,096 announcement bytes in the
-test fixture.
+Known limit: the binding is longer on the `mcp` routes, and the 4,096-byte
+announcement caps the interpreter path and the state directory together. With a
+63-character host, a UUID session id and plain ASCII paths, the fallback route
+leaves 2,698 bytes for the two paths, `mcp` 2,902, against 3,041 on `cli`. A
+longer binding is not announced.
 
 ## Behaviour
 
@@ -242,8 +245,11 @@ or a stop. Only the idle-wake waiter exits 2.
   announcement counted, the 10,000-byte output cap leaves 2,848 bytes for an
   announcement in the first case and 2,224 bytes in the second. The
   announcement is 1,016 bytes in the receiver tests and never more than 4,096.
-  An announcement larger than that room leaves less than the batch needs, so
-  the renderer returns nothing and the batch is deferred.
+  Beside an announcement larger than that room, nothing is claimed: a bodies
+  batch is claimed beside an announcement only when it fits at body cap 0 with
+  every frame at its widest. The announcement goes alone and the next hook, with
+  no announcement in front, takes the batch whole, no attempt spent. A batch
+  that does not fit even then is deferred.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The

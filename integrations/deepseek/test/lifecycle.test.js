@@ -814,8 +814,8 @@ test("route: toolRoute mcp publishes the mcp lines and no CLI instruction", asyn
 test("route: toolRoute mcp-with-cli-fallback adds the CLI only if MCP is unavailable, and the retry rule", async () => {
   const lines = (await routeSession("mcp-with-cli-fallback")).lifecycle.context().split("\n")
   assert.equal(lines[2], ROUTE_LINES.mcp[0])
-  assert.match(lines[4], /^Only if the agent-chat MCP server or its transport is unavailable, set AGENT_CHAT_INSTANCE_FILE/)
-  assert.equal(lines[5], "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport.")
+  assert.equal(lines[3], "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli.")
+  assert.equal(lines[4], "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport.")
   assert.ok(Buffer.byteLength(lines.join("\n"), "utf8") <= MAX_CONTEXT_BYTES)
 })
 
@@ -878,7 +878,7 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       const content = delivery.calls.deliver[0].batch.content
       assert.match(content, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
       const cli = content.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI lines")
+      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI line")
       assert.equal(content.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
       if (noticeBodies) assert.ok(content.includes(`Body cut. Read all of it with history: room=${joined.room_id}, after=101, limit=1`))
       assert.ok(whole(delivery) <= MAX_CONTEXT_BYTES)

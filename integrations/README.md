@@ -136,7 +136,10 @@ Before the claim, `packCandidates` takes the longest prefix of the `pending` can
 fits `bound`, and at least one, from the `sizes` that `pending` reports. The estimate for a message is its header,
 markers and pointer at their longest, plus three bytes for each stored body byte, up to the body cap. A retry batch,
 or a `pending` reply without `sizes`, is claimed whole, because the server refuses any other set for a stored batch.
-A missing or invalid size counts as a full body.
+A missing or invalid size counts as a full body. `claude-code` and `codex` can show a binding in the same output as a
+notice. Beside a binding still to be shown, they claim a bodies batch only when it fits at cap 0 with every frame at
+its widest. Otherwise the binding goes alone, nothing is claimed and no attempt is spent, and the next hook, with no
+binding, takes the batch whole.
 
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
 bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line
@@ -175,7 +178,7 @@ stays closed, so an unknown key next to `toolRoute` is still refused.
 |---|---|
 | absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The text is byte-identical to the text before `toolRoute` existed. |
 | `"mcp"` | The tools of the MCP server named `agent-chat`: `bind` (when the server has it), `who`, `history`, `send`, `ack` and `reply`. The text says not to run the CLI, and it carries no CLI argument. |
-| `"mcp-with-cli-fallback"` | The `mcp` text, then the CLI. The binding names the CLI in a line introduced by "Only if the agent-chat MCP server or its transport is unavailable", then gives the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." The notice and the Codex wake point at the binding's CLI lines and keep the no-replay clause: "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport." |
+| `"mcp-with-cli-fallback"` | The `mcp` bind line, then one line with the tools and the CLI: "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli." Then the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." The CLI's own `--help` names its arguments. The notice and the Codex wake point at the binding's CLI line and keep the no-replay clause: "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport." |
 
 The text names the server and its tools, never a callable name. A harness prefixes MCP tools its own way (Claude Code
 `mcp__<server>__<tool>`, OpenCode `<server>_<tool>`), and the model takes the name from its own tool list. So the same
@@ -208,9 +211,10 @@ Room. A notice is rendered after the claim, and a stored retry batch is claimed 
 bytes on one route than on `cli` could leave a batch with no notice at all. The rule: in each mode, every route's own
 notice lines, and its pointer line, are at most the `cli` route's. Then any batch that renders on `cli` renders on every
 route, and `WORST_FRAME_BYTES` holds for all of them. The shared suite checks this. The `mcp` notice lines are therefore
-shorter than the binding's, and the fallback notice and wake point at the binding's CLI lines instead of repeating
-them. The binding is outside that rule and takes more room on the `mcp` routes. With the test fixtures' short
-interpreter, state directory and session id, and every other field at its widest:
+shorter than the binding's, and the fallback notice and wake point at the binding's CLI line instead of repeating it.
+The binding is outside that rule and takes more room on the `mcp` routes; the fallback binding puts the tools and the
+CLI in one line to keep it short. With the test fixtures' short interpreter, state directory and session id, and every
+other field at its widest:
 
 | Budget | `cli` | `mcp` | `mcp-with-cli-fallback` |
 |---|---|---|---|
@@ -218,11 +222,13 @@ interpreter, state directory and session id, and every other field at its widest
 | Notice lines before the first frame, bodies mode | 1,189 | 982 | 1,111 |
 | Pointer line of a cut body | 120 | 116 | 116 |
 | 16 widest frames at cap 0, as rendered, Pi and DeepSeek bound 8,137 | 7,685 | 7,414 | 7,543 |
-| Longest binding (63-character host) in `claude-code`, cap 4,096; `codex` is one byte shorter, cap 2,048 | 1,065 | 1,204 | 1,596 |
+| Longest binding (63-character host) in `claude-code`, cap 4,096; `codex` is one byte shorter, cap 2,048 | 1,065 | 1,204 | 1,408 |
 | Codex wake prefix, test limit under 800 | 655 | 608 | 737 |
 
-On `codex` the longer binding leaves less room for interpreter and state paths before `CHAT_BINDING_TOO_LONG`: 453
-bytes on the fallback route, against 984 on `cli`.
+The binding caps the interpreter path and the state directory together. With a 63-character host, a UUID session id
+and plain ASCII paths, `codex` leaves 994 bytes on `cli`, 855 on `mcp` and 651 on the fallback route; one byte more
+refuses at start with `CHAT_BINDING_TOO_LONG`. `claude-code` leaves 3,041, 2,902 and 2,698; one byte more and the
+binding is not announced. A test in each of the two packages pins its numbers.
 
 Rule for a future package: read `toolRoute` with the same values and the same strict refusal, copy `shared/notice.js`
 as `lib/notice.js`, and take every route line from it. Do not add a second route key or route text of its own.

@@ -32,7 +32,9 @@ const bytes = text => Buffer.byteLength(text, "utf8")
 // The tool routes, and the values a config loader refuses, which the renderer refuses as a caller error.
 const ROUTES = ["cli", "mcp", "mcp-with-cli-fallback"]
 const BAD_ROUTES = ["CLI", "MCP", "", "http", "mcp-with-fallback", null, 1, true, ["mcp"], {}]
-const FALLBACK_INTRO = "Only if the agent-chat MCP server or its transport is unavailable, "
+// The fallback binding's tool line, then its CLI line: the instance-file variable and the interpreter form only.
+const FALLBACK_TOOLS = "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). "
+const FALLBACK_CLI = "Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli."
 const RETRY_RULE = "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport."
 // What only the CLI route may say, and a harness-specific callable name no route may say.
 const CLI_TEXT = /AGENT_CHAT_INSTANCE_FILE|agent_chat\.cli|--room|--key|--after|--limit|stdin/
@@ -422,15 +424,13 @@ export function runNoticeSuite(label, notice, copy, { noticeBound } = {}) {
     for (const line of bindingRouteLines("mcp")) assert.doesNotMatch(line, CLI_TEXT)
   })
 
-  test(`${label}: the fallback binding is the mcp lines, then the CLI only if MCP is unavailable, then the retry rule`, () => {
-    const [bind, use, fallback, retry, ...rest] = bindingRouteLines("mcp-with-cli-fallback")
+  test(`${label}: the fallback binding is the mcp bind line, the tools with the CLI only if MCP is unavailable, then the retry rule`, () => {
+    const [bind, use, retry, ...rest] = bindingRouteLines("mcp-with-cli-fallback")
     assert.deepEqual(rest, [])
     assert.equal(bind, bindingRouteLines("mcp")[0])
-    assert.equal(`${use} Do not run the Agent Chat CLI.`, bindingRouteLines("mcp")[1], "the mcp line without its CLI ban")
-    assert.ok(fallback.startsWith(FALLBACK_INTRO))
-    assert.match(fallback, /AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat\.cli/)
+    assert.equal(use, FALLBACK_TOOLS + FALLBACK_CLI)
     assert.equal(retry, RETRY_RULE)
-    for (const line of [bind, use, retry]) assert.doesNotMatch(line, CLI_TEXT)
+    for (const line of [bind, FALLBACK_TOOLS, retry]) assert.doesNotMatch(line, CLI_TEXT)
   })
 
   for (const bodies of [false, true]) {
