@@ -6,6 +6,7 @@ credential discovery, automatic join or model work.
 """
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,7 +15,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from .client import Address, Client, resolve_origin
-from .instance_file import InstanceSecret, prepare_instance
+from .instance_file import InstanceSecret, discard_instance, prepare_instance
 from .models import RECEIPT_FEED_LIMIT, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 from .protocol import cursor, token_digest
 
@@ -75,29 +76,39 @@ def join_instance(
     It must not rotate the secret or turn a retry into a replacement process.
     A malformed response remains uncertain even if registration committed.
 
-    With `resolve_by`, a monotonic time, the server host is resolved once before that time and before anything is
-    written. The registration and every later request of the binding connect only to those addresses.
+    With `resolve_by`, a monotonic time, the server host is resolved once before that time, after the record's own
+    checks. The registration and every later request of the binding connect only to those addresses.
+
+    `TRANSPORT_UNAVAILABLE` here means nothing was sent: the lookup failed or no address accepted a connection. No
+    instance can exist that the record would recover, so a record this call created is discarded. A record that
+    was already there, from an attempt that may have registered, stays for the next retry, as on every other
+    failure.
     """
     if enabled is not True:
         raise ChatError("INTEGRATION_DISABLED")
     if harness not in ("pi", "codex", "claude", "deepseek", "opencode"):
         raise ChatError("INVALID_REQUEST")
     registration_client = Client(server_origin, host_token, deadline=deadline)
-    addresses: tuple[Address, ...] = ()
-    if resolve_by is not None:
-        # After the origin and credential checks, so a refused join looks nothing up.
-        addresses = resolve_origin(server_origin, deadline=resolve_by)
-        registration_client = Client(server_origin, host_token, deadline=deadline, addresses=addresses)
+    created = not os.path.lexists(directory / f"{boot_id}.json")
     secret = prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
-    result = registration_client.request(
-        "POST",
-        "/v1/sessions",
-        {
-            "native_session_id": secret.native_session_id,
-            "boot_id": str(secret.boot_id),
-            "instance_token_hash": token_digest(secret.token),
-        },
-    )
+    addresses: tuple[Address, ...] = ()
+    try:
+        if resolve_by is not None:
+            addresses = resolve_origin(server_origin, deadline=resolve_by)
+            registration_client = Client(server_origin, host_token, deadline=deadline, addresses=addresses)
+        result = registration_client.request(
+            "POST",
+            "/v1/sessions",
+            {
+                "native_session_id": secret.native_session_id,
+                "boot_id": str(secret.boot_id),
+                "instance_token_hash": token_digest(secret.token),
+            },
+        )
+    except ChatError as error:
+        if created and error.code == "TRANSPORT_UNAVAILABLE":
+            discard_instance(directory, boot_id)
+        raise
     try:
         if (
             not isinstance(result, dict)

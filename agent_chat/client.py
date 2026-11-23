@@ -44,9 +44,15 @@ _RESOLVER = (
     "import json,socket,sys; print(json.dumps(socket.getaddrinfo("
     "sys.argv[1],int(sys.argv[2]),type=socket.SOCK_STREAM)))"
 )
-#: Run before the lookup on Linux. PR_SET_PDEATHSIG has the kernel send the child SIGKILL when its parent dies,
-#: even by SIGKILL, so no lookup outlives its caller. A parent that died before prctl ran is no longer the child's
-#: parent, so the child then exits. Without ctypes, or when prctl is refused, the deadline's kill is the only bound.
+#: Run first on every POSIX system: the child arms its own kernel alarm for the time its parent has left (argv[4]).
+#: SIGALRM's default action ends the process even inside a libc lookup, so the child is bounded with no parent.
+_OWN_DEADLINE = (
+    "import math,signal,sys\n"
+    "signal.signal(signal.SIGALRM,signal.SIG_DFL); signal.alarm(max(1,math.ceil(float(sys.argv[4]))))\n"
+)
+#: Then, on Linux, the faster bound. PR_SET_PDEATHSIG has the kernel send the child SIGKILL when its parent dies,
+#: even by SIGKILL. A parent that died before prctl ran is no longer the child's parent, so the child then exits.
+#: Without ctypes, or when prctl is refused, the child's own alarm still ends it.
 _DIE_WITH_PARENT = (
     "import os,sys\n"
     "try:\n import ctypes; ctypes.CDLL(None).prctl(1,9,0,0,0)\n"
@@ -59,13 +65,18 @@ def _resolve(hostname: str, port: int, *, deadline: float) -> list[Address]:
     """Resolve in a private stdlib-only child that is killed and reaped at the deadline.
 
     getaddrinfo has no cancellation API. A child can be killed and reaped; abandoning a resolver thread would leave
-    expired work behind. The child receives only the destination, never the credential. On Linux it also ends
-    with its parent, so a caller killed while the lookup is pending leaves no process behind.
+    expired work behind. The child receives only the destination, never the credential. A caller killed while the
+    lookup is pending leaves no process behind for long: the child's own alarm ends it at the deadline, rounded up
+    to a whole second, and on Linux it also ends with its parent.
     """
-    _time_left(deadline)
-    source = (_DIE_WITH_PARENT if sys.platform.startswith("linux") else "") + _RESOLVER
+    left = _time_left(deadline)
+    source = (
+        (_OWN_DEADLINE if os.name == "posix" else "")
+        + (_DIE_WITH_PARENT if sys.platform.startswith("linux") else "")
+        + _RESOLVER
+    )
     with subprocess.Popen(
-        [sys.executable, "-I", "-S", "-c", source, hostname, str(port), str(os.getpid())],
+        [sys.executable, "-I", "-S", "-c", source, hostname, str(port), str(os.getpid()), repr(left)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -278,9 +289,7 @@ class Client:
                 factory = partial(_connect_pinned, self._addresses, deadline=self._deadline)
                 setattr(connection, "_create_connection", factory)
             elif self._deadline is not None:
-                setattr(
-                    connection, "_create_connection", partial(_connect_before_deadline, deadline=self._deadline)
-                )
+                setattr(connection, "_create_connection", partial(_connect_before_deadline, deadline=self._deadline))
             connection.connect()
             check()
             # From here on every transport phase is under the absolute deadline,

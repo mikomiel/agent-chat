@@ -22,12 +22,12 @@ from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from agent_chat import client, instance_client, instance_worker
-from agent_chat.instance_file import InstanceSecret
+from agent_chat.instance_file import InstanceSecret, prepare_instance, read_instance
 from agent_chat.models import ChatError, Heartbeat
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -209,7 +209,7 @@ def test_a_hanging_resolver_at_join_is_bounded_by_the_join_deadline(
     # The code that a failed connection has, which every integration's rejoin policy already handles.
     assert error.value.code == "TRANSPORT_UNAVAILABLE"
     assert len(children) == 1 and children[0].poll() is not None
-    assert list(directory.iterdir()) == []  # the lookup comes before the binding's record is written
+    assert list(directory.iterdir()) == []  # no record is left: the one this join created is discarded
 
 
 def test_the_worker_alarm_cuts_a_hanging_join_lookup_short_as_a_transport_refusal(
@@ -247,6 +247,77 @@ def test_the_worker_alarm_cuts_a_hanging_join_lookup_short_as_a_transport_refusa
     # Not REQUEST_UNCERTAIN, which a bare timeout escaping the join would become.
     assert error.value.code == "TRANSPORT_UNAVAILABLE"
     assert len(children) == 1 and children[0].poll() is not None
+    assert list(directory.iterdir()) == []  # no record is left
+
+
+def _join_with_refused_addresses(
+    monkeypatch: pytest.MonkeyPatch, directory: Path, boot_id: UUID
+) -> instance_client.JoinedInstance:
+    """A join whose lookup succeeds and lists two addresses that both refuse the connection."""
+    listed = [_entry(_refused_port()), _entry(_refused_port())]
+    monkeypatch.setattr(client, "_RESOLVER", f"print({json.dumps(listed)!r})")
+    return instance_client.join_instance(
+        directory,
+        "refused-native",
+        boot_id,
+        server_origin=f"https://{HOSTNAME}:8443",
+        host_token=HOST_TOKEN,
+        harness="pi",
+        enabled=True,
+        resolve_by=time.monotonic() + 5,
+    )
+
+
+def test_a_registration_that_reaches_no_address_leaves_no_record(
+    children: list[subprocess.Popen[bytes]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fails on f00a0a7: the record that the join created stayed behind after a request that was never sent."""
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    with pytest.raises(ChatError) as error:
+        _join_with_refused_addresses(monkeypatch, directory, uuid4())
+    assert error.value.code == "TRANSPORT_UNAVAILABLE"
+    assert len(children) == 1 and children[0].returncode == 0  # the lookup itself succeeded
+    assert list(directory.iterdir()) == []
+
+
+def test_a_retried_registration_that_reaches_no_address_keeps_the_earlier_record(
+    children: list[subprocess.Popen[bytes]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Passes on f00a0a7 too. A record from an earlier attempt that may have registered is the retry's only proof."""
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    boot_id = uuid4()
+    earlier = prepare_instance(directory, "refused-native", boot_id, server_origin=f"https://{HOSTNAME}:8443")
+    with pytest.raises(ChatError) as error:
+        _join_with_refused_addresses(monkeypatch, directory, boot_id)
+    assert error.value.code == "TRANSPORT_UNAVAILABLE"
+    assert read_instance(directory / f"{boot_id}.json").token == earlier.token
+
+
+def test_an_unsafe_binding_directory_fails_before_any_lookup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Fails on f00a0a7: the lookup ran first, so its failure hid BINDING_FILE_UNSAFE."""
+
+    def no_lookup(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("the join looked the host up before checking its binding directory")
+
+    monkeypatch.setattr(socket, "getaddrinfo", no_lookup)
+    monkeypatch.setattr(subprocess, "Popen", no_lookup)
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o755)
+    with pytest.raises(ChatError) as error:
+        instance_client.join_instance(
+            directory,
+            "unsafe-native",
+            uuid4(),
+            server_origin=f"https://{HOSTNAME}:8443",
+            host_token=HOST_TOKEN,
+            harness="pi",
+            enabled=True,
+            resolve_by=time.monotonic() + 5,
+        )
+    assert error.value.code == "BINDING_FILE_UNSAFE"
     assert list(directory.iterdir()) == []
 
 
@@ -272,9 +343,11 @@ def _alive(pid: int) -> bool:
         return False
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the parent-death signal is Linux-only")
-def test_a_killed_worker_leaves_no_resolver_behind(tmp_path: Path) -> None:
-    """Fails on the old code: no resolver child exists, the join resolves in the worker itself."""
+def _kill_the_worker_during_its_join_lookup(tmp_path: Path, setup: str, *, gone_within: float) -> None:
+    """Start the real worker with `setup` run first, kill it while the lookup blocks, and wait for the child to go.
+
+    Only the lookup in the resolver child is replaced, by one that never answers.
+    """
     directory = tmp_path / "binding"
     directory.mkdir(mode=0o700)
     frame = {
@@ -288,10 +361,9 @@ def test_a_killed_worker_leaves_no_resolver_behind(tmp_path: Path) -> None:
         "host_token": HOST_TOKEN,
         "harness": "pi",
     }
-    # The real worker, with only the lookup in the resolver child replaced by one that never answers.
     source = (
         "import agent_chat.client as client; client._RESOLVER = 'import time; time.sleep(60)'\n"
-        "from agent_chat import instance_worker; raise SystemExit(instance_worker.main())\n"
+        "from agent_chat import instance_worker\n" + setup + "raise SystemExit(instance_worker.main())\n"
     )
     resolver: int | None = None
     with subprocess.Popen(
@@ -316,7 +388,7 @@ def test_a_killed_worker_leaves_no_resolver_behind(tmp_path: Path) -> None:
             assert _alive(resolver)
             worker.kill()
             worker.wait(timeout=5)
-            until = time.monotonic() + 3
+            until = time.monotonic() + gone_within
             while _alive(resolver) and time.monotonic() < until:
                 time.sleep(0.02)
             assert not _alive(resolver), "the resolver child outlived the killed worker"
@@ -325,6 +397,26 @@ def test_a_killed_worker_leaves_no_resolver_behind(tmp_path: Path) -> None:
                 worker.kill()
             if resolver is not None and _alive(resolver):
                 os.kill(resolver, signal.SIGKILL)  # by exact pid, only on failure
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the parent-death signal is Linux-only")
+def test_a_killed_worker_leaves_no_resolver_behind(tmp_path: Path) -> None:
+    """Fails on the old code: no resolver child exists, the join resolves in the worker itself."""
+    # The worker keeps its 20-second limit, so only the parent-death signal can end the child this soon.
+    _kill_the_worker_during_its_join_lookup(tmp_path, "", gone_within=3)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the child's own alarm needs POSIX signals")
+def test_a_resolver_whose_death_signal_is_refused_ends_at_its_own_alarm(tmp_path: Path) -> None:
+    """Fails on f00a0a7: with prctl refused, nothing bounded the child, which slept on after the worker died."""
+    setup = (
+        "refused = client._DIE_WITH_PARENT.replace('prctl(1,9,0,0,0)', 'prctl(-1,0,0,0,0)')\n"
+        "assert refused != client._DIE_WITH_PARENT, 'the death-signal call was not found'\n"
+        "client._DIE_WITH_PARENT = refused  # an invalid option: prctl fails with EINVAL, as a denying sandbox would\n"
+        "instance_worker.REQUEST_SECONDS = 2\n"
+    )
+    # The child's alarm is the 2-second join limit rounded up, counted from its start; the margin covers the rest.
+    _kill_the_worker_during_its_join_lookup(tmp_path, setup, gone_within=2 + 2)
 
 
 def test_refused_cached_addresses_answer_transport_unavailable_and_the_worker_keeps_serving(

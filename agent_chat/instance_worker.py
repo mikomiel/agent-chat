@@ -5,10 +5,12 @@ status, receipts, receipts_delivered and end requests. EOF, idle expiry and fail
 instance. All I/O runs under a real process deadline, including pipe backpressure. Imports start
 nothing.
 
-The join resolves the server host once, in a child process that the join's deadline bounds and that,
-on Linux, dies with the worker. Every later request connects only to those addresses, in order, and performs no
-name resolution; TLS still verifies the host name. When none of them accepts a connection the request
-fails with TRANSPORT_UNAVAILABLE. Only the next join, the parent's rejoin, resolves again.
+The join resolves the server host once, after the binding record is written, in a child process that
+the join's deadline bounds, that arms its own alarm for that deadline and that, on Linux, dies with the
+worker. A join that sends nothing removes the record it created. Every later request connects only to
+those addresses, in order, and performs no name resolution; TLS still verifies the host name. When none
+of them accepts a connection the request fails with TRANSPORT_UNAVAILABLE. Only the next join, the
+parent's rejoin, resolves again.
 """
 
 import json
