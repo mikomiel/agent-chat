@@ -145,7 +145,7 @@ or a stop. Only the idle-wake waiter exits 2.
 | `UserPromptSubmit` | `prompt` | Reports the session busy, or in Plan Mode when `permission_mode` is `plan`, then delivers a claimed batch as `additionalContext`. May start a missing receiver. |
 | `PostToolUse` | `tool` | The same as `prompt`, between tool calls. Never starts a receiver. |
 | `Stop` | `stop` | Reports the session idle. Prints nothing: `additionalContext` on `Stop` would continue the turn. |
-| `Stop` (`asyncRewake`) | `wait` | Holds a connection open. When an addressed message arrives while the session is idle, claims it, writes the notice to standard error and exits 2, which wakes the idle session. A binding that no hook has shown yet goes in front of the notice. |
+| `Stop` (`asyncRewake`) | `wait` | Holds a connection open. When an addressed message arrives while the session is idle, claims it, writes the notice to standard error and exits 2, which wakes the idle session. |
 | `SessionEnd` | `session-end` | Ends the instance, stops the worker and removes the socket. |
 
 - **Join.** The receiver starts one worker with the Claude Code `session_id` as
@@ -249,10 +249,7 @@ or a stop. Only the idle-wake waiter exits 2.
   batch is claimed beside an announcement only when it fits at body cap 0 with
   every frame at its widest. The announcement goes alone and the next hook, with
   no announcement in front, takes the batch whole, no attempt spent. A batch
-  that does not fit even then is deferred. An idle waiter follows the same rule
-  and cannot send the binding alone, so it does not wake the session for such
-  a batch: the next prompt shows the binding, and the hook after it takes the
-  batch.
+  that does not fit even then is deferred.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The

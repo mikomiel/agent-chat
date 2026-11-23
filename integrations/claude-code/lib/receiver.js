@@ -358,9 +358,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   async function wakePoll() {
     const current = waiter
     if (!current || current.delivering || inflight || chatState() !== null) return
-    // The waiter's output wakes the session: a binding still to be shown (a join or a rejoin that no hook has announced
-    // yet) goes in front of the notice, as a hook would put it.
-    const replied = await guard(deliver({ link: current.link, wake: true, announce: announcement(), holder: current }))
+    const replied = await guard(deliver({ link: current.link, wake: true, holder: current }))
     if (replied === true && waiter === current) dropWaiter()
     await report()
   }

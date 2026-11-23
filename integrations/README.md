@@ -200,10 +200,11 @@ different `instance_file`, and every notice says to bind its `instance_file` fir
 the new binding still re-binds. No protocol field or state is added.
 
 Self-contained notices. A notice can be the first Agent Chat text a model sees: a Claude Code idle wake can follow a
-join that no hook has shown. So a notice never depends on the binding having been shown. The fallback notice names
-its own CLI, and the Claude Code waiter puts a binding still to be shown in front of its notice, as a hook does. A
-Codex wake carries no binding and points at the one shown: it is a queued user turn, and that turn's own prompt hook
-carries a binding still to be shown in the same turn.
+join that no hook has shown. So a notice never depends on the binding having been shown: the `cli` notice names the
+CLI form, the `mcp` notice says to bind its `instance_file` first when it is new, and the fallback notice names its
+own CLI. The Claude Code waiter delivers the notice alone, and the next hook shows the pending binding. A Codex wake
+carries no binding and points at the one shown: it is a queued user turn, and that turn's own prompt hook carries a
+binding still to be shown in the same turn.
 
 Replies across transports. The CLI `reply` without `--key` and the `reply` tool without `key` derive the same key from
 the session and the parent message, so a one-step reply keeps its key on either transport.
