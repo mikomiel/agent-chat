@@ -175,7 +175,7 @@ stays closed, so an unknown key next to `toolRoute` is still refused.
 |---|---|
 | absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The text is byte-identical to the text before `toolRoute` existed. |
 | `"mcp"` | The tools of the MCP server named `agent-chat`: `bind` (when the server has it), `who`, `history`, `send`, `ack` and `reply`. The text says not to run the CLI, and it carries no CLI argument. |
-| `"mcp-with-cli-fallback"` | The `mcp` text, then the CLI, introduced by "Only if the agent-chat MCP server or its transport is unavailable", then the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." |
+| `"mcp-with-cli-fallback"` | The `mcp` text, then the CLI. The binding names the CLI in a line introduced by "Only if the agent-chat MCP server or its transport is unavailable", then gives the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." The notice and the Codex wake point at the binding's CLI lines and keep the no-replay clause: "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport." |
 
 The text names the server and its tools, never a callable name. A harness prefixes MCP tools its own way (Claude Code
 `mcp__<server>__<tool>`, OpenCode `<server>_<tool>`), and the model takes the name from its own tool list. So the same
@@ -193,32 +193,36 @@ What an `mcp` route needs, outside this repository:
 
 Rejoin. A rejoin already replaces the binding in every package, and the binding says the previous `instance_file` is
 no longer valid. On the `mcp` routes the binding also says to call `bind` again whenever a later binding gives a
-different `instance_file`, and every notice says to call `bind` first when its `instance_file` differs from the one
-last bound. A model that missed the new binding still re-binds. No protocol field or state is added.
+different `instance_file`, and every notice says to bind its `instance_file` first when it is new. A model that missed
+the new binding still re-binds. No protocol field or state is added.
 
 Replies across transports. The CLI `reply` without `--key` and the `reply` tool without `key` derive the same key from
-the session and the parent message, so the fallback notice shows `reply MESSAGE_ID` with no key, and a fallback reply
-keeps the key of the reply it repeats.
+the session and the parent message, so a one-step reply keeps its key on either transport.
 
 One source. The route text is in [`shared/notice.js`](shared/notice.js): `TOOL_ROUTES`, `bindingRouteLines(route)`,
 `wakeInstructions(route)`, and the `route` option of `renderNotice` and `packCandidates`. The Python reference holds
 the notice lines too, and vectors with a `route` field pin both. A package passes `config.toolRoute` to every call that
 renders or sizes text, and adds no route text of its own.
 
-Room. The `mcp` routes add bytes to every binding and notice. With the test fixtures' short interpreter, state
-directory and session id, and every other field at its widest:
+Room. A notice is rendered after the claim, and a stored retry batch is claimed whole, so a notice that takes more
+bytes on one route than on `cli` could leave a batch with no notice at all. The rule: in each mode, every route's own
+notice lines, and its pointer line, are at most the `cli` route's. Then any batch that renders on `cli` renders on every
+route, and `WORST_FRAME_BYTES` holds for all of them. The shared suite checks this. The `mcp` notice lines are therefore
+shorter than the binding's, and the fallback notice and wake point at the binding's CLI lines instead of repeating
+them. The binding is outside that rule and takes more room on the `mcp` routes. With the test fixtures' short
+interpreter, state directory and session id, and every other field at its widest:
 
 | Budget | `cli` | `mcp` | `mcp-with-cli-fallback` |
 |---|---|---|---|
-| 16 widest frames at cap 0, as rendered, Pi and DeepSeek bound 8,137 | 7,685 | 7,694 | 8,096 |
+| Notice lines before the first frame, metadata mode | 874 | 741 | 870 |
+| Notice lines before the first frame, bodies mode | 1,189 | 982 | 1,111 |
+| Pointer line of a cut body | 120 | 116 | 116 |
+| 16 widest frames at cap 0, as rendered, Pi and DeepSeek bound 8,137 | 7,685 | 7,414 | 7,543 |
 | Longest binding (63-character host) in `claude-code`, cap 4,096; `codex` is one byte shorter, cap 2,048 | 1,065 | 1,204 | 1,596 |
-| Codex wake prefix, test limit under 800 | 655 | 608 | 789 |
+| Codex wake prefix, test limit under 800 | 655 | 608 | 737 |
 
-The fallback route leaves 41 bytes for longer interpreter and state paths before a 16-frame retry batch at its widest
-no longer fits the Pi and DeepSeek bound. On `codex`, 16 widest metadata rows behind the longest announcement fit on
-`cli` and `mcp` but not on the fallback route (3,959 bytes against 3,895; 15 fit): nothing is claimed, the binding goes alone,
-and the next hook delivers the batch whole ([its README](codex/README.md) describes this path). The wake keeps the
-retry rule in a shorter form and points at the binding's CLI lines.
+On `codex` the longer binding leaves less room for interpreter and state paths before `CHAT_BINDING_TOO_LONG`: 453
+bytes on the fallback route, against 984 on `cli`.
 
 Rule for a future package: read `toolRoute` with the same values and the same strict refusal, copy `shared/notice.js`
 as `lib/notice.js`, and take every route line from it. Do not add a second route key or route text of its own.

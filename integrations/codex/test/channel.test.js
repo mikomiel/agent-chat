@@ -147,7 +147,7 @@ for (const route of ROUTES) {
       assert.match(text, /call ack or reply with message=MESSAGE_ID/)
     }
     if (route === "mcp") assert.doesNotMatch(text, /--room|--key|CLI/)
-    if (route === "mcp-with-cli-fallback") assert.match(text, /Only if that server or its transport is unavailable, use that binding's CLI fallback; reconcile an uncertain send or reply, never replaying it automatically on the other transport\./)
+    if (route === "mcp-with-cli-fallback") assert.ok(text.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport.\n"))
     const widest = number => ({ id: id(number), kind: "consultation", room_id: joined.room_id, history_after: "9".repeat(19) })
     const width = bytes(JSON.stringify(widest(1)))
     const size = count => bytes(prefix) + 2 + count * width + (count - 1)

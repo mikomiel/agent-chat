@@ -801,12 +801,46 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       await lifecycle.poll()
       assert.equal(sent.length, 1, `noticeBodies ${noticeBodies}`)
       const content = sent[0].payload.content
-      assert.match(content, /Use the agent-chat MCP tools\. If the server exposes bind and instance_file below differs from the one you last bound, call bind with exactly instance_file below first\./)
-      assert.match(content, /call ack with message=MESSAGE_ID/)
+      assert.match(content, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
       const cli = content.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.equal(cli.length, toolRoute === "mcp" ? 0 : 1, "only the fallback line names the CLI")
+      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI lines")
+      assert.equal(content.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
       if (noticeBodies) assert.ok(content.includes(`Body cut. Read all of it with history: room=${joined.room_id}, after=101, limit=1`))
       assert.ok(Buffer.byteLength(content, "utf8") <= MAX_CONTEXT_BYTES)
     }
+  })
+}
+
+// Review of #131: a stored retry batch is claimed whole, and a notice is rendered only after the claim. A batch that
+// renders on cli must render on every route, or the adapter defers it until the server drops it. Sixteen questions with
+// bodies, four-digit cursors and 350-byte interpreter and state paths: on the first cut of the fallback route this batch
+// needed 8,139 bytes at cap 0, over the 8,137-byte bound.
+for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
+  test(`route: on ${toolRoute} a whole retry batch that fits on cli, with long paths, is handed, not deferred`, async () => {
+    const { pi, emit, ctx, sent } = fakePi()
+    const long = { ...joined, instance_file: `/${"d".repeat(337)}/boot-1.json` }
+    const rows = Array.from({ length: 16 }, (_, index) => ({ ...bodyRow(index + 1, "q".repeat(4096)), history_after: String(1000 + index) }))
+    const ids = rows.map(row => row.id)
+    const worker = fakeWorker({
+      ready: Promise.resolve(long),
+      answer: (op, fields) => {
+        if (op === "pending") return { messages: ids, sizes: Object.fromEntries(ids.map(id => [id, 4096])), retry: true }
+        if (op === "claim") return { dispatch: true, attempt_id: attempt, reservation_ms: 20_000, admitted_at: ADMITTED, messages: rows.filter(row => fields.messages.includes(row.id)) }
+        if (op === "status") return { muted: false }
+        return {}
+      },
+    })
+    const python = `/${"p".repeat(349)}`
+    const lifecycle = createAgentChat(pi, { ...config, python, noticeBodies: true, toolRoute }, { ...timers, startProcess: () => worker, now: () => 1000 })
+    emit("session_start", {}, ctx)
+    await flush()
+    emit("input", { source: "interactive" }, ctx)
+    await lifecycle.poll()
+    assert.deepEqual(worker.requests.find(row => row.op === "claim").fields.messages, ids, "the retry batch is claimed whole")
+    assert.equal(worker.requests.find(row => row.op === "settle").fields.result.outcome, "handed")
+    assert.equal(sent.length, 1)
+    const content = sent[0].payload.content
+    assert.ok(Buffer.byteLength(content, "utf8") <= MAX_CONTEXT_BYTES)
+    for (const id of ids) assert.ok(content.includes(`message ${id} kind question`), id)
   })
 }

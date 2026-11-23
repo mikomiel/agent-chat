@@ -1141,11 +1141,10 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       const context = (await r.op(turn())).sent[0].context
       assert.ok(context.startsWith(CHAT_PREFIX), "the binding was announced already")
       const notice = context.slice(CHAT_PREFIX.length)
-      assert.match(notice, /Use the agent-chat MCP tools\. If the server exposes bind and instance_file below differs from the one you last bound, call bind with exactly instance_file below first\./)
-      assert.match(notice, /call ack with message=MESSAGE_ID/)
+      assert.match(notice, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
       const cli = notice.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.equal(cli.length, toolRoute === "mcp" ? 0 : 1, "only the fallback line names the CLI")
-      assert.ok(cli.every(line => line.startsWith("Only if the agent-chat MCP server or its transport is unavailable, ")))
+      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI lines")
+      assert.equal(notice.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
       assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
     }
   })

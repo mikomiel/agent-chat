@@ -148,9 +148,8 @@ rejoin the binding says to call `bind` again with the new `instance_file`.
 The wake text follows the route too; on the fallback route it points at the
 binding's CLI lines. The longest fallback binding takes 1,595 of the 2,048
 announcement bytes in the test fixture, so longer interpreter and state paths
-reach `CHAT_BINDING_TOO_LONG` sooner. Behind an announcement that long, 16
-metadata rows at their widest do not fit on the fallback route: they wait for the
-next hook, as [Behaviour](#behaviour) describes.
+reach `CHAT_BINDING_TOO_LONG` sooner. No route's notice takes more bytes than the
+`cli` notice, so a batch that fits on `cli` fits on every route.
 
 ## Behaviour
 

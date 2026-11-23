@@ -76,21 +76,20 @@ TOOL_ROUTES = ("cli", "mcp", "mcp-with-cli-fallback")
 
 
 class _RouteText(NamedTuple):
-    """One route's notice lines: the read line (metadata or bodies), the surface line, the ack line, the lines after
-    it, and the pointer of a cut body."""
+    """One route's notice lines: the read line (metadata or bodies), the lines after it and before the untrusted line,
+    the lines after that, and the pointer of a cut body.
+
+    A stored retry batch is claimed whole, so no route takes more notice bytes than `cli`: in each mode every route's
+    own lines, and its pointer line, are at most the cli route's.
+    """
 
     read: str
     bodies: str
-    use: str
-    ack: str
-    after: tuple[str, ...]
+    head: tuple[str, ...]
+    tail: tuple[str, ...]
     pointer: str
 
 
-_RETRY = (
-    "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay "
-    "it automatically on the other transport."
-)
 _CLI_ROUTE = _RouteText(
     read="Read each item with the existing CLI: history --room ROOM --after HISTORY_AFTER --limit 1; verify its ID.",
     bodies=(
@@ -98,43 +97,36 @@ _CLI_ROUTE = _RouteText(
         "the rest. Verify that the history read returns the ID shown in that item's header. A reply's --room is the "
         "room shown in that item's header."
     ),
-    use=(
+    head=(
         "Use exactly instance_file below as AGENT_CHAT_INSTANCE_FILE and the declared python with -I -m "
-        "agent_chat.cli."
+        "agent_chat.cli.",
     ),
-    ack=(
+    tail=(
         "After processing, run ack MESSAGE_ID (no other arguments) or reply MESSAGE_ID --room ROOM --key UUID "
-        "(body on stdin)."
+        "(body on stdin).",
     ),
-    after=(),
     pointer="Body cut. Read all of it with: history --room {room} --after {after} --limit 1",
 )
 _MCP_ROUTE = _RouteText(
-    read="Read each item with the history tool: room=ROOM, after=HISTORY_AFTER, limit=1; verify its ID.",
+    read="Read each item with history: room=ROOM, after=HISTORY_AFTER, limit=1; verify its ID.",
     bodies=(
-        "Each item below carries its body. A cut body has a pointer line with the exact history arguments to read "
-        "the rest. Verify that the history read returns the ID shown in that item's header."
+        "Each item below carries its body; a cut body has a pointer line with the history arguments for the rest. "
+        "Verify the read returns the ID in its header."
     ),
-    use=(
-        "Use the agent-chat MCP tools. If the server exposes bind and instance_file below differs from the one you "
-        "last bound, call bind with exactly instance_file below first."
+    head=(
+        "Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply (body) on "
+        "message=MESSAGE_ID.",
     ),
-    ack=(
-        "After processing, call ack with message=MESSAGE_ID (no other arguments) or reply with message=MESSAGE_ID "
-        "and body. Omit key and room on reply: the server derives them from the parent message."
-    ),
-    after=(),
+    tail=(),
     pointer="Body cut. Read all of it with history: room={room}, after={after}, limit=1",
 )
 _ROUTES = {
     "cli": _CLI_ROUTE,
     "mcp": _MCP_ROUTE,
     "mcp-with-cli-fallback": _MCP_ROUTE._replace(
-        after=(
-            "Only if the agent-chat MCP server or its transport is unavailable, run the declared python -I -m "
-            "agent_chat.cli with AGENT_CHAT_INSTANCE_FILE=instance_file below: history --room ROOM --after "
-            "HISTORY_AFTER --limit 1, ack MESSAGE_ID, reply MESSAGE_ID.",
-            _RETRY,
+        tail=(
+            "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically "
+            "on the other transport.",
         ),
     ),
 }
@@ -206,7 +198,7 @@ def _binding(joined: Mapping[str, Any], python: Any) -> str:
 
 def _preamble(joined: Mapping[str, Any], python: Any, *, bodies: bool, text: _RouteText) -> list[str]:
     """The adapter's own lines before the first message, for one route's notice text."""
-    lines = [_FIRST, text.bodies if bodies else text.read, text.use, _UNTRUSTED, text.ack, *text.after]
+    lines = [_FIRST, text.bodies if bodies else text.read, *text.head, _UNTRUSTED, *text.tail]
     lines.append(_BINDING_LABEL if bodies else _BINDING_METADATA_LABEL)
     lines.append(_binding(joined, python))
     return lines

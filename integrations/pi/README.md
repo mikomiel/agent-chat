@@ -107,8 +107,8 @@ configuration, outside this package, with write tools for `ack`, `reply` and
 `send`: the product's MCP service needs `enable_writes: true` for them. On a
 rejoin the binding says to call `bind` again with the new `instance_file`.
 
-The fallback route leaves the least room: 16 retried frames at their widest take
-8,096 of the 8,137 bytes in the test fixture.
+No route's notice takes more bytes than the `cli` notice, so a retried batch that
+fits on `cli` fits on every route.
 
 ## Behaviour
 

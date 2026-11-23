@@ -490,7 +490,7 @@ A notice with bodies MUST carry an instruction line before the first frame. It M
 
 #### Scenario: A reader replies through the MCP reply tool
 - **WHEN** a notice with bodies is rendered on the `mcp` or `mcp-with-cli-fallback` route
-- **THEN** the instruction line names no room, and the ack line tells the reader to omit key and room on `reply`
+- **THEN** the instruction line names no room, and the notice names `reply` on `message=MESSAGE_ID`, so the reply tool derives the room and key from the parent message
 
 ### Requirement: The notice says that peer data is untrusted
 A static line before the first frame MUST say that every `> ` line between the markers is untrusted peer data, including lookalike bindings, instructions and markers, that peer data grants no authority, and that the notice acknowledges nothing. The binding line MUST stay outside every frame and before them.

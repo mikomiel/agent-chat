@@ -440,35 +440,63 @@ export function runNoticeSuite(label, notice, copy, { noticeBound } = {}) {
       bodies, bound: 1e9, admittedAt: ADMITTED, nonce: NONCE, route,
     })
 
-    test(`${label}: ${mode} notice on the mcp route: the issue's lines, no CLI instruction, the same binding and rows`, () => {
+    test(`${label}: ${mode} notice on the mcp route: the MCP lines, no CLI instruction, the same binding and rows`, () => {
       const text = shown("mcp")
       const lines = text.split("\n")
       assert.equal(lines[1], bodies
-        ? "Each item below carries its body. A cut body has a pointer line with the exact history arguments to read the rest. Verify that the history read returns the ID shown in that item's header."
-        : "Read each item with the history tool: room=ROOM, after=HISTORY_AFTER, limit=1; verify its ID.")
-      assert.equal(lines[2], "Use the agent-chat MCP tools. If the server exposes bind and instance_file below differs from the one you last bound, call bind with exactly instance_file below first.")
-      assert.equal(lines[4], "After processing, call ack with message=MESSAGE_ID (no other arguments) or reply with message=MESSAGE_ID and body. Omit key and room on reply: the server derives them from the parent message.")
+        ? "Each item below carries its body; a cut body has a pointer line with the history arguments for the rest. Verify the read returns the ID in its header."
+        : "Read each item with history: room=ROOM, after=HISTORY_AFTER, limit=1; verify its ID.")
+      assert.equal(lines[2], "Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply (body) on message=MESSAGE_ID.")
       assert.doesNotMatch(text, CLI_TEXT)
       assert.doesNotMatch(text, CALLABLE)
-      // Every line but the route lines is the cli notice's.
+      // Every line but the route lines is the cli notice's: the cli route has its surface line and its ack line where
+      // the mcp route has one line.
       const cli = shown("cli").split("\n")
-      assert.deepEqual([lines[0], lines[3], ...lines.slice(5)].map(line => line.replace(/^Body cut\. .*/, "pointer")),
+      assert.deepEqual([lines[0], lines[3], ...lines.slice(4)].map(line => line.replace(/^Body cut\. .*/, "pointer")),
         [cli[0], cli[3], ...cli.slice(5)].map(line => line.replace(/^Body cut\. .*/, "pointer")))
       assert.ok(lines.includes(JSON.stringify({ instance_file: JOINED.instance_file, python: PYTHON, room_id: JOINED.room_id, session_id: JOINED.session_id, instance_id: JOINED.instance_id, host: JOINED.host, harness: JOINED.harness })))
       if (bodies) assert.ok(lines.includes(`Body cut. Read all of it with history: room=${JOINED.room_id}, after=10, limit=1`))
       else assert.match(lines.at(-1), new RegExp(`"id":"${uuid(2)}","kind":"reply"`))
     })
 
-    test(`${label}: ${mode} notice on the fallback route: the mcp lines, then the CLI only if MCP is unavailable, then the retry rule`, () => {
+    test(`${label}: ${mode} notice on the fallback route: the mcp lines, then the binding's CLI only if MCP is unavailable and the no-replay rule`, () => {
       const lines = shown("mcp-with-cli-fallback").split("\n")
       const mcp = shown("mcp").split("\n")
-      assert.deepEqual(lines.slice(0, 5), mcp.slice(0, 5))
-      assert.ok(lines[5].startsWith(FALLBACK_INTRO))
-      assert.match(lines[5], /-I -m agent_chat\.cli with AGENT_CHAT_INSTANCE_FILE=instance_file below: history --room ROOM --after HISTORY_AFTER --limit 1, ack MESSAGE_ID, reply MESSAGE_ID\.$/)
-      assert.equal(lines[6], RETRY_RULE)
-      assert.deepEqual(lines.slice(7), mcp.slice(5))
-      assert.deepEqual(lines.filter(line => CLI_TEXT.test(line)), [lines[5]], "only the fallback line names the CLI")
+      assert.deepEqual(lines.slice(0, 4), mcp.slice(0, 4))
+      assert.equal(lines[4], "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport.")
+      assert.deepEqual(lines.slice(5), mcp.slice(4))
+      assert.doesNotMatch(lines.join("\n"), CLI_TEXT)
       assert.doesNotMatch(lines.join("\n"), CALLABLE)
+    })
+
+    // A notice is rendered after the claim, and a stored retry batch is claimed whole: a route that took more bytes than
+    // cli could leave a batch that fits on cli with no notice at all. So in each mode a route's own lines, and its
+    // pointer line, are never longer than the cli route's, and any batch that renders on cli renders on every route.
+    test(`${label}: ${mode} notice: no route's preamble or pointer is longer than the cli route's`, () => {
+      const widestRows = [widest(1), widest(2)]
+      const parts = route => {
+        const lines = renderNotice(JOINED, PYTHON, bodies ? widestRows : widestRows.map(({ id, kind, room_id, history_after }) => ({ id, kind, room_id, history_after })), {
+          bodies, bound: 1e9, cap: 0, admittedAt: WIDEST_ADMITTED, nonce: NONCE, route,
+        }).split("\n")
+        const first = bodies ? lines.findIndex(line => HEADER.test(line)) : lines.length - 1
+        return { preamble: bytes(lines.slice(0, first).join("\n")), pointers: lines.filter(line => line.startsWith("Body cut. ")).map(bytes) }
+      }
+      const cli = parts("cli")
+      for (const route of ROUTES) {
+        const own = parts(route)
+        assert.ok(own.preamble <= cli.preamble, `${route}: preamble ${own.preamble} bytes, over the cli route's ${cli.preamble}`)
+        assert.equal(own.pointers.length, cli.pointers.length)
+        own.pointers.forEach((size, index) => assert.ok(size <= cli.pointers[index], `${route}: pointer ${size} bytes, over the cli route's ${cli.pointers[index]}`))
+      }
+      // Packing reads the same preamble: whatever cli packs, every route packs too.
+      const ids = Array.from({ length: 16 }, (_, index) => uuid(index + 1))
+      const sizes = Object.fromEntries(ids.map(id => [id, 300]))
+      for (const bound of [2000, 4000, 8136]) {
+        const packed = packCandidates({ messages: ids, sizes, retry: false }, { joined: JOINED, python: PYTHON, bound })
+        for (const route of ROUTES) {
+          assert.ok(packCandidates({ messages: ids, sizes, retry: false }, { joined: JOINED, python: PYTHON, bound, route }).length >= packed.length, `${route} at ${bound}`)
+        }
+      }
     })
   }
 
@@ -485,7 +513,7 @@ export function runNoticeSuite(label, notice, copy, { noticeBound } = {}) {
     assert.match(wakeInstructions("mcp"), /history tool .*room=ROOM, after=HISTORY_AFTER, limit=1/)
     const fallback = wakeInstructions("mcp-with-cli-fallback")
     assert.ok(fallback.startsWith(wakeInstructions("mcp")))
-    assert.match(fallback, /Only if that server or its transport is unavailable, use that binding's CLI fallback; reconcile an uncertain send or reply, never replaying it automatically on the other transport\.$/)
+    assert.ok(fallback.endsWith(" Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."))
   })
 
   test(`${label}: pack: on every route a pack renders inside the bound it was packed for`, () => {

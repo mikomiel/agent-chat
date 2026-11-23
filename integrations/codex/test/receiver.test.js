@@ -3882,9 +3882,9 @@ test("route: toolRoute mcp-with-cli-fallback announces the mcp lines, the CLI on
 
 // The receiver refuses a config whose longest binding does not fit MAX_BINDING_BYTES. On every route the fixture config
 // joins and its longest binding (63-character host) fits. Behind the worst announcement a notice still has room for one
-// widest message, in either mode; metadata rows that do not fit there wait for the next hook, which has no announcement in
-// front, and there sixteen rows at their widest fit on every route.
-test("route: every route's longest binding fits MAX_BINDING_BYTES, and every route's notice keeps the package's room", async () => {
+// widest message in either mode, and for sixteen metadata rows at their widest: no route's notice lines are longer than
+// the cli route's.
+test("route: every route's longest binding fits MAX_BINDING_BYTES, and every route's notice keeps the cli route's room", async () => {
   const ID = "00000000-0000-4000-8000-000000000000"
   const widestRow = { id: ID, kind: "consultation", room_id: ID, history_after: "9".repeat(19) }
   const widestFrame = validRow(ID, { kind: "consultation", history_after: "9".repeat(19), body: "x".repeat(16384), body_truncated: true, sender_session_id: null, sender_principal_id: ID, created_at: "0001-01-01T00:00:00.000000+00:00" })
@@ -3900,6 +3900,7 @@ test("route: every route's longest binding fits MAX_BINDING_BYTES, and every rou
     const notice = (rows, bound, bodies = false) => renderNotice(joinedAs, baseConfig.python, rows, { bodies, bound, admittedAt: "9999-12-31T23:59:59.999999+00:00", route: toolRoute })
     assert.ok(notice([widestRow], behindWorst), `${toolRoute}: one widest metadata row fits behind the worst announcement`)
     assert.ok(notice([widestFrame], behindWorst, true), `${toolRoute}: one widest framed message fits behind the worst announcement`)
+    assert.ok(notice(Array(16).fill(widestRow), behindWorst), `${toolRoute}: sixteen widest metadata rows fit behind the worst announcement`)
     assert.ok(notice(Array(16).fill(widestRow), alone), `${toolRoute}: sixteen widest metadata rows fit with no announcement`)
   }
 })
@@ -3932,10 +3933,10 @@ for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
       await r.begin()
       const context = (await r.op(turn())).sent[0].context
       assert.ok(context.startsWith(CHAT_PREFIX), "the binding was announced already")
-      assert.match(context, /Use the agent-chat MCP tools\. If the server exposes bind and instance_file below differs from the one you last bound, call bind with exactly instance_file below first\./)
-      assert.match(context, /call ack with message=MESSAGE_ID/)
+      assert.match(context, /Use the agent-chat MCP tools: bind instance_file below first if new, then ack or reply \(body\) on message=MESSAGE_ID\./)
       const cli = context.split("\n").filter(line => /agent_chat\.cli|--room|--key/.test(line))
-      assert.equal(cli.length, toolRoute === "mcp" ? 0 : 1, "only the fallback line names the CLI")
+      assert.deepEqual(cli, [], "the notice names no CLI argument: the fallback points at the binding's CLI lines")
+      assert.equal(context.includes("Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport."), toolRoute !== "mcp")
       if (noticeBodies) assert.ok(context.includes(`Body cut. Read all of it with history: room=${ROOM}, after=1234, limit=1`))
       assert.ok(bytes(context) <= MAX_OUTPUT_BYTES)
       assert.deepEqual(r.worker.ops("settle")[0].result, { outcome: "handed", reason: null })
