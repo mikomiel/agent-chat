@@ -377,13 +377,6 @@ sends its request: it does not wait for the worker to end its instance.
   claimed whole, and only when their notice fits with every row at its widest;
   otherwise nothing is claimed, the binding is sent alone, and the next hook,
   with no announcement in front, is offered the batch whole, no attempt spent.
-  A claimed notice that does not fit beside the announcement goes alone and is
-  handed: every notice is self-contained, and the announcement stays to be
-  shown. Until a hook confirms that it wrote the announcement, each hook shows
-  it alone and claims nothing; claiming resumes after the confirmed write.
-  This holds for that announcement only: one already confirmed by another hook
-  when the notice's receipt arrives, or a later boot's after a rejoin, holds
-  back no batch.
   The hook
   refuses any text over the budget as a second check. A wake's whole text, the
   fixed line and the rows, is bounded by the same 6,000 bytes. It carries no
@@ -392,11 +385,10 @@ sends its request: it does not wait for the worker to end its instance.
   claim is sized with the same renderer, on rows at their widest, so a batch
   that is claimed always renders; a larger batch is not claimed, and the poll
   waits 10 seconds. In bodies mode a wake also claims no more rows than a hook
-  arriving then would pack for the same candidates, sizes and announcement:
+  arriving then would claim for the same candidates, sizes and announcement:
   a batch that a wake claims and then defers is offered again whole, and the
-  next hook must deliver it with its bodies (beside an announcement, the
-  first hook without one). A retry batch is claimed whole or not at all, by a
-  wake as by a hook.
+  next hook must deliver it with its bodies. A retry batch is claimed whole or
+  not at all, by a wake as by a hook.
 - **Notice.** `lib/notice.js` is a byte-identical copy of the shared notice
   renderer, [`../shared/notice.js`](../shared/notice.js). A body sits between
   two marker lines that carry a random nonce, every body line starts with `> `,
@@ -823,16 +815,18 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   the adapter's own lines take 7,688 bytes when every header field is at its
   widest. The 6,000-byte output cap leaves 5,945 bytes after the delivery line,
   and 3,895 bytes once the longest binding announcement (2,048 bytes and two
-  line feeds) is counted too. Sixteen messages with short bodies also take
-  more than 3,895 bytes, so a full retry batch does not fit beside an
-  announcement of that size: the notice goes alone and the batch is handed, and
-  the next hook shows the announcement alone; no hook claims again until that
-  write is confirmed. A batch
-  that does not fit even alone
-  renders nothing and is deferred. One message at its widest takes 1,598 bytes in the same
+  line feeds) is counted too. A batch that does not fit renders nothing and is
+  deferred. Sixteen messages with short bodies also take more than 3,895 bytes,
+  so a full retry batch is deferred while an announcement of that size is in
+  front of it. One message at its widest takes 1,598 bytes in the same
   fixture, which leaves 2,297 bytes at the smallest bound for longer
   interpreter, state and host values, so a packed first claim can be delivered.
   `test/notice.test.js` holds a first claim to that bound.
+- **Fallback route room beside a binding.** On `mcp-with-cli-fallback` a binding
+  still to be shown and the notice after it take 341 bytes more than on `cli`
+  in metadata mode and 279 bytes more in bodies mode, so a batch beside that
+  binding reaches the overflow behaviour above (not claimed, or claimed and
+  deferred) that many bytes sooner.
 - **Self-started turns.** `UserPromptSubmit` also fires for turns the operator
   did not type. Each is a turn start to the receiver and may be delivered to.
 - **No sender receipts.** This version neither reads nor renders the receipts

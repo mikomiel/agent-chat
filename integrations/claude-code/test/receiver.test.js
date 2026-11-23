@@ -1,6 +1,5 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { createHash } from "node:crypto"
 import { EventEmitter } from "node:events"
 import { existsSync } from "node:fs"
 import { PassThrough } from "node:stream"
@@ -1188,17 +1187,16 @@ test("route: each route leaves the documented room for interpreter and state pat
   }
 })
 
-// After a rejoin the new binding is still to be shown. The hook claims as it did before #131. When the binding and the
-// notice fit together, both go out; when they do not, the notice goes alone (every notice is self-contained), the batch
-// is handed, and the binding stays to be shown for the next hook (review of #165). Before, such a batch was deferred.
-async function afterRejoin(config, handlers, { once = true } = {}) {
+// After a rejoin the new binding is still to be shown. The hook claims as it did before #131: when the binding and the
+// notice fit together, both go out.
+async function afterRejoin(config, handlers) {
   let refuse = true
   let claimed = false
   const r = await rig({
     config,
     handlers: {
       ...handlers,
-      pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : claimed && once ? { messages: [] } : handlers.pending(fields)),
+      pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : claimed ? { messages: [] } : handlers.pending(fields)),
       claim: fields => { claimed = true; return handlers.claim(fields) },
     },
   })
@@ -1214,44 +1212,7 @@ const retryRows = count => Array.from({ length: count }, (_, index) => bodyRow(i
 const retryAfterRejoin = (toolRoute, { python, directory, rows }) =>
   afterRejoin({ noticeBodies: true, toolRoute, python, directory }, bodiesHandlers(rows, { retry: true }))
 
-// The notice went out alone: every row, no binding; the next hook shows the binding, once.
-async function noticeAloneThenBinding(r, ids) {
-  const [first] = (await r.op(turn({ event: "PostToolUse" }))).sent
-  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids], "the hook claims the batch whole")
-  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
-  assert.ok(first.context.startsWith(CHAT_PREFIX), "the notice goes alone")
-  assert.doesNotMatch(first.context, /Agent Chat is available to this session/)
-  for (const id of ids) assert.ok(first.context.includes(id), id)
-  assert.ok(first.context.includes(`${r.worker.bootIds[1]}.json`), "the notice's own binding line names the new instance file")
-  assert.ok(bytes(first.context) <= MAX_OUTPUT_BYTES)
-  const [next] = (await r.op(turn({ event: "PostToolUse" }))).sent
-  assert.match(next.context, /^Agent Chat is available to this session/, "the next hook shows the binding")
-  assert.ok(next.context.includes(`${r.worker.bootIds[1]}.json`))
-  assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "and only once")
-}
-
 for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
-  test(`route: on ${toolRoute} a retry batch that does not fit beside the new binding goes out alone, and the next hook shows the binding`, async () => {
-    const rows = retryRows(16)
-    const r = await retryAfterRejoin(toolRoute, { python: `/${"p".repeat(1399)}`, directory: `/${"d".repeat(799)}`, rows })
-    await noticeAloneThenBinding(r, rows.map(row => row.id))
-  })
-
-  // Metadata mode claims the ids whole with no fit check, so a binding near its cap and sixteen rows at their widest
-  // overflow the output together; the notice goes alone the same way.
-  test(`route: on ${toolRoute} a metadata batch that does not fit beside the new binding goes out alone, and the next hook shows the binding`, async () => {
-    const ids = Array.from({ length: 16 }, (_, index) => uuid(index + 1))
-    const fits = BINDING_PATH_ROOM[toolRoute] - baseConfig.directory.length + (63 - "synthetic-host".length) + (36 - "session-1".length)
-    const r = await afterRejoin({ toolRoute, python: `/${"p".repeat(fits - 101)}` }, {
-      pending: () => ({ messages: ids }),
-      claim: fields => ({
-        dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000,
-        messages: fields.messages.map(id => ({ id, kind: "consultation", room_id: ROOM, history_after: "9".repeat(19) })),
-      }),
-    })
-    await noticeAloneThenBinding(r, ids)
-  })
-
   test(`route: on ${toolRoute} a retry batch that fits beside the new binding goes out with it`, async () => {
     const rows = retryRows(16)
     const r = await retryAfterRejoin(toolRoute, { python: baseConfig.python, directory: baseConfig.directory, rows })
@@ -1261,138 +1222,6 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
     assert.match(reply.context, /^Agent Chat is available to this session/)
     for (const row of rows) assert.ok(reply.context.includes(`message ${row.id} kind question`), row.id)
     assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "the binding was shown")
-  })
-}
-
-// A second large batch waits behind the first: the hook after a notice that went out alone shows the binding alone and
-// claims nothing, so the binding is not postponed again; the hook after that claims the second batch (review of #165).
-for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
-  for (const noticeBodies of [false, true]) {
-    test(`route: on ${toolRoute} after a ${noticeBodies ? "bodies" : "metadata"} notice went out alone, hooks show the binding until its write is confirmed before they claim the next batch`, async () => {
-      const room = BINDING_PATH_ROOM[toolRoute] - baseConfig.directory.length + (63 - "synthetic-host".length) + (36 - "session-1".length)
-      const batches = [0, 1].map(batch => Array.from({ length: 16 }, (_, index) => uuid(100 * batch + index + 1)))
-      const queue = [...batches]
-      const rowOf = id => (noticeBodies
-        ? { ...bodyRow(Number(id.slice(-12)), "r".repeat(4096)), id }
-        : { id, kind: "consultation", room_id: ROOM, history_after: "9".repeat(19) })
-      const r = await afterRejoin({ toolRoute, noticeBodies, python: `/${"p".repeat(noticeBodies ? 1399 : room - 101)}`, ...(noticeBodies ? { directory: `/${"d".repeat(799)}` } : {}) }, {
-        pending: fields => (!queue.length ? { messages: [] } : fields.bodies === true
-          ? { messages: queue[0], sizes: Object.fromEntries(queue[0].map(id => [id, 4096])), retry: true } : { messages: queue[0] }),
-        claim: fields => {
-          queue.shift()
-          return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, admitted_at: ADMITTED, messages: fields.messages.map(rowOf) }
-        },
-      }, { once: false })
-      const [first] = (await r.op(turn({ event: "PostToolUse" }))).sent
-      assert.ok(first.context.startsWith(CHAT_PREFIX), "the first batch goes out alone")
-      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]])
-      // The hook's pipe is gone: the binding write is not confirmed, so the binding is still to be shown.
-      const [lost] = (await r.op(turn({ event: "PostToolUse" }), hookDouble({ sendOk: false }))).sent
-      assert.match(lost.context, /^Agent Chat is available to this session/, "the next hook sends the binding alone")
-      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
-      const [second] = (await r.op(turn({ event: "PostToolUse" }))).sent
-      assert.match(second.context, /^Agent Chat is available to this session/, "the hook after an unconfirmed write sends the binding alone again")
-      assert.ok(!second.context.includes(CHAT_PREFIX))
-      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
-      const [third] = (await r.op(turn({ event: "PostToolUse" }))).sent
-      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), batches, "the hook after it claims the second batch")
-      assert.ok(third.context.startsWith(CHAT_PREFIX), "with no binding left to show")
-      for (const id of batches[1]) assert.ok(third.context.includes(id), id)
-      assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }, { outcome: "handed", reason: null }])
-    })
-  }
-}
-
-// The flag that holds a batch back is for the binding beside which the notice went out alone, and only while that binding
-// is still to be shown (review of #165). A hook whose write receipt waits until the test releases it.
-function heldHook(events) {
-  const hook = hookDouble({ events })
-  let release
-  const held = new Promise(resolve => { release = resolve })
-  const next = hook.next
-  hook.next = async () => { await held; return next() }
-  return { hook, release }
-}
-
-// A session after a rejoin, with boot 1's binding still to be shown; `rejoin()` later leaves boot 2's. The heartbeat
-// refuses on request, so the second rejoin needs no hook that reads pending. Every row is metadata at its widest, and
-// the interpreter path is long, so sixteen rows do not fit beside the binding and one row does.
-async function rejoinable(toolRoute, queue) {
-  let stale = false
-  const room = BINDING_PATH_ROOM[toolRoute] - baseConfig.directory.length + (63 - "synthetic-host".length) + (36 - "session-1".length)
-  const r = await afterRejoin({ toolRoute, python: `/${"p".repeat(room - 101)}` }, {
-    heartbeat: () => (stale ? { refused: "STALE_INSTANCE" } : {}),
-    pending: () => ({ messages: queue[0] ?? [] }),
-    claim: fields => {
-      queue.shift()
-      return {
-        dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000,
-        messages: fields.messages.map(id => ({ id, kind: "consultation", room_id: ROOM, history_after: "9".repeat(19) })),
-      }
-    },
-  }, { once: false })
-  r.rejoin = async () => {
-    stale = true
-    await r.clock.advance(30_000)
-    stale = false
-    await r.clock.advance(10_000)
-    assert.equal(r.worker.bootIds.length, 3, "rejoined again")
-    r.worker.log.length = 0
-  }
-  return r
-}
-const LARGE_BATCH = Array.from({ length: 16 }, (_, index) => uuid(index + 1))
-const SMALL_BATCH = [uuid(201)]
-// The cli output of the first hook after a rejoin with SMALL_BATCH pending and the same paths, on ff095e0 before #131,
-// with the boot id as BOOT.
-const PRE_ROUTE_REJOIN_OUTPUT = { bytes: 8034, sha256: "6e18a239573ef4d1de5845a08cb6903afeba03a252ef614430791711b6fdf546" }
-
-// The first hook after the second rejoin claims SMALL_BATCH and shows boot 2's binding with it.
-async function bindingAndBatch(r, toolRoute) {
-  const [reply] = (await r.op(turn({ event: "PostToolUse" }))).sent
-  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [SMALL_BATCH], "the first hook claims the batch")
-  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
-  assert.match(reply.context, /^Agent Chat is available to this session/, "with the new binding in front")
-  assert.ok(reply.context.includes(`${r.worker.bootIds[2]}.json`))
-  assert.ok(reply.context.includes(SMALL_BATCH[0]))
-  if (toolRoute === "cli") {
-    const text = reply.context.replaceAll(r.worker.bootIds[2], "BOOT")
-    assert.deepEqual({ bytes: bytes(text), sha256: createHash("sha256").update(text).digest("hex") }, PRE_ROUTE_REJOIN_OUTPUT,
-      "the cli output is the one before #131")
-  }
-  assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "the binding was shown")
-}
-
-for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
-  test(`route: on ${toolRoute} a binding another hook confirmed while a notice went out alone holds back no later batch`, async () => {
-    const queue = [LARGE_BATCH]
-    const r = await rejoinable(toolRoute, queue)
-    const held = heldHook(r.events)
-    const handing = r.op(turn({ event: "PostToolUse" }), held.hook)
-    await settle()
-    assert.ok(held.hook.sent[0].context.startsWith(CHAT_PREFIX), "the notice goes alone")
-    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [LARGE_BATCH])
-    // While that receipt is on its way, a parallel hook shows the binding, and its write is confirmed.
-    const [parallel] = (await r.op(turn({ event: "PostToolUse" }))).sent
-    assert.match(parallel.context, /^Agent Chat is available to this session/)
-    held.release()
-    await handing
-    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
-    assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "the binding was shown")
-    queue.push(SMALL_BATCH)
-    await r.rejoin()
-    await bindingAndBatch(r, toolRoute)
-  })
-
-  test(`route: on ${toolRoute} a notice that went out alone beside one boot's binding holds back no batch beside the next boot's`, async () => {
-    const queue = [LARGE_BATCH]
-    const r = await rejoinable(toolRoute, queue)
-    const [first] = (await r.op(turn({ event: "PostToolUse" }))).sent
-    assert.ok(first.context.startsWith(CHAT_PREFIX), "the notice goes alone beside boot 1's binding")
-    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [LARGE_BATCH])
-    queue.push(SMALL_BATCH)
-    await r.rejoin()
-    await bindingAndBatch(r, toolRoute)
   })
 }
 

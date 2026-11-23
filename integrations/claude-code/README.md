@@ -245,14 +245,12 @@ or a stop. Only the idle-wake waiter exits 2.
   announcement counted, the 10,000-byte output cap leaves 2,848 bytes for an
   announcement in the first case and 2,224 bytes in the second. The
   announcement is 1,016 bytes in the receiver tests and never more than 4,096.
-  When the announcement and the notice do not fit together, in either mode, the
-  notice goes alone and the batch is handed: every notice is self-contained,
-  and the announcement stays to be shown. Until a hook confirms that it wrote
-  the announcement, each hook shows it alone and claims nothing; claiming
-  resumes after the confirmed write. This holds for that announcement only:
-  one already confirmed by another hook when the notice's receipt arrives, or
-  a later boot's after a rejoin, holds back no batch. A batch whose notice does
-  not fit even alone is deferred.
+  An announcement larger than that room leaves less than the batch needs, so
+  the renderer returns nothing and the batch is deferred.
+- **Fallback route room beside an announcement.** On `mcp-with-cli-fallback`
+  an announcement and the notice after it take 341 bytes more than on `cli` in
+  metadata mode and 279 bytes more in bodies mode, so a batch beside an
+  announcement is claimed and then deferred that many bytes sooner.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The

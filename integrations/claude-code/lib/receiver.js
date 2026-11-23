@@ -82,10 +82,6 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let joined = null
   let bootId = null
   let announced = null // the boot id whose binding the model has been shown
-  // The boot id of a binding still to be shown when a notice went out alone beside it: until that binding's write is
-  // confirmed, each hook shows it alone and claims nothing, so a run of large batches cannot keep postponing it. Cleared by
-  // confirm, and by a hook that finds another boot's binding pending: the flag is for its own boot only.
-  let bindingFirst = null
   let native = "unknown" // idle | busy | plan | unknown, from the last hook event
   let stopped = true // clears on the first turn event; Claude Code reports no stop
   let failure = null // the fail-closed latch: the reason
@@ -162,8 +158,6 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     ].join("\n")
     return bytes(text) <= MAX_BINDING_BYTES ? text : null
   }
-
-  const confirm = announce => { announced = announce.boot; bindingFirst = null }
 
   const announcement = ({ always = false } = {}) => {
     const text = bindingText()
@@ -283,7 +277,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
     if (isDone(done, "written")) {
-      if (announce) confirm(announce)
+      if (announce) announced = announce.boot
       if (wake) native = "busy" // the notice starts a turn; the next Stop reports idle
       return { result: { outcome: "handed", reason: null }, replied: true }
     }
@@ -327,20 +321,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
           else if (started + reservation - now() <= MIN_RESERVATION_MS) result = UNCERTAIN // the status call used the reservation
           else {
-            const render = limit => renderNotice(joined, config.python, grant.messages ?? [], {
-              bodies, bound: limit, admittedAt: grant.admitted_at, route: config.toolRoute,
+            const notice = renderNotice(joined, config.python, grant.messages ?? [], {
+              bodies, bound, admittedAt: grant.admitted_at, route: config.toolRoute,
             })
-            // A binding still to be shown goes in front of the notice. When the two do not fit together, the notice goes
-            // alone: every notice is self-contained, and the binding stays to be shown, so the next hook shows it.
-            let shown = announce
-            let notice = render(bound)
-            if (notice === null && announce) {
-              notice = render(MAX_OUTPUT_BYTES - bytes(CHAT_PREFIX))
-              shown = null
-            }
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, (shown ? prefix : CHAT_PREFIX) + notice, started + reservation, wake, shown))
-            if (announce && !shown && result.outcome === "handed" && announced !== announce.boot) bindingFirst = announce.boot
+            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, wake, announce))
           }
         }
         if (!live) return replied
@@ -363,7 +348,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   async function announceOnly(link, announce) {
     await link.send({ context: announce.text, ack: true })
-    if (isDone(await link.next(2_000), "written")) confirm(announce)
+    if (isDone(await link.next(2_000), "written")) announced = announce.boot
   }
 
   const disabledReply = () => {
@@ -380,7 +365,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const message = announce ? `Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.` : undefined
     if (!announce) return link.send({ context: null })
     await link.send({ context: announce.text, ack: true, message })
-    if (isDone(await link.next(2_000), "written")) confirm(announce)
+    if (isDone(await link.next(2_000), "written")) announced = announce.boot
   }
 
   function setNative(request, running) {
@@ -394,10 +379,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     setNative(request, "busy")
     if (failure) return link.send(disabledReply())
     let replied = false
-    const pending = bindingFirst === null ? null : announcement()
-    if (pending && pending.boot !== bindingFirst) bindingFirst = null // the flag was for an earlier boot's binding
     if (inflight) void report() // a slow request never stacks up behind every tool call
-    else if (pending && bindingFirst !== null) await report() // the binding goes alone below; its receipt clears the flag
     else {
       await report()
       replied = (await guard(deliver({
