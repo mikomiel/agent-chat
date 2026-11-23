@@ -6,7 +6,6 @@ credential discovery, automatic join or model work.
 """
 
 import json
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -15,7 +14,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from .client import Address, Client, resolve_origin
-from .instance_file import InstanceSecret, discard_instance, prepare_instance
+from .instance_file import InstanceSecret, _prepare_instance, discard_instance
 from .models import RECEIPT_FEED_LIMIT, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 from .protocol import cursor, token_digest
 
@@ -89,8 +88,9 @@ def join_instance(
     if harness not in ("pi", "codex", "claude", "deepseek", "opencode"):
         raise ChatError("INVALID_REQUEST")
     registration_client = Client(server_origin, host_token, deadline=deadline)
-    created = not os.path.lexists(directory / f"{boot_id}.json")
-    secret = prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
+    # Whether the exclusive open made the record, never a separate existence probe: an alarm inside a probe that
+    # swallows OSError would read as "absent" and mark an earlier attempt's recoverable record for removal.
+    secret, created = _prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
     addresses: tuple[Address, ...] = ()
     try:
         if resolve_by is not None:

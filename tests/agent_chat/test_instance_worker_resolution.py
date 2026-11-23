@@ -295,6 +295,79 @@ def test_a_retried_registration_that_reaches_no_address_keeps_the_earlier_record
     assert read_instance(directory / f"{boot_id}.json").token == earlier.token
 
 
+def test_an_alarm_in_the_record_step_ends_the_join_and_keeps_the_earlier_record(
+    children: list[subprocess.Popen[bytes]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fails on 36cc973: its existence probe swallowed the alarm, and the join went on to delete the record.
+
+    The alarm fires at the first file system call that names the binding directory, whichever step makes it.
+    """
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    boot_id = uuid4()
+    earlier = prepare_instance(directory, "refused-native", boot_id, server_origin=f"https://{HOSTNAME}:8443")
+    fired: list[str] = []
+
+    def alarm_once(name: str, original: Any) -> Any:
+        def call(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if not fired and kwargs.get("dir_fd") is None and str(directory) in str(path):
+                fired.append(name)
+                raise client.Interrupted("worker interrupted")
+            return original(path, *args, **kwargs)
+
+        return call
+
+    monkeypatch.setattr(os, "lstat", alarm_once("lstat", os.lstat))
+    monkeypatch.setattr(os, "open", alarm_once("open", os.open))
+    with pytest.raises(client.Interrupted):
+        _join_with_refused_addresses(monkeypatch, directory, boot_id)
+    assert fired
+    assert children == []  # neither the lookup nor the registration ran after the alarm
+    monkeypatch.undo()
+    assert read_instance(directory / f"{boot_id}.json").token == earlier.token
+
+
+@pytest.mark.parametrize(
+    ("origin", "destination", "host_header", "verified"),
+    [
+        ("https://[2001:db8::1:2]", ("2001:db8::1:2", 443), "[2001:db8::1:2]", ["2001:db8::1:2"]),
+        ("http://[::1]", ("::1", 80), "[::1]", []),
+    ],
+    ids=["https-default-port", "http-default-port"],
+)
+def test_an_ipv6_literal_on_the_default_port_keeps_its_whole_address(
+    origin: str,
+    destination: tuple[str, int],
+    host_header: str,
+    verified: list[str],
+    server: _Server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fails on 36cc973: with no port, http.client read the literal's last group as one and verified 2001:db8::1."""
+    seen_destinations: list[tuple[str, int]] = []
+    seen_names: list[str | None] = []
+    connect_pinned = client._connect_pinned
+
+    def record_destination(addresses: Any, destination: tuple[str, int], *args: Any, **kwargs: Any) -> Any:
+        seen_destinations.append(destination)
+        return connect_pinned(addresses, destination, *args, **kwargs)
+
+    def plain_wrap(
+        _context: ssl.SSLContext, transport: socket.socket, *, server_hostname: str | None = None, **_kwargs: Any
+    ) -> socket.socket:
+        seen_names.append(server_hostname)
+        return transport
+
+    monkeypatch.setattr(client, "_connect_pinned", record_destination)
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", plain_wrap)
+    pinned = ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", server.port)),)
+    result = client.Client(origin, HOST_TOKEN, addresses=pinned).request("GET", "/v1/instance/status")
+    assert result["instance_id"] == server.instance_id
+    assert seen_destinations == [destination]
+    assert seen_names == verified
+    assert server.hosts == [("/v1/instance/status", host_header)]  # a default port stays out of the header
+
+
 def test_an_unsafe_binding_directory_fails_before_any_lookup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Fails on f00a0a7: the lookup ran first, so its failure hid BINDING_FILE_UNSAFE."""
 

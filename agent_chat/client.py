@@ -271,6 +271,10 @@ class Client:
                 return None
             return _time_left(self._deadline)
 
+        # Always an explicit port. Given none, http.client reads a trailing `:<digits>` of the host as one, so an
+        # IPv6 literal such as 2001:db8::1:2 would connect to, and verify, a different address. The Host header
+        # still omits a default port, as http.client does whenever the port is its default.
+        port = origin.port or (443 if origin.scheme == "https" else 80)
         try:
             left = check()
             timeout = 3.0 if left is None else max(0.001, min(3.0, left))
@@ -278,11 +282,9 @@ class Client:
                 # Unlike create_default_context, this does not enable SSLKEYLOGFILE.
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                 context.load_default_certs()
-                connection = http.client.HTTPSConnection(
-                    origin.hostname, origin.port, timeout=timeout, context=context
-                )
+                connection = http.client.HTTPSConnection(origin.hostname, port, timeout=timeout, context=context)
             else:
-                connection = http.client.HTTPConnection(origin.hostname, origin.port, timeout=timeout)
+                connection = http.client.HTTPConnection(origin.hostname, port, timeout=timeout)
             # http.client's runtime socket-factory seam is private and absent from typeshed. It replaces only how
             # the socket is made: server_hostname and the Host header come from connection.host, the origin's host.
             if self._addresses:
