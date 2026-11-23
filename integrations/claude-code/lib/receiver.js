@@ -82,9 +82,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let joined = null
   let bootId = null
   let announced = null // the boot id whose binding the model has been shown
-  // Set when a notice went out alone beside a binding still to be shown: until that binding's write is confirmed, each
-  // hook shows it alone and claims nothing, so a run of large batches cannot keep postponing it. Cleared by confirm only.
-  let bindingFirst = false
+  // The boot id of a binding still to be shown when a notice went out alone beside it: until that binding's write is
+  // confirmed, each hook shows it alone and claims nothing, so a run of large batches cannot keep postponing it. Cleared by
+  // confirm, and by a hook that finds another boot's binding pending: the flag is for its own boot only.
+  let bindingFirst = null
   let native = "unknown" // idle | busy | plan | unknown, from the last hook event
   let stopped = true // clears on the first turn event; Claude Code reports no stop
   let failure = null // the fail-closed latch: the reason
@@ -162,7 +163,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return bytes(text) <= MAX_BINDING_BYTES ? text : null
   }
 
-  const confirm = announce => { announced = announce.boot; bindingFirst = false }
+  const confirm = announce => { announced = announce.boot; bindingFirst = null }
 
   const announcement = ({ always = false } = {}) => {
     const text = bindingText()
@@ -339,7 +340,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             }
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
             else ({ result, replied } = await hand(link, (shown ? prefix : CHAT_PREFIX) + notice, started + reservation, wake, shown))
-            if (announce && !shown && result.outcome === "handed") bindingFirst = true
+            if (announce && !shown && result.outcome === "handed" && announced !== announce.boot) bindingFirst = announce.boot
           }
         }
         if (!live) return replied
@@ -393,8 +394,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     setNative(request, "busy")
     if (failure) return link.send(disabledReply())
     let replied = false
+    const pending = bindingFirst === null ? null : announcement()
+    if (pending && pending.boot !== bindingFirst) bindingFirst = null // the flag was for an earlier boot's binding
     if (inflight) void report() // a slow request never stacks up behind every tool call
-    else if (bindingFirst && announcement()) await report() // the binding goes alone below; only its receipt clears the flag
+    else if (pending && bindingFirst !== null) await report() // the binding goes alone below; its receipt clears the flag
     else {
       await report()
       replied = (await guard(deliver({

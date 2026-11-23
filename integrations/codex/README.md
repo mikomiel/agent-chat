@@ -381,6 +381,9 @@ sends its request: it does not wait for the worker to end its instance.
   handed: every notice is self-contained, and the announcement stays to be
   shown. Until a hook confirms that it wrote the announcement, each hook shows
   it alone and claims nothing; claiming resumes after the confirmed write.
+  This holds for that announcement only: one already confirmed by another hook
+  when the notice's receipt arrives, or a later boot's after a rejoin, holds
+  back no batch.
   The hook
   refuses any text over the budget as a second check. A wake's whole text, the
   fixed line and the rows, is bounded by the same 6,000 bytes. It carries no

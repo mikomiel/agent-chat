@@ -1,5 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { createHash } from "node:crypto"
 import { EventEmitter } from "node:events"
 import { existsSync } from "node:fs"
 import { PassThrough } from "node:stream"
@@ -1300,6 +1301,99 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
       assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }, { outcome: "handed", reason: null }])
     })
   }
+}
+
+// The flag that holds a batch back is for the binding beside which the notice went out alone, and only while that binding
+// is still to be shown (review of #165). A hook whose write receipt waits until the test releases it.
+function heldHook(events) {
+  const hook = hookDouble({ events })
+  let release
+  const held = new Promise(resolve => { release = resolve })
+  const next = hook.next
+  hook.next = async () => { await held; return next() }
+  return { hook, release }
+}
+
+// A session after a rejoin, with boot 1's binding still to be shown; `rejoin()` later leaves boot 2's. The heartbeat
+// refuses on request, so the second rejoin needs no hook that reads pending. Every row is metadata at its widest, and
+// the interpreter path is long, so sixteen rows do not fit beside the binding and one row does.
+async function rejoinable(toolRoute, queue) {
+  let stale = false
+  const room = BINDING_PATH_ROOM[toolRoute] - baseConfig.directory.length + (63 - "synthetic-host".length) + (36 - "session-1".length)
+  const r = await afterRejoin({ toolRoute, python: `/${"p".repeat(room - 101)}` }, {
+    heartbeat: () => (stale ? { refused: "STALE_INSTANCE" } : {}),
+    pending: () => ({ messages: queue[0] ?? [] }),
+    claim: fields => {
+      queue.shift()
+      return {
+        dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000,
+        messages: fields.messages.map(id => ({ id, kind: "consultation", room_id: ROOM, history_after: "9".repeat(19) })),
+      }
+    },
+  }, { once: false })
+  r.rejoin = async () => {
+    stale = true
+    await r.clock.advance(30_000)
+    stale = false
+    await r.clock.advance(10_000)
+    assert.equal(r.worker.bootIds.length, 3, "rejoined again")
+    r.worker.log.length = 0
+  }
+  return r
+}
+const LARGE_BATCH = Array.from({ length: 16 }, (_, index) => uuid(index + 1))
+const SMALL_BATCH = [uuid(201)]
+// The cli output of the first hook after a rejoin with SMALL_BATCH pending and the same paths, on ff095e0 before #131,
+// with the boot id as BOOT.
+const PRE_ROUTE_REJOIN_OUTPUT = { bytes: 8034, sha256: "6e18a239573ef4d1de5845a08cb6903afeba03a252ef614430791711b6fdf546" }
+
+// The first hook after the second rejoin claims SMALL_BATCH and shows boot 2's binding with it.
+async function bindingAndBatch(r, toolRoute) {
+  const [reply] = (await r.op(turn({ event: "PostToolUse" }))).sent
+  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [SMALL_BATCH], "the first hook claims the batch")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+  assert.match(reply.context, /^Agent Chat is available to this session/, "with the new binding in front")
+  assert.ok(reply.context.includes(`${r.worker.bootIds[2]}.json`))
+  assert.ok(reply.context.includes(SMALL_BATCH[0]))
+  if (toolRoute === "cli") {
+    const text = reply.context.replaceAll(r.worker.bootIds[2], "BOOT")
+    assert.deepEqual({ bytes: bytes(text), sha256: createHash("sha256").update(text).digest("hex") }, PRE_ROUTE_REJOIN_OUTPUT,
+      "the cli output is the one before #131")
+  }
+  assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "the binding was shown")
+}
+
+for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
+  test(`route: on ${toolRoute} a binding another hook confirmed while a notice went out alone holds back no later batch`, async () => {
+    const queue = [LARGE_BATCH]
+    const r = await rejoinable(toolRoute, queue)
+    const held = heldHook(r.events)
+    const handing = r.op(turn({ event: "PostToolUse" }), held.hook)
+    await settle()
+    assert.ok(held.hook.sent[0].context.startsWith(CHAT_PREFIX), "the notice goes alone")
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [LARGE_BATCH])
+    // While that receipt is on its way, a parallel hook shows the binding, and its write is confirmed.
+    const [parallel] = (await r.op(turn({ event: "PostToolUse" }))).sent
+    assert.match(parallel.context, /^Agent Chat is available to this session/)
+    held.release()
+    await handing
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+    assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "the binding was shown")
+    queue.push(SMALL_BATCH)
+    await r.rejoin()
+    await bindingAndBatch(r, toolRoute)
+  })
+
+  test(`route: on ${toolRoute} a notice that went out alone beside one boot's binding holds back no batch beside the next boot's`, async () => {
+    const queue = [LARGE_BATCH]
+    const r = await rejoinable(toolRoute, queue)
+    const [first] = (await r.op(turn({ event: "PostToolUse" }))).sent
+    assert.ok(first.context.startsWith(CHAT_PREFIX), "the notice goes alone beside boot 1's binding")
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [LARGE_BATCH])
+    queue.push(SMALL_BATCH)
+    await r.rejoin()
+    await bindingAndBatch(r, toolRoute)
+  })
 }
 
 for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {

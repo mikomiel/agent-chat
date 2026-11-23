@@ -140,7 +140,9 @@ A missing or invalid size counts as a full body. `claude-code` and `codex` can s
 the same output as a notice. When the two do not fit together, the notice goes alone and the batch is handed: every
 notice is self-contained, and the binding stays to be shown. Until a hook confirms that it wrote the binding, each
 hook shows the binding alone and claims nothing, so a run of large batches cannot postpone it; claiming resumes on
-the hook after the confirmed write. Only a notice that does not fit even alone is deferred.
+the hook after the confirmed write. This holds for that binding only: a binding already confirmed by another hook
+when the notice's receipt arrives, or a later binding after a rejoin, holds back no batch. Only a notice that does not
+fit even alone is deferred.
 
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
 bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line

@@ -249,8 +249,10 @@ or a stop. Only the idle-wake waiter exits 2.
   notice goes alone and the batch is handed: every notice is self-contained,
   and the announcement stays to be shown. Until a hook confirms that it wrote
   the announcement, each hook shows it alone and claims nothing; claiming
-  resumes after the confirmed write. A batch whose notice does not fit even
-  alone is deferred.
+  resumes after the confirmed write. This holds for that announcement only:
+  one already confirmed by another hook when the notice's receipt arrives, or
+  a later boot's after a rejoin, holds back no batch. A batch whose notice does
+  not fit even alone is deferred.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The
