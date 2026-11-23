@@ -82,8 +82,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let joined = null
   let bootId = null
   let announced = null // the boot id whose binding the model has been shown
-  // Set when a notice went out alone beside a binding still to be shown: the next hook shows that binding alone and
-  // claims nothing, so a run of large batches cannot keep postponing it. Cleared once the binding is shown.
+  // Set when a notice went out alone beside a binding still to be shown: until that binding's write is confirmed, each
+  // hook shows it alone and claims nothing, so a run of large batches cannot keep postponing it. Cleared by confirm only.
   let bindingFirst = false
   let native = "unknown" // idle | busy | plan | unknown, from the last hook event
   let stopped = true // clears on the first turn event; Claude Code reports no stop
@@ -394,10 +394,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (failure) return link.send(disabledReply())
     let replied = false
     if (inflight) void report() // a slow request never stacks up behind every tool call
-    else if (bindingFirst && announcement()) {
-      bindingFirst = false // the binding goes alone below, once, before the next claim
-      await report()
-    } else {
+    else if (bindingFirst && announcement()) await report() // the binding goes alone below; only its receipt clears the flag
+    else {
       await report()
       replied = (await guard(deliver({
         link, wake: false, announce: announcement(), deadline: now() + clamp(request.patience_ms, 30_000),

@@ -3997,7 +3997,7 @@ for (const toolRoute of ROUTES) {
 // A second large batch waits behind the first: the hook after a notice that went out alone shows the binding alone and
 // claims nothing, so the binding is not postponed again; the hook after that claims the second batch (review of #165).
 for (const toolRoute of ROUTES) {
-  test(`route: on ${toolRoute} after a notice went out alone, the next hook shows the binding before it claims the next batch`, async () => {
+  test(`route: on ${toolRoute} after a notice went out alone, hooks show the binding until its write is confirmed before they claim the next batch`, async () => {
     const batches = [0, 1].map(batch => Array.from({ length: 12 }, (_, index) => uid(100 * batch + index + 1)))
     const queue = [...batches]
     let refuse = true
@@ -4021,8 +4021,12 @@ for (const toolRoute of ROUTES) {
     const [first] = (await r.op(turn({ event: "tool" }))).sent
     assert.ok(first.context.startsWith(CHAT_PREFIX), "the first batch goes out alone")
     assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]])
+    // The hook's pipe is gone: the binding write is not confirmed, so the binding is still to be shown.
+    const [lost] = (await r.op(turn({ event: "tool" }), hookDouble({ sendOk: false }))).sent
+    assert.match(lost.context, /^Agent Chat is available to this session/, "the next hook sends the binding alone")
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
     const [second] = (await r.op(turn({ event: "tool" }))).sent
-    assert.match(second.context, /^Agent Chat is available to this session/, "the next hook shows the binding")
+    assert.match(second.context, /^Agent Chat is available to this session/, "the hook after an unconfirmed write sends the binding alone again")
     assert.doesNotMatch(second.context, /AGENT-CHAT-BODY/)
     assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
     const [third] = (await r.op(turn({ event: "tool" }))).sent

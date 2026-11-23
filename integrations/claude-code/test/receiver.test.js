@@ -1267,7 +1267,7 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
 // claims nothing, so the binding is not postponed again; the hook after that claims the second batch (review of #165).
 for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
   for (const noticeBodies of [false, true]) {
-    test(`route: on ${toolRoute} after a ${noticeBodies ? "bodies" : "metadata"} notice went out alone, the next hook shows the binding before it claims the next batch`, async () => {
+    test(`route: on ${toolRoute} after a ${noticeBodies ? "bodies" : "metadata"} notice went out alone, hooks show the binding until its write is confirmed before they claim the next batch`, async () => {
       const room = BINDING_PATH_ROOM[toolRoute] - baseConfig.directory.length + (63 - "synthetic-host".length) + (36 - "session-1".length)
       const batches = [0, 1].map(batch => Array.from({ length: 16 }, (_, index) => uuid(100 * batch + index + 1)))
       const queue = [...batches]
@@ -1285,8 +1285,12 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
       const [first] = (await r.op(turn({ event: "PostToolUse" }))).sent
       assert.ok(first.context.startsWith(CHAT_PREFIX), "the first batch goes out alone")
       assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]])
+      // The hook's pipe is gone: the binding write is not confirmed, so the binding is still to be shown.
+      const [lost] = (await r.op(turn({ event: "PostToolUse" }), hookDouble({ sendOk: false }))).sent
+      assert.match(lost.context, /^Agent Chat is available to this session/, "the next hook sends the binding alone")
+      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
       const [second] = (await r.op(turn({ event: "PostToolUse" }))).sent
-      assert.match(second.context, /^Agent Chat is available to this session/, "the next hook shows the binding")
+      assert.match(second.context, /^Agent Chat is available to this session/, "the hook after an unconfirmed write sends the binding alone again")
       assert.ok(!second.context.includes(CHAT_PREFIX))
       assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [batches[0]], "and claims nothing")
       const [third] = (await r.op(turn({ event: "PostToolUse" }))).sent

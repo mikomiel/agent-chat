@@ -379,8 +379,8 @@ sends its request: it does not wait for the worker to end its instance.
   with no announcement in front, is offered the batch whole, no attempt spent.
   A claimed notice that does not fit beside the announcement goes alone and is
   handed: every notice is self-contained, and the announcement stays to be
-  shown. The next hook shows it alone and claims nothing; claiming resumes on
-  the hook after that.
+  shown. Until a hook confirms that it wrote the announcement, each hook shows
+  it alone and claims nothing; claiming resumes after the confirmed write.
   The hook
   refuses any text over the budget as a second check. A wake's whole text, the
   fixed line and the rows, is bounded by the same 6,000 bytes. It carries no
@@ -823,7 +823,8 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   line feeds) is counted too. Sixteen messages with short bodies also take
   more than 3,895 bytes, so a full retry batch does not fit beside an
   announcement of that size: the notice goes alone and the batch is handed, and
-  the next hook shows the announcement alone, before it claims again. A batch
+  the next hook shows the announcement alone; no hook claims again until that
+  write is confirmed. A batch
   that does not fit even alone
   renders nothing and is deferred. One message at its widest takes 1,598 bytes in the same
   fixture, which leaves 2,297 bytes at the smallest bound for longer

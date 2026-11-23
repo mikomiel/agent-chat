@@ -247,9 +247,10 @@ or a stop. Only the idle-wake waiter exits 2.
   announcement is 1,016 bytes in the receiver tests and never more than 4,096.
   When the announcement and the notice do not fit together, in either mode, the
   notice goes alone and the batch is handed: every notice is self-contained,
-  and the announcement stays to be shown. The next hook shows it alone and
-  claims nothing; claiming resumes on the hook after that. A batch whose notice
-  does not fit even alone is deferred.
+  and the announcement stays to be shown. Until a hook confirms that it wrote
+  the announcement, each hook shows it alone and claims nothing; claiming
+  resumes after the confirmed write. A batch whose notice does not fit even
+  alone is deferred.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The
