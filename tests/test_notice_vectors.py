@@ -75,7 +75,7 @@ def test_the_vectors_have_unique_names() -> None:
 
 @pytest.mark.parametrize("vector", NOTICES, ids=[vector["name"] for vector in NOTICES])
 def test_notice_vector(vector: dict[str, Any]) -> None:
-    options = {key: vector[key] for key in ("admitted_at", "nonce", "cap") if key in vector}
+    options = {key: vector[key] for key in ("admitted_at", "nonce", "cap", "route") if key in vector}
     result = notice.render_notice(
         vector["joined"], vector["python"], vector["rows"], bound=vector["bound"], bodies=vector["bodies"], **options
     )
@@ -87,7 +87,7 @@ def test_notice_vector(vector: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize("vector", PACKS, ids=[vector["name"] for vector in PACKS])
 def test_pack_vector(vector: dict[str, Any]) -> None:
-    options = {"cap": vector["cap"]} if "cap" in vector else {}
+    options = {key: vector[key] for key in ("cap", "route") if key in vector}
     chosen = notice.pack_candidates(
         vector["pending"], joined=vector["joined"], python=vector["python"], bound=vector["bound"], **options
     )
@@ -365,3 +365,18 @@ def test_a_pack_of_several_messages_renders_without_cutting_text_bodies() -> Non
         if len(chosen) > 1:
             pointers = [line for line in text.split("\n") if POINTER.fullmatch(line)]
             assert len(pointers) == len([row for row in rows if row["body_truncated"]])
+
+
+@pytest.mark.parametrize("route", ["MCP", "CLI", "", "http", None, 1, True, ["mcp"]])
+def test_a_route_outside_the_enum_is_a_caller_error(route: object) -> None:
+    with pytest.raises(ValueError, match="route is one of"):
+        _render([_row(1, "x")], bound=10**9, route=route)
+    with pytest.raises(ValueError, match="route is one of"):
+        notice.pack_candidates(
+            {"messages": ["a"], "sizes": {}}, joined=JOINED, python=PYTHON, bound=10**9, route=route
+        )
+
+
+def test_the_tool_routes_are_the_package_config_enum() -> None:
+    assert notice.TOOL_ROUTES == ("cli", "mcp", "mcp-with-cli-fallback")
+    assert _render([_row(1, "x")], bound=10**9) == _render([_row(1, "x")], bound=10**9, route="cli")

@@ -85,6 +85,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
+| `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
 Name the file in the environment of the Claude Code process:
 
@@ -106,6 +107,30 @@ host token is never logged.
 
 The service and its host-token provisioning are documented in the product
 [README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+
+### Tool route
+
+`toolRoute` picks the Agent Chat surface that the binding and the notice name. The
+[integrations README](../README.md#tool-route) gives the exact text and the room
+each route takes.
+
+- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
+  has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
+- `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
+  transport is unavailable, and the rule not to replay an uncertain send or reply
+  on the other transport.
+
+An `mcp` route needs an MCP server entry named `agent-chat` in the harness
+configuration, outside this package, with write tools for `ack`, `reply` and
+`send`: the product's MCP service needs `enable_writes: true` for them. On a
+rejoin the binding says to call `bind` again with the new `instance_file`.
+
+Known limit: the binding is longer on the `mcp` routes, and the 4,096-byte
+announcement caps the interpreter path and the state directory together. With a
+63-character host, a UUID session id and plain ASCII paths, the fallback route
+leaves 2,698 bytes for the two paths, `mcp` 2,902, against 3,041 on `cli`. A
+longer binding is not announced.
 
 ## Behaviour
 
@@ -222,6 +247,10 @@ or a stop. Only the idle-wake waiter exits 2.
   announcement is 1,016 bytes in the receiver tests and never more than 4,096.
   An announcement larger than that room leaves less than the batch needs, so
   the renderer returns nothing and the batch is deferred.
+- **Fallback route room beside an announcement.** On `mcp-with-cli-fallback`
+  an announcement and the notice after it take 341 bytes more than on `cli` in
+  metadata mode and 279 bytes more in bodies mode, so a batch beside an
+  announcement is claimed and then deferred that many bytes sooner.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The

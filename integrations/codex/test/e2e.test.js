@@ -81,6 +81,8 @@ function hook(env, name, payload) {
 }
 
 const alive = pid => { try { process.kill(pid, 0); return true } catch { return false } }
+// Cleanup kill: the process may exit between a liveness check and the kill, so a missing process is not a failure.
+const reap = pid => { try { process.kill(pid, "SIGKILL") } catch (error) { if (error?.code !== "ESRCH") throw error } }
 
 // Answers the reads like an idle, default-mode main thread and records the queue traffic.
 function appServerHandler(threadId, queued) {
@@ -147,7 +149,7 @@ function fixture(session, withAppServer, { through = false } = {}) {
       // A failed test must not leave processes behind: stop exactly the two this test started.
       const [first] = entries().filter(entry => entry.op === "join")
       for (const pid of [first?.pid, first?.ppid]) {
-        if (Number.isInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL")
+        if (Number.isInteger(pid) && pid > 1 && alive(pid)) reap(pid)
       }
       rmSync(root, { recursive: true, force: true })
     },
@@ -378,8 +380,8 @@ test("a receiver refuses a state directory that no longer resolves to the one it
     const workers = [f.state, private_].flatMap(directory => {
       try { return readFileSync(join(directory, "worker.log"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.op === "join").map(entry => entry.pid) } catch { return [] }
     })
-    if (child && child.exitCode === null && child.signalCode === null) process.kill(child.pid, "SIGKILL")
-    for (const pid of workers) if (Number.isInteger(pid) && pid > 1 && alive(pid)) process.kill(pid, "SIGKILL")
+    if (child && child.exitCode === null && child.signalCode === null) reap(child.pid)
+    for (const pid of workers) if (Number.isInteger(pid) && pid > 1 && alive(pid)) reap(pid)
     await f.cleanup()
   }
 })

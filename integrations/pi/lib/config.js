@@ -6,11 +6,12 @@
 // A delegated child never joins, even when it inherits the variable.
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs"
 import { isAbsolute } from "node:path"
+import { TOOL_ROUTES } from "./notice.js"
 
 export const PI_CHAT_CONFIG_ENV = "AGENT_CHAT_PI_CONFIG"
 const MAX_BYTES = 16 * 1024
 const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "python"]
-const OPTIONAL = ["noticeBodies", "harness"]
+const OPTIONAL = ["noticeBodies", "harness", "toolRoute"]
 
 export function loadConfig(env = process.env, name = PI_CHAT_CONFIG_ENV) {
   const raw = env[name]
@@ -35,6 +36,7 @@ export function loadConfig(env = process.env, name = PI_CHAT_CONFIG_ENV) {
     !REQUIRED.every(key => key in data) ||
     !Object.keys(data).every(key => REQUIRED.includes(key) || OPTIONAL.includes(key)) ||
     (OPTIONAL.includes("noticeBodies") && "noticeBodies" in data && typeof data.noticeBodies !== "boolean") ||
+    ("toolRoute" in data && !TOOL_ROUTES.includes(data.toolRoute)) ||
     ("harness" in data && data.harness !== "pi") ||
     data.chatEnabled !== true ||
     !REQUIRED.slice(1).every(key => typeof data[key] === "string" && data[key]) ||

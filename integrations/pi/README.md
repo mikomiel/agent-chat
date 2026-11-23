@@ -72,6 +72,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
+| `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
 Point Pi at the file:
 
@@ -87,6 +88,27 @@ on every refusal; the host token is never logged.
 
 The service and its host-token provisioning are documented in the product
 [README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+
+### Tool route
+
+`toolRoute` picks the Agent Chat surface that the binding and the notice name. The
+[integrations README](../README.md#tool-route) gives the exact text and the room
+each route takes.
+
+- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
+  has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
+- `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
+  transport is unavailable, and the rule not to replay an uncertain send or reply
+  on the other transport.
+
+An `mcp` route needs an MCP server entry named `agent-chat` in the harness
+configuration, outside this package, with write tools for `ack`, `reply` and
+`send`: the product's MCP service needs `enable_writes: true` for them. On a
+rejoin the binding says to call `bind` again with the new `instance_file`.
+
+No route's notice takes more bytes than the `cli` notice, so a retried batch that
+fits on `cli` fits on every route.
 
 ## Behaviour
 
@@ -134,9 +156,11 @@ The service and its host-token provisioning are documented in the product
   different planning extension does not expose that state.
 - Sender receipts are not rendered yet. They are read-only and never wake a
   model, so their absence does not change delivery.
-- The binding context tells the model to use the `agent-chat` CLI for `who`,
-  `history`, `send`, `reply` and `ack`. No chat tools are registered by this
-  version; the CLI is the one message surface.
+- By default the binding context and the notice tell the model to use the
+  Agent Chat CLI for `who`, `history`, `send`, `reply` and `ack`; `toolRoute`
+  names the `agent-chat` MCP tools instead (see [Tool route](#tool-route)). This
+  version registers no chat tools of its own: an MCP route needs an
+  `agent-chat` MCP server that Pi reaches outside this package.
 - `lib/notice.js` is a byte-identical copy of [`../shared/notice.js`](../shared/notice.js).
   Edit the shared file and copy it over; `test/notice.test.js` fails on any
   difference. The [notice contract](../README.md#notice-contract) lists what
