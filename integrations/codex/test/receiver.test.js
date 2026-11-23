@@ -4105,7 +4105,8 @@ async function bindingAndBatch(r, toolRoute, boot = 2) {
 }
 
 // The notice goes alone beside boot 1's binding while a parallel hook shows that binding and its write is confirmed.
-async function confirmedInParallel(r) {
+// `meanwhile` runs before the notice's receipt arrives.
+async function confirmedInParallel(r, meanwhile = async () => {}) {
   const held = heldHook(r.events)
   const handing = r.op(turn({ event: "tool" }), held.hook)
   await settle()
@@ -4113,11 +4114,16 @@ async function confirmedInParallel(r) {
   assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [LARGE_BATCH])
   const [parallel] = (await r.op(turn({ event: "tool" }))).sent
   assert.match(parallel.context, /^Agent Chat is available to this session/)
+  await meanwhile()
   held.release()
   await handing
   assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
-  assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], "the binding was shown")
   r.worker.log.length = 0
+}
+// A start whose own write of the binding is lost: the binding is to be shown again.
+async function lostStart(r) {
+  const [restart] = (await r.op({ op: "start", wait_ms: 5000 }, hookDouble({ sendOk: false }))).sent
+  assert.match(restart.context, /^Agent Chat is available to this session/, "the start's write is not confirmed")
 }
 
 for (const toolRoute of ROUTES) {
@@ -4125,6 +4131,7 @@ for (const toolRoute of ROUTES) {
     const queue = [LARGE_BATCH]
     const r = await rejoinable(toolRoute, queue)
     await confirmedInParallel(r)
+    assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], "the binding was shown")
     queue.push(SMALL_BATCH)
     await r.rejoin()
     await bindingAndBatch(r, toolRoute)
@@ -4136,8 +4143,18 @@ for (const toolRoute of ROUTES) {
     const queue = [LARGE_BATCH]
     const r = await rejoinable(toolRoute, queue)
     await confirmedInParallel(r)
-    const [restart] = (await r.op({ op: "start", wait_ms: 5000 }, hookDouble({ sendOk: false }))).sent
-    assert.match(restart.context, /^Agent Chat is available to this session/, "the start's write is not confirmed")
+    assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], "the binding was shown")
+    await lostStart(r)
+    queue.push(SMALL_BATCH)
+    await bindingAndBatch(r, null, 1) // no route: a start has no pre-#131 capture here
+  })
+
+  // The reverse order (review of #165): the start drops the receipts and its own write is lost before the notice's
+  // receipt arrives. That receipt is for text written under the earlier start, so it arms nothing.
+  test(`route: on ${toolRoute} a notice receipt that arrives after a start dropped the receipts holds back no batch`, async () => {
+    const queue = [LARGE_BATCH]
+    const r = await rejoinable(toolRoute, queue)
+    await confirmedInParallel(r, () => lostStart(r))
     queue.push(SMALL_BATCH)
     await bindingAndBatch(r, null, 1) // no route: a start has no pre-#131 capture here
   })

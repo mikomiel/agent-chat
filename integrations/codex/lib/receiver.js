@@ -600,15 +600,19 @@ export function createReceiver(config, { sessionId, ownerPid }, {
             const render = limit => renderNotice(joined, config.python, grant.messages ?? [], { bodies, bound: limit, admittedAt: grant.admitted_at, route: config.toolRoute })
             // An announcement still to be shown goes in front of the notice. When the two do not fit together, the notice
             // goes alone: every notice is self-contained, and the announcement stays to be shown, so the next hook shows it.
-            let shown = announce
+            let front = announce
             let notice = render(bound)
             if (notice === null && announce) {
               notice = render(MAX_OUTPUT_BYTES - bytes(CHAT_PREFIX))
-              shown = null
+              front = null
             }
+            // A receipt for a notice written before the newest start does not arm the flag, as it confirms nothing (confirm).
+            const generation = shown
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, (shown ? prefix : CHAT_PREFIX) + notice, started + reservation, deadline, shown))
-            if (announce && !shown && result.outcome === "handed" && announced !== announce.boot) bindingFirst = announce.boot
+            else ({ result, replied } = await hand(link, (front ? prefix : CHAT_PREFIX) + notice, started + reservation, deadline, front))
+            if (announce && !front && result.outcome === "handed" && generation === shown && announced !== announce.boot) {
+              bindingFirst = announce.boot
+            }
           }
         }
         // A wake that did not hand, whatever stopped it after the claim, waits before the next one.
