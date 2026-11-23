@@ -6,6 +6,7 @@
 // line. A delegated child never joins, even when it inherits the variable.
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs"
 import { isAbsolute } from "node:path"
+import { TOOL_ROUTES } from "./notice.js"
 import { trustedFile } from "./trust.js"
 
 // The harness this package joins as. The join frame and the socket name prefix both read it, so the code that
@@ -14,7 +15,7 @@ export const HARNESS = "codex"
 export const CODEX_CHAT_CONFIG_ENV = "AGENT_CHAT_CODEX_CONFIG"
 const MAX_BYTES = 16 * 1024
 const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "python"]
-const OPTIONAL = ["noticeBodies", "appServer"]
+const OPTIONAL = ["noticeBodies", "appServer", "toolRoute"]
 
 // The app-server control socket named as unix://PATH: an absolute path and no other scheme. Null when it is not.
 // This only parses the path. `trustedSocket` in trust.js decides before every connection whether the socket and its
@@ -58,6 +59,7 @@ export function loadConfig(env = process.env, name = CODEX_CHAT_CONFIG_ENV, trus
   if (!Object.keys(data).every(key => REQUIRED.includes(key) || OPTIONAL.includes(key))) return null
   if (data.chatEnabled !== true) return null
   if ("noticeBodies" in data && typeof data.noticeBodies !== "boolean") return null
+  if ("toolRoute" in data && !TOOL_ROUTES.includes(data.toolRoute)) return null
   if ("appServer" in data && appServerPath(data.appServer) === null) return null
   if (!REQUIRED.slice(1).every(key => typeof data[key] === "string" && data[key])) return null
   if (!["python", "directory"].every(key => isAbsolute(data[key]))) return null

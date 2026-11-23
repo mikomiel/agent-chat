@@ -6,10 +6,12 @@
 // line. A delegated child never joins, even when it inherits the variable.
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs"
 import { isAbsolute } from "node:path"
+import { TOOL_ROUTES } from "./notice.js"
 
 export const OPENCODE_CHAT_CONFIG_ENV = "AGENT_CHAT_OPENCODE_CONFIG"
 const MAX_BYTES = 16 * 1024
 const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "python"]
+const OPTIONAL = ["toolRoute"]
 
 export function loadConfig(env = process.env, name = OPENCODE_CHAT_CONFIG_ENV) {
   const raw = env[name]
@@ -33,8 +35,9 @@ export function loadConfig(env = process.env, name = OPENCODE_CHAT_CONFIG_ENV) {
   }
   if (data === null || typeof data !== "object" || Array.isArray(data)) return null
   if (!REQUIRED.every(key => key in data)) return null
-  if (!Object.keys(data).every(key => REQUIRED.includes(key))) return null
+  if (!Object.keys(data).every(key => REQUIRED.includes(key) || OPTIONAL.includes(key))) return null
   if (data.chatEnabled !== true) return null
+  if ("toolRoute" in data && !TOOL_ROUTES.includes(data.toolRoute)) return null
   if (!REQUIRED.slice(1).every(key => typeof data[key] === "string" && data[key])) return null
   if (!["python", "directory"].every(key => isAbsolute(data[key]))) return null
   return data

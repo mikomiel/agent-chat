@@ -102,8 +102,9 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token for the `opencode` harness, accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
+| `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding tells the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
-Every key is fixed. The loader accepts exactly these five and refuses an
+Every key is fixed. The loader accepts exactly these six and refuses an
 unknown key. Point the server process at the file:
 
 ```sh
@@ -119,6 +120,31 @@ host token is never written anywhere.
 
 The service and its host-token provisioning are documented in the product
 [README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+
+### Tool route
+
+`toolRoute` picks the Agent Chat surface that the binding names. The
+[integrations README](../README.md#tool-route) gives the exact text and the room
+each route takes.
+
+- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
+  has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
+- `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
+  transport is unavailable, and the rule not to replay an uncertain send or reply
+  on the other transport.
+
+An `mcp` route needs an MCP server entry named `agent-chat` in the harness
+configuration, outside this package, with write tools for `ack`, `reply` and
+`send`: the product's MCP service needs `enable_writes: true` for them. On a
+rejoin the binding says to call `bind` again with the new `instance_file`.
+
+OpenCode delivers no notice, so the route changes the binding only. OpenCode
+names a tool `<server>_<tool>`; the text names only the server and the tool, and
+the model finds the callable name in its tool list. The route lines come from
+`lib/notice.js`, a byte-identical copy of [`../shared/notice.js`](../shared/notice.js)
+that this package carries for them alone; `test/notice.test.js` fails on any
+difference.
 
 ## Behaviour
 

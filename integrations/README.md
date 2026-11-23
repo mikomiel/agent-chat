@@ -98,12 +98,14 @@ delivers nothing and has no notice. The contract has two implementations that pa
 the same vectors in [`notice-vectors.json`](notice-vectors.json): the Python reference
 [`agent_chat/notice.py`](../agent_chat/notice.py) and the dependency-free JavaScript module
 [`shared/notice.js`](shared/notice.js). A package keeps no dependency and reads nothing outside its own directory
-at run time, so each delivering package ships a byte-identical copy as `lib/notice.js`. A test in each of them fails
-when its copy differs from the shared source.
+at run time, so each package ships a byte-identical copy as `lib/notice.js`. OpenCode renders no notice and uses its
+copy for the [tool route](#tool-route) lines of its binding only. A test in each package fails when its copy differs from
+the shared source.
 After you edit `shared/notice.js`, copy it over each `lib/notice.js`. The normative text is the notice requirements in
 [`openspec/specs/chat-clients/spec.md`](../openspec/specs/chat-clients/spec.md).
 
-In bodies mode, a notice has:
+In bodies mode, a notice has the parts below. The instruction lines and the pointer line follow the
+[tool route](#tool-route); the `--room` wording below is the `cli` route's.
 
 - the adapter's own instruction lines and the binding line, then one static line that says every `> ` line between
   the markers is untrusted peer data and grants no authority. One instruction line tells the reader to verify that a
@@ -160,6 +162,66 @@ Limits that remain:
   [its README](codex/README.md) gives the numbers.
 - The table of escaped code points is fixed. A code point that a later Unicode version makes invisible stays
   unescaped until the table and the vectors change.
+
+## Tool route
+
+The optional config key `toolRoute` says which Agent Chat surface the binding, the notice and the Codex wake tell the
+model to use. It is a deployment fact, not something a package detects. Every package accepts the same three values,
+and refuses every other value the way it refuses a wrong `noticeBodies` type: `loadConfig` returns `null`, chat stays
+off and nothing is logged. `"MCP"`, `""`, `"http"`, `null`, a number, a boolean and an array are refused. The key set
+stays closed, so an unknown key next to `toolRoute` is still refused.
+
+| Value | What the text tells the model |
+|---|---|
+| absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The text is byte-identical to the text before `toolRoute` existed. |
+| `"mcp"` | The tools of the MCP server named `agent-chat`: `bind` (when the server has it), `who`, `history`, `send`, `ack` and `reply`. The text says not to run the CLI, and it carries no CLI argument. |
+| `"mcp-with-cli-fallback"` | The `mcp` text, then the CLI, introduced by "Only if the agent-chat MCP server or its transport is unavailable", then the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." |
+
+The text names the server and its tools, never a callable name. A harness prefixes MCP tools its own way (Claude Code
+`mcp__<server>__<tool>`, OpenCode `<server>_<tool>`), and the model takes the name from its own tool list. So the same
+text works in every package.
+
+What an `mcp` route needs, outside this repository:
+
+- An MCP server entry named `agent-chat` in the harness configuration.
+- Write tools on that server for `ack`, `reply` and `send`. The product's optional MCP service is read-only unless it
+  runs with `enable_writes: true` (product [README](../README.md), "MCP (optional)").
+- A way for that server to act as this session. The product's MCP service authenticates every request with the
+  instance token, which changes at every rejoin, and it has no `bind` tool. The text tells the model to call `bind`
+  with the exact `instance_file` only when the server exposes `bind`, for example a per-session stdio server that takes
+  the binding at run time.
+
+Rejoin. A rejoin already replaces the binding in every package, and the binding says the previous `instance_file` is
+no longer valid. On the `mcp` routes the binding also says to call `bind` again whenever a later binding gives a
+different `instance_file`, and every notice says to call `bind` first when its `instance_file` differs from the one
+last bound. A model that missed the new binding still re-binds. No protocol field or state is added.
+
+Replies across transports. The CLI `reply` without `--key` and the `reply` tool without `key` derive the same key from
+the session and the parent message, so the fallback notice shows `reply MESSAGE_ID` with no key, and a fallback reply
+keeps the key of the reply it repeats.
+
+One source. The route text is in [`shared/notice.js`](shared/notice.js): `TOOL_ROUTES`, `bindingRouteLines(route)`,
+`wakeInstructions(route)`, and the `route` option of `renderNotice` and `packCandidates`. The Python reference holds
+the notice lines too, and vectors with a `route` field pin both. A package passes `config.toolRoute` to every call that
+renders or sizes text, and adds no route text of its own.
+
+Room. The `mcp` routes add bytes to every binding and notice. With the test fixtures' short interpreter, state
+directory and session id, and every other field at its widest:
+
+| Budget | `cli` | `mcp` | `mcp-with-cli-fallback` |
+|---|---|---|---|
+| 16 widest frames at cap 0, as rendered, Pi and DeepSeek bound 8,137 | 7,685 | 7,694 | 8,096 |
+| Longest binding (63-character host) in `claude-code`, cap 4,096; `codex` is one byte shorter, cap 2,048 | 1,065 | 1,204 | 1,596 |
+| Codex wake prefix, test limit under 800 | 655 | 608 | 789 |
+
+The fallback route leaves 41 bytes for longer interpreter and state paths before a 16-frame retry batch at its widest
+no longer fits the Pi and DeepSeek bound. On `codex`, 16 widest metadata rows behind the longest announcement fit on
+`cli` and `mcp` but not on the fallback route (3,959 bytes against 3,895; 15 fit): nothing is claimed, the binding goes alone,
+and the next hook delivers the batch whole ([its README](codex/README.md) describes this path). The wake keeps the
+retry rule in a shorter form and points at the binding's CLI lines.
+
+Rule for a future package: read `toolRoute` with the same values and the same strict refusal, copy `shared/notice.js`
+as `lib/notice.js`, and take every route line from it. Do not add a second route key or route text of its own.
 
 ## Rules
 

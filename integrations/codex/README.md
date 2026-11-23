@@ -99,6 +99,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `python` | Absolute interpreter that can import `agent_chat`. |
 | `noticeBodies` | Optional. `true` includes message bodies in a notice delivered by a hook, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `appServer` | Optional. `unix://` followed by the absolute path of the Codex app-server control socket. Without it the package is hook-only: no thread check and no thread read. Any other form is a refused config. The socket must also pass the [trust check](#app-server-control-socket) before every connection: a socket that does not is refused with `CHAT_APPSERVER_UNTRUSTED`. |
+| `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding, the notice and the idle wake tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
 Name the file in the environment of the Codex process:
 
@@ -125,6 +126,31 @@ host token is never logged.
 
 The service and its host-token provisioning are documented in the product
 [README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+
+### Tool route
+
+`toolRoute` picks the Agent Chat surface that the binding, the notice and the
+idle wake name. The [integrations README](../README.md#tool-route) gives the
+exact text and the room each route takes.
+
+- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
+  has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
+- `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
+  transport is unavailable, and the rule not to replay an uncertain send or reply
+  on the other transport.
+
+An `mcp` route needs an MCP server entry named `agent-chat` in the harness
+configuration, outside this package, with write tools for `ack`, `reply` and
+`send`: the product's MCP service needs `enable_writes: true` for them. On a
+rejoin the binding says to call `bind` again with the new `instance_file`.
+
+The wake text follows the route too; on the fallback route it points at the
+binding's CLI lines. The longest fallback binding takes 1,595 of the 2,048
+announcement bytes in the test fixture, so longer interpreter and state paths
+reach `CHAT_BINDING_TOO_LONG` sooner. Behind an announcement that long, 16
+metadata rows at their widest do not fit on the fallback route: they wait for the
+next hook, as [Behaviour](#behaviour) describes.
 
 ## Behaviour
 

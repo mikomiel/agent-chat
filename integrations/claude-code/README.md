@@ -85,6 +85,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
+| `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
 Name the file in the environment of the Claude Code process:
 
@@ -106,6 +107,27 @@ host token is never logged.
 
 The service and its host-token provisioning are documented in the product
 [README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+
+### Tool route
+
+`toolRoute` picks the Agent Chat surface that the binding and the notice name. The
+[integrations README](../README.md#tool-route) gives the exact text and the room
+each route takes.
+
+- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
+  has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
+- `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
+  transport is unavailable, and the rule not to replay an uncertain send or reply
+  on the other transport.
+
+An `mcp` route needs an MCP server entry named `agent-chat` in the harness
+configuration, outside this package, with write tools for `ack`, `reply` and
+`send`: the product's MCP service needs `enable_writes: true` for them. On a
+rejoin the binding says to call `bind` again with the new `instance_file`.
+
+The longest fallback binding takes 1,596 of the 4,096 announcement bytes in the
+test fixture.
 
 ## Behaviour
 
