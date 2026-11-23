@@ -2,8 +2,13 @@
 
 The parent supplies one explicit join, then serial heartbeat, pending, claim, settle,
 status, receipts, receipts_delivered and end requests. EOF, idle expiry and failure end only this
-instance. All I/O runs under a real process deadline, including DNS and pipe backpressure. Imports
-start nothing.
+instance. All I/O runs under a real process deadline, including pipe backpressure. Imports start
+nothing.
+
+The join resolves the server host once, in a child process that the join's deadline bounds and that,
+on Linux, dies with the worker. Every later request connects only to those addresses, in order, and performs no
+name resolution; TLS still verifies the host name. When none of them accepts a connection the request
+fails with TRANSPORT_UNAVAILABLE. Only the next join, the parent's rejoin, resolves again.
 """
 
 import json
@@ -17,6 +22,7 @@ from typing import Any
 from uuid import UUID
 
 from . import instance_client, instance_file
+from .client import Interrupted
 from .models import LEASE_SECONDS, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 
 MAX_FRAME = 128 * 1024
@@ -34,7 +40,7 @@ HEARTBEAT_OUTAGE = PENDING_OUTAGE | {"REQUEST_UNCERTAIN"}
 
 
 def _interrupt(_signum: int, _frame: Any) -> None:
-    raise TimeoutError("worker interrupted")
+    raise Interrupted("worker interrupted")
 
 
 def _read(expected: int) -> dict[str, Any] | None:
@@ -99,6 +105,8 @@ def _join(request: dict[str, Any]) -> instance_client.JoinedInstance:
         host_token=request["host_token"],
         harness=request["harness"],
         enabled=request["enabled"],
+        # The alarm armed before the join frame stays the outer bound; this one bounds the lookup itself.
+        resolve_by=monotonic() + REQUEST_SECONDS,
     )
 
 

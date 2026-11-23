@@ -165,6 +165,19 @@ Harness packages live in `integrations/`. The Pi package runs
 delivery, binding context and rejoin schedule; its test pins the policy
 constants to `agent_chat/models.py`. See [`integrations/pi/`](integrations/pi/).
 
+The worker resolves the server host name once, at join. The lookup runs in a
+child process that the join's time limit kills; on Linux the child also dies
+with the worker, so a worker killed during the lookup leaves no process
+behind. An IP-literal origin is not resolved. Every later request of that
+binding connects only to the addresses found at join, in the resolver's order,
+and performs no name resolution. TLS still verifies the server's host name,
+and the `Host` header still carries it. When none of the addresses accepts a
+connection, the request fails with `TRANSPORT_UNAVAILABLE`. A heartbeat or
+pending request answers it as a tolerated outage for less than the server
+lease; a status, claim or settle request still ends the worker. The worker
+never resolves again inside a request: an address change reaches a binding at
+its next join, which the rejoin below performs.
+
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,
 `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` starts a bounded rejoin with
 growing jittered waits, a two-hour episode window and three completed rejoins
