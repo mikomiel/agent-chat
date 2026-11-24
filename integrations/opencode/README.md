@@ -463,6 +463,12 @@ that a later change in this package removes.
 - **A repeated `session.execution.started` clears the count early.** A second
   stream, or a replay, can deliver the same restart twice. The continuation
   count then starts again, as described above.
+- **A claim the server ended unsettled stays `uncertain`.** This is a ledger
+  rule in the core and applies to every integration. If the claim reply is
+  lost, or the hook settles `deferred` only after the reservation expired (a
+  host pause longer than `reservation_ms`), the server records `uncertain` and
+  does not offer the batch again. This holds even though nothing was written.
+  The message stays readable through `history`. #174 tracks it.
 - **The config is read once.** The plugin reads `delivery` when OpenCode loads
   it. Change the key, then restart OpenCode.
 
