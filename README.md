@@ -171,7 +171,9 @@ limit kills. The child also arms its own alarm for that limit, rounded up to a
 whole second, so a worker killed during the lookup leaves no process behind
 past it; on Linux the child dies with the worker at once. Until the child has
 started, though, a stalled `execve` of the interpreter can hold the worker past
-that limit (#171). A join that sends
+that limit (#171). A killed child is reaped by the system's init, so in a
+container whose PID 1 does not reap adopted children it stays a zombie until
+the container exits. A join that sends
 nothing, because the lookup fails or no address accepts a connection, fails
 with `TRANSPORT_UNAVAILABLE`. Its record stays, for a retry of the same boot or
 for the next start's stale sweep. A join that reuses a saved record marks it
