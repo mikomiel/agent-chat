@@ -586,7 +586,7 @@ With `delivery` set to `true`, the OpenCode plugin MUST claim a message and MUST
 - **AND** a later hook call for a session that the events left joined and eligible makes exactly one claim
 
 ### Requirement: The idle hook never rejects and never holds the host
-The hook callback MUST NOT reject or throw, whatever fails inside it. It MUST return within one budget of 1,500 milliseconds, and every wait inside it MUST end by that budget. When the budget ends, the hook MUST send nothing further and MUST settle a grant it holds as `uncertain`.
+The hook callback MUST NOT reject or throw, whatever fails inside it. It MUST return within one budget of 1,500 milliseconds, and every wait inside it MUST end by that budget. When the budget ends, the hook MUST start no further step: it MUST NOT claim, admit or report again, and a grant it holds settles as the requirement on running out of time states.
 
 #### Scenario: A step fails
 - **WHEN** the worker, the host or the `session.get` call throws or rejects inside the hook
@@ -595,7 +595,35 @@ The hook callback MUST NOT reject or throw, whatever fails inside it. It MUST re
 #### Scenario: A step hangs
 - **WHEN** the worker, `session.get`, the entry read or `session.synthetic` never answers
 - **THEN** the callback returns when the budget ends
-- **AND** a grant the hook already held settles `uncertain`, and `busy` does not outlive the hook
+- **AND** `busy` does not outlive the hook
+
+### Requirement: The hook's budget is a deadline that the hook reads on the clock
+The budget MUST be a deadline on the monotonic clock: the start of the hook plus 1,500 milliseconds. The hook MUST read the clock immediately before `claim` and immediately before `session.synthetic`, and MUST NOT rely on a timer alone.
+
+#### Scenario: A pause delays the pending reply
+- **WHEN** the event loop pauses, the clock passes the deadline before the timer runs, and then the reply to `pending` arrives
+- **THEN** the plugin sends no `claim` and makes no `synthetic` call
+- **AND** `busy` does not outlive the hook
+
+#### Scenario: A pause between the claim and the admission
+- **WHEN** the clock passes the deadline after the claim and before the admission, and no timer has run
+- **THEN** the plugin makes no `synthetic` call
+- **AND** it settles the grant `deferred` with reason `offline`
+
+### Requirement: A hook that runs out of time settles by what it has written
+A grant that the hook holds when the budget ends, and has not written to the session, MUST settle `deferred` with reason `offline`, whatever is left of its reservation. An admission that `session.synthetic` has not answered when the budget ends MUST settle `uncertain`. An input that `session.synthetic` has accepted MUST NOT be ended by the budget.
+
+#### Scenario: The claim answers after the budget
+- **WHEN** the budget ends while the claim is in flight, and the grant arrives later
+- **THEN** the plugin makes no `synthetic` call and settles the grant `deferred` with reason `offline`
+
+#### Scenario: The admission is in flight
+- **WHEN** the budget ends and `session.synthetic` has not answered
+- **THEN** the plugin settles the attempt `uncertain`
+
+#### Scenario: The admission is accepted and the final heartbeat stalls
+- **WHEN** `session.synthetic` has answered, the final `unknown` heartbeat is still in flight when the budget ends, and the exact delivered event arrives before the reservation deadline
+- **THEN** the plugin settles the attempt `handed`, once the heartbeat has returned
 
 ### Requirement: The idle hook returns at once when there is nothing to deliver
 The hook MUST return before its first wait, and do nothing, for a session with no joined record, a member that does not own the joins, a child or fork session, a session whose chat is off or has not sent its first heartbeat, and a session that has used its continuation allowance.
@@ -677,7 +705,7 @@ The plugin MUST settle an admitted batch `handed` only when `session.inbox.deliv
 - **THEN** the plugin settles the attempt `uncertain`
 
 #### Scenario: The deadline passes
-- **WHEN** the attempt's deadline passes with no delivered event, or the grant can no longer be admitted in time
+- **WHEN** the attempt's deadline passes with no delivered event, or the grant has 500 milliseconds or less of its reservation left and the hook is still within its budget when it would admit it
 - **THEN** the plugin settles the attempt `uncertain`
 
 ### Requirement: An attempt is settled once, and an event opens none

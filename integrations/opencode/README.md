@@ -390,13 +390,21 @@ sent after.
 **The hook never rejects and never holds the host.** OpenCode runs each hook in
 turn with no catch and no time limit, so a rejection would fail the user's end
 of turn and a hang would stall it. The callback therefore never rejects, and it
-returns within 1,500 ms whatever is pending. When that budget runs out, a step
-already in flight finishes in the background, nothing moves forward after it,
-a grant already held settles `uncertain`, and an input in flight settles
-`uncertain`. The callback returns before its first `await`, doing nothing, for a
-session with no record, a member that does not own the joins, a child or fork
-session, a session whose chat is off or not yet past its first heartbeat, and a
-session that has used its continuation allowance.
+returns within 1,500 ms whatever is pending. The budget is a deadline on the
+monotonic clock, taken when the hook starts. A timer enforces it, and the hook
+also reads the clock immediately before `claim` and immediately before
+`synthetic`, because a timer can run late behind a paused event loop. When the
+budget runs out, a step already in flight finishes in the background and nothing
+moves forward after it. A grant already held, and not yet written to the
+session, settles `deferred` with reason `offline`, so the server offers the
+batch again. An admission still in flight, where `synthetic` was called and has
+not returned, settles `uncertain`. An input that `synthetic` has accepted is not
+ended by the budget: its exact delivered event or its deadline settles it, even
+when the hook's final heartbeat is still waiting. The callback returns before
+its first `await`, doing nothing, for a session with no record, a member that
+does not own the joins, a child or fork session, a session whose chat is off or
+not yet past its first heartbeat, and a session that has used its continuation
+allowance.
 
 **Settlement.** The host promotes an admitted input into the session's history
 after the hook has returned, so the plugin settles in the background. One
@@ -405,8 +413,8 @@ attempt is open for a session at a time.
 | Outcome | When |
 |---|---|
 | `handed` | `session.inbox.delivered` arrives for exactly the inbox id of the attempt, before its deadline. The deadline is the start of the claim plus the grant's `reservation_ms`. |
-| `uncertain`, reason `transport_ambiguous` | Every other case: `synthetic` throws or rejects, the exact event arrives late, the event stream is lost or restarts, the session's chat ends, a newer attempt replaces the attempt, or the deadline passes. Also a grant that the hook can no longer admit in time. |
-| `deferred`, reason `offline` | The renderer returns nothing, because the batch does not fit the bound. Nothing is sent to the session. |
+| `uncertain`, reason `transport_ambiguous` | Every other case: `synthetic` throws or rejects, the hook's budget ends while `synthetic` is in flight, the exact event arrives late, the event stream is lost or restarts, the session's chat ends, a newer attempt replaces the attempt, or the deadline passes. Also a grant with 500 ms or less of its reservation left, while the hook is within its budget. |
+| `deferred`, reason `offline` | The renderer returns nothing, because the batch does not fit the bound, or the hook's budget ended after the claim and before `synthetic`, whatever is left of the reservation. Nothing is sent to the session, so the server offers the batch again. |
 
 A delivered event for another id changes nothing. The host promotes every input
 of the session, such as another plugin's, and a replayed old event says nothing
@@ -714,7 +722,8 @@ and binding context over a double of the host and a worker double that rejects
 an overlapping request, as the real worker does. It covers the `delivery`
 switch and the hook's registration and disposal; the property that no sequence
 of events makes a claim or an input; a hook that never rejects and is released
-at its budget; the refusals (Plan, a failed or slow read, a missing entry, a
+at its budget; a budget that is read on the clock before the claim and before the
+admission, and that never ends an input the host accepted; the refusals (Plan, a failed or slow read, a missing entry, a
 child, a fork, a non-owner); the order of the worker's requests; the admitted
 call and its text; settlement; the turn that the hook, the tick and the
 settlements share; and the cap.

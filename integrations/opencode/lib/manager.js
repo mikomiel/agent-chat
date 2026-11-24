@@ -55,14 +55,17 @@
 // event is read only against the attempt the hook made (`session.inbox.delivered`, lib/delivery.js) or as a reset of the cap
 // (`session.execution.started`). It never creates a record and never runs on a session's chain: it takes the lifecycle's turn
 // at the worker, or claims nothing. Everything it awaits is under one budget, `IDLE_BUDGET_MS`: the host does not time a hook
-// out, so a hook that did not return would stall the session's end of turn. At the budget the hook returns, nothing moves forward
-// from it, and an attempt in flight settles uncertain.
+// out, so a hook that did not return would stall the session's end of turn. The budget is a deadline on the monotonic clock,
+// the hook's start plus the budget, and it is read again just before the claim and just before the admission: a timer can run
+// late. At the budget the hook returns and nothing moves forward from it. A grant held and not yet written to the session
+// settles deferred, so the server offers it again. An admission still in flight settles uncertain. An input that the host has
+// accepted is not the budget's: its delivered event or its own deadline settles it, whatever the hook's cleanup is doing.
 //
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
 // rejection there, or in a signal applied on receipt, disables chat for that session only. A deleted session never rejoins in this process. A session
 // that faulted stays out while its refusal is in the bounded lookup cache, so a worker that is still ending is not
 // raced by a second join until that entry is evicted.
-import { CHAT_SOURCE } from "./channel.js"
+import { CHAT_SOURCE, monotonicNow } from "./channel.js"
 import { CALL_TIMEOUT_MS, isMissing } from "./context.js"
 import { createDelivery, inboxIDOf } from "./delivery.js"
 import { describeFailure } from "./worker.js"
@@ -124,6 +127,8 @@ export function createManager(ctx, config, parts, {
   reportDeleted = null,
   reportNotRoot = null,
   idleBudgetMs = IDLE_BUDGET_MS,
+  // The clock of the hook's own deadline, the hook's start plus the budget. Monotonic, so a wall-clock step cannot move it.
+  monotonic = monotonicNow,
   // The open attempt of each session and the cap. Its clock is the lifecycle's, not `now` above: a deadline is on that one.
   delivery = createDelivery(),
 } = {}) {
@@ -321,12 +326,14 @@ export function createManager(ctx, config, parts, {
   // that arrives early finds it, and the call is not awaited past the attempt's own end: a call that never answers ends with
   // the hook's budget. The input is a steer input admitted with `resume: false`: it joins a run that is going on and never
   // starts one, which is the only way a plugin can hand input to a session it has just proved to be between model turns. A
-  // rejection or a throw leaves the attempt uncertain: the input may exist already, and it cannot be taken back.
+  // rejection or a throw leaves the attempt uncertain: the input may exist already, and it cannot be taken back. A call that
+  // returns hands the attempt over to its own event and deadline: from then on the budget does not end it, because the host
+  // has accepted the input and its delivered event can still come in time.
   function admitter(record, turn) {
     return async ({ text, attemptID, deadline }) => {
       const inboxID = inboxIDOf(attemptID)
       const attempt = delivery.open(record.id, { inboxID, deadline })
-      turn.attempt = attempt
+      turn.admitting = attempt
       let call
       try {
         call = Promise.resolve(ctx.session.synthetic({
@@ -342,15 +349,17 @@ export function createManager(ctx, config, parts, {
         attempt.abandon()
         return attempt
       }
-      call.then(undefined, () => attempt.abandon())
+      call.then(() => { turn.admitting = null }, () => attempt.abandon())
       await Promise.race([call.then(undefined, () => {}), attempt.done])
       return attempt
     }
   }
 
   // One hook's work, up to the lifecycle's own sequence. Every host answer is checked against the turn before the next step.
+  // The turn is over when the budget's timer has run, and also when the clock is at the deadline: a timer can run late, and
+  // a reply can be read before it does.
   async function deliver(record, turn) {
-    const open = () => !turn.over && active && !record.dead
+    const open = () => !turn.over && active && !record.dead && monotonic() < turn.until
     // The same lookup as a join, so a session the host no longer has, or one that is a child or a fork, is reported as always.
     const info = await lookup(record.id)
     if (!open() || !isRootSession(info, record.id) || info.agent === PLAN_AGENT) return
@@ -365,12 +374,12 @@ export function createManager(ctx, config, parts, {
     if (!active || config?.delivery !== true || typeof sessionID !== "string" || !sessionID || isRefused(sessionID)) return undefined
     const record = records.get(sessionID)
     if (!record || record.dead || !record.context || !record.lifecycle?.ready?.() || !delivery.allowed(sessionID)) return undefined
-    const turn = { over: false, attempt: null }
+    const turn = { over: false, admitting: null, until: monotonic() + idleBudgetMs }
     let timer
     const expired = new Promise(resolve => {
       timer = setTimeoutImpl(() => {
         turn.over = true
-        turn.attempt?.abandon() // an input in flight may still land: it is uncertain, whatever the host answers later
+        turn.admitting?.abandon() // a call still in flight may land the input: it is uncertain, whatever the host answers later
         resolve()
       }, idleBudgetMs)
       timer?.unref?.() // the hook returns at the budget; the timer must not outlive it

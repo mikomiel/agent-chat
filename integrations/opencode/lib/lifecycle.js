@@ -270,8 +270,11 @@ export function createLifecycle(bus, native, config, {
 
   // The idle delivery. `admit({ text, attemptID, deadline })` is the caller's: it asks the host to admit the notice and
   // resolves, once the host has answered or the attempt has ended, to `{ done }`, where `done` resolves to the settlement
-  // for the worker. `open()` says whether the caller is still within its time: after it turns false nothing moves forward,
-  // and a grant already held is settled uncertain. The returned promise resolves when the turn at the worker is released.
+  // for the worker. `open()` says whether the caller is still within its time, and it reads the caller's clock: it is asked
+  // immediately before the claim and immediately before the admission, as well as after each answer, because a timer can run
+  // late. After it turns false nothing moves forward. A grant already held and not yet admitted is settled deferred: nothing
+  // was written to the session, so the server may offer it again. The returned promise resolves when the turn at the worker
+  // is released.
   async function idle(admit, open = () => true) {
     if (!ready() || beating) return
     const record = live
@@ -286,9 +289,11 @@ export function createLifecycle(bus, native, config, {
       const busy = await request("heartbeat", { state: BUSY_STATE })
       if (!current() || !open() || refusedBy(busy) !== null) return
       const candidates = await request("pending")
-      if (!current() || !open() || refusedBy(candidates) !== null) return
+      if (!current() || refusedBy(candidates) !== null) return
       const ids = Array.isArray(candidates?.messages) ? candidates.messages.filter(id => typeof id === "string") : []
       if (!ids.length) return
+      // The claim reserves the batch at the server. The caller's time is asked immediately before it, on the clock.
+      if (!open()) return
       const started = now()
       const grant = await request("claim", { key: randomUUID(), messages: ids })
       // A worker that was replaced or ended while the claim ran cannot settle it: the server ends the reservation itself.
@@ -303,10 +308,14 @@ export function createLifecycle(bus, native, config, {
       reservation = grant.attempt_id
       settlement = UNCERTAIN
       const deadline = started + Number(grant.reservation_ms)
-      if (!open() || !(deadline - now() > MIN_RESERVATION_MS)) return
+      // Too little of the reservation is left to prove a delivery, and the server may have ended it already: uncertain. A caller
+      // that is out of time as well has written nothing, so the grant is deferred, as at the admission below.
+      if (!(deadline - now() > MIN_RESERVATION_MS)) { if (!open()) settlement = NOT_RENDERED; return }
       let text = null
       try { text = renderNotice(joined, config.python, grant.messages ?? [], { bound: NOTICE_BOUND, route: config.toolRoute }) } catch { /* not rendered */ }
-      if (text === null) { settlement = NOT_RENDERED; return }
+      // Nothing has been written to the session yet, so a batch that is not rendered, or whose caller is out of time, is not
+      // uncertain: the server offers it again. The caller's time is asked immediately before the admission, on the clock.
+      if (text === null || !open()) { settlement = NOT_RENDERED; return }
       // Admission is the last step. From the call on the input may exist and cannot be taken back, so a throw is uncertain.
       try { admitted = await admit({ text: CHAT_PREFIX + text, attemptID: reservation, deadline }) } catch { admitted = null }
       if (admitted?.done) settlement = null

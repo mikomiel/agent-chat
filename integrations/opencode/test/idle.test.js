@@ -48,6 +48,7 @@ const BUSY = { native_state: "busy", stopped: false, plan_mode: false }
 const UNKNOWN = { native_state: "unknown", stopped: true, plan_mode: false }
 const HANDED = { outcome: "handed", reason: null }
 const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
+const DEFERRED = { outcome: "deferred", reason: "offline" }
 const BUDGET_MS = 1500
 const DELIVERED = "session.inbox.delivered"
 const attemptID = number => `00000000-0000-4000-8000-${String(number).padStart(12, "0")}`
@@ -60,9 +61,13 @@ const hangs = () => new Promise(() => {})
 // A clock and timers the test moves by hand. Every timer is cleared by whoever set it, or fires when the clock reaches it.
 function fakeClock(start = 1000) {
   let time = start
+  let fired = 0
   const timers = []
   return {
     now: () => time,
+    fired: () => fired,
+    // A paused event loop: the clock moves and no timer has run yet. Whatever the loop delivers next is read at the new time.
+    jump(ms) { time += ms },
     setTimeoutImpl(fn, delay) {
       const timer = { at: time + delay, delay, fn, live: true, unref() {} }
       timers.push(timer)
@@ -73,6 +78,7 @@ function fakeClock(start = 1000) {
       time += ms
       for (const timer of timers.filter(item => item.live && item.at <= time).sort((a, b) => a.at - b.at)) {
         timer.live = false
+        fired += 1
         timer.fn()
       }
     },
@@ -187,7 +193,7 @@ function build({ config = DELIVERING, host = hostContext(), worker, clock = fake
     },
   }
   const member = createMember(host, config, parts, {
-    managerOptions: { setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl, delivery },
+    managerOptions: { setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl, monotonic: clock.now, delivery },
   })
   const detach = registry.attach(member)
   return { registry, member, detach, host, clock, workers, ticks }
@@ -491,7 +497,7 @@ test("a hung worker, a hung session read and a hung entry read each release the 
   assertNoClaim(slowList, "a hung entry read claims nothing")
 })
 
-test("a hook that runs out of time after the claim settles uncertain, sends no admission, reports not-eligible, and overlaps nothing", async t => {
+test("a hook that runs out of time during the claim settles the grant deferred offline, sends no admission, reports not-eligible, and overlaps nothing", async t => {
   const gate = defer(t)
   const worker = strictWorker({
     claim: () => gate.promise.then(() => ({ dispatch: true, attempt_id: attemptID(1), reservation_ms: 20_000, messages: [MESSAGE] })),
@@ -506,7 +512,7 @@ test("a hook that runs out of time after the claim settles uncertain, sends no a
   await flush()
   // The sequence ends in the background: nothing moves forward, the grant is settled, and busy does not stay.
   assert.deepEqual(worker.ops(), ["heartbeat", "heartbeat", "pending", "claim", "settle", "heartbeat"])
-  assert.deepEqual(worker.requests[4].fields, { attempt: attemptID(1), result: UNCERTAIN })
+  assert.deepEqual(worker.requests[4].fields, { attempt: attemptID(1), result: DEFERRED }) // nothing was written, so it is offered again
   assert.deepEqual(worker.requests[5].fields.state, UNKNOWN)
   assert.deepEqual(h.host.calls.synthetic, [])
   assert.equal(worker.counters.overlaps, 0)
@@ -522,6 +528,83 @@ test("a hook that runs out of time while the admission is in flight settles that
   assert.deepEqual(h.workers[0].ops(), ["heartbeat", "heartbeat", "pending", "claim", "heartbeat", "settle"])
   assert.deepEqual(lastRequest(h).fields, { attempt: attemptID(1), result: UNCERTAIN })
   assert.equal(h.workers[0].counters.overlaps, 0)
+})
+
+test("an input that synthetic accepted is not abandoned at the budget: a stalled cleanup heartbeat does not void the proof", async t => {
+  const gate = defer(t)
+  let busy = false
+  const worker = strictWorker({
+    heartbeat: fields => {
+      if (fields.state.native_state === "busy") { busy = true; return {} }
+      return busy ? gate.promise.then(() => ({})) : {} // the join's heartbeat is quick: only the hook's cleanup heartbeat hangs
+    },
+  })
+  const h = build({ worker })
+  t.after(() => h.detach())
+  await join(h)
+  const running = idle(h)
+  await flush()
+  assert.equal(h.host.calls.synthetic.length, 1) // accepted: the hook now waits for its cleanup heartbeat
+  await pastBudget(h, running) // the budget ends the hook, and must leave the accepted input alone
+  assert.deepEqual(worker.ops(), ["heartbeat", "heartbeat", "pending", "claim", "heartbeat"])
+  h.clock.advance(3_000) // well before the reservation deadline, which is 20 s after the claim
+  h.registry.dispatch(delivered("ses_a", inboxIDOf(attemptID(1))))
+  await flush()
+  assert.equal(worker.ops().includes("settle"), false) // the stalled heartbeat holds the worker: nothing is sent yet
+  gate.resolve()
+  await flush()
+  assert.deepEqual(worker.ops(), ["heartbeat", "heartbeat", "pending", "claim", "heartbeat", "settle"])
+  assert.deepEqual(lastRequest(h).fields, { attempt: attemptID(1), result: HANDED })
+  assert.equal(worker.counters.overlaps, 0)
+})
+
+test("the hook's deadline is read on the clock before the claim: a pause that delivers the pending reply late, ahead of the timer, makes no claim", async t => {
+  for (const pause of [BUDGET_MS, BUDGET_MS + 1, 60_000]) {
+    const clock = fakeClock()
+    const worker = strictWorker({ pending: () => { clock.jump(pause); return { messages: [MESSAGE.id] } } })
+    const h = await eligible(t, { clock, worker })
+    await idle(h)
+    assert.equal(clock.fired(), 0, `${pause}: no timer has run, so only the clock can know that the time is over`)
+    assert.deepEqual(worker.ops(), ["heartbeat", "heartbeat", "pending", "heartbeat"], `${pause}`) // the reply came, and nothing followed
+    assert.equal(claimsOf(h), 0, `${pause}`)
+    assert.deepEqual(h.host.calls.synthetic, [], `${pause}`)
+    assert.deepEqual(h.host.calls.prompt, [], `${pause}`)
+    assert.deepEqual(lastRequest(h).fields.state, UNKNOWN, `${pause}`)
+  }
+  // The same fixture claims when the pause is shorter than the budget.
+  const clock = fakeClock()
+  const h = await eligible(t, { clock, worker: strictWorker({ pending: () => { clock.jump(BUDGET_MS - 1); return { messages: [MESSAGE.id] } } }) })
+  await idle(h)
+  assert.equal(claimsOf(h), 1)
+  assert.equal(h.host.calls.synthetic.length, 1)
+})
+
+test("the hook's deadline is read on the clock before the admission: a pause between the claim and the admission settles the grant deferred offline and admits nothing", async t => {
+  const answer = clock => pause => () => {
+    clock.jump(pause)
+    return { dispatch: true, attempt_id: attemptID(1), reservation_ms: 20_000, messages: [MESSAGE] }
+  }
+  // The reservation is 20 s. A pause of 19,499 ms leaves 501 ms of it, and 19,500 ms leaves 500 ms, which is too little to prove a
+  // delivery: the hook is out of time as well, so the grant is still not written, and still deferred.
+  for (const pause of [BUDGET_MS, BUDGET_MS + 1, 10_000, 19_499, 19_500, 60_000]) {
+    const clock = fakeClock()
+    const worker = strictWorker({ claim: answer(clock)(pause) })
+    const h = await eligible(t, { clock, worker })
+    await idle(h)
+    assert.equal(clock.fired(), 0, `${pause}: no timer has run`)
+    assert.deepEqual(h.host.calls.synthetic, [], `${pause}`)
+    assert.deepEqual(h.host.calls.prompt, [], `${pause}`)
+    assert.deepEqual(worker.ops(), ["heartbeat", "heartbeat", "pending", "claim", "settle", "heartbeat"], `${pause}`)
+    assert.deepEqual(worker.requests[4].fields, { attempt: attemptID(1), result: DEFERRED }, `${pause}`) // nothing was written
+    assert.deepEqual(worker.requests[5].fields.state, UNKNOWN, `${pause}`)
+    assert.equal(worker.counters.overlaps, 0, `${pause}`)
+  }
+  // The same fixture admits when the pause is shorter than the budget.
+  const clock = fakeClock()
+  const h = await eligible(t, { clock, worker: strictWorker({ claim: answer(clock)(BUDGET_MS - 1) }) })
+  await idle(h)
+  assert.equal(h.host.calls.synthetic.length, 1)
+  assert.equal(h.workers[0].ops().includes("settle"), false) // the background settles it later
 })
 
 // ---------------------------------------------------------------------------------------------------------------------
