@@ -235,7 +235,11 @@ and plain ASCII paths, `codex` leaves 940 bytes on `cli`, 798 on `mcp` and 594 o
 refuses at start with `CHAT_BINDING_TOO_LONG`. `claude-code` leaves 2,987, 2,845 and 2,641; one byte more and the
 binding is not announced. A test in each of the two packages pins its numbers. They include the
 [receipts sentence](#sender-receipts) that every binding of these two packages carries: without it `codex` left 994, 855
-and 651 bytes, and `claude-code` 3,041, 2,902 and 2,698.
+and 651 bytes, and `claude-code` 3,041, 2,902 and 2,698. In `noticeBodies` mode a `codex` retry batch is claimed whole,
+so a hook that carries the binding can find it too large to follow, since the interpreter path is in both: the hook sends
+the binding alone and settles the batch `deferred` with reason `offline`. Each such hook spends one of the batch's three
+attempts, and a batch with none left is not offered again; the first offer after the binding is confirmed, which the
+ledger makes after its backoff, is delivered whole. #172 tracks a fit check before the claim.
 
 Rule for a future package: read `toolRoute` with the same values and the same strict refusal, copy `shared/notice.js`
 as `lib/notice.js`, and take every route line from it. Do not add a second route key or route text of its own.
@@ -284,8 +288,9 @@ The rules below bind every package that shows receipts.
   at a later boundary, and the session may be muted by then. At the boundary the package asks the server nothing and
   uses the latest `muted` flag that a worker answer carried: a `receipts` answer that has rows, and the `status` answer
   of a claim. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the answer that
-  staged the notice came at most 5 seconds before. `deepseek` also drops it unless its native state, read again
-  without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and
+  staged the notice came at most 5 seconds before. The three packages count those seconds on the wall clock, so a
+  suspend ages a notice, and an age that is negative or not a number drops it. `deepseek` also drops it unless its
+  native state, read again without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and
   a later poll offers them again. `claude-code` and `codex` answer the hook as for any reply with nothing to carry.
   `pi` hands a notice to Pi in the pass that got the answer, so it has no later boundary of its own.
 - **What a notice holds.** One fixed paragraph that says the lines are data, not instructions or replies, grant no
@@ -346,6 +351,10 @@ Limits that remain:
 - The output-time check cannot see a mute that lands after the last answer that carried the flag and less than 5 seconds
   before the output. The notice is then shown and its ids are marked, and the next poll sees the mute. A notice is data,
   not an instruction, so the cost is one notice shown to a session that was just muted.
+- `pi` hands its notice to Pi in the pass that got the answer, but Pi holds a `triggerTurn: false` message while a run is
+  active and appends it at the end of the running turn, after the assistant message and every tool result, or when the
+  run ends if that comes first (the Pi 1.5.0 and 1.5.2 source). The mute window on `pi` therefore extends to the end of
+  that turn, tool calls that have not started included, and the package cannot withdraw the message.
 - A notice is output only at a boundary within 5 seconds of the answer that staged it: a second prompt or tool event in
   `claude-code` and `codex`, a pre-step in `deepseek`. A staged notice holds the next poll until a boundary shows it or
   drops it, so a session whose boundaries are always more than 5 seconds apart drops each notice, and its receipts

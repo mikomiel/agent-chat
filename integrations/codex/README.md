@@ -156,7 +156,15 @@ UUID session id and plain ASCII paths, the fallback route leaves 594 bytes for
 the two paths, `mcp` 798, against 940 on `cli`. A longer path refuses at start
 with `CHAT_BINDING_TOO_LONG`, and chat stays off. These numbers include the
 sentence at the end of the binding that tells the model how to ask for receipts:
-54 bytes on `cli` and 57 on each `mcp` route.
+54 bytes on `cli` and 57 on each `mcp` route. In `noticeBodies` mode a hook
+that carries the binding, the first one after a rejoin for example, shares its
+6,000 bytes between the binding and the notice, and the interpreter path is in
+both. A retry batch is claimed whole, so it can be too large to follow the
+binding: the hook then sends the binding alone and settles the batch `deferred`
+with reason `offline`. Each such hook spends one of the batch's three attempts,
+and a batch with none left is not offered again; the first offer after the
+binding is confirmed, which the ledger makes after its backoff, is delivered
+whole. #172 tracks a fit check before the claim.
 
 ## Behaviour
 
@@ -420,8 +428,10 @@ sends its request: it does not wait for the worker to end its instance.
   while the session is idle, so a receipt cannot wake the thread. The notice is
   checked again when a hook would carry it, with no request: the latest mute
   flag any worker answer carried must be `false` and the notice at most 5
-  seconds old, otherwise it is dropped, the hook is answered as for any reply
-  with nothing to carry, and its rows are offered again. When the hook's
+  seconds old on the wall clock, so a suspend ages it, otherwise it is dropped
+  (an age that is negative or not a number counts as too old), the hook is
+  answered as for any reply with nothing to carry, and its rows are offered
+  again. When the hook's
   receipt says it wrote the text, the receiver marks exactly those ids
   delivered at once; a refused or failed mark is sent again at the next pass. A
   pass sends one request, the mark that waits or else the poll. A
@@ -740,9 +750,9 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   reservation, with no suspend, can still make the settlement late, for a
   hook's single status call as for a wake's; the clock checks bound
   everything else.
-- **A suspend during a hook's claim.** Only the wake checks the wall clock.
-  The hook path measures its reservation and its deadline on the monotonic
-  clock alone, which on Linux does not count time spent suspended, so a hook
+- **A suspend during a hook's claim.** Only the wake checks the wall clock
+  against a claim. The hook path measures its reservation and its deadline on
+  the monotonic clock alone, which on Linux does not count time spent suspended, so a hook
   whose host was suspended after its claim can still write after the server's
   reservation expired; the ledger closes an attempt whose reservation expired
   as `uncertain` (`claim_expired`, `agent_chat/deliveries.py`).

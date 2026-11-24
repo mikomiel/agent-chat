@@ -176,6 +176,12 @@ fits on `cli` fits on every route.
   a `triggerTurn: false` message; no live Pi run has shown it. If a release did
   not emit it, the receipts would be shown again in each later turn and never
   marked.
+- Pi holds a `triggerTurn: false` message while a run is active and appends it
+  at the end of the running turn, after the assistant message and every tool
+  result, or when the run ends if that comes first (the Pi 1.5.0 and 1.5.2
+  source). The mute window of a receipts notice therefore extends to the end of
+  that turn, tool calls that have not started included: a session muted in that
+  time still gets the notice, and the extension cannot withdraw it.
 - By default the binding context and the notice tell the model to use the
   Agent Chat CLI for `who`, `history`, `send`, `reply` and `ack`; `toolRoute`
   names the `agent-chat` MCP tools instead (see [Tool route](#tool-route)). This

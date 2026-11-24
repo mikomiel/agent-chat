@@ -172,12 +172,13 @@ const WAKE_POLL_MS = 2_000 // the receiver's wake poll cadence
 async function rig({ config = {}, rows = [], tweak = () => {}, thread } = {}) {
   const clock = scheduler()
   const began = clock.now()
+  let wallSkew = 0 // how far the wall clock is from the scheduler's (monotonic) clock: a suspend or a step moves it alone
   const events = []
   const worker = workerDouble({ events })
   worker.server.rows = rows
   tweak(worker.server)
   const receiver = createReceiver({ ...baseConfig, ...(thread ? { appServer: APP_SERVER } : {}), ...config }, { sessionId: "session-1", ownerPid: 4242 }, {
-    startProcess: worker.startProcess, openThread: () => thread, now: clock.now, random: () => 0.5,
+    startProcess: worker.startProcess, openThread: () => thread, now: clock.now, wall: () => clock.now() + wallSkew, random: () => 0.5,
     setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl,
     setIntervalImpl: clock.setIntervalImpl, clearIntervalImpl: clock.clearIntervalImpl,
     alive: () => true, startTime: () => null, release: () => {}, exit: () => {},
@@ -186,6 +187,7 @@ async function rig({ config = {}, rows = [], tweak = () => {}, thread } = {}) {
   await settle()
   const r = {
     receiver, clock, events, worker, server: worker.server, elapsed: () => clock.now() - began,
+    wallJump: ms => { wallSkew += ms }, // the wall clock moves, and the scheduler's clock does not
     // One hook event, then the background pass it starts.
     async op(request, hook = hookDouble({ events })) {
       await receiver.handle(request, hook)
@@ -889,4 +891,39 @@ test("a pass with a mark waiting sends no feed request: the mark takes it, and t
   await r.op(turn()) // the next cadence reads the feed
   assert.equal(r.count("receipts"), 2)
   assert.equal(r.count("receipts_delivered"), 5)
+})
+
+// Review 6032554837: the age of a staged notice is counted on the wall clock, as `claude-code` counts it, so that a suspend ages
+// it. The scheduler's clock is the monotonic one, which does not count a suspend; `wallJump` moves the wall clock alone.
+
+test("a staged notice that a suspend aged is dropped: the wall clock moved 60 s and the monotonic clock did not move", async () => {
+  const feed = [rcpt(1)]
+  const r = await staged({ rows: feed })
+  r.wallJump(60_000)
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the notice is dropped, and the hook is still answered")
+  assert.equal(r.count("receipts_delivered"), 0, "nothing was shown, so nothing is marked")
+  await r.clock.advance(POLL_MS)
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the next cadence asks for the row again")
+  const shown = (await r.op(turn())).sent[0]
+  assert.ok(isNoticeText(shown.context) && shown.context.includes(feed[0].message_id), "and the row is shown by the next event")
+  assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
+})
+
+test("a staged notice is dropped when the wall clock stepped back or reads no number: such an age counts as too old", async () => {
+  for (const step of [-60_000, NaN]) {
+    const r = await staged({ rows: [rcpt(1)] })
+    r.wallJump(step)
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }], `a wall clock moved by ${step}: dropped, and the hook is still answered`)
+    assert.equal(r.count("receipts_delivered"), 0, `${step}: nothing was shown, so nothing is marked`)
+  }
+})
+
+test("a staged notice is aged on the wall clock alone: 6 s of monotonic time with a steady wall clock still shows it", async () => {
+  const feed = [rcpt(1)]
+  const r = await staged({ rows: feed })
+  await r.clock.advance(POLL_MS + 1000)
+  r.wallJump(-(POLL_MS + 1000)) // the wall clock did not move over those 6 s
+  const shown = (await r.op(turn())).sent[0]
+  assert.ok(isNoticeText(shown.context) && shown.context.includes(feed[0].message_id), "the notice is shown")
+  assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
 })

@@ -1200,7 +1200,7 @@ test("the delivery vocabulary is the core's, and every reason this package can s
   ]) assert.ok(settleVocabulary(result), JSON.stringify(result))
 })
 
-test("with no clock injected the receiver runs on the monotonic clock, and nothing but a wake reads the wall clock", t => {
+test("with no clock injected the receiver runs on the monotonic clock, and nothing but a wake and a staged receipts notice reads the wall clock", t => {
   const wall = t.mock.method(Date, "now", () => 0) // a wall clock that was stepped back to the epoch
   createReceiver({ ...baseConfig, appServer: APP_SERVER }, { sessionId: "session-1", ownerPid: 4242 }, {
     openThread: () => threadDouble(),
@@ -2291,7 +2291,7 @@ test("the thread is handed the receiver's own clock, so the reservation and the 
   assert.equal(handed.now(), r.clock.now() + 123_456, "it is the clock that the receiver itself reads")
 })
 
-test("with no clock injected the receiver and its thread run on the monotonic clock, and nothing but a wake reads the wall clock", t => {
+test("with no clock injected the receiver and its thread run on the monotonic clock, and nothing but a wake and a staged receipts notice reads the wall clock", t => {
   const wall = t.mock.method(Date, "now", () => 0) // a wall clock that was stepped back to the epoch
   const thread = wakeDouble()
   createReceiver({ ...baseConfig, appServer: APP_SERVER }, { sessionId: "session-1", ownerPid: 4242 }, {
@@ -3940,8 +3940,9 @@ test("route: each route leaves the documented room for interpreter and state pat
 })
 
 // A stored retry batch is claimed whole, after a rejoin with the new binding still to be shown. The hook claims as it did
-// before #131: when the binding and the notice fit together, both go out.
-async function retryAfterRejoin(toolRoute, { python, count }) {
+// before #131: when the binding and the notice fit together, both go out. With `offerAgain` the server offers the batch again
+// until it is handed, as the ledger does for a deferred batch once its backoff has run; otherwise it offers it once.
+async function retryAfterRejoin(toolRoute, { python, count, offerAgain = false }) {
   const ids = Array.from({ length: count }, (_, index) => uid(index + 1))
   let refuse = true
   let claimed = false
@@ -3949,11 +3950,15 @@ async function retryAfterRejoin(toolRoute, { python, count }) {
     pending: fields => (refuse ? { refused: "STALE_INSTANCE" } : claimed ? { messages: [] } : fields.bodies === true
       ? { messages: ids, sizes: Object.fromEntries(ids.map(id => [id, 1])), retry: true } : { messages: ids }),
     claim: fields => {
-      claimed = true
+      claimed = !offerAgain
       return {
         dispatch: true, attempt_id: `attempt-${r.worker.ops("claim").length}`, reservation_ms: 30_000, admitted_at: ADMITTED,
         messages: fields.messages.map(id => validRow(id, { body: "q" })),
       }
+    },
+    settle: fields => {
+      if (fields.result.outcome === "handed") claimed = true
+      return {}
     },
   }) })
   await r.begin()
@@ -3985,6 +3990,49 @@ for (const toolRoute of ROUTES) {
         "the cli output is the one before #131")
     }
     assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], "the binding was shown")
+  })
+}
+
+// The first hook after a rejoin shares one 6,000-byte output between the new binding and the notice, and the interpreter path
+// is in both, so each byte of it costs two. A retry batch is claimed whole, so once the hook cannot hold both, the binding goes
+// alone and the batch waits: the hook settles it `deferred` with reason `offline`, which spends one of its three attempts. The
+// ledger offers it again after its backoff, and that offer, with no binding in front of it, is delivered whole. The double
+// offers it again at once; the backoff is the ledger's. The path stays inside the binding's room on every route.
+for (const toolRoute of ROUTES) {
+  test(`route: on ${toolRoute} a retry batch that no longer fits beside the new binding waits: the binding goes alone, and the next offer is delivered whole`, async () => {
+    const firstHook = async length => {
+      const { r, ids } = await retryAfterRejoin(toolRoute, { python: baseConfig.python + "x".repeat(length), count: 10, offerAgain: true })
+      return { r, ids, reply: (await r.op(turn({ event: "tool" }))).sent[0] }
+    }
+    const holdsBatch = ({ ids, reply }) => ids.every(id => reply.context.includes(`message ${id} kind question`))
+    // The longest extra path for which one hook still carries both: the binding and the notice take 2 bytes for each byte of it.
+    const edge = Math.floor((MAX_OUTPUT_BYTES - bytes((await firstHook(0)).reply.context)) / 2)
+    assert.ok(baseConfig.python.length + edge + 1 + baseConfig.directory.length <= BINDING_PATH_ROOM[toolRoute], "the path is inside the binding's room")
+
+    const fits = await firstHook(edge)
+    assert.ok(holdsBatch(fits), "at the edge one hook carries the binding and the batch")
+    assert.match(fits.reply.context, /^Agent Chat is available to this session/)
+    assert.ok(bytes(fits.reply.context) <= MAX_OUTPUT_BYTES && bytes(fits.reply.context) + 2 > MAX_OUTPUT_BYTES, "and one byte more of path would not fit")
+    assert.deepEqual(fits.r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+
+    const waits = async length => {
+      const { r, ids, reply } = await firstHook(length)
+      assert.match(reply.context, /^Agent Chat is available to this session/)
+      assert.ok(reply.context.includes(`${r.worker.bootIds[1]}.json`), `${length}: the first hook carries the new binding`)
+      for (const id of ids) assert.ok(!reply.context.includes(`message ${id} kind question`), `${length}: the binding goes alone: ${id} is not in it`)
+      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids], `${length}: the batch was claimed whole`)
+      assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "offline" }], `${length}: and is deferred, which spends an attempt`)
+
+      const [next] = (await r.op(turn({ event: "tool" }))).sent
+      assert.ok(!next.context.includes("Agent Chat is available"), `${length}: the binding was shown, and is not sent again`)
+      for (const id of ids) assert.ok(next.context.includes(`message ${id} kind question`), `${length}: the next offer delivers ${id}`)
+      assert.ok(bytes(next.context) <= MAX_OUTPUT_BYTES)
+      assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids, ids], `${length}: the same batch, whole`)
+      assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "offline" }, { outcome: "handed", reason: null }])
+      assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], `${length}: and nothing is offered after it`)
+    }
+    await waits(edge + 1)
+    if (toolRoute === "cli") await waits(510) // the reviewer's case: an interpreter path 510 bytes longer
   })
 }
 
