@@ -66,12 +66,17 @@ function fakePi(confirm) {
 }
 
 // One session with a scripted server. `server` is what the worker answers; `log` is every request, in order, across
-// every worker the session starts.
-async function session({ confirm = "inside", rows = [], toolRoute } = {}) {
+// every worker the session starts. The worker names the capability `receipts-cancel` in its join reply, as the core's does
+// (`capabilities` is what its first worker names, `rejoinedCapabilities` what a later one does; null names none), and a
+// promise in `server.gates` holds that operation's answer until it resolves. `cancel()` ends a held receipts request, which
+// then answers `refused: CLI_INTERRUPTED` as the worker's does on the signal; `cancels` records every call and what was held.
+const RECEIPTS_OPS = new Set(["receipts", "receipts_delivered"])
+async function session({ confirm = "inside", rows = [], toolRoute, capabilities = ["receipts-cancel"], rejoinedCapabilities = capabilities } = {}) {
   const { pi, emit, sent, confirm: confirmNow } = fakePi(confirm)
   const native = { idle: false, mode: "tui", plan: false }
-  const server = { rows, muted: false, receiptsReply: null, markReply: null, delivery: null, fail: {}, heartbeatRefusal: null }
+  const server = { rows, muted: false, receiptsReply: null, markReply: null, delivery: null, fail: {}, heartbeatRefusal: null, gates: {} }
   const log = []
+  const cancels = [] // every cancel() call in order: { worker, held } with the receipts operation held then, or null
   const clock = { t: 1_000_000 }
   // A claim gets a new attempt id each time, as the core's does, and the same ones in every session.
   let claims = 0
@@ -103,14 +108,28 @@ async function session({ confirm = "inside", rows = [], toolRoute } = {}) {
     const index = workers.length
     const requests = []
     let close
+    let held = null // { op, end }: the receipts request that waits on its gate
     const closed = new Promise(resolve => { close = resolve })
+    const named = index === 0 ? capabilities : rejoinedCapabilities
     const worker = {
-      ready: Promise.resolve(index === 0 ? joined : rejoined), closed, requests,
+      ready: Promise.resolve({ ...(index === 0 ? joined : rejoined), ...(named ? { capabilities: named } : {}) }), closed, requests,
       request(op, fields) {
         requests.push({ op, fields })
         log.push({ op, fields, worker: index })
-        try { return Promise.resolve(answer(op, fields)) } catch (error) { return Promise.reject(error) }
+        const gate = server.gates[op]
+        if (!gate) {
+          try { return Promise.resolve(answer(op, fields)) } catch (error) { return Promise.reject(error) }
+        }
+        return new Promise((resolve, reject) => {
+          if (RECEIPTS_OPS.has(op)) held = { op, end: () => resolve({ refused: "CLI_INTERRUPTED" }) }
+          gate.then(() => { try { resolve(answer(op, fields)) } catch (error) { reject(error) } })
+        }).finally(() => { held = null })
       },
+      cancel() {
+        cancels.push({ worker: index, held: held?.op ?? null })
+        if (server.cancelEnds !== false) held?.end()
+      },
+      endHeld: () => held?.end(),
       stop() { close({ code: 0, signal: null }); return closed },
     }
     workers.push(worker)
@@ -124,7 +143,7 @@ async function session({ confirm = "inside", rows = [], toolRoute } = {}) {
   await flush()
   emit("input", { source: "interactive" }, ctx)
   const api = {
-    lifecycle, emit, sent, native, server, log, clock, notices, workers, ctx,
+    lifecycle, emit, sent, native, server, log, clock, notices, workers, ctx, cancels,
     // The rejoin timer: the first rejoin waits 2,500 ms (random is fixed at 0). A delivery's handoff timer waits 5,000 ms.
     rejoins: () => timeouts.filter(entry => entry.ms === 2500),
     confirm: confirmNow,
@@ -567,4 +586,181 @@ test("a tick with a mark waiting sends no feed request: the mark takes it, and t
   assert.equal(s.count("receipts"), 2)
   assert.equal(s.count("receipts_delivered"), 4)
   assert.equal(s.receiptSends().length, 1, "and the row is not shown again")
+})
+
+// Issue #175: a receipts request gives way. A heartbeat or a delivery poll that falls due while one is in flight ends it (the
+// worker answers `refused` on the cancel signal), and the loop sends no receipts request while either is due. Every test
+// below holds the receipts request on a gate that nothing releases, so only the cancel can end it, and moves no clock for it.
+const held = () => new Promise(() => {})
+// The state change of the first prompt is reported by the first drive: send it now, and count requests from here.
+const primed = async s => { await s.lifecycle.heartbeat(); return s.log.length }
+const opsSince = (s, start) => s.log.slice(start).map(entry => entry.op)
+
+test("a delivery poll that falls due while a receipts read is in flight ends the read, and is made at once", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.server.gates.receipts = held()
+  const first = s.tick(0)
+  await flush()
+  assert.equal(s.count("receipts"), 1, "the read is in flight")
+  assert.deepEqual(s.cancels, [], "nothing has asked for it to end")
+  const second = s.tick() // the next poll arrives; the read would hold the loop
+  delete s.server.gates.receipts // a later read is answered; the first one stays held
+  await Promise.all([first, second])
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "one cancel, of the read in flight")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts", "tick", "pending", "receipts"], "the poll went before the next read")
+  assert.equal(s.workers.length, 1, "a cancelled read is not a failure: no rejoin")
+  assert.deepEqual(s.rejoins(), [])
+  assert.notEqual(globalThis[Symbol.for("agent-chat.pi.disabled")], true)
+  assert.equal(s.receiptSends().length, 1, "and the row of the read that was asked again is shown once")
+})
+
+test("a heartbeat that falls due while a receipts read is in flight ends the read, and is sent at once", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.server.gates.receipts = held()
+  const first = s.tick(0)
+  await flush()
+  const beat = s.lifecycle.heartbeat()
+  await Promise.all([first, beat])
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }])
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts", "heartbeat"], "the heartbeat was sent as soon as the read ended")
+  assert.equal(s.workers.length, 1)
+  assert.notEqual(globalThis[Symbol.for("agent-chat.pi.disabled")], true)
+})
+
+test("a delivery waits for no receipts mark: the poll that finds a message ends the mark in flight, and delivers it", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed, confirm: "later" })
+  await s.tick(0) // the notice is sent, and Pi has not yet reported it as output
+  s.confirm()
+  s.native.idle = true // the turn ended: a message can be delivered
+  s.server.gates.receipts_delivered = held()
+  const first = s.tick() // its poll finds nothing, and the mark that waits is held
+  await flush()
+  assert.equal(s.count("receipts_delivered"), 1, "the mark is in flight")
+  s.server.delivery = peerMessage
+  const second = s.tick()
+  delete s.server.gates.receipts_delivered
+  await Promise.all([first, second])
+  assert.equal(s.deliveries().length, 1, "the message was delivered while the first mark was still held")
+  assert.equal(s.log.find(entry => entry.op === "settle").fields.result.outcome, "handed")
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts_delivered" }])
+  const marks = s.log.filter(entry => entry.op === "receipts_delivered")
+  assert.deepEqual(marks.map(entry => entry.fields), [{ receipts: ids(feed) }, { receipts: ids(feed) }], "the ended mark kept its ids, and was sent again")
+  assert.equal(s.receiptSends().length, 1, "and the row was not shown again")
+  await s.tick()
+  assert.equal(s.count("receipts_delivered"), 2, "marked: nothing is sent again")
+})
+
+// The window between the signal and the worker's answer, held open: the worker has been told to end the read and has not
+// answered. The worker holds one request, so the heartbeat waits for the answer to the cancel, and not for the read.
+test("nothing is sent while the worker has not yet answered the cancel, and the heartbeat goes the moment it has", async () => {
+  const s = await session({ rows: [row(1)] })
+  await primed(s)
+  s.server.gates.receipts = held()
+  s.server.cancelEnds = false
+  const first = s.tick(0)
+  await flush()
+  const sent = s.log.length
+  const beat = s.lifecycle.heartbeat()
+  await flush()
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }])
+  assert.equal(s.log.length, sent, "no request was written while the worker holds the read")
+  s.workers[0].endHeld() // the worker answers the cancel
+  await Promise.all([first, beat])
+  assert.deepEqual(s.log.slice(sent).map(entry => entry.op), ["heartbeat"])
+})
+
+test("a receipts request is not sent while a heartbeat is due: the heartbeat that fell due during the poll goes first", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  let release
+  s.server.gates.pending = new Promise(resolve => { release = resolve })
+  const first = s.tick(0)
+  await flush()
+  assert.deepEqual(opsSince(s, start), ["tick", "pending"], "the poll is waiting")
+  await s.lifecycle.heartbeat() // the loop is busy: the heartbeat is due, and nothing is in flight to end
+  delete s.server.gates.pending
+  release()
+  await first
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts"], "the heartbeat, then the read that waited")
+  assert.deepEqual(s.cancels, [], "the read was not yet asked: there was nothing to end")
+})
+
+test("a receipts request is not sent while a delivery poll is due: the poll that fell due during the poll goes first", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  let release
+  s.server.gates.pending = new Promise(resolve => { release = resolve })
+  const first = s.tick(0)
+  await flush()
+  const second = s.tick() // the loop is busy: this poll is due, and nothing is in flight to end
+  delete s.server.gates.pending
+  release()
+  await Promise.all([first, second])
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "tick", "pending", "receipts"], "both polls, then the one read")
+  assert.deepEqual(s.cancels, [])
+  assert.equal(s.receiptSends().length, 1, "the read that waited was made, and shown")
+})
+
+for (const [name, named] of [["no capabilities", null], ["an empty list", []], ["another name", ["something-else"]], ["a string, not a list", "receipts-cancel"]]) {
+  test(`a worker whose join reply has ${name} is sent no receipts request at all: no read, no mark, no cancel`, async () => {
+    const feed = [row(1)]
+    const s = await session({ rows: feed, capabilities: named })
+    for (let index = 0; index < 4; index += 1) await s.tick(index === 0 ? 0 : POLL_MS / 1000)
+    s.native.idle = true
+    s.server.delivery = peerMessage
+    await s.tick()
+    assert.equal(s.deliveries().length, 1, "deliveries are what they were")
+    assert.equal(s.count("receipts"), 0)
+    assert.equal(s.count("receipts_delivered"), 0)
+    assert.deepEqual(s.cancels, [])
+    assert.equal(s.receiptSends().length, 0)
+  })
+}
+
+test("a worker that names the capability among others is asked for receipts", async () => {
+  const s = await session({ rows: [row(1)], capabilities: ["something-else", "receipts-cancel"] })
+  await s.tick(0)
+  assert.equal(s.count("receipts"), 1)
+})
+
+test("the capability is the join reply's of the worker that serves: a worker that rejoined without it is asked for no receipts", async () => {
+  const feed = [row(1), row(2)]
+  const s = await session({ rows: feed, rejoinedCapabilities: null })
+  await s.tick(0)
+  assert.equal(s.receiptSends().length, 1)
+  s.server.heartbeatRefusal = "STALE_INSTANCE"
+  await s.lifecycle.heartbeat()
+  s.server.heartbeatRefusal = null
+  s.clock.t += POLL_MS
+  s.rejoins()[0].fn()
+  await flush()
+  assert.equal(s.workers.length, 2)
+  for (let index = 0; index < 3; index += 1) await s.tick()
+  assert.deepEqual(s.workers[1].requests.filter(entry => entry.op.startsWith("receipts")), [], "no read and no mark through the new worker")
+  assert.ok(s.workers[1].requests.some(entry => entry.op === "pending"), "it serves deliveries")
+})
+
+test("a session whose requests never overlap a receipts request cancels nothing", async () => {
+  const run = await deliveryRun({ rows: [row(1), row(2), row(3)] })
+  assert.ok(run.s.count("receipts") >= 1 && run.s.count("receipts_delivered") >= 1, "the receipts path ran")
+  assert.deepEqual(run.s.cancels, [])
+})
+
+test("a heartbeat or a poll that falls due while a request that is not a receipts request is in flight cancels nothing, once a receipts request has ended", async () => {
+  const s = await session({ rows: [row(1)] })
+  await s.tick(0)
+  assert.equal(s.count("receipts"), 1, "a receipts request was made, and answered")
+  let release
+  s.server.gates.heartbeat = new Promise(resolve => { release = resolve })
+  const beating = s.lifecycle.heartbeat() // its request is held
+  await flush()
+  const polling = s.tick() // a poll falls due meanwhile
+  await s.lifecycle.heartbeat() // and a heartbeat
+  delete s.server.gates.heartbeat
+  release()
+  await Promise.all([beating, polling])
+  assert.deepEqual(s.cancels, [], "no receipts request was in flight: there was nothing to end")
 })

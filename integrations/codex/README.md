@@ -96,7 +96,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `directory` | Absolute state directory, created beforehand, owned by the current user, mode `0700`, and below directories that only the current user or root can change (see [App-server control socket](#app-server-control-socket); `/tmp`, which is sticky, counts). It holds the receiver socket and its locks. The hook and the receiver each resolve it once and use its canonical path (every link above it resolved) for everything they keep there, and that path must be 75 bytes or fewer, so that the socket path fits (see [App-server control socket](#app-server-control-socket)). |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
-| `python` | Absolute interpreter that can import `agent_chat`. |
+| `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
 | `noticeBodies` | Optional. `true` includes message bodies in a notice delivered by a hook, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `appServer` | Optional. `unix://` followed by the absolute path of the Codex app-server control socket. Without it the package is hook-only: no thread check and no thread read. Any other form is a refused config. The socket must also pass the [trust check](#app-server-control-socket) before every connection: a socket that does not is refused with `CHAT_APPSERVER_UNTRUSTED`. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding, the notice and the idle wake tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
@@ -436,18 +436,19 @@ sends its request: it does not wait for the worker to end its instance.
   delivered at once; a refused or failed mark is sent again at the next pass. A
   pass sends one request, the mark that waits or else the poll. A
   staged notice that was not shown is released at `Stop` and at `Interrupt`. The
-  request runs after the hook's reply, queued like any other: it never replaces a
-  claim or a wake, and one that follows it waits for it. The core's worker ends
-  a receipts request after 2 seconds, so a hook behind one keeps the 2.5 seconds
-  a claim needs. A hook gives the receiver at most 6 seconds, counted from its
-  arrival, and the receiver starts a claim only while 2.5 of them remain, so
-  behind a worker without that deadline, an older core, one that waited more
-  than 3.5 seconds skips the claim: it sends no claim request and spends no
-  attempt. A hook that arrives while a `Stop`'s state report waits behind the
-  request skips its claim at once, with the same result. The message stays
-  offered for 24 hours after it was stored, and the next prompt or tool hook
-  offers it again; once the session is idle, with `appServer` the wake does, and
-  hook-only the next prompt does. The binding ends its route lines
+  request runs after the hook's reply, queued like any other, and it never
+  replaces a claim or a wake. It gives way: a hook's or a wake's claim, a
+  heartbeat or a state report that queues behind it ends it with the worker's
+  cancel signal, so, client-side, none of them waits for it beyond the worker's
+  answer to the signal, and no hook skips its claim for it. The server is
+  another wait: a receipts read that stalls inside it keeps the row of the
+  instance, so the request that goes first after the cancel, the `pending` that
+  opens a claim or a heartbeat, waits for it, up to 3 seconds, and is refused if
+  the row is still held. That hook or wake then delivers nothing, and the
+  message stays on the server for the next one. Only a worker whose join reply
+  lists `receipts-cancel` is asked for receipts; an older core shows none. The
+  binding
+  ends its route lines
   with one sentence that tells the model how to ask for receipts. The
   [receipts contract](../README.md#sender-receipts) has the rules.
 - **Delegated sessions.** A session that is not the main thread never joins:

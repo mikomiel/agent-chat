@@ -72,13 +72,23 @@ function scheduler() {
 }
 
 // The product's worker as a double. `server` is what it knows; a function in `failures` throws that request's error, and a
-// promise in `gates` holds that operation's answer until it is released.
+// promise in `gates` holds that operation's answer until it is released. Like the core's worker, it names the capability
+// `receipts-cancel` in its join reply (`capabilities`, null for an older worker), and `cancel()` ends the receipts request that
+// is held on its gate: that request answers `refused: CLI_INTERRUPTED`, as the worker's does on the signal. A cancel while no
+// receipts request is held changes nothing, as in worker.js; `cancels` records every call and what was held at the time.
+// With `server.cancelEnds` false the signal has not been answered yet: the request stays held until `endHeld()`, which holds
+// the window between the signal and the answer open.
+const RECEIPTS_OPERATIONS = new Set(["receipts", "receipts_delivered"])
 function workerDouble({ events }) {
   const log = [] // every request in order: { op, boot, ...fields }
+  const cancels = [] // every cancel() call in order: { boot, held } with the receipts operation held then, or null
   const bootIds = []
   const server = {
     rows: [], muted: false, receipts: null, mark: null, pending: [], failures: {}, gates: {}, heartbeat: null, status: null,
+    capabilities: ["receipts-cancel"], cancelEnds: true,
   }
+  const named = boot => (typeof server.capabilities === "function" ? server.capabilities(boot) : server.capabilities)
+  let held = null // { op, end }: the receipts request waiting on its gate
   let attempts = 0
   const answer = (op, fields) => {
     const failure = server.failures[op]
@@ -102,20 +112,33 @@ function workerDouble({ events }) {
     const joined = {
       session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
       room_id: ROOM, host: "synthetic-host", harness: "codex", instance_file: `/tmp/agent-chat-state/${identity.bootId}.json`,
+      ...(named(boot) ? { capabilities: named(boot) } : {}),
     }
     return {
       ready: Promise.resolve(joined),
       async request(op, fields = {}) {
         log.push({ op, boot, ...fields })
         events.push(op === "heartbeat" ? `heartbeat:${fields.state.native_state}` : op === "settle" ? `settle:${fields.result.outcome}` : op)
-        if (server.gates[op]) await server.gates[op]
+        const gate = server.gates[op]
+        if (gate && RECEIPTS_OPERATIONS.has(op)) {
+          const ended = await new Promise(resolve => {
+            held = { op, end: () => resolve(true) }
+            gate.then(() => resolve(false))
+          })
+          held = null
+          if (ended) return { refused: "CLI_INTERRUPTED" }
+        } else if (gate) await gate
         return answer(op, fields)
+      },
+      cancel() {
+        cancels.push({ boot, held: held?.op ?? null })
+        if (server.cancelEnds) held?.end()
       },
       stop() { events.push("stop"); finish({ code: 0, signal: null }); return closed },
       closed,
     }
   }
-  return { startProcess, log, bootIds, server, ops: name => log.filter(entry => entry.op === name) }
+  return { startProcess, log, cancels, bootIds, server, endHeld: () => held?.end(), ops: name => log.filter(entry => entry.op === name) }
 }
 
 // The hook end of one connection. A context frame with `ack` is answered with the configured write receipt.
@@ -616,7 +639,8 @@ test("an answer that arrives after the turn ended is not staged, and the next tu
   r.server.gates.receipts = new Promise(resolve => { open = resolve })
   await r.op(turn())
   assert.equal(r.count("receipts"), 1, "the poll is waiting for its answer")
-  // The Stop event waits at most three seconds for its state report, which queues behind the request in flight.
+  // The Stop's state report ends the request in flight (the double answers the cancel at once), so the Stop answers without
+  // waiting. The answer that arrives for real after the turn ended is a later test's case: this one holds the cancelled read.
   const stopping = r.op(stopEvent)
   await settle()
   await r.clock.advance(3_000)
@@ -645,24 +669,19 @@ test("after a rejoin the unmarked ids are marked through the new instance, and o
   assert.deepEqual(marks.map(entry => [entry.boot, entry.receipts]), [[1, ids(feed)], [2, ids(feed)]])
 })
 
-test("a poll in flight never makes a hook skip its claim: the delivery waits its turn in the queue and is still made", async () => {
+test("a hook that arrives while a poll is in flight ends the poll and delivers at once: it waits for nothing and skips nothing", async () => {
   const r = await ready({ rows: [rcpt(1)] })
-  let open
-  r.server.gates.receipts = new Promise(resolve => { open = resolve })
+  r.server.gates.receipts = new Promise(() => {}) // never released: only the cancel can end this read
   await r.op(turn())
   assert.equal(r.count("receipts"), 1, "the poll is in flight")
+  assert.deepEqual(r.worker.cancels, [], "nothing has asked for it to end")
   r.server.pending = [uid(1)]
-  const hook = hookDouble({ events: r.events })
-  const handled = r.receiver.handle(turn(), hook)
-  await settle()
-  assert.deepEqual(hook.sent, [], "the delivery is queued behind the request that is in flight")
-  delete r.server.gates.receipts
-  open()
-  await handled
-  await settle()
+  const hook = await r.op(turn()) // no clock moves and nothing is released: the delivery cannot be waiting for the read
   assert.equal(hook.sent.length, 1)
   assert.ok(isDeliveryText(hook.sent[0].context), "the claim was not skipped")
   assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }], "one cancel, of the read that was in flight")
+  assert.equal(r.worker.bootIds.length, 1, "a cancelled read is held, not a failure")
 })
 
 test("no receipts request is made once chat is disabled", async () => {
@@ -928,140 +947,354 @@ test("a staged notice is aged on the wall clock alone: 6 s of monotonic time wit
   assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
 })
 
-// A receipts read that holds the worker past a hook's budget (#175). The pass starts after a hook's reply, so the next hook can
-// arrive while it is in flight, and the delivery that hook asks for waits in the queue behind it. A claim needs CLAIM_MARGIN_MS
-// (2.5 s) of the hook's 6 s patience, so a read that outlasts the other 3.5 s makes the hook skip its claim. The core's worker
-// ends a receipts request within 2 s (RECEIPT_SECONDS, agent_chat/instance_worker.py), so the shipped worker never holds one that
-// long. These tests give the receiver a worker that does, as a core without that deadline is, and advance the clock while the
-// read is held, which the gated test above does not. They pin what the receiver does then: what the skip costs and what follows.
-const HOOK_PATIENCE_MS = 6_000
-const CLAIM_MARGIN_MS = 2_500
+// A receipts request gives way (#175). The pass starts after a hook's reply, so the next hook, a heartbeat or a Stop's state
+// report can arrive while it is in flight. Each of them ends the request: the worker answers `refused` on the cancel signal,
+// and what waited goes next. The tests below give the worker a read that nothing releases, so only the cancel can end it, and
+// most of them move no clock: a request that waited for the read would never be answered, and a hook that waited would skip.
+const holdReads = r => { r.server.gates.receipts = new Promise(() => {}) }
 
-// A pass whose read is in flight, then a hook that arrives behind it. The read ends `after` ms later, on the receiver's clock.
-async function behindSlowRead(r, after) {
-  let open
-  r.server.gates.receipts = new Promise(resolve => { open = resolve })
-  await r.op(turn()) // its reply starts the pass, and the pass is held
-  assert.equal(r.count("receipts"), 1, "the read is in flight")
-  r.server.pending = [uid(1)]
-  const hook = hookDouble({ events: r.events })
-  const handled = r.receiver.handle(turn(), hook)
-  await settle()
-  assert.deepEqual(hook.sent, [], "the hook waits in the queue behind the read")
-  await r.clock.advance(after)
-  delete r.server.gates.receipts
-  open()
-  await handled
-  await settle()
-  return hook
-}
-
-test("a hook that waited behind a receipts read for more than its patience less the claim margin skips its claim: nothing is spent, and the next hook delivers", async () => {
+test("a heartbeat that falls due while a poll is in flight ends the poll and is sent at once", async () => {
   const r = await ready({ rows: [] })
-  const hook = await behindSlowRead(r, HOOK_PATIENCE_MS - CLAIM_MARGIN_MS + 1)
-  assert.equal(r.count("pending"), 2, "the candidates were read for the hook that started the pass, and again for this one once the read ended")
-  assert.equal(r.count("claim"), 0, "no claim request: the ledger was asked for no attempt, so none is spent")
-  assert.equal(r.count("settle"), 0)
-  assert.deepEqual(hook.sent, [{ context: null }], "the hook was answered, with nothing")
+  holdReads(r)
+  await r.op(turn())
+  assert.equal(r.count("receipts"), 1, "the poll is in flight")
+  const beats = r.count("heartbeat")
+  await r.clock.advance(HEARTBEAT_MS)
+  assert.equal(r.count("heartbeat"), beats + 1, "the heartbeat went out while the read would still be held")
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }], "one cancel, of the read in flight")
+  assert.equal(r.worker.bootIds.length, 1, "a cancelled read is held, not a failure")
+  assert.notEqual(r.receiver.state(), "offline")
+})
+
+test("a Stop's state report ends a poll in flight: the Stop answers at once, and the next prompt delivers", async () => {
+  const r = await ready({ rows: [] })
+  holdReads(r)
+  await r.op(turn())
+  r.server.pending = [uid(1)]
+  const beats = r.count("heartbeat")
+  const stopped = await r.op(stopEvent) // no clock moves: the Stop does not wait for its report
+  assert.deepEqual(stopped.sent, [{ ok: true }])
+  assert.equal(r.count("heartbeat"), beats + 1, "the state report was sent")
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
   const next = await r.op(turn())
-  assert.ok(isDeliveryText(next.sent[0].context), "the next hook has its own patience and delivers it")
+  assert.ok(isDeliveryText(next.sent[0].context), "the next prompt claims")
   assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [[uid(1)]])
   assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
 })
 
-test("a read that ends exactly at the patience less the claim margin does not make a hook skip: the budget is 3.5 s", async () => {
+test("a worker that holds every receipts read until it is cancelled delays no hook: each hook ends the read it finds and delivers", async () => {
   const r = await ready({ rows: [] })
-  const hook = await behindSlowRead(r, HOOK_PATIENCE_MS - CLAIM_MARGIN_MS)
-  assert.ok(isDeliveryText(hook.sent[0].context), "the claim was made")
+  holdReads(r)
+  await r.op(turn()) // its reply starts a pass, and the pass is held
+  for (let round = 1; round <= 3; round += 1) {
+    assert.equal(r.count("receipts"), round, `round ${round}: a read is in flight`)
+    r.server.pending = [uid(round)]
+    const hook = await r.op(turn())
+    assert.ok(isDeliveryText(hook.sent[0].context), `round ${round}: the hook delivered, with no clock moved and nothing released`)
+    assert.equal(r.worker.cancels.length, round, `round ${round}: it ended the read it found`)
+    await r.clock.advance(POLL_MS + 500) // a pass is due again
+    await r.op(turn()) // and this hook's reply starts it, held again
+  }
+  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [[uid(1)], [uid(2)], [uid(3)]], "three hooks, three claims, no skip")
+  assert.ok(r.worker.cancels.every(entry => entry.held === "receipts"))
+  assert.equal(r.worker.bootIds.length, 1)
+})
+
+// The window between the signal and the worker's answer, held open: the worker has been told to end the read and has not
+// answered yet. A request that queues in it queues behind the read, and none of them is counted as a slow request.
+test("a heartbeat queued behind a poll does not make a hook skip its claim: the delivery queues behind it, and is made", async () => {
+  const r = await ready({ rows: [] })
+  holdReads(r)
+  r.server.cancelEnds = false
+  await r.op(turn())
+  await r.clock.advance(HEARTBEAT_MS) // the heartbeat queues behind the read, and the worker is told to end it
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
+  const before = r.worker.log.length
+  r.server.pending = [uid(1)]
+  const hook = hookDouble({ events: r.events })
+  const handled = r.receiver.handle(turn(), hook)
+  await settle()
+  assert.deepEqual(hook.sent, [], "the hook waits for the worker's answer to the cancel, and not for the read")
+  assert.equal(r.worker.log.length, before, "nothing was sent meanwhile: the worker holds one request")
+  r.worker.endHeld() // the worker answers the cancel
+  await handled
+  await settle()
+  const sent = r.worker.log.slice(before).filter(entry => !RECEIPTS_OPERATIONS.has(entry.op)).map(entry => entry.op)
+  assert.deepEqual(sent, ["heartbeat", "pending", "claim", "status", "settle"],
+    "the heartbeat first, then the hook's whole claim sequence: nothing was skipped")
+  assert.ok(isDeliveryText(hook.sent[0].context))
   assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
 })
 
-test("hook-only: after a skipped claim nothing delivers the message while the session is idle, and the next prompt does", async () => {
-  const r = await ready({ rows: [] })
-  await behindSlowRead(r, HOOK_PATIENCE_MS)
-  await r.op(stopEvent)
-  r.worker.log.length = 0
-  await r.clock.advance(3_600_000) // an hour idle
-  assert.deepEqual(r.worker.log.filter(entry => entry.op !== "heartbeat"), [], "no pending read, no claim: without an app-server nothing wakes an idle session")
-  const prompt = await r.op(turn())
-  assert.ok(isDeliveryText(prompt.sent[0].context), "the next prompt delivers it")
-  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+test("a read that the worker answers for real after the turn ended is not staged, although the Stop asked it to end; the Stop does not wait for it", async () => {
+  const r = await ready({ rows: [rcpt(1)] })
+  let open
+  r.server.gates.receipts = new Promise(resolve => { open = resolve })
+  r.server.cancelEnds = false
+  await r.op(turn())
+  assert.equal(r.count("receipts"), 1, "the poll is waiting for its answer")
+  const stopping = r.op(stopEvent)
+  await settle()
+  await r.clock.advance(3_000) // the Stop stops waiting for its report, which queues behind the read until the worker answers
+  assert.deepEqual((await stopping).sent, [{ ok: true }])
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
+  delete r.server.gates.receipts
+  open() // the real answer, with a row in it, arrives after the turn ended
+  await settle()
+  const next = await r.op(turn())
+  assert.deepEqual(next.sent, [{ context: null }], "nothing was staged for the new turn")
 })
 
-test("with an app-server, the wake delivers a message whose claim a hook skipped, as soon as the session is idle", async () => {
+// A pass at the head of the queue (a heartbeat holds the worker, the pass queues behind it, and a second heartbeat queues behind
+// the pass). The first heartbeat ends and the pass is at the head: it sends nothing when something is queued, and sends its
+// request when nothing is.
+for (const queued of [true, false]) {
+  test(`a pass at the head of the queue ${queued ? "sends nothing when a counted sequence is queued behind it, and a later pass asks" : "sends its request when none is queued behind it"}`, async () => {
+    const r = await ready({ rows: [] })
+    await r.op(turn()) // the first poll, answered at once
+    assert.equal(r.count("receipts"), 1)
+    let open
+    r.server.gates.heartbeat = new Promise(resolve => { open = resolve })
+    await r.clock.advance(HEARTBEAT_MS) // a heartbeat holds the worker
+    await r.op(turn()) // its reply starts a pass, which queues behind the heartbeat
+    if (queued) await r.clock.advance(HEARTBEAT_MS) // the next heartbeat queues behind the pass
+    const beats = r.count("heartbeat")
+    assert.equal(r.count("receipts"), 1, "nothing is asked while the first heartbeat holds the worker")
+    delete r.server.gates.heartbeat
+    open()
+    await settle()
+    assert.deepEqual(r.worker.cancels, [], "the pass had not asked yet: there was nothing to end")
+    if (queued) {
+      assert.equal(r.count("heartbeat"), beats + 1, "the queued heartbeat went")
+      assert.equal(r.count("receipts"), 1, "and the pass at the head sent nothing")
+      await r.clock.advance(POLL_MS)
+      await r.op(turn())
+      assert.equal(r.count("receipts"), 2, "a later pass asks again")
+    } else assert.equal(r.count("receipts"), 2, "the pass at the head sent its request")
+  })
+}
+
+test("a mark that a delivery ended keeps its ids, and the next pass sends it again", async () => {
+  const feed = [rcpt(1)]
+  const r = await staged({ rows: feed })
+  r.server.gates.receipts_delivered = new Promise(() => {})
+  const shown = await r.op(turn()) // shows the notice; the mark that follows at once is held
+  assert.ok(isNoticeText(shown.sent[0].context))
+  assert.equal(r.count("receipts_delivered"), 1, "the mark is in flight")
+  r.server.pending = [uid(1)]
+  const hook = await r.op(turn())
+  assert.ok(isDeliveryText(hook.sent[0].context), "the delivery did not wait for the mark")
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts_delivered" }])
+  delete r.server.gates.receipts_delivered
+  await r.clock.advance(POLL_MS)
+  await r.op(turn())
+  assert.deepEqual(r.marks(), [{ receipts: ids(feed) }, { receipts: ids(feed) }], "the same ids, sent again, and accepted")
+  await r.clock.advance(POLL_MS)
+  await r.op(turn())
+  assert.equal(r.count("receipts_delivered"), 2, "marked: nothing is sent again")
+})
+
+test("a session whose requests never overlap a receipts request cancels nothing", async () => {
+  const run = await session({ rows: [rcpt(1), rcpt(2), rcpt(3)] })
+  assert.ok(run.r.count("receipts") >= 1 && run.r.count("receipts_delivered") >= 1, "the receipts path ran")
+  assert.deepEqual(run.r.worker.cancels, [])
+})
+
+// The wake poll's claim is a counted sequence like a hook's: a read in flight when it queues is ended too.
+test("a receipts read in flight when the session goes idle is ended by the Stop's report, and the wake that follows is not held", async () => {
   const thread = threadDouble()
   const r = await ready({ rows: [], thread })
-  await behindSlowRead(r, HOOK_PATIENCE_MS)
-  assert.equal(r.count("claim"), 0, "the hook claimed nothing")
-  await r.op(stopEvent)
+  holdReads(r)
+  await r.op(turn())
+  r.server.pending = [uid(1)]
+  await r.op(stopEvent) // idle: the Stop's report ends the read
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
   await r.clock.advance(WAKE_POLL_MS)
   assert.equal(thread.adds.length, 1, "the wake queued the message")
   assert.equal(r.worker.ops("claim").length, 1)
   assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
 })
 
-// A second way for a hook to skip its claim, whatever its patience: the Stop's state report is a counted request, and a hook
-// that arrives while one is queued answers at once, so that a slow request never stacks up behind every tool call. A receipts
-// read ahead of that report keeps it queued until the read ends, so the next prompt skips until then.
-test("a Stop's state report queued behind a receipts read makes the next prompt skip its claim at once: nothing is spent, and the next hook delivers", async () => {
-  const r = await ready({ rows: [] })
-  let open
-  r.server.gates.receipts = new Promise(resolve => { open = resolve })
-  await r.op(turn()) // its reply starts the pass, and the pass is held
-  assert.equal(r.count("receipts"), 1, "the read is in flight")
-  r.server.pending = [uid(1)]
-  const stopped = hookDouble({ events: r.events })
-  const stopping = r.receiver.handle(stopEvent, stopped)
-  await settle()
-  await r.clock.advance(3_000) // the Stop stops waiting for its report, which stays queued behind the read
-  await stopping
-  assert.deepEqual(stopped.sent, [{ ok: true }])
-  const prompt = hookDouble({ events: r.events })
-  const handled = r.receiver.handle(turn(), prompt)
-  await settle()
-  assert.deepEqual(prompt.sent, [{ context: null }], "answered at once, while the read is still held")
-  assert.equal(r.count("pending"), 1, "no candidates were read for it: only the first hook's read")
-  assert.equal(r.count("claim"), 0)
-  delete r.server.gates.receipts
-  open()
-  await handled
-  await settle()
-  assert.equal(r.count("claim"), 0, "the skipped prompt claimed nothing")
-  const next = await r.op(turn())
-  assert.ok(isDeliveryText(next.sent[0].context), "once the read has ended the next hook delivers it")
-  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [[uid(1)]])
-  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+// The capability gate. Only a worker whose join reply names `receipts-cancel` is asked for receipts: a request that cannot be
+// ended would hold the worker, and every hook behind it. The worker module signals only such a worker.
+for (const [name, capabilities] of [["no capabilities", null], ["an empty list", []], ["another name", ["something-else"]], ["a string, not a list", "receipts-cancel"]]) {
+  test(`a worker whose join reply has ${name} is sent no receipts request at all: no poll, no mark, no cancel`, async () => {
+    const r = await ready({ rows: [rcpt(1)], tweak: server => { server.capabilities = capabilities } })
+    for (let index = 0; index < 4; index += 1) {
+      await r.op(turn())
+      await r.clock.advance(POLL_MS)
+    }
+    r.server.pending = [uid(1)]
+    const hook = await r.op(turn())
+    assert.ok(isDeliveryText(hook.sent[0].context), "deliveries are what they were")
+    assert.equal(r.count("receipts"), 0)
+    assert.equal(r.count("receipts_delivered"), 0)
+    assert.deepEqual(r.worker.cancels, [])
+  })
+}
+
+test("a worker that names the capability among others is asked for receipts", async () => {
+  const r = await ready({ rows: [rcpt(1)], tweak: server => { server.capabilities = ["something-else", "receipts-cancel"] } })
+  await r.op(turn())
+  assert.equal(r.count("receipts"), 1)
 })
 
-// The loop that a worker without a receipts deadline can sustain. A pass is due again once a cadence has passed, and a hook's
-// reply starts it: when every read lasts longer than a cadence, the hook that waited behind one starts the next, and the next
-// hook waits behind that. The receiver cannot end a read; only the worker's deadline can. This pins the receiver against a
-// hung worker, not the shipped one, and is why the worker's receipts deadline must stay under the 3.5 s of budget.
-test("against a worker that holds every receipts read for longer than a cadence, every hook skips its claim; the first quick read ends it", async () => {
-  const r = await ready({ rows: [] })
-  let release
-  const hold = () => { r.server.gates.receipts = new Promise(resolve => { release = resolve }) }
-  hold()
-  await r.op(turn()) // its reply starts a pass, held
-  r.server.pending = [uid(1)]
-  for (let round = 1; round <= 3; round += 1) {
-    const hook = hookDouble({ events: r.events })
-    const handled = r.receiver.handle(turn(), hook)
-    await settle()
-    await r.clock.advance(POLL_MS + 500)
-    const open = release
-    hold() // the pass that this hook's reply starts is held as well
-    open()
-    await handled
-    await settle()
-    assert.deepEqual(hook.sent, [{ context: null }], `hook ${round}: answered with nothing`)
-    assert.equal(r.count("receipts"), round + 1, `hook ${round}: its reply started the next read`)
+test("the capability is the join reply's of the worker that serves: a worker that rejoined without it is asked for no receipts", async () => {
+  const feed = [rcpt(1), rcpt(2)]
+  const r = await staged({ rows: feed, tweak: server => { server.capabilities = boot => (boot === 1 ? ["receipts-cancel"] : null) } })
+  r.server.mark = () => ({ refused: "SERVICE_UNAVAILABLE" })
+  await r.op(turn()) // shown, confirmed, and its mark is refused
+  r.server.mark = null
+  r.server.heartbeat = staleOnce()
+  await r.clock.advance(HEARTBEAT_MS) // the heartbeat loses the lease and a rejoin is scheduled
+  await r.clock.advance(3750)
+  assert.equal(r.worker.bootIds.length, 2, "rejoined")
+  for (let index = 0; index < 3; index += 1) {
+    await r.clock.advance(POLL_MS)
+    await r.op(turn())
   }
-  assert.equal(r.count("claim"), 0, "three hooks in a row, and nothing was claimed")
-  delete r.server.gates.receipts
-  release()
-  await settle()
+  assert.deepEqual(r.worker.log.filter(entry => entry.boot === 2 && RECEIPTS_OPERATIONS.has(entry.op)), [], "no read and no mark through the new worker")
+  assert.ok(r.worker.log.some(entry => entry.boot === 2 && entry.op === "pending"), "it serves deliveries")
+})
+
+// Wire order after a cancel (#175). A cancel ends the package's wait for a receipts request. It does not end the server's work
+// on it: the server can still hold the instance row, and the first request after the cancel then waits for it, up to 3 seconds,
+// and is refused. The worker holds a refused `pending` or `heartbeat` as a brief outage and the next one asks again, so the hook
+// that sent it delivers nothing and loses nothing. A `claim`, a `settle` or a `status` that went first would meet the same
+// wait, and a claim or a settle that is refused that way is uncertain (#174). So the first request after a cancelled receipts
+// request is a `pending` or a `heartbeat`, whichever path cancelled it, and no `claim`, `settle` or `status` goes before a
+// `pending`. Each test below gives the worker a message to claim, so a claim that went too early would show; it ends a read
+// that nothing releases, and reads the worker double's log from the index of that read.
+const FIRST_AFTER_CANCEL = ["pending", "heartbeat"]
+const NEEDS_A_PENDING = ["claim", "settle", "status"]
+
+// Hold a receipts read with a first event, and return its index in the worker's log.
+async function holdPass(r) {
+  holdReads(r)
+  await r.op(turn())
+  const at = r.worker.log.length - 1
+  assert.equal(r.worker.log[at].op, "receipts", "the poll is in flight")
+  return at
+}
+
+// The requests the worker received after the cancelled one, in order, without any later receipts request. The first of them,
+// whatever it is, must be a `pending` or a `heartbeat`, and no `claim`, `settle` or `status` goes before a `pending`.
+function wireAfter(r, heldAt, label) {
+  assert.ok(RECEIPTS_OPERATIONS.has(r.worker.log[heldAt]?.op), `${label}: the request at ${heldAt} is a receipts request`)
+  const after = r.worker.log.slice(heldAt + 1).map(entry => entry.op)
+  assert.ok(FIRST_AFTER_CANCEL.includes(after[0]), `${label}: the first request after the cancelled one is a pending or a heartbeat, not ${after[0]} (${after.join(", ")})`)
+  const ops = after.filter(op => !RECEIPTS_OPERATIONS.has(op))
+  const early = ops.findIndex(op => NEEDS_A_PENDING.includes(op))
+  assert.ok(early === -1 || (ops.includes("pending") && ops.indexOf("pending") < early), `${label}: no claim, settle or status goes before a pending (${ops.join(", ")})`)
+  return ops
+}
+
+// The hook command names the event, and the receiver keeps a prompt and a tool event apart: only a prompt clears a local stop.
+for (const event of ["prompt", "tool"]) {
+  test(`wire order: a ${event} hook that ends a poll in flight sends a pending first, and its claim after it`, async () => {
+    const r = await ready({ rows: [] })
+    const heldAt = await holdPass(r)
+    r.server.pending = [uid(1)]
+    const hook = await r.op(turn({ event }))
+    assert.ok(isDeliveryText(hook.sent[0].context), "the hook delivered")
+    assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }], "it ended the read it found")
+    assert.deepEqual(wireAfter(r, heldAt, event), ["pending", "claim", "status", "settle"])
+  })
+}
+
+test("wire order: a turn event that changes the state ends the poll with its state report first, and the next claim follows a pending", async () => {
+  const r = await ready({ rows: [] })
+  const heldAt = await holdPass(r)
+  r.server.pending = [uid(1)]
+  await r.op(turn({ permission_mode: "plan" })) // Plan Mode: the state is reported, and nothing is claimed
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
+  assert.deepEqual(wireAfter(r, heldAt, "Plan Mode"), ["heartbeat"])
   const next = await r.op(turn())
-  assert.ok(isDeliveryText(next.sent[0].context), "the first hook that finds no read in flight delivers it")
-  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+  assert.ok(isDeliveryText(next.sent[0].context), "the next turn delivered")
+  assert.deepEqual(wireAfter(r, heldAt, "the next turn"), ["heartbeat", "heartbeat", "pending", "claim", "status", "settle"])
+})
+
+test("wire order: a Stop that ends a poll in flight sends its state report first, and the next prompt claims after a pending", async () => {
+  const r = await ready({ rows: [] })
+  const heldAt = await holdPass(r)
+  r.server.pending = [uid(1)]
+  const stopped = await r.op(stopEvent)
+  assert.deepEqual(stopped.sent, [{ ok: true }])
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
+  assert.deepEqual(wireAfter(r, heldAt, "Stop"), ["heartbeat"])
+  const next = await r.op(turn())
+  assert.ok(isDeliveryText(next.sent[0].context), "the next prompt delivered")
+  assert.deepEqual(wireAfter(r, heldAt, "the next prompt"), ["heartbeat", "heartbeat", "pending", "claim", "status", "settle"])
+})
+
+test("wire order: an Interrupt that ends a poll in flight sends its state report first, and the next prompt claims after a pending", async () => {
+  const r = await ready({ rows: [] })
+  const heldAt = await holdPass(r)
+  r.server.pending = [uid(1)]
+  const interrupted = await r.op({ op: "interrupt" })
+  assert.deepEqual(interrupted.sent, [{ ok: true }])
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
+  assert.deepEqual(wireAfter(r, heldAt, "Interrupt"), ["heartbeat"])
+  const next = await r.op(turn())
+  assert.ok(isDeliveryText(next.sent[0].context), "the next prompt delivered")
+  assert.deepEqual(wireAfter(r, heldAt, "the next prompt"), ["heartbeat", "heartbeat", "pending", "claim", "status", "settle"])
+})
+
+test("wire order: a session start that ends a poll in flight sends its state report first, and the next prompt claims after a pending", async () => {
+  const r = await ready({ rows: [] })
+  const heldAt = await holdPass(r)
+  r.server.pending = [uid(1)]
+  await r.op({ op: "start", wait_ms: 0 }) // a compaction: the state is unknown again, and the report is not awaited
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
+  assert.deepEqual(wireAfter(r, heldAt, "a start"), ["heartbeat"])
+  const next = await r.op(turn())
+  assert.ok(isDeliveryText(next.sent[0].context), "the next prompt delivered")
+  assert.deepEqual(wireAfter(r, heldAt, "the next prompt"), ["heartbeat", "heartbeat", "pending", "claim", "status", "settle"])
+})
+
+test("wire order: a heartbeat that falls due ends a poll in flight and goes first, and the next claim follows a pending", async () => {
+  const r = await ready({ rows: [] })
+  const heldAt = await holdPass(r)
+  r.server.pending = [uid(1)]
+  await r.clock.advance(HEARTBEAT_MS)
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }])
+  assert.deepEqual(wireAfter(r, heldAt, "the heartbeat timer"), ["heartbeat"])
+  const next = await r.op(turn())
+  assert.ok(isDeliveryText(next.sent[0].context), "the next event delivered")
+  assert.deepEqual(wireAfter(r, heldAt, "the next event"), ["heartbeat", "pending", "claim", "status", "settle"])
+})
+
+test("wire order: a hook that ends a mark in flight sends a pending first, and its claim after it", async () => {
+  const r = await staged({ rows: [rcpt(1)] })
+  r.server.gates.receipts_delivered = new Promise(() => {})
+  await r.op(turn()) // shows the notice; the mark that follows at once is held
+  const heldAt = r.worker.log.length - 1
+  assert.equal(r.worker.log[heldAt].op, "receipts_delivered", "the mark is in flight")
+  r.server.pending = [uid(1)]
+  const hook = await r.op(turn())
+  assert.ok(isDeliveryText(hook.sent[0].context), "the hook delivered")
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts_delivered" }])
+  assert.deepEqual(wireAfter(r, heldAt, "a mark"), ["pending", "claim", "status", "settle"])
+})
+
+// The idle wake. Its poll reports the state, then claims, and both end a read in flight. The read cannot be in flight in an
+// idle session unless the worker has not yet answered the Stop's signal, so this holds that window open: the Stop's state
+// report is queued behind the read, the wake poll's report queues behind it, and the worker answers the signal after both.
+// The Stop's report goes first, then the wake's pending, and only then its claim.
+test("wire order: a wake poll that queues behind a read the worker has not yet ended goes after the state report, and claims after a pending", async () => {
+  const thread = threadDouble()
+  const r = await ready({ rows: [], thread })
+  r.server.cancelEnds = false
+  const heldAt = await holdPass(r)
+  r.server.pending = [uid(1)]
+  const stopping = r.op(stopEvent) // its report queues behind the read, and the worker is told to end it
+  await settle()
+  await r.clock.advance(3_000) // the wake poll falls due at 2 s and queues; the Stop stops waiting for its report at 3 s
+  assert.deepEqual((await stopping).sent, [{ ok: true }])
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }, { boot: 1, held: "receipts" }], "the Stop's report signalled, and so did the wake")
+  assert.equal(r.worker.log.length, heldAt + 1, "nothing was sent while the worker held the read")
+  r.worker.endHeld() // the worker answers the signal
+  await settle()
+  assert.equal(thread.adds.length, 1, "the wake queued the message")
+  assert.deepEqual(wireAfter(r, heldAt, "the wake"), ["heartbeat", "pending", "claim", "status", "settle", "heartbeat"])
 })

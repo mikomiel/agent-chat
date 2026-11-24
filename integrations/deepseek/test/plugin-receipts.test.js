@@ -268,6 +268,7 @@ async function integrated({ rows = [], native = { state: "busy" } } = {}) {
   const joined = {
     session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
     room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "deepseek", instance_file: "/tmp/agent-chat-state/boot-1.json",
+    capabilities: ["receipts-cancel"], // the worker that is asked for receipts: its join reply names the cancel
   }
   const clock = { t: 5_000_000 }
   const server = { rows, muted: false }

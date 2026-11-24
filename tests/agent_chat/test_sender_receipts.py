@@ -1,7 +1,15 @@
 """Sender receipts (migration 007): non-waking, at most one per message, recipient and state, policy by kind."""
 
 import json
+import signal
+import subprocess
+import sys
 from hashlib import sha256
+from http.client import HTTPConnection
+from pathlib import Path
+from threading import Event, Thread
+from time import monotonic, sleep
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -22,6 +30,7 @@ from agent_chat.publication import publish, request_digest
 from agent_chat.retention import prune
 
 EXCLUDED_KINDS = ("status", *COORDINATION_KINDS)
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -321,3 +330,146 @@ def test_an_ended_instance_cannot_read_its_receipts(db, actors):
     ):
         with pytest.raises(ChatError, match="^STALE_INSTANCE$"):
             call()
+
+
+def test_a_receipts_read_that_stalls_holds_the_instance_row_for_a_concurrent_pending(
+    http_api, credentials, register, lock_wait, monkeypatch
+):
+    """The server serializes one instance's requests on its row, receipts included, whoever still waits for them.
+
+    A receipts read that stops after `lock_actor` keeps the row until its transaction ends, also when its client
+    has gone: the worker abandons a read at its 2 s deadline, and the server does not know. A `pending` of the same
+    instance parks behind it, answers once it ends, and ends with a coded outage only after the service's 3 s lock
+    limit. This is a residual of every client-side design; it is measured here, not removed.
+    """
+    port = http_api.args[0]
+    token, _ = register(SimpleNamespace(request=http_api), credentials, "row-lock")
+    real = receipts.visible
+    stall = SimpleNamespace(entered=Event(), release=Event())
+
+    def stalled(db, actor, **kwargs):
+        stall.entered.set()
+        stall.release.wait(10)
+        return real(db, actor, **kwargs)
+
+    monkeypatch.setattr(receipts, "visible", stalled)
+
+    def abandon_a_read():
+        """Send the read and walk away, as the worker does at its deadline."""
+        stall.entered, stall.release = Event(), Event()
+        client = HTTPConnection("127.0.0.1", port, timeout=5)
+        client.request("GET", "/v1/instance/receipts", headers={"Authorization": "Bearer " + token})
+        assert stall.entered.wait(5), "the read never reached its stall"
+        client.close()
+
+    def ask(answers):
+        started = monotonic()
+        answer = http_api("GET", "/v1/instance/deliveries/pending", token=token)
+        answers.append((answer, started, monotonic()))
+
+    # The holder ends after 1 s: the pending parked behind an abandoned read answers, and only after it ended.
+    abandon_a_read()
+    answers = []
+    waiter = Thread(target=ask, args=(answers,))
+    waiter.start()
+    lock_wait("agent_chat.instances")
+    sleep(1)
+    released = monotonic()
+    stall.release.set()
+    waiter.join(8)
+    assert len(answers) == 1
+    (status, body), started, ended = answers[0]
+    assert (status, body["messages"]) == (200, [])
+    assert ended >= released and ended - started < 3
+
+    # The holder outlasts the lock limit: the pending ends with the database outage code, after about 3 s.
+    abandon_a_read()
+    answers = []
+    waiter = Thread(target=ask, args=(answers,))
+    waiter.start()
+    waiter.join(8)
+    assert len(answers) == 1
+    (status, body), started, ended = answers[0]
+    assert (status, body["error"]["code"]) == (503, "DATABASE_UNAVAILABLE")
+    assert 2.9 <= ended - started < 5
+    stall.release.set()
+
+    # The abandoned read ends too, and the row is free again: the next pending answers.
+    answers = []
+    ask(answers)
+    assert answers[0][0][0] == 200
+
+
+def test_a_real_worker_ends_a_held_receipts_read_on_the_cancel_signal_and_serves_the_next_pending(
+    http_api, credentials, tmp_path, monkeypatch
+):
+    """The cancel signal and the server's row lock together, through the real worker process and a real SIGUSR1.
+
+    Cancelling ends the client's wait, not the server's transaction. The worker answers at once and keeps serving;
+    the next `pending` of the same instance waits for the row, and ends as the brief outage the receivers already
+    tolerate if the transaction outlasts the client's 3 s socket timeout.
+    """
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    join = {
+        "id": 0, "op": "join", "enabled": True, "directory": str(directory), "native_session_id": "cancel-native",
+        "boot_id": str(uuid4()), "server_origin": f"http://127.0.0.1:{http_api.args[0]}",
+        "host_token": credentials.agent, "harness": "pi",
+    }
+    stall = SimpleNamespace(armed=False, entered=Event(), release=Event())
+    real = receipts.visible
+
+    def held(db, actor, **kwargs):
+        if stall.armed:
+            stall.entered.set()
+            stall.release.wait(10)
+        return real(db, actor, **kwargs)
+
+    monkeypatch.setattr(receipts, "visible", held)
+
+    def ask(process, request):
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    with subprocess.Popen(
+        [sys.executable, "-m", "agent_chat.instance_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=ROOT, env={},
+    ) as process:
+        try:
+            joined = ask(process, join)["result"]
+            assert joined["capabilities"] == ["receipts-cancel"]
+            # A signal while the worker is idle is for the request that follows, and no other. Whether the worker reads
+            # it before or after that request begins, the answer is the same, and the next request is served.
+            process.send_signal(signal.SIGUSR1)
+            assert ask(process, {"id": 1, "op": "receipts"}) == {"id": 1, "result": {"refused": "CLI_INTERRUPTED"}}
+            # A status read, not a pending: an empty pending is answered from the worker's own backoff for two seconds.
+            served = ask(process, {"id": 2, "op": "status"})["result"]
+            assert served["instance_id"] == joined["instance_id"] and "refused" not in served
+            # A read that the server holds, and a signal sent once it is in the server's hands.
+            stall.armed = True
+            process.stdin.write(json.dumps({"id": 3, "op": "receipts"}) + "\n")
+            process.stdin.flush()
+            assert stall.entered.wait(10)
+            started = monotonic()
+            process.send_signal(signal.SIGUSR1)
+            assert json.loads(process.stdout.readline()) == {"id": 3, "result": {"refused": "CLI_INTERRUPTED"}}
+            assert monotonic() - started < 1.5  # the worker's own deadline is 2 s: the signal ended it
+            # The abandoned read still holds the instance row on the server, so a pending now waits for it. It ends as
+            # an outage that the worker tolerates and the receivers read as brief: no rejoin, and chat stays on.
+            asked = monotonic()
+            answer = ask(process, {"id": 4, "op": "pending"})
+            assert answer["result"]["refused"] in {"SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE"}
+            assert 2.5 < monotonic() - asked < 7
+            assert process.poll() is None
+            # The server's transaction ends, and the same worker serves the next pending.
+            stall.release.set()
+            assert ask(process, {"id": 5, "op": "pending"}) == {"id": 5, "result": {"messages": []}}
+            assert process.stdin is not None
+            process.stdin.close()
+            process.wait(timeout=30)
+            assert process.returncode == 0 and process.stderr is not None and process.stderr.read() == ""
+        finally:
+            stall.release.set()
+            if process.poll() is None:
+                process.kill()

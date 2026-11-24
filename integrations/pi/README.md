@@ -70,7 +70,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `directory` | Absolute directory for this process's binding record, private to the user. Use an absolute host path in the real file; the placeholder above keeps this example free of one. |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
-| `python` | Absolute interpreter that can import `agent_chat`. |
+| `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
@@ -142,7 +142,15 @@ fits on `cli` fits on every route.
   a refused or failed mark is sent again at the next pass. A pass sends one
   request, the mark that waits or else the poll, so a mark that keeps failing
   holds the poll. The pass runs after the delivery poll, so receipts never
-  change the bytes of a delivery, a heartbeat or the binding. A refused or malformed answer is held and never ends
+  change the bytes of a delivery, a heartbeat or the binding. It gives way: a
+  heartbeat or a delivery poll that falls due while the request is in flight
+  ends it with the worker's cancel signal, and the pass sends no request while
+  either is due. That is client-side only: a receipts read that stalls inside
+  the server keeps the row of the instance, so the heartbeat or the `pending`
+  that goes first after the cancel waits for it, up to 3 seconds, and is refused
+  if the row is still held. Nothing is delivered then, and the message stays on
+  the server. Only a worker whose join reply lists `receipts-cancel` is asked
+  for receipts; an older core shows none. A refused or malformed answer is held and never ends
   chat; a thrown error that carries a code takes the path it takes on any
   request. The binding ends its route lines with one sentence that tells the
   model how to ask for receipts. The

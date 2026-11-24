@@ -34,6 +34,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     return reply(frame.id, {
       session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
       room_id: "${ROOM}", host: "synthetic-host", harness: "codex", instance_file: dir + "/instance.json",
+      capabilities: ["receipts-cancel"],
     })
   }
   if (frame.op === "pending") return reply(frame.id, { messages: [] })

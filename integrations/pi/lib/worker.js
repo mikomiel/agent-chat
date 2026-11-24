@@ -10,6 +10,13 @@ const MAX_FRAME = 128 * 1024
 const REQUEST_MS = 22_000 // the worker's 20s I/O deadline plus exit/IPC margin
 const CLOSE_MS = 5000
 const OPERATIONS = new Set(["join", "heartbeat", "status", "end", "pending", "claim", "settle", "receipts", "receipts_delivered"])
+// A receipts request is the only one a signal may end: the worker answers it `refused` and serves on. Only a worker whose
+// join reply names the capability is signalled, because one without the handler would die of the signal, and only such a
+// worker is asked for receipts at all (`cancelsReceipts`): a receipts request that cannot be ended would hold the worker's
+// one request slot, and every hook, heartbeat and state report behind it.
+const CANCELLABLE = new Set(["receipts", "receipts_delivered"])
+const CANCEL_CAPABILITY = "receipts-cancel"
+export const cancelsReceipts = joined => Array.isArray(joined?.capabilities) && joined.capabilities.includes(CANCEL_CAPABILITY)
 
 const failure = (code, operation) => Object.assign(new Error(code), operation === undefined ? { code } : { code, operation })
 
@@ -53,6 +60,7 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "pi" },
   let exited = false
   let termTimer = null
   let killTimer = null
+  let cancels = false // the join reply said that this worker ends a receipts request on SIGUSR1
   let resolveClosed
   const closed = new Promise(resolve => { resolveClosed = resolve })
 
@@ -74,6 +82,15 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "pi" },
     return closed
   }
 
+  // Ends the receipts request in flight, if there is one: the worker answers it `refused` within milliseconds, and the request
+  // that waited behind it goes next. One signal per request. A worker that is stopping or has exited has no request in
+  // flight: stop() and the close handler settle it first.
+  function cancel() {
+    if (!cancels || !pending || !CANCELLABLE.has(pending.op) || pending.cancelled) return
+    pending.cancelled = true
+    try { child.kill("SIGUSR1") } catch { /* gone */ }
+  }
+
   // Installed before anything touches the pipes: a spawn that fails after it
   // returned (EMFILE, ENFILE) emits `error` on the next tick, and an `error` with
   // no listener would end the Pi process.
@@ -83,7 +100,7 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "pi" },
     // start failed, and nothing is left to end.
     exited = true
     resolveClosed({ code: null, signal: null, started: false })
-    return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, stop, closed }
+    return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, cancel, stop, closed }
   }
   child.stdin.on("error", () => { rejectPending("CHAT_REQUEST_UNCERTAIN"); void stop() })
   child.on("close", (code, signal) => {
@@ -154,6 +171,9 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "pi" },
     native_session_id: nativeSessionId,
     boot_id: bootId,
     harness,
+  }).then(joined => {
+    cancels = cancelsReceipts(joined)
+    return joined
   })
-  return { ready, request, stop, closed }
+  return { ready, request, cancel, stop, closed }
 }

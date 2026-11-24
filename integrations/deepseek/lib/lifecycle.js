@@ -28,6 +28,10 @@
 //                             or the turn is no longer running outside Plan Mode.
 //   receiptsConfirmed(id)     the native session logged the message with this id.
 //
+// Receipts are asked only of a worker whose join reply names `receipts-cancel`, and they give way: a heartbeat or a delivery
+// poll that falls due while a receipts request is in flight ends it with the worker's cancel signal, and the drive loop sends
+// no receipts request while one is due.
+//
 // This module never starts a model turn on its own and never treats a peer
 // message as authorization.
 import { randomUUID } from "node:crypto"
@@ -35,7 +39,7 @@ import { MAX_CONTEXT_BYTES, NOTICE_BOUND } from "./channel.js"
 import { bindingRouteLines, packCandidates, receiptsHint, renderNotice, renderReceiptNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
 import * as receipts from "./receipts.js"
-import { describeFailure, startWorker } from "./worker.js"
+import { cancelsReceipts, describeFailure, startWorker } from "./worker.js"
 
 const HEARTBEAT_MS = 30_000
 const POLL_MS = 2_000
@@ -82,6 +86,7 @@ export function createLifecycle(bus, delivery, config, {
   let dirty = false
   let pollDue = false
   let receiptsDue = false
+  let reading = false // a receipts request is out on the worker: a heartbeat or a delivery poll that falls due ends it
   let receiptState = receipts.createReceipts()
   let pendingReceipts = null // { ids, text, id, at }: a notice staged for the next step (id null) or taken by it (id set); `at` is when its answer came
   let stopped = true
@@ -231,7 +236,12 @@ export function createLifecycle(bus, delivery, config, {
     dirty ||= heartbeat
     pollDue ||= poll
     receiptsDue ||= poll
-    if (busy) return
+    if (busy) {
+      // What is due waits for the single flight. A receipts request in flight would hold it, so it is ended: the worker
+      // answers it `refused` within milliseconds, and the loop takes what is due. Every call here is a heartbeat or a poll.
+      if (reading) live.worker.cancel()
+      return
+    }
     busy = true
     try {
       while ((dirty || pollDue || receiptsDue) && live && !closed && !disabled) {
@@ -245,7 +255,9 @@ export function createLifecycle(bus, delivery, config, {
           pollDue = false
           await pollOnce()
         }
-        if (receiptsDue && live) {
+        // A heartbeat or a delivery poll that fell due during the requests above goes first: the receipts request is sent
+        // only when none is due, with nothing awaited between this check and the write, and `receiptsDue` stays set.
+        if (receiptsDue && live && !dirty && !pollDue) {
           receiptsDue = false
           await receiptsPass()
         }
@@ -264,7 +276,7 @@ export function createLifecycle(bus, delivery, config, {
   // other. A refused or malformed answer, and every other error here, is held: it never ends chat and never reaches a delivery.
   async function receiptsPass() {
     try {
-      if (!receipts.due(receiptState, now())) return
+      if (!cancelsReceipts(joined) || !receipts.due(receiptState, now())) return
       if (receipts.toMark(receiptState).length > 0) {
         receiptState = receipts.polled(receiptState, now())
         await markReceipts()
@@ -281,10 +293,12 @@ export function createLifecycle(bus, delivery, config, {
   // read that fails holds receipts for this pass and latches nothing.
   function offerable() { return !pendingReceipts && !stopped && !closed && !disabled && receiptsState() === "busy" }
 
+  // `reading` is true from the write until the answer, so a heartbeat or a poll that falls due meanwhile ends the request.
   async function receiptsRequest(operation, fields) {
+    reading = true
     try { return await request(operation, fields) } catch (error) {
       throw Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation, receipts: true })
-    }
+    } finally { reading = false }
   }
 
   // Exactly the ids whose output the native session logged, and never an empty list: the worker ends on one. An answer

@@ -11,6 +11,11 @@ worker. A join that sends nothing keeps its record, for a retry of the same boot
 stale sweep. Every later request connects only to those addresses, in order, and performs no name
 resolution; TLS still verifies the host name. When none of them accepts a connection the request fails
 with TRANSPORT_UNAVAILABLE. Only the next join, the parent's rejoin, resolves again.
+
+The join reply names what this worker can do beyond the base requests (`capabilities`). `receipts-cancel` means
+that SIGUSR1 ends a receipts request that is running, which then answers `refused`, so that a delivery never waits
+in this worker behind advisory work; the server finishes the request. Nothing else ends on it: outside a receipts
+request the signal is remembered once, for the request that follows, and never ends the worker.
 """
 
 import json
@@ -29,11 +34,10 @@ from .models import LEASE_SECONDS, ChatError, DeliveryClaim, DeliveryResult, Hea
 
 MAX_FRAME = 128 * 1024
 REQUEST_SECONDS = 20
-# A receipts request holds the parent's one request slot, and a hook's delivery queues behind it with 6 s of
-# patience, of which a claim needs the last 2.5 s (`PATIENCE_MS` and `CLAIM_MARGIN_MS` in the Claude Code and Codex
-# packages). So it has its own deadline, well inside the remaining 3.5 s, and not the alarm's REQUEST_SECONDS: a
-# request that runs out answers `refused` like any other receipts failure, and the parent asks again at its next
-# poll.
+# A receipts request holds the parent's one request slot. A parent that has a delivery, a heartbeat or a state
+# report to send ends it with CANCEL_SIGNAL; this deadline, well inside the alarm's REQUEST_SECONDS, is what ends
+# one that nobody asks to end. A request that runs out answers `refused` like any other receipts failure, and the
+# parent asks again at its next poll.
 RECEIPT_SECONDS = 2.0
 IDLE_SECONDS = 90
 # A server restart fails a poll or a heartbeat without ending the session. Each op tolerates its own
@@ -45,10 +49,19 @@ IDLE_SECONDS = 90
 # failed mute read is the same refusal, not the fatal `status` request.
 PENDING_OUTAGE = frozenset({"TRANSPORT_UNAVAILABLE", "SERVICE_UNAVAILABLE"})
 HEARTBEAT_OUTAGE = PENDING_OUTAGE | {"REQUEST_UNCERTAIN"}
+RECEIPTS_OPERATIONS = frozenset({"receipts", "receipts_delivered"})
+# The signal that ends a receipts request, fixed at import: the worker names it in its join reply, and a parent
+# signals only a worker that did, because a process without the handler would die of it.
+CANCEL_SIGNAL = signal.SIGUSR1
+CAPABILITIES = ("receipts-cancel",)
 
 
 def _interrupt(_signum: int, _frame: Any) -> None:
     raise Interrupted("worker interrupted")
+
+
+class _ReceiptsCancelled(Interrupted):
+    """What CANCEL_SIGNAL raises inside a receipts request. SIGTERM and the alarm raise a plain `Interrupted`."""
 
 
 def _read(expected: int) -> dict[str, Any] | None:
@@ -220,6 +233,8 @@ def main() -> int:
     published_state: Heartbeat | None = None
     failing_since: dict[str, float] = {}
     terminated = False
+    receipts_open = False  # a receipts request runs: the only time CANCEL_SIGNAL interrupts anything
+    cancel_latched = False  # a cancel arrived that no request has answered yet; a request that follows one answers it
 
     def _terminate(signum: int, frame: Any) -> None:
         # SIGTERM makes the blocked request fail like a transport error. Record it so it is never tolerated.
@@ -232,16 +247,41 @@ def main() -> int:
             return False
         return monotonic() - failing_since.setdefault(op, monotonic()) < LEASE_SECONDS
 
+    def _cancel(_signum: int, _frame: Any) -> None:
+        nonlocal receipts_open, cancel_latched
+        cancel_latched = True
+        if receipts_open:
+            receipts_open = False  # one interrupt per request: a second signal latches, it never raises again
+            raise _ReceiptsCancelled("receipts request cancelled")
+
     def _receipt(call: Callable[..., Any], *arguments: Any) -> Any:
+        nonlocal receipts_open, cancel_latched
         try:
-            return call(*arguments, deadline=monotonic() + RECEIPT_SECONDS)
+            try:
+                # From this store until the `finally`, everything is inside the outer `try`, so a cancel that lands
+                # anywhere in the request, or in its clean-up, is answered below. Before it, the handler only latches.
+                receipts_open = True
+                if cancel_latched:
+                    raise _ReceiptsCancelled("receipts request cancelled before it began")
+                return call(*arguments, deadline=monotonic() + RECEIPT_SECONDS)
+            finally:
+                receipts_open = False
+        except _ReceiptsCancelled:
+            if terminated:  # SIGTERM came with it: a stop still ends the worker
+                raise
+            cancel_latched = False
+            return {"refused": "CLI_INTERRUPTED"}
         except ChatError as error:
             if terminated:  # SIGTERM interrupted the call: a stop still ends the worker
                 raise
+            if cancel_latched:  # the cancel interrupted the client, which reported it as a failed transport
+                cancel_latched = False
+                return {"refused": "CLI_INTERRUPTED"}
             return {"refused": error.code}
 
     signal.signal(signal.SIGALRM, _interrupt)
     signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(CANCEL_SIGNAL, _cancel)
     signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
     try:
         request = _read(0)
@@ -260,6 +300,7 @@ def main() -> int:
                     "host": instance.host,
                     "harness": instance.harness,
                     "instance_file": str(directory / f"{instance.binding.boot_id}.json"),
+                    "capabilities": list(CAPABILITIES),
                 },
             },
             credentials,
@@ -277,6 +318,8 @@ def main() -> int:
             if request is None:
                 break
             operation = request.get("op")
+            if operation not in RECEIPTS_OPERATIONS:
+                cancel_latched = False  # a cancel is for a receipts request; it never carries over to another kind
             if operation == "heartbeat" and set(request) == {"id", "op", "state"}:
                 state = Heartbeat.model_validate(request["state"])
                 try:

@@ -11,9 +11,11 @@
 // message never grants authority.
 //
 // Sender receipts are a second, passive output (integrations/README.md, "Sender receipts"). A pass runs in the
-// background after a prompt or tool event was answered, so it never delays a hook. It queues behind every other worker
-// request, is not counted in `inflight`, and never runs between a claim and its settle. Its notice is shown only in the
-// reply of a prompt or tool event that would otherwise carry nothing: never in a delivery, never in an announcement,
+// background after a prompt or tool event was answered, so it never delays a hook, and only a worker whose join reply names
+// `receipts-cancel` is asked at all. It is not counted in `inflight` and never runs between a claim and its settle. It gives
+// way, client-side, to every other request: a counted sequence that queues behind a receipts read ends it with the worker's cancel signal
+// (`exclusive`), and a pass that finds a counted sequence queued sends nothing (`receiptsAsk`). Its notice is shown only in
+// the reply of a prompt or tool event that would otherwise carry nothing: never in a delivery, never in an announcement,
 // never in a wake, and no hook but a prompt or tool event ever carries one, so it can neither wake the model nor change
 // what a delivery carries. A pass sends one request, and a notice is checked again when it is output: the latest mute flag
 // any answer carried, and its age.
@@ -26,7 +28,7 @@ import { bindingRouteLines, packCandidates, receiptsHint, renderNotice, renderRe
 import { createRejoinPolicy } from "./policy.js"
 import { ownerAlive, processStartTime } from "./process.js"
 import * as receipts from "./receipts.js"
-import { describeFailure, startWorker } from "./worker.js"
+import { cancelsReceipts, describeFailure, startWorker } from "./worker.js"
 
 export { processStartTime } // the owner check reads start times through lib/process.js; the tests reach it here
 
@@ -65,6 +67,8 @@ const clamp = (value, max) => (Number.isFinite(value) ? Math.max(0, Math.min(max
 const refused = result => (result && typeof result === "object" && typeof result.refused === "string" ? result.refused : null)
 const brief = result => BRIEF_OUTAGE.has(refused(result))
 const isDone = (frame, outcome) => frame?.op === "done" && frame.outcome === outcome
+// What a receipts request that was never sent answers: the worker's own answer to a cancelled one, and a held one for the pass.
+const CANCELLED = Object.freeze({ refused: "CLI_INTERRUPTED" })
 
 export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
@@ -122,6 +126,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let staged = null // { ids, text, at }: a notice waiting for a prompt or tool event that has nothing else to carry; `at` is when its answer came, on the wall clock
   let handing = false // a notice is out on a hook's connection, not yet confirmed
   let receiptsBusy = false // a pass is queued or running
+  let receiptsReading = false // a receipts request is out on the worker: a counted sequence that queues ends it
   let firstAttempt
   const attempted = new Promise(resolve => { firstAttempt = resolve })
 
@@ -132,9 +137,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     tail = run.then(() => {}, () => {})
     return run
   }
+  // A counted sequence that queues behind a receipts read ends that read: the worker answers it `refused` within
+  // milliseconds, and the sequence waits for that and no longer. Such a sequence is counted from its turn, not from its
+  // queuing: it is no slow request yet, and a hook that arrives in that moment must not skip its claim for a receipts read.
   function exclusive(task) {
-    inflight += 1
-    return lane(task).finally(() => { inflight -= 1 })
+    const behind = receiptsReading
+    if (behind) live?.worker.cancel()
+    else inflight += 1
+    return lane(() => { if (behind) inflight += 1; return task() }).finally(() => { inflight -= 1 })
   }
   const guard = promise => promise.catch(error => handleFailure(error))
   const within = (promise, ms) => new Promise(resolve => {
@@ -667,11 +677,15 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (isDone(await link.next(2_000), "written")) confirm(announce)
   }
 
-  // A request of the receipts pass. A transport failure is marked, so the pass can tell it from its own fault.
+  // A request of the receipts pass. It is sent only if no counted sequence is queued behind it: that sequence goes first, and
+  // the next pass asks again. Nothing is awaited between this check and the write, so a sequence that queues after the write
+  // finds `receiptsReading` and ends the read. A transport failure is marked, so the pass can tell it from its own fault.
   async function receiptsAsk(operation, fields) {
+    if (inflight) return CANCELLED
+    receiptsReading = true
     try { return await ask(operation, fields) } catch (error) {
       throw Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation, receipts: true })
-    }
+    } finally { receiptsReading = false }
   }
 
   // The ids whose output a hook confirmed, and only those. The answer is not a success unless it says so; a failed mark keeps
@@ -698,14 +712,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     receiptState = receipts.issued(receiptState, notice.ids)
   }
 
-  // A pass runs after the event's own reply was sent. It sends ONE request: the mark that waits, or, when none waits, the feed
-  // poll. Two in a row would hold the one worker flight, and a delivery queued behind them, for both; so a mark that keeps
-  // failing also holds the poll, and the poll waits for the next cadence once the mark has landed. The lane decides when it
-  // gets there, so a confirmation that landed while the pass queued is marked first. A transport failure goes where any
-  // request's failure goes; a refused or malformed answer, and any fault of this code, is held: it never ends chat and never
-  // reaches a delivery. `force` is a mark right after a confirmation: a mark is not a poll, so the cadence does not apply.
+  // A pass runs after the event's own reply was sent, and only against a worker that ends a receipts request on the cancel
+  // signal. It sends ONE request: the mark that waits, or, when none waits, the feed poll. Two in a row would hold the one
+  // worker flight for both; so a mark that keeps failing also holds the poll, and the poll waits for the next cadence once the
+  // mark has landed. The lane decides when it gets there, so a confirmation that landed while the pass queued is marked first.
+  // A pass that is cancelled, or finds a sequence queued, is a refused answer: held, and asked again by a later pass. A
+  // transport failure goes where any request's failure goes; a refused or malformed answer, and any fault of this code, is
+  // held: it never ends chat and never reaches a delivery. `force` is a mark right after a confirmation: a mark is not a
+  // poll, so the cadence does not apply.
   function receiptsPass({ force = false } = {}) {
-    if (receiptsBusy || !live || !joined || closed || failure) return
+    if (receiptsBusy || !live || !joined || closed || failure || !cancelsReceipts(joined)) return
     if (!force && !receipts.due(receiptState, now())) return
     const marks = receipts.toMark(receiptState).length > 0
     const poll = !force && !staged && !handing && chatState() === "busy"

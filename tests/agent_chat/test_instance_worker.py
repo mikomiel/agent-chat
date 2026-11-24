@@ -1320,3 +1320,426 @@ def test_a_stalled_receipts_request_is_refused_inside_its_deadline_and_the_worke
         assert "refused" not in replies[1]["result"]
     # The next request is served by the same worker.
     assert replies[2]["result"] == _ReceiptsServer.identity
+
+
+# The receipts cancel. A parent with a delivery, a heartbeat or a state report to send ends a receipts request that
+# holds the worker's one slot by signalling SIGUSR1; the request answers `refused` and the worker serves on. The signal
+# can land at any point of the worker's life, and it must never end the worker or leave a request without exactly one
+# frame. The windows are held open here, not raced: the handler is called at the named point, as the interpreter would
+# call it, and the real-signal tests send a real signal once the request is known to be in the server's hands.
+CANCEL = instance_worker.CANCEL_SIGNAL
+MESSAGE = str(uuid4())
+CANCELLED = {"refused": "CLI_INTERRUPTED"}
+
+
+def _signal_cancel(handlers: dict[int, Any]) -> Any:
+    """A request that the cancel signal reaches: the handler raises out of it, as it does out of a socket read."""
+
+    def cancel() -> None:
+        handlers[CANCEL](CANCEL, None)
+
+    return cancel
+
+
+def _client_cancelled(handlers: dict[int, Any], code: str = "TRANSPORT_UNAVAILABLE") -> Any:
+    """A request that fails the way the HTTP client does when the cancel signal interrupts it."""
+
+    def interrupted() -> ChatError:
+        with pytest.raises(instance_worker._ReceiptsCancelled):
+            handlers[CANCEL](CANCEL, None)
+        return ChatError(code)
+
+    return interrupted
+
+
+def _assert_one_frame_each(frames: list[dict[str, Any]], requests: int) -> None:
+    """The join reply, then one frame per request in order, each an answer or an error and never both."""
+    assert [frame["id"] for frame in frames] == list(range(requests + 1))
+    assert all(("result" in frame) != ("error" in frame) for frame in frames)
+
+
+def _paths(calls: list[tuple[float, str]]) -> list[str]:
+    return [path.rsplit("/", 1)[-1] for _at, path in calls]
+
+
+def test_the_join_reply_names_the_receipts_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    code, frames, _calls = _timed_worker(monkeypatch, [], [])
+    assert code == 0
+    assert frames[0]["result"]["capabilities"] == ["receipts-cancel"]
+    assert CANCEL == signal.SIGUSR1  # the signal the packages send by name
+
+
+@pytest.mark.parametrize("where", ["raw", "converted by the client"])
+@pytest.mark.parametrize("operation", sorted(RECEIPT_OPERATIONS))
+def test_a_cancel_inside_a_receipts_request_refuses_it_and_the_worker_serves_on(
+    monkeypatch: pytest.MonkeyPatch, operation: str, where: str
+) -> None:
+    frame, key = RECEIPT_OPERATIONS[operation]
+    handlers: dict[int, Any] = {}
+    cancel = _signal_cancel(handlers) if where == "raw" else _client_cancelled(handlers, "REQUEST_UNCERTAIN")
+    expected = {"receipts": []} if operation == "receipts" else {"delivered": frame["receipts"]}
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, frame), (2, {"op": "pending"}), (3, frame)], [{"messages": [MESSAGE]}],
+        failures={key: [cancel]}, handlers=handlers,
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 3)
+    assert frames[1]["result"] == CANCELLED  # one code, whichever way the client reported the interrupted request
+    assert frames[2]["result"] == {"messages": [MESSAGE]}  # the next pending is served
+    assert frames[3]["result"] == expected  # and the receipts request after it is not refused
+    assert _paths(calls) == [key, "pending", key, "end"]
+
+
+def test_a_cancel_between_the_feed_and_the_mute_read_refuses_the_whole_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers: dict[int, Any] = {}
+    row = _receipt_row()
+    code, frames, calls = _timed_worker(
+        monkeypatch,
+        [(1, {"op": "receipts"}), (2, {"op": "pending"}), (3, {"op": "receipts"})],
+        [{"messages": [MESSAGE]}],
+        feed=[row], muted=False, failures={"status": [_signal_cancel(handlers)]}, handlers=handlers,
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 3)
+    assert frames[1]["result"] == CANCELLED  # the feed that was read is not offered without the flag it needs
+    assert frames[2]["result"] == {"messages": [MESSAGE]}
+    assert frames[3]["result"] == {"receipts": [row], "muted": False}
+    assert _paths(calls) == ["receipts", "status", "pending", "receipts", "status", "end"]
+
+
+def test_a_cancel_after_the_answer_is_computed_and_before_the_request_returns_refuses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers: dict[int, Any] = {}
+    real = instance_worker._receipts_with_mute
+
+    def answered_then_cancelled(instance: Any, *, deadline: float) -> dict[str, Any]:
+        answer = real(instance, deadline=deadline)
+        handlers[CANCEL](CANCEL, None)  # the request is still open: this raises out of it
+        return answer
+
+    monkeypatch.setattr(instance_worker, "_receipts_with_mute", answered_then_cancelled)
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, {"op": "receipts"}), (2, {"op": "pending"})], [{"messages": [MESSAGE]}], handlers=handlers
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 2)
+    assert frames[1]["result"] == CANCELLED
+    assert frames[2]["result"] == {"messages": [MESSAGE]}
+    assert _paths(calls) == ["receipts", "pending", "end"]
+
+
+def test_a_cancel_after_the_request_closed_and_before_its_frame_is_written_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers: dict[int, Any] = {}
+    real_write = instance_worker._write
+
+    def write(frame: dict[str, Any], credentials: tuple[str, ...]) -> None:
+        if frame.get("id") == 1 and "result" in frame:
+            handlers[CANCEL](CANCEL, None)  # no request is open: it is remembered, not raised
+        real_write(frame, credentials)
+
+    monkeypatch.setattr(instance_worker, "_write", write)
+    code, frames, calls = _timed_worker(
+        monkeypatch,
+        [(1, {"op": "receipts"}), (2, {"op": "pending"}), (3, {"op": "receipts"})],
+        [{"messages": [MESSAGE]}],
+        handlers=handlers,
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 3)
+    assert frames[1]["result"] == {"receipts": []}  # the answer that was computed goes out whole
+    assert frames[2]["result"] == {"messages": [MESSAGE]}
+    # The signal was for the request that had ended. The pending after it cleared it, so the next receipts request
+    # asks the server.
+    assert frames[3]["result"] == {"receipts": []}
+    assert _paths(calls) == ["receipts", "pending", "receipts", "end"]
+
+
+def test_a_cancel_while_the_frame_is_being_written_never_tears_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    handlers: dict[int, Any] = {}
+    real_write = instance_worker._write
+    written: list[int] = []
+
+    def write(frame: dict[str, Any], credentials: tuple[str, ...]) -> None:
+        if not (frame.get("id") == 1 and "result" in frame):
+            return real_write(frame, credentials)
+        target = instance_worker.sys.stdout.buffer
+
+        class OneByteAtATime:
+            def write(self, view: memoryview) -> int:
+                taken = target.write(bytes(view[:1]))
+                written.append(taken)
+                if len(written) == 1:
+                    handlers[CANCEL](CANCEL, None)  # lands after the first byte of the frame is out
+                return taken
+
+        original = instance_worker.sys
+        torn = SimpleNamespace(stdin=original.stdin, stdout=SimpleNamespace(buffer=OneByteAtATime()))
+        setattr(instance_worker, "sys", torn)
+        try:
+            real_write(frame, credentials)
+        finally:
+            setattr(instance_worker, "sys", original)
+
+    monkeypatch.setattr(instance_worker, "_write", write)
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, {"op": "receipts"}), (2, {"op": "pending"})], [{"messages": [MESSAGE]}], handlers=handlers
+    )
+    assert code == 0
+    assert len(written) > 1  # the frame really went out a byte at a time, and the signal landed inside it
+    _assert_one_frame_each(frames, 2)
+    assert frames[1]["result"] == {"receipts": []}
+    assert frames[2]["result"] == {"messages": [MESSAGE]}
+    assert _paths(calls) == ["receipts", "pending", "end"]
+
+
+@pytest.mark.parametrize("between", ["a frame written", "a frame read"])
+def test_a_cancel_that_comes_before_a_receipts_request_refuses_it_without_asking(
+    monkeypatch: pytest.MonkeyPatch, between: str
+) -> None:
+    handlers: dict[int, Any] = {}
+    if between == "a frame written":
+        real_write = instance_worker._write
+
+        def write(frame: dict[str, Any], credentials: tuple[str, ...]) -> None:
+            real_write(frame, credentials)
+            if frame.get("id") == 1:
+                handlers[CANCEL](CANCEL, None)  # the worker is idle, waiting for its next request
+
+        monkeypatch.setattr(instance_worker, "_write", write)
+    else:
+        real_read = instance_worker._read
+
+        def read(expected: int) -> dict[str, Any] | None:
+            request = real_read(expected)
+            if request is not None and request["id"] == 2:
+                handlers[CANCEL](CANCEL, None)  # the first receipts request: read, and not yet begun
+            return request
+
+        monkeypatch.setattr(instance_worker, "_read", read)
+    code, frames, calls = _timed_worker(
+        monkeypatch,
+        [(1, {"op": "heartbeat", "state": HEARTBEAT_STATE}), (2, {"op": "receipts"}), (3, {"op": "receipts"}),
+         (4, {"op": "pending"})],
+        [{"messages": [MESSAGE]}], handlers=handlers,
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 4)
+    assert frames[2]["result"] == CANCELLED  # refused at once, and the server was not asked
+    assert frames[3]["result"] == {"receipts": []}  # the signal was answered once: the next request is asked
+    assert frames[4]["result"] == {"messages": [MESSAGE]}
+    assert _paths(calls) == ["heartbeat", "receipts", "pending", "end"]
+
+
+def test_a_cancel_that_comes_before_another_kind_of_request_is_forgotten(monkeypatch: pytest.MonkeyPatch) -> None:
+    handlers: dict[int, Any] = {}
+    real_write = instance_worker._write
+
+    def write(frame: dict[str, Any], credentials: tuple[str, ...]) -> None:
+        real_write(frame, credentials)
+        if frame.get("id") == 1:
+            handlers[CANCEL](CANCEL, None)
+
+    monkeypatch.setattr(instance_worker, "_write", write)
+    code, frames, calls = _timed_worker(
+        monkeypatch,
+        [(1, {"op": "heartbeat", "state": HEARTBEAT_STATE}), (2, {"op": "status"}), (3, {"op": "receipts"})],
+        [], handlers=handlers,
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 3)
+    assert frames[3]["result"] == {"receipts": []}  # not cancelled: the status request in between took the signal
+    assert _paths(calls) == ["heartbeat", "status", "receipts", "end"]
+
+
+def test_a_second_cancel_after_the_first_interrupted_the_request_is_remembered_not_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handlers: dict[int, Any] = {}
+
+    def twice() -> None:
+        with pytest.raises(instance_worker._ReceiptsCancelled):
+            handlers[CANCEL](CANCEL, None)
+        # The first signal ended the interrupt window itself, before it raised: a second one, while the first is being
+        # answered, finds nothing open. This call would raise out of the request if the window were still open.
+        handlers[CANCEL](CANCEL, None)
+
+    code, frames, calls = _timed_worker(
+        monkeypatch,
+        [(1, {"op": "receipts"}), (2, {"op": "pending"}), (3, {"op": "receipts"})],
+        [{"messages": [MESSAGE]}],
+        failures={"receipts": [twice]}, handlers=handlers,
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 3)
+    assert frames[1]["result"] == {"receipts": []}  # nothing escaped the request
+    assert frames[2]["result"] == {"messages": [MESSAGE]}
+    assert frames[3]["result"] == {"receipts": []}  # and the second signal did not reach the request after the pending
+
+
+def test_the_cancel_signal_never_ends_a_worker_outside_a_receipts_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    handlers: dict[int, Any] = {}
+    code, frames, calls = _timed_worker(
+        monkeypatch,
+        [(1, {"op": "heartbeat", "state": HEARTBEAT_STATE}), (3, {"op": "pending"}), (4, {"op": "status"})],
+        [{"messages": [MESSAGE]}],
+        failures={name: [_signal_cancel(handlers)] for name in ("heartbeat", "pending", "status")},
+        handlers=handlers,
+    )
+    assert code == 0  # three requests, each with the signal landing inside it: none of them is interrupted
+    _assert_one_frame_each(frames, 3)
+    assert frames[2]["result"] == {"messages": [MESSAGE]}
+    assert _paths(calls) == ["heartbeat", "pending", "status", "end"]
+
+
+# What the cancel must not touch: SIGTERM and the alarm still end the worker, in a receipts request as anywhere else.
+@pytest.mark.parametrize("operation", sorted(RECEIPT_OPERATIONS))
+@pytest.mark.parametrize("where", ["raw", "converted by the client"])
+def test_sigterm_during_a_receipts_request_still_ends_the_worker(
+    monkeypatch: pytest.MonkeyPatch, operation: str, where: str
+) -> None:
+    frame, key = RECEIPT_OPERATIONS[operation]
+    handlers: dict[int, Any] = {}
+    if where == "converted by the client":
+        stop = _sigterm(handlers, "TRANSPORT_UNAVAILABLE")
+    else:
+        def stop() -> None:
+            handlers[15](15, None)
+
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, frame), (2, {"op": "pending"})], [{"messages": [MESSAGE]}],
+        failures={key: [stop]}, handlers=handlers,
+    )
+    assert code == 1
+    assert len(frames) == 2 and frames[1]["error"]["code"] in {"TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"}
+    assert _paths(calls) == [key, "end"]  # the second frame was never read, and the instance was ended
+
+
+@pytest.mark.parametrize("operation", sorted(RECEIPT_OPERATIONS))
+def test_the_alarm_during_a_receipts_request_is_not_taken_for_a_cancel(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    frame, key = RECEIPT_OPERATIONS[operation]
+    handlers: dict[int, Any] = {}
+
+    def alarm() -> None:
+        handlers[14](14, None)  # the 20 s alarm, outside any conversion by the client
+
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, frame), (2, {"op": "pending"})], [{"messages": [MESSAGE]}],
+        failures={key: [alarm]}, handlers=handlers,
+    )
+    assert code == 1
+    assert len(frames) == 2 and frames[1] == {"id": 1, "error": {"code": "REQUEST_UNCERTAIN"}}
+    assert _paths(calls) == [key, "end"]
+
+
+def test_sigterm_that_comes_with_a_cancel_still_ends_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    handlers: dict[int, Any] = {}
+
+    def both() -> None:
+        with pytest.raises(TimeoutError):
+            handlers[15](15, None)
+        handlers[CANCEL](CANCEL, None)  # the cancel raises while the stop is recorded: the stop wins
+
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, {"op": "receipts"}), (2, {"op": "pending"})], [{"messages": [MESSAGE]}],
+        failures={"receipts": [both]}, handlers=handlers,
+    )
+    assert code == 1
+    assert len(frames) == 2 and frames[1]["error"]["code"] == "REQUEST_UNCERTAIN"
+    assert _paths(calls) == ["receipts", "end"]
+
+
+class _HeldServer(_ReceiptsServer):
+    """The receipts server, told when a request has reached it, so that a signal is sent only after that."""
+
+    reached = threading.Event()
+
+    def _answer(self) -> None:
+        type(self).reached.set()
+        super()._answer()
+
+    do_GET = do_POST = _answer
+
+
+@pytest.mark.parametrize("operation", sorted(RECEIPT_OPERATIONS))
+def test_a_real_cancel_signal_ends_a_held_receipts_request_at_once_and_the_worker_serves_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, operation: str
+) -> None:
+    """A real socket, the real client, the real clock and a real signal sent once the server holds the request."""
+    frame, _key = RECEIPT_OPERATIONS[operation]
+    path = "/v1/instance/receipts" if operation == "receipts" else "/v1/instance/receipts/delivered"
+    instance = instance_client.JoinedInstance(
+        InstanceSecret("held-native", uuid4(), "1" * 64, "http://127.0.0.1:1"), uuid4(), uuid4(), uuid4(),
+        "synthetic-host", "pi",
+    )
+    _HeldServer.identity = {"instance_id": str(instance.instance_id), "session_id": str(instance.session_id)}
+    _HeldServer.stalled = frozenset({path})  # its answer drips for 8 s
+    _HeldServer.reached = threading.Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HeldServer)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    installed: list[Any] = []
+    try:
+        port = server.server_address[1]
+        pinned = ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", port)),)
+        bound = instance_client.JoinedInstance(
+            InstanceSecret("held-native", instance.binding.boot_id, "1" * 64, f"http://127.0.0.1:{port}"),
+            instance.session_id, instance.instance_id, instance.room_id, "synthetic-host", "pi", pinned,
+        )
+        frames = iter(
+            [{"id": 0, "op": "join", "directory": str(tmp_path), "host_token": "synthetic-host-secret"}]
+            + [{"id": 1, **frame}, {"id": 2, "op": "status"}]
+        )
+        read_at: list[float] = []
+        wrote_at: list[float] = []
+        output = io.BytesIO()
+
+        def readline(_size: int) -> bytes:
+            read_at.append(time.monotonic())
+            item = next(frames, None)
+            return b"" if item is None else (json.dumps(item) + "\n").encode()
+
+        class Stdout:
+            def write(self, view: memoryview) -> int:
+                wrote_at.append(time.monotonic())
+                return output.write(view)
+
+        def install(number: int, handler: Any) -> None:
+            if number == CANCEL:  # the real handler for the real signal; the alarm and SIGTERM stay off
+                installed.append(signal.signal(number, handler))
+
+        def send_when_held() -> None:
+            assert _HeldServer.reached.wait(10)
+            os.kill(os.getpid(), CANCEL)
+
+        sender = threading.Thread(target=send_when_held, daemon=True)
+        monkeypatch.setattr(instance_worker, "RECEIPT_SECONDS", 30.0)  # the deadline cannot be what ends the request
+        monkeypatch.setattr(instance_worker, "_join", lambda _request: bound)
+        monkeypatch.setattr(
+            instance_worker, "sys",
+            SimpleNamespace(stdin=SimpleNamespace(buffer=SimpleNamespace(readline=readline)),
+                            stdout=SimpleNamespace(buffer=Stdout())),
+        )
+        monkeypatch.setattr(
+            instance_worker, "signal",
+            SimpleNamespace(SIGALRM=14, SIGTERM=15, ITIMER_REAL=0, signal=install, setitimer=lambda *_args: None),
+        )
+        sender.start()
+        code = instance_worker.main()
+        sender.join(10)
+    finally:
+        for previous in installed:
+            signal.signal(CANCEL, previous)
+        server.shutdown()
+        server.server_close()
+    replies = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert code == 0
+    assert replies[1]["result"] == CANCELLED
+    assert wrote_at[1] - read_at[1] < 4.0  # the signal ended it; the server held it for 8 s and the deadline was 30 s
+    assert replies[2]["result"] == _HeldServer.identity  # the same worker answers the next request

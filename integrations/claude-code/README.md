@@ -83,7 +83,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `directory` | Absolute state directory, created beforehand, owned by the current user, mode `0700`. It holds the binding record and the receiver socket, so its path must be 71 bytes or fewer. |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
-| `python` | Absolute interpreter that can import `agent_chat`. |
+| `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
@@ -206,17 +206,16 @@ or a stop. Only the idle-wake waiter exits 2.
   is sent again at the next pass. A pass sends one request, the mark that waits
   or else the poll. A staged notice that was not shown is
   released at `Stop`. The request runs after the hook's reply, queued like any
-  other: it never replaces a claim, and a claim that follows it waits for it.
-  The core's worker ends a receipts request after 2 seconds, so a hook behind
-  one keeps the 2.5 seconds a claim needs. A hook whose state is already
-  published has 6 seconds from its arrival and starts a claim only while 2.5 of
-  them remain, so behind a worker without that deadline, an older core, one that
-  waited more than 3.5 seconds skips the claim: it sends no claim request and
-  spends no attempt. A hook that arrives while a `Stop`'s state report waits
-  behind the request skips its claim at once, with the same result. The message
-  stays offered for 24 hours after it was stored, and the next prompt or tool
-  hook offers it again; once the session is idle the waiter does, and without a
-  waiter the next prompt does. The binding
+  other, and it never replaces a claim. It gives way: a claim, a heartbeat or a
+  state report that queues behind it ends it with the worker's cancel signal, so,
+  client-side, none of them waits for it beyond the worker's answer to the
+  signal, and no hook skips its claim for it. The server is another wait: a
+  receipts read that stalls inside it keeps the row of the instance, so the
+  request that goes first after the cancel, the `pending` that opens a claim or
+  a heartbeat, waits for it, up to 3 seconds, and is refused if the row is still
+  held. That hook then delivers nothing, and the message stays on the server for
+  the next one. Only a worker whose join reply lists `receipts-cancel` is asked
+  for receipts; an older core shows none. The binding
   ends its route lines with one sentence that tells the model how to ask for
   receipts. The [receipts contract](../README.md#sender-receipts) has the rules.
 - **Delegated sessions.** A hook payload that carries `agent_id` (a subagent

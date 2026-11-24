@@ -589,6 +589,24 @@ A package's receipts pass MUST send at most one receipts request: the mark that 
 - **THEN** it sends no receipts request and chat stays on
 - **AND** a later delivery is handed with no new Web prompt
 
+### Requirement: A receipts request gives way to every other request
+A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`. It MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
+
+#### Scenario: A worker without the capability
+- **WHEN** a worker's join reply has no `capabilities` list, or the list does not contain `receipts-cancel`
+- **THEN** the package sends no `receipts` and no `receipts_delivered` request to it
+- **AND** every delivery, heartbeat, claim and settle is what it is without receipts
+
+#### Scenario: A rejoin onto another worker
+- **WHEN** a rejoin starts a worker whose join reply differs in `capabilities` from the worker before it
+- **THEN** the package follows the join reply of the worker that serves, and of no other
+
+#### Scenario: A request falls due while a receipts request is in flight
+- **WHEN** a heartbeat, a state report, a delivery poll or a claim falls due while a receipts request is in flight and nothing releases that request
+- **THEN** the package cancels the receipts request, and sends the due request when the worker has answered the cancel
+- **AND** the package holds the `refused` answer like any refusal, changes no state for it, and keeps the ids of a mark that was ended
+- **AND** chat stays on, and those ids are marked at a later pass
+
 ### Requirement: Sender receipts never wake and never change delivery
 A package MUST output a receipts notice only at a native boundary of a turn that already runs, and MUST NOT start a turn, claim, settle, steer or wake for it. A pending receipt MUST NOT change the bytes of a claim, a handoff, a settle, a heartbeat, a binding announcement or a wake, and a receipts request MUST NOT sit between a claim and its settle.
 
