@@ -95,7 +95,8 @@ The service and its host-token provisioning are documented in the product
 [integrations README](../README.md#tool-route) gives the exact text and the room
 each route takes.
 
-- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
+  the binding ends them with the one receipts sentence.
 - `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
   has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
 - `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
@@ -130,6 +131,21 @@ fits on `cli` fits on every route.
   claim; the [notice contract](../README.md#notice-contract) lists the limit.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
+- **Sender receipts.** While a turn runs, at most every 5 seconds, the extension
+  asks the worker for the `handed` and `acked` receipts of messages this session
+  sent, and shows up to 10 of the oldest as one `agent-chat-receipts` custom
+  message with `triggerTurn: false`, so they never start a turn. It asks only
+  while Pi's native state is busy and shows rows only when the worker's answer
+  says the session is not muted: an idle, stopped, Plan Mode, unknown or muted
+  session leaves them on the server. After Pi's `message_start` carries the
+  message's own marker object, the next pass marks exactly those ids delivered;
+  a refused or failed mark is sent again at the next pass. The pass runs after
+  the delivery poll, so receipts never change the bytes of a delivery, a
+  heartbeat or the binding. A refused or malformed answer is held and never ends
+  chat; a thrown error that carries a code takes the path it takes on any
+  request. The binding ends its route lines with one sentence that tells the
+  model how to ask for receipts. The
+  [receipts contract](../README.md#sender-receipts) has the rules.
 - **Rejoin.** A worker error or a request timeout that carries
   `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or
   `REQUEST_UNCERTAIN`, and a join `BINDING_CONFLICT`, start a bounded rejoin:
@@ -154,8 +170,11 @@ fits on `cli` fits on every route.
 - Plan Mode detection follows the `plan-mode` state recorded by Pi's shipped
   example extension, including its startup flag. Use `/agent-chat-off` if a
   different planning extension does not expose that state.
-- Sender receipts are not rendered yet. They are read-only and never wake a
-  model, so their absence does not change delivery.
+- Sender receipts have run only against a harness double. The mark waits for
+  `message_start` with the message's marker, as the Pi 1.5.2 source emits it for
+  a `triggerTurn: false` message; no live Pi run has shown it. If a release did
+  not emit it, the receipts would be shown again in each later turn and never
+  marked.
 - By default the binding context and the notice tell the model to use the
   Agent Chat CLI for `who`, `history`, `send`, `reply` and `ack`; `toolRoute`
   names the `agent-chat` MCP tools instead (see [Tool route](#tool-route)). This
@@ -179,4 +198,6 @@ node --test
 The suite covers config refusal, the join frame and frame validation, rejoin
 budget/window/backoff, delivery and settlement, the system-prompt binding,
 fail-closed latching and the shared notice vectors, with the claim packing for
-bodies mode. It needs no PostgreSQL, no service and no credential.
+bodies mode, and sender receipts: the offer rules, the confirmation and the mark,
+and that a delivery and the binding are byte-identical with receipts pending. It
+needs no PostgreSQL, no service and no credential.

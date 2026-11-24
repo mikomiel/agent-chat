@@ -133,7 +133,8 @@ The service and its host-token provisioning are documented in the product
 idle wake name. The [integrations README](../README.md#tool-route) gives the
 exact text and the room each route takes.
 
-- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
+  the binding ends them with the one receipts sentence.
 - `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
   has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
 - `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
@@ -151,9 +152,11 @@ a batch that fits on `cli` fits on every route.
 
 Known limit: the binding is longer on the `mcp` routes, and the binding caps the
 interpreter path and the state directory together. With a 63-character host, a
-UUID session id and plain ASCII paths, the fallback route leaves 651 bytes for
-the two paths, `mcp` 855, against 994 on `cli`. A longer path refuses at start
-with `CHAT_BINDING_TOO_LONG`, and chat stays off.
+UUID session id and plain ASCII paths, the fallback route leaves 594 bytes for
+the two paths, `mcp` 798, against 940 on `cli`. A longer path refuses at start
+with `CHAT_BINDING_TOO_LONG`, and chat stays off. These numbers include the
+sentence at the end of the binding that tells the model how to ask for receipts:
+54 bytes on `cli` and 57 on each `mcp` route.
 
 ## Behaviour
 
@@ -403,6 +406,26 @@ sends its request: it does not wait for the worker to end its instance.
   nothing. A hook asks the status right before its write; a wake asks it once
   before it starts and again after its fresh reading, right before its last
   checks and the add.
+- **Sender receipts.** After the reply of a prompt or tool hook, at most every
+  5 seconds and only while the turn is busy (the hook state and, with
+  `appServer`, the thread's own status), the receiver asks the worker for the
+  `handed` and `acked` receipts of messages this session sent. The first poll
+  comes one cadence after the receiver starts. When the worker's answer says the
+  session is not muted, up to 10 of the oldest rows are staged as one notice,
+  and the next prompt or tool hook of a running turn carries it as
+  `additionalContext`. Only a reply that would otherwise carry nothing does, so a
+  notice never shares an output or its 6,000-byte cap with the binding or a
+  delivery. A hook that is out of patience, or whose connection has closed, gets
+  no notice, and the notice stays staged. A wake carries none, and nothing polls
+  while the session is idle, so a receipt cannot wake the thread. When the
+  hook's receipt says it wrote the text, the receiver marks exactly those ids
+  delivered at once; a refused or failed mark is sent again at the next pass. A
+  staged notice that was not shown is released at `Stop` and at `Interrupt`. The
+  request runs after the hook's reply, queued like any other: it never replaces a
+  claim or a wake, and one that follows it waits for it, so a slow server can
+  delay it by up to the worker's deadline. The binding ends its route lines with
+  one sentence that tells the model how to ask for receipts. The
+  [receipts contract](../README.md#sender-receipts) has the rules.
 - **Delegated sessions.** A session that is not the main thread never joins:
   - A hook payload that carries `agent_id` is ignored: no join, no claim, no
     output.
@@ -823,15 +846,18 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   interpreter, state and host values, so a packed first claim can be delivered.
   `test/notice.test.js` holds a first claim to that bound.
 - **Fallback route room beside a binding.** On `mcp-with-cli-fallback` a binding
-  still to be shown and the notice after it take 341 bytes more than on `cli`
-  in metadata mode and 279 bytes more in bodies mode, so a batch beside that
+  still to be shown and the notice after it take 344 bytes more than on `cli`
+  in metadata mode and 282 bytes more in bodies mode, so a batch beside that
   binding reaches the overflow behaviour above (not claimed, or claimed and
   deferred) that many bytes sooner.
 - **Self-started turns.** `UserPromptSubmit` also fires for turns the operator
   did not type. Each is a turn start to the receiver and may be delivered to.
-- **No sender receipts.** This version neither reads nor renders the receipts
-  of messages the session sent. They never wake a model, so their absence does
-  not change delivery.
+- **Receipts are untested live.** Sender receipts have run only against doubles
+  and one test of the real hook command, receiver and socket with a worker
+  double; no Codex session has shown a notice. A wake does not carry receipts, so
+  an idle session sees them only after its next turn starts. As for a delivery,
+  the hook's receipt means the text was flushed, not read, and a receipt is
+  marked at that point.
 - **No title.** Hooks carry no session title and none is read. The server keeps
   the stored title.
 - **Per-event cost and process ownership.** Each event starts a Node process.
@@ -983,7 +1009,10 @@ the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors,
 the notice limits at the smallest bound, the socket, its stale-socket recovery, its shutdown beside a successor and under a held bind lock and its start handshake, the bind lock (a live owner, a dead owner, a reused pid, an interleaved takeover and several contender processes over one stale lock), the shared socket trust rule against an injected file system (the 103-byte path limit on the real path included, and a directory named with doubled or trailing separators or a `.` name), the hook and the client against a real receiver socket
 on trusted and untrusted paths, the state directory resolved once behind a link and handed to the receiver, which refuses a directory that resolves differently, the WebSocket client against a
 fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff, a heartbeat that counts as published only once it is confirmed), the wake text (the fixed line and the rows, no binding, and a claim sized by the same renderer), a wake's reservation that is too short (`failed`, nothing sent), a suspend before the add measured on the wall clock (and a wall clock stepped back), the budget after the add after a suspend, a wake's second status after its fresh reading (a mute committed meanwhile), a prompt that takes over from a wake poll that has not claimed and does not wait for one on its refresh read,
-settlement, rejoin and shutdown with a manual clock, the hook commands
+settlement, rejoin and shutdown with a manual clock, sender receipts (the offer
+rules, the confirmation and the mark, that a delivery, the binding and a wake are
+byte-identical with receipts pending, and that a wake and `Stop` carry no
+notice), the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner
 hint), the plugin shape that Codex reads, and runs of the real hook and
 receiver processes against a fake worker and a fake app-server. It needs no

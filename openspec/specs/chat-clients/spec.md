@@ -1,7 +1,7 @@
 # chat-clients Specification
 
 ## Purpose
-Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, and the notice contract that puts a peer message body into a harness session.
+Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, and the sender receipts that a harness package shows without waking it.
 
 ## Requirements
 
@@ -13,6 +13,7 @@ After a successful join the adapter MUST expose `python`, `instance_file`, `room
 - **THEN** the context carries the eight binding fields and the route lines of the configured tool route
 - **AND** on the `cli` route, and in the fallback lines of the `mcp-with-cli-fallback` route, it names the interpreter form and the environment variable the CLI needs
 - **AND** on the `mcp` and `mcp-with-cli-fallback` routes it tells the model to call the agent-chat MCP `bind` tool, when the server exposes one, with exactly the `instance_file` shown, and again whenever a later binding shows a different one
+- **AND** a package that shows sender receipts ends its route lines with one sentence that tells the model how to ask for them: `send/reply --receipts asks for handed/acked receipts.` on the `cli` route, and `send/reply receipts=true asks for handed/acked receipts.` on the `mcp` and `mcp-with-cli-fallback` routes
 - **AND** it carries no token and no other session's binding
 
 #### Scenario: Tool route
@@ -554,4 +555,44 @@ The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer
 
 #### Scenario: A package copy drifts
 - **WHEN** a delivering package's `lib/notice.js` differs by one byte from `integrations/shared/notice.js`
+- **THEN** that package's tests fail
+
+### Requirement: A package offers sender receipts only to a busy, unmuted session
+A package that shows sender receipts MUST offer them only while the session is joined, its native state is busy and the worker's `receipts` answer carries `muted` as `false`; an absent or non-boolean `muted` MUST count as muted. It MUST ask for them at most every 5 seconds and only while a turn runs, MUST show at most 10 of the oldest rows in one notice, each row whole or not at all, and MUST NOT show an id again once its output was confirmed.
+
+#### Scenario: A session that cannot show receipts
+- **WHEN** the session is idle, stopped, in Plan Mode, in an unknown state or muted, or the worker's answer carries no boolean `muted`
+- **THEN** the package shows no receipt and no notice is output
+- **AND** the receipts stay pending on the server
+
+### Requirement: Sender receipts never wake and never change delivery
+A package MUST output a receipts notice only at a native boundary of a turn that already runs, and MUST NOT start a turn, claim, settle, steer or wake for it. A pending receipt MUST NOT change the bytes of a claim, a handoff, a settle, a heartbeat, a binding announcement or a wake, and a receipts request MUST NOT sit between a claim and its settle.
+
+#### Scenario: Receipts pending
+- **WHEN** receipts are pending
+- **THEN** every delivery, binding announcement and wake that the package outputs, and every claim, settle and heartbeat request it makes, is byte-identical to that of a session with no receipts pending
+
+### Requirement: A package marks only the receipts its harness confirmed
+A package MUST send `receipts_delivered` with exactly the ids a notice showed, and only after its harness confirmed the output. A `refused` or malformed answer MUST NOT end chat, and the ids of a mark that was refused or failed MUST be sent again at the next poll.
+
+#### Scenario: A notice that reached the model
+- **WHEN** the harness confirms that a receipts notice was output
+- **THEN** the package sends `receipts_delivered` with exactly the ids in that notice, and never an empty list
+- **AND** a notice that was not confirmed is not marked, and its rows are offered again
+
+#### Scenario: A refusal or a failed mark
+- **WHEN** either receipts operation answers `refused` or something malformed
+- **THEN** chat stays on, heartbeat, claim and settle keep running, and the package asks again at its next poll
+- **AND** the ids of a mark that was refused are kept, and after a rejoin they are marked through the new instance
+
+#### Scenario: A transport failure on a receipts request
+- **WHEN** a receipts request throws a transport error that carries a code, such as `REQUEST_UNCERTAIN`
+- **THEN** the package handles it as it handles that error on any other request: a rejoin within the budget, or fail closed
+- **AND** `CHAT_REQUEST_INVALID` and an error that carries no code are held, and chat stays on
+
+### Requirement: Sender receipts use the shared state machine and renderer unchanged
+A package that shows sender receipts MUST ship `lib/receipts.js` as a byte-identical copy of `integrations/shared/receipts.js`, and its tests MUST fail when the copy differs. Its receipt notice MUST come from `renderReceiptNotice` in its `lib/notice.js` copy, which passes the vectors in `integrations/receipt-vectors.json`.
+
+#### Scenario: A receipts copy drifts
+- **WHEN** a package's `lib/receipts.js` differs by one byte from `integrations/shared/receipts.js`
 - **THEN** that package's tests fail

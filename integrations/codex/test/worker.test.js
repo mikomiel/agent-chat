@@ -200,3 +200,34 @@ for (const missing of ["stdin", "stdout"]) {
     assert.deepEqual(await worker.stop(), { code: null, signal: null, started: false }) // nothing to end
   })
 }
+
+// Issue #130: sender receipts are two more operations of the same worker. A frame carries only the fields the worker
+// reads, an answer comes back as the worker gave it (a refusal is an answer, not a failure) and the worker goes on serving.
+test("the receipts operations are sent as the worker's frames and answer as the worker did", async () => {
+  const { child, frames } = harness()
+  const worker = startWorker(config, { nativeSessionId: "native-1", bootId: "boot-1" }, { spawnImpl: () => child })
+  child.stdout.write(`${JSON.stringify({ id: 0, result: { session_id: "s", instance_id: "i", room_id: "r", host: "h", harness: "synthetic", instance_file: "/tmp/s.json" } })}\n`)
+  await worker.ready
+  const ids = ["aaaaaaaa-aaaa-4aaa-8aaa-000000000001", "aaaaaaaa-aaaa-4aaa-8aaa-000000000002"]
+  const feed = worker.request("receipts")
+  assert.deepEqual(frames.at(-1), { op: "receipts", id: 1 })
+  child.stdout.write(`${JSON.stringify({ id: 1, result: { receipts: [], muted: false } })}\n`)
+  assert.deepEqual(await feed, { receipts: [], muted: false })
+  const mark = worker.request("receipts_delivered", { receipts: ids })
+  assert.deepEqual(frames.at(-1), { op: "receipts_delivered", receipts: ids, id: 2 })
+  child.stdout.write(`${JSON.stringify({ id: 2, result: { delivered: ids } })}\n`)
+  assert.deepEqual(await mark, { delivered: ids })
+  const refused = worker.request("receipts")
+  child.stdout.write(`${JSON.stringify({ id: 3, result: { refused: "SERVICE_UNAVAILABLE" } })}\n`)
+  assert.deepEqual(await refused, { refused: "SERVICE_UNAVAILABLE" })
+  const next = worker.request("heartbeat", { state: { native_state: "busy", stopped: false, plan_mode: false } })
+  child.stdout.write(`${JSON.stringify({ id: 4, result: {} })}\n`)
+  assert.deepEqual(await next, {})
+})
+
+test("a failure of a receipts operation names the operation, and no other label", () => {
+  for (const operation of ["receipts", "receipts_delivered"]) {
+    assert.equal(describeFailure(Object.assign(new Error("x"), { code: "REQUEST_UNCERTAIN", operation })), `${operation}:REQUEST_UNCERTAIN`)
+  }
+  assert.equal(describeFailure(Object.assign(new Error("x"), { code: "REQUEST_UNCERTAIN", operation: "receipts; rm -rf" })), "REQUEST_UNCERTAIN")
+})

@@ -43,7 +43,45 @@ The hints describe the state observed when the server builds the response. A
 retry returns the original message and can report updated hints. The stored
 recipient list survives changes in room membership. Hints cover only
 recipients who still have access to the room. An unaddressed message has an
-empty array. Use sender receipts to confirm handoff or acknowledgement.
+empty array. Use [sender receipts](#sender-receipts) to confirm handoff or
+acknowledgement.
+
+## Sender receipts
+
+A sender receipt tells the session that sent an addressed message that a
+recipient reached `handed` (an adapter wrote the message into the recipient's
+native turn) or `acked` (the recipient acknowledged it). Recording a receipt
+writes no replay event and touches no delivery or wake ledger, so a receipt
+never wakes anyone. A `replied` outcome is the reply message itself and follows
+the wake rules.
+
+| Message kind | Receipts |
+| --- | --- |
+| `question`, `consultation` | Always, when addressed and sent by a session. |
+| `message`, `reply` | Only when the sender asked: `receipts` is `true` on the HTTP and MCP routes, and the CLI passes `--receipts`. |
+| every other kind | Never. |
+
+A publication with no sending session, such as an operator or browser
+publication, never carries receipts, and neither does an unaddressed message.
+
+`GET /v1/instance/receipts` returns the live instance's own undelivered
+receipts, oldest first, at most 50. Each row names the receipt `id`, the
+`message_id`, the `state`, the recipient's session, harness and host, and
+`created_at`. Only receipts of retained messages in rooms the session may still
+read are listed. Reading marks nothing.
+
+`POST /v1/instance/receipts/delivered` takes `{"receipts": [...]}` with 1 to 50
+distinct receipt ids and marks them delivered. It is idempotent: a repeat marks
+nothing new and still lists the id in `delivered`. An id that belongs to
+another session is ignored and not disclosed. An adapter marks a receipt only
+after its output reached the model, so a receipt it could not show is listed
+again by the next read.
+
+An adapter shows receipts only while the session is not muted. The worker's
+`receipts` answer carries a boolean `muted` flag whenever the feed has rows;
+an absent or non-boolean flag reads as muted, and the receipts wait on the
+server. See [Sender receipts](../integrations/README.md#sender-receipts) for the
+rules the harness packages follow.
 
 ## History paging
 

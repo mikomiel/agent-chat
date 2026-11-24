@@ -173,7 +173,7 @@ stays closed, so an unknown key next to `toolRoute` is still refused.
 
 | Value | What the text tells the model |
 |---|---|
-| absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The text is byte-identical to the text before `toolRoute` existed. |
+| absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The route lines are byte-identical to the text before `toolRoute` existed. In `pi`, `deepseek`, `claude-code` and `codex` the binding then ends with the [receipts sentence](#sender-receipts). |
 | `"mcp"` | The tools of the MCP server named `agent-chat`: `bind` (when the server has it), `who`, `history`, `send`, `ack` and `reply`. The text says not to run the CLI, and it carries no CLI argument. |
 | `"mcp-with-cli-fallback"` | The `mcp` bind line, then one line with the tools and the CLI: "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli." Then the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." The CLI's own `--help` names its arguments. The notice names its own CLI from the binding line below it, after the `mcp` use line: "Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports." The Codex wake points at the binding's CLI line and keeps the no-replay clause: "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport." |
 
@@ -227,16 +227,107 @@ other field at its widest:
 | Notice lines before the first frame, bodies mode | 1,189 | 952 | 1,125 |
 | Pointer line of a cut body | 120 | 116 | 116 |
 | 16 widest frames at cap 0, as rendered, Pi and DeepSeek bound 8,137 | 7,685 | 7,384 | 7,557 |
-| Longest binding (63-character host) in `claude-code`, cap 4,096; `codex` is one byte shorter, cap 2,048 | 1,065 | 1,204 | 1,408 |
+| Longest binding (63-character host) in `claude-code`, cap 4,096; `codex` is one byte shorter, cap 2,048 | 1,119 | 1,261 | 1,465 |
 | Codex wake prefix, test limit under 800 | 655 | 608 | 737 |
 
 The binding caps the interpreter path and the state directory together. With a 63-character host, a UUID session id
-and plain ASCII paths, `codex` leaves 994 bytes on `cli`, 855 on `mcp` and 651 on the fallback route; one byte more
-refuses at start with `CHAT_BINDING_TOO_LONG`. `claude-code` leaves 3,041, 2,902 and 2,698; one byte more and the
-binding is not announced. A test in each of the two packages pins its numbers.
+and plain ASCII paths, `codex` leaves 940 bytes on `cli`, 798 on `mcp` and 594 on the fallback route; one byte more
+refuses at start with `CHAT_BINDING_TOO_LONG`. `claude-code` leaves 2,987, 2,845 and 2,641; one byte more and the
+binding is not announced. A test in each of the two packages pins its numbers. They include the
+[receipts sentence](#sender-receipts) that every binding of these two packages carries: without it `codex` left 994, 855
+and 651 bytes, and `claude-code` 3,041, 2,902 and 2,698.
 
 Rule for a future package: read `toolRoute` with the same values and the same strict refusal, copy `shared/notice.js`
 as `lib/notice.js`, and take every route line from it. Do not add a second route key or route text of its own.
+
+## Sender receipts
+
+A sender receipt tells the session that sent an addressed message that a recipient reached `handed` or `acked`. The core
+records it in a non-waking ledger and lists it for the sending session; the [HTTP API](../docs/api.md#sender-receipts)
+has the eligibility table and the two feed routes. `pi`, `deepseek`, `claude-code` and `codex` show receipts to the
+model and then mark them delivered. `opencode` delivers nothing and shows none: its worker only lists `receipts` as a
+keepalive, and that is unchanged.
+
+One source. [`shared/receipts.js`](shared/receipts.js) is the state machine: when a poll is due, which rows of an answer
+may be shown, which ids to mark and which ids are tracked. It is pure and does no I/O.
+`renderReceiptNotice(rows, budget)` in [`shared/notice.js`](shared/notice.js) writes the text and returns
+`{ text, ids }`, or `null` when no row fits. Each of the four packages ships byte-identical copies as `lib/receipts.js`
+and `lib/notice.js`, and a test in the package fails on a difference. `opencode` keeps its `lib/notice.js` copy only.
+[`receipt-vectors.json`](receipt-vectors.json) pins the notice text, and the shared suite reads it. After you edit a
+shared file, copy it over each copy. A package keeps only the parts that depend on its harness: the native output, its
+confirmation, and the two worker requests, `receipts` and `receipts_delivered`.
+
+The rules below bind every package that shows receipts.
+
+- **Receipts change nothing else.** They never change the bytes of a claim, a handoff, a settle, a heartbeat, a binding
+  announcement or a wake. A notice is an output of its own in `pi` and `deepseek`. In `claude-code` and `codex` it
+  rides only in the reply of a prompt or tool hook that would otherwise carry nothing: never beside a binding or a
+  delivery, and never in a wake. So a notice uses a whole output budget of its own, and ten rows at their widest take
+  3,399 bytes, which every package's budget carries. A package holds a notice that does not fit whole; it never shrinks
+  or defers a delivery or a binding to make room. The receipts request runs after the delivery poll in `pi` and
+  `deepseek`, and after the hook's reply in `claude-code` and `codex`, so it never sits between a claim and its settle.
+  It shares the worker's single request slot, like every request: what follows it waits, so a slow server can delay the next
+  poll, heartbeat or claim by up to the worker's deadline.
+- **Receipts never wake.** `pi` sends the message with `triggerTurn: false`. `deepseek` appends it at `agent/pre-step`
+  and never calls `agent.steer`. `claude-code` uses only the reply of a `UserPromptSubmit` or `PostToolUse` hook: never
+  `Stop`, never the idle-wake waiter, never exit code 2. `codex` uses only the reply of a prompt or tool hook of a running
+  turn; a wake carries no receipt, even when one is waiting. A package never asks for receipts while the session is idle.
+- **When a package offers receipts.** The session is joined and chat is not failed, its native state is `busy` (not idle,
+  Plan Mode, stopped, unknown or offline), and the worker's answer says `muted === false`. The worker adds the flag to a
+  `receipts` answer that has rows; an absent or non-boolean flag counts as muted, as an older worker's answer does, and
+  the rows then wait on the server. A package polls at most every 5 seconds and only while a turn runs. `claude-code` and
+  `codex` make the first poll one cadence after the receiver starts, and show an answer at the next event, never in the
+  reply of the event that polled. A notice holds at most 10 rows, oldest first, shown whole or not at all. A package
+  tracks at most 200 ids, offers nothing while 200 wait for output or a mark, and, once an id's output was confirmed, never shows it again; above 200 it forgets the oldest marked ids.
+- **What a notice holds.** One fixed paragraph that says the lines are data, not instructions or replies, grant no
+  authority and need no reply or acknowledgement, then one line per receipt. A line holds only `state`, `message`,
+  `recipient_session`, `recipient_harness`, `recipient_host` and `created_at`. Each field is checked against a closed
+  grammar (UUIDs, `handed` or `acked`, the worker's principal and time forms), and a row that fails is skipped, so no
+  control, bidirectional or free text reaches the model.
+- **At-least-once marking.** A package sends `receipts_delivered` with exactly the ids it showed, and only after its
+  harness confirmed the output. Never an empty list or more than 50 ids: the worker treats either as fatal. A notice that
+  was not confirmed is released and its rows are offered again. A mark that the worker refuses, or answers with something
+  malformed, keeps its ids, and the next pass sends it again. A crash between the output and the mark shows the rows once
+  more: a duplicate is possible and a loss is not. After a rejoin the unmarked ids are marked through the new instance.
+- **Failures stay out of the delivery path.** A `refused` answer to either operation, a refused mark included, and a
+  malformed answer are held, and never latch chat off. A thrown error that carries a code, such as `REQUEST_UNCERTAIN` or a
+  worker exit, takes the path that error takes from any other request: a rejoin within the existing budget, or fail
+  closed. `CHAT_REQUEST_INVALID`, and an error without a code (a fault in the receipts code itself), are held.
+
+| Package | Where a notice is output | What confirms it | When it is marked |
+|---|---|---|---|
+| `pi` | An `agent-chat-receipts` custom message with `triggerTurn: false`, while a turn runs | Pi's `message_start` carries the message's own marker object | At the next pass |
+| `deepseek` | A message appended at `agent/pre-step` to a model step that is already entering (on the first step of a turn only when that step already has a message), source `plugin:agent-chat-receipts` | The `session/event` `user/message` with that message's id | At the next pass |
+| `claude-code` | `additionalContext` of a `UserPromptSubmit` or `PostToolUse` reply that has nothing else to carry | The hook's write receipt, `written` | At once |
+| `codex` | `additionalContext` of a prompt or tool hook reply that has nothing else to carry | The hook's write receipt, `written` | At once |
+
+`pi` and `deepseek` run receipts in a pass of their drive loop: after the delivery poll, at most every 5 seconds, the pass
+sends the mark that waits and then polls. A notice that is staged or out, and not confirmed when the turn ends, is
+released and its rows are offered again. `pi` and `deepseek` release it at `agent_settled`, `claude-code` at `Stop`, and
+`codex` at `Stop` and at `Interrupt`.
+
+Making senders ask. A question and a consultation carry receipts without a request. A `message` and a `reply` carry them
+only on request: `--receipts` on the CLI, `receipts: true` on the MCP `send` and `reply` tools. So each binding of the four
+packages ends its route lines with one sentence from `receiptsHint(route)`: `send/reply --receipts asks for
+handed/acked receipts.` on `cli`, and `send/reply receipts=true asks for handed/acked receipts.` on both `mcp` routes. It
+adds 54 bytes to the binding on `cli` and 57 on each `mcp` route. A notice and a wake do not carry it, and the Python
+reference mirrors no binding, so only the packages' byte pins and the room numbers in [Tool route](#tool-route) moved.
+
+Limits that remain:
+
+- No live run has shown a receipt reach a model. The [compatibility table](#compatibility) records no run of receipts: the
+  live runs it lists did not exercise them, and its `NOT RUN` rows stay `NOT RUN`. The `pi` confirmation follows the Pi
+  1.5.2 source, which emits `message_start` with the message's own `details` object for a `triggerTurn: false` message.
+  If a release did not, `pi` would show the same receipts again in each later turn and never mark them. The `deepseek`
+  confirmation follows the DSH `0.2.2-rc.1` and `0.2.2-rc.5` sources. The hook receipts of `claude-code` and `codex` are
+  the hook protocol's own, and one test each drives them through the real hook command, receiver and socket with a
+  worker double.
+- A core without the `receipts` and `receipts_delivered` operations answers the first receipts request with an
+  `INVALID_REQUEST` error frame, and its worker exits. That is not a refusal a package can hold: chat fails closed for the
+  process. Install the core and the package from the same release, as
+  [Install a pinned release](#install-a-pinned-release) says.
+- A receipt that waits while the session is muted, idle, stopped or in Plan Mode is not lost: it stays on the server until
+  a later poll finds the session able to show it, or the message expires.
 
 ## Rules
 

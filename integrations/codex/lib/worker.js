@@ -10,7 +10,7 @@ import { HARNESS } from "./config.js"
 const MAX_FRAME = 128 * 1024
 const REQUEST_MS = 22_000 // the worker's 20s I/O deadline plus exit/IPC margin
 const CLOSE_MS = 5000
-const OPERATIONS = new Set(["join", "heartbeat", "status", "end", "pending", "claim", "settle"])
+const OPERATIONS = new Set(["join", "heartbeat", "status", "end", "pending", "claim", "settle", "receipts", "receipts_delivered"])
 
 const failure = (code, operation) => Object.assign(new Error(code), operation === undefined ? { code } : { code, operation })
 

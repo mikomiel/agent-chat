@@ -226,7 +226,8 @@ def parser() -> Parser:
                 "--receipts",
                 action="store_true",
                 help="Ask for non-waking handed/acked receipts on an addressed message or reply "
-                "(question and consultation always carry them; other kinds never do)",
+                "(question and consultation always carry them; message and reply only with this flag; "
+                "other kinds never do)",
             )
         if name == "send":
             command.add_argument(
