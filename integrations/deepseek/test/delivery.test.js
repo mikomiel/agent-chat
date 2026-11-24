@@ -310,3 +310,52 @@ for (const registry of ["rc.1", "rc.2+"]) {
     assert.equal(steers.length, 1)
   })
 }
+
+// `peek` is the receipts' read: `state`'s classification with no side effect (#130).
+
+test("peek classifies exactly as state does, in every state the delivery has", () => {
+  const prompt = { source: { kind: "user", rpcId: "rpc-1" } }
+  const cases = [
+    ["stopped", {}, {}, delivery => delivery, "stopped"],
+    ["idle", {}, {}, delivery => delivery.onInserted(prompt), null],
+    ["running", { status: "running" }, {}, delivery => delivery.onInserted(prompt), "busy"],
+    ["a parked inbox item", {}, {}, (delivery, fake) => { delivery.onInserted(prompt); fake.agent.inbox.nextStep.push({}) }, "busy"],
+    ["Plan Mode", {}, { plan: { active: true, pending: false } }, delivery => delivery.onInserted(prompt), "plan"],
+    ["a pending Plan Mode selection", {}, { plan: { active: false, pending: true } }, delivery => delivery.onInserted(prompt), "plan"],
+    ["an unreadable plan projection", {}, { planUnreadable: true }, delivery => delivery.onInserted(prompt), "unknown"],
+    ["a status that is not a state", { status: "paused" }, {}, delivery => delivery.onInserted(prompt), "unknown"],
+    ["offline", {}, {}, delivery => { delivery.onInserted(prompt); delivery.disable() }, "offline"],
+    ["a delivery that was disposed", {}, {}, delivery => { delivery.onInserted(prompt); delivery.dispose() }, "stale_binding"],
+  ]
+  for (const [name, agentOptions, ctxOptions, prepare, expected] of cases) {
+    const fake = setup(agentOptions, ctxOptions)
+    prepare(fake.delivery, fake)
+    assert.equal(fake.delivery.peek(), expected, `${name}: peek`)
+    assert.equal(fake.delivery.state(), expected, `${name}: state`)
+  }
+})
+
+test("peek never latches, warns or fences: a state it cannot read is unknown and nothing else changes", () => {
+  const fake = fakeAgent()
+  const warnings = []
+  const projection = { readable: false }
+  const ctx = fakeCtx(fake.agent)
+  const read = ctx.get
+  ctx.logger = { warn: message => warnings.push(message) }
+  ctx.get = name => (name === "sessionProjections" && !projection.readable ? { snapshot() { throw new Error("plan unit unavailable") } } : read(name))
+  const delivery = createDelivery(ctx, fake.agent, options)
+  delivery.onInserted({ source: { kind: "user", rpcId: "rpc-1" } })
+  const token = delivery.capture()
+  assert.equal(delivery.peek(), "unknown")
+  assert.equal(delivery.peek(), "unknown", "and asked again")
+  assert.deepEqual(warnings, [], "no warning")
+  projection.readable = true
+  assert.equal(delivery.state(token), null, "the token from before is still current, and nothing latched")
+  // The delivery's own question latches on the same unreadable state, as it always has.
+  projection.readable = false
+  assert.equal(delivery.state(), "unknown")
+  assert.equal(warnings.length, 1)
+  projection.readable = true
+  assert.equal(delivery.state(), "stopped", "and only a later Web prompt restores it")
+  assert.equal(delivery.state(token), "stale_binding", "the latch fenced the old token")
+})

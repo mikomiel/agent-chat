@@ -139,9 +139,10 @@ fits on `cli` fits on every route.
   says the session is not muted: an idle, stopped, Plan Mode, unknown or muted
   session leaves them on the server. After Pi's `message_start` carries the
   message's own marker object, the next pass marks exactly those ids delivered;
-  a refused or failed mark is sent again at the next pass. The pass runs after
-  the delivery poll, so receipts never change the bytes of a delivery, a
-  heartbeat or the binding. A refused or malformed answer is held and never ends
+  a refused or failed mark is sent again at the next pass. A pass sends one
+  request, the mark that waits or else the poll, so a mark that keeps failing
+  holds the poll. The pass runs after the delivery poll, so receipts never
+  change the bytes of a delivery, a heartbeat or the binding. A refused or malformed answer is held and never ends
   chat; a thrown error that carries a code takes the path it takes on any
   request. The binding ends its route lines with one sentence that tells the
   model how to ask for receipts. The
@@ -199,5 +200,6 @@ The suite covers config refusal, the join frame and frame validation, rejoin
 budget/window/backoff, delivery and settlement, the system-prompt binding,
 fail-closed latching and the shared notice vectors, with the claim packing for
 bodies mode, and sender receipts: the offer rules, the confirmation and the mark,
-and that a delivery and the binding are byte-identical with receipts pending. It
+one request per pass, and that a delivery and the binding are byte-identical with
+receipts pending. It
 needs no PostgreSQL, no service and no credential.

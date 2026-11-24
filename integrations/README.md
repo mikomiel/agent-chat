@@ -267,7 +267,8 @@ The rules below bind every package that shows receipts.
   or defers a delivery or a binding to make room. The receipts request runs after the delivery poll in `pi` and
   `deepseek`, and after the hook's reply in `claude-code` and `codex`, so it never sits between a claim and its settle.
   It shares the worker's single request slot, like every request: what follows it waits, so a slow server can delay the next
-  poll, heartbeat or claim by up to the worker's deadline.
+  poll, heartbeat or claim by up to the worker's deadline. A pass sends one receipts request, never a mark and a poll in
+  a row, so what follows waits for one request.
 - **Receipts never wake.** `pi` sends the message with `triggerTurn: false`. `deepseek` appends it at `agent/pre-step`
   and never calls `agent.steer`. `claude-code` uses only the reply of a `UserPromptSubmit` or `PostToolUse` hook: never
   `Stop`, never the idle-wake waiter, never exit code 2. `codex` uses only the reply of a prompt or tool hook of a running
@@ -279,6 +280,14 @@ The rules below bind every package that shows receipts.
   `codex` make the first poll one cadence after the receiver starts, and show an answer at the next event, never in the
   reply of the event that polled. A notice holds at most 10 rows, oldest first, shown whole or not at all. A package
   tracks at most 200 ids, offers nothing while 200 wait for output or a mark, and, once an id's output was confirmed, never shows it again; above 200 it forgets the oldest marked ids.
+- **A staged notice is checked again when it is output.** `deepseek`, `claude-code` and `codex` stage a notice and output it
+  at a later boundary, and the session may be muted by then. At the boundary the package asks the server nothing and
+  uses the latest `muted` flag that a worker answer carried: a `receipts` answer that has rows, and the `status` answer
+  of a claim. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the answer that
+  staged the notice came at most 5 seconds before. `deepseek` also drops it unless its native state, read again
+  without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and
+  a later poll offers them again. `claude-code` and `codex` answer the hook as for any reply with nothing to carry.
+  `pi` hands a notice to Pi in the pass that got the answer, so it has no later boundary of its own.
 - **What a notice holds.** One fixed paragraph that says the lines are data, not instructions or replies, grant no
   authority and need no reply or acknowledgement, then one line per receipt. A line holds only `state`, `message`,
   `recipient_session`, `recipient_harness`, `recipient_host` and `created_at`. Each field is checked against a closed
@@ -286,9 +295,13 @@ The rules below bind every package that shows receipts.
   control, bidirectional or free text reaches the model.
 - **At-least-once marking.** A package sends `receipts_delivered` with exactly the ids it showed, and only after its
   harness confirmed the output. Never an empty list or more than 50 ids: the worker treats either as fatal. A notice that
-  was not confirmed is released and its rows are offered again. A mark that the worker refuses, or answers with something
+  was not confirmed, or was dropped before its output, is released and its rows are offered again. A mark that the worker refuses, or answers with something
   malformed, keeps its ids, and the next pass sends it again. A crash between the output and the mark shows the rows once
   more: a duplicate is possible and a loss is not. After a rejoin the unmarked ids are marked through the new instance.
+- **A receipts read changes no delivery state.** `deepseek` reads its native state for receipts with a read that never
+  stops chat, logs a warning or fences a delivery. The delivery's own question keeps its latch: a state it cannot
+  classify stops delivery until the next Web prompt. A state that the receipts read cannot classify holds receipts for
+  that pass and changes nothing else, so a later delivery is handed with no new Web prompt.
 - **Failures stay out of the delivery path.** A `refused` answer to either operation, a refused mark included, and a
   malformed answer are held, and never latch chat off. A thrown error that carries a code, such as `REQUEST_UNCERTAIN` or a
   worker exit, takes the path that error takes from any other request: a rejoin within the existing budget, or fail
@@ -302,8 +315,10 @@ The rules below bind every package that shows receipts.
 | `codex` | `additionalContext` of a prompt or tool hook reply that has nothing else to carry | The hook's write receipt, `written` | At once |
 
 `pi` and `deepseek` run receipts in a pass of their drive loop: after the delivery poll, at most every 5 seconds, the pass
-sends the mark that waits and then polls. A notice that is staged or out, and not confirmed when the turn ends, is
-released and its rows are offered again. `pi` and `deepseek` release it at `agent_settled`, `claude-code` at `Stop`, and
+sends one request, the mark that waits or, when none waits, the poll. `claude-code` and `codex` do the same in the pass
+that follows a hook's reply. A mark that keeps failing therefore holds the poll, and once it lands the poll waits for the
+next cadence. A notice that is staged or out, and not confirmed when the turn ends, is released and its rows are offered
+again. `pi` and `deepseek` release it at `agent_settled`, `claude-code` at `Stop`, and
 `codex` at `Stop` and at `Interrupt`.
 
 Making senders ask. A question and a consultation carry receipts without a request. A `message` and a `reply` carry them
@@ -328,6 +343,13 @@ Limits that remain:
   [Install a pinned release](#install-a-pinned-release) says.
 - A receipt that waits while the session is muted, idle, stopped or in Plan Mode is not lost: it stays on the server until
   a later poll finds the session able to show it, or the message expires.
+- The output-time check cannot see a mute that lands after the last answer that carried the flag and less than 5 seconds
+  before the output. The notice is then shown and its ids are marked, and the next poll sees the mute. A notice is data,
+  not an instruction, so the cost is one notice shown to a session that was just muted.
+- A notice is output only at a boundary within 5 seconds of the answer that staged it: a second prompt or tool event in
+  `claude-code` and `codex`, a pre-step in `deepseek`. A staged notice holds the next poll until a boundary shows it or
+  drops it, so a session whose boundaries are always more than 5 seconds apart drops each notice, and its receipts
+  arrive late or not at all. The rows stay on the server, so nothing is lost.
 
 ## Rules
 

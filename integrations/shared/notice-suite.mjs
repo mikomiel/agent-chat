@@ -662,7 +662,7 @@ export function runNoticeSuite(label, notice, copy, { noticeBound } = {}) {
  * @param {URL} copy the package's lib/receipts.js, to compare with the shared source
  */
 export function runReceiptsSuite(label, receipts, copy) {
-  const { createReceipts, due, polled, offer, issued, confirmed, released, toMark, marked, accepted, POLL_MS, MAX_OFFER, MAX_MARK, SEEN_LIMIT } = receipts
+  const { createReceipts, due, polled, offer, muteSeen, showable, issued, confirmed, released, toMark, marked, accepted, POLL_MS, MAX_OFFER, MAX_MARK, SEEN_LIMIT } = receipts
   const fresh = (number, extra = {}) => ({ id: uuid(number), message_id: uuid(5000 + number), ...extra })
   const answer = (rows, muted = false) => ({ receipts: rows, muted })
   const ids = rows => rows.map(item => item.id)
@@ -829,5 +829,57 @@ export function runReceiptsSuite(label, receipts, copy) {
     for (const bad of [null, undefined, "ok", 1, [], {}, { delivered: "x" }, { delivered: null }, { refused: "STALE_INSTANCE" }, { delivered: [], refused: "X" }, { refused: "SERVICE_UNAVAILABLE", delivered: [] }]) {
       assert.equal(accepted(bad), false, JSON.stringify(bad))
     }
+  })
+
+  test(`${label}: a state that has heard no answer with a mute flag shows nothing`, () => {
+    const state = createReceipts()
+    for (const stagedAt of [0, 1000]) assert.equal(showable(state, stagedAt, stagedAt), false)
+    assert.equal(showable(muteSeen(state, { receipts: [] }), 0, 0), false, "an empty feed carries no flag")
+  })
+
+  test(`${label}: an answer with a muted key sets the latest flag, whatever its value; every other answer leaves it`, () => {
+    const start = createReceipts()
+    const frozen = JSON.stringify(start)
+    let state = muteSeen(start, { receipts: [fresh(1)], muted: false })
+    assert.notEqual(state, start)
+    assert.equal(JSON.stringify(start), frozen, "the argument is left alone")
+    assert.equal(showable(state, 0, 0), true)
+    // A status answer carries the flag among other fields. The latest answer wins, in both directions.
+    state = muteSeen(state, { session_id: uuid(1), muted: true, rooms: [] })
+    assert.equal(showable(state, 0, 0), false, "a later muted answer closes it")
+    state = muteSeen(state, { muted: false })
+    assert.equal(showable(state, 0, 0), true, "and a later unmuted one opens it")
+    for (const value of [true, null, undefined, 0, 1, "false", "true", [], {}]) {
+      assert.equal(showable(muteSeen(state, { muted: value }), 0, 0), false, `a flag of ${JSON.stringify(value) ?? "undefined"} is not an unmuted session`)
+    }
+    // A heartbeat, a pending read, a mark, an empty feed and a refusal carry no flag, and a value that is no object is no answer.
+    for (const other of [{ receipts: [] }, { delivered: [] }, { messages: [] }, { refused: "SERVICE_UNAVAILABLE" }, { instance_id: uuid(1), native_state: "busy", stopped: false }, {}, null, undefined, "muted", 5, true, []]) {
+      assert.equal(muteSeen(state, other), state, JSON.stringify(other) ?? "undefined")
+    }
+  })
+
+  test(`${label}: a notice is showable only while the latest flag is false and it is at most one poll old`, () => {
+    const open = muteSeen(createReceipts(), { receipts: [], muted: false })
+    for (const age of [0, 1, 2000, POLL_MS - 1, POLL_MS]) assert.equal(showable(open, 7000, 7000 + age), true, `${age} ms old`)
+    assert.equal(showable(open, 7000, 7000 + POLL_MS + 1), false, "one millisecond past a poll")
+    assert.equal(showable(open, 7000, 7000 + 60_000), false)
+    for (const now of [6999, 0, -1, NaN, undefined, Infinity]) assert.equal(showable(open, 7000, now), false, `now ${now}: a clock that went back or cannot be read`)
+    for (const stagedAt of [NaN, undefined]) assert.equal(showable(open, stagedAt, 7000), false, `staged at ${stagedAt}`)
+    for (const muted of [true, null, undefined, 0, 1, "false", [], {}]) {
+      assert.equal(showable(muteSeen(open, { muted }), 7000, 7000), false, `a flag of ${JSON.stringify(muted) ?? "undefined"}`)
+    }
+  })
+
+  test(`${label}: the latest flag survives a poll, an issue, a confirmation, a release, a mark and a trim, and an offer does not read it`, () => {
+    let state = muteSeen(createReceipts(), { muted: false })
+    state = polled(state, 1000)
+    state = issued(state, [uuid(1)])
+    state = confirmed(state, [uuid(1)])
+    state = released(state, [uuid(2)])
+    state = marked(state, [uuid(1)])
+    state = marked(confirmed(state, Array.from({ length: SEEN_LIMIT + 5 }, (_, index) => uuid(index + 10))), [uuid(10)])
+    assert.equal(showable(state, 0, 0), true)
+    const closed = muteSeen(createReceipts(), { muted: true })
+    assert.deepEqual(ids(offer(closed, answer([fresh(1)]))), [uuid(1)], "an offer follows its own answer, not an earlier flag")
   })
 }

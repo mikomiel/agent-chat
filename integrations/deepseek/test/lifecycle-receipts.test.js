@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { readFileSync } from "node:fs"
+import { createDelivery } from "../lib/delivery.js"
 import { createLifecycle } from "../lib/lifecycle.js"
 import { MAX_CONTEXT_BYTES } from "../lib/channel.js"
 import { renderReceiptNotice } from "../lib/notice.js"
@@ -60,12 +61,13 @@ async function session({ rows = [], toolRoute } = {}) {
   const contexts = []
   const delivery = {
     state: () => (typeof native.state === "function" ? native.state() : native.state),
+    peek: () => (typeof native.state === "function" ? native.state() : native.state),
     heartbeatState: () => ({ native_state: "idle", stopped: false, plan_mode: false }),
     context: text => contexts.push(text),
     deliver(batch, deadline) { delivered.push({ batch, deadline }); return Promise.resolve({ outcome: "handed", reason: null }) },
     disable() {},
   }
-  const server = { rows, muted: false, receiptsReply: null, markReply: null, delivery: null, fail: {}, heartbeatRefusal: null }
+  const server = { rows, muted: false, receiptsReply: null, markReply: null, delivery: null, fail: {}, heartbeatRefusal: null, status: null }
   const log = []
   const clock = { t: 1_000_000 }
   let claims = 0
@@ -81,7 +83,7 @@ async function session({ rows = [], toolRoute } = {}) {
     if (op === "receipts_delivered") return typeof server.markReply === "function" ? server.markReply(fields) : { delivered: fields.receipts }
     if (op === "pending") return { messages: server.delivery ? [server.delivery.id] : [] }
     if (op === "claim") return { dispatch: true, attempt_id: nextAttempt(), reservation_ms: 20_000, messages: server.delivery ? [server.delivery] : [] }
-    if (op === "status") return { muted: false }
+    if (op === "status") return server.status ? server.status() : { muted: false }
     if (op === "settle") { server.delivery = null; return {} }
     return {}
   }
@@ -246,12 +248,13 @@ test("at most one poll every five seconds, however often the lifecycle ticks", a
 test("one notice at a time: while one is staged or waiting to be logged, no second poll is made", async () => {
   const s = await session({ rows: [row(1)] })
   await s.tick(0)
-  for (let index = 0; index < 4; index += 1) await s.tick()
+  for (let index = 0; index < 4; index += 1) await s.tick(1.25) // one cadence in all: a notice is taken at most one cadence after it was staged
   assert.equal(s.count("receipts"), 1)
   const taken = s.take()
   for (let index = 0; index < 3; index += 1) await s.tick()
   assert.equal(s.count("receipts"), 1, "taken, not yet logged: still one at a time")
   s.lifecycle.receiptsConfirmed(taken.id)
+  await s.tick() // the mark takes this tick; the feed waits for the next
   await s.tick()
   assert.equal(s.count("receipts"), 2, "logged and marked: the feed is read again")
 })
@@ -567,4 +570,200 @@ test("the binding does not depend on receipts: same bytes before, while a notice
   assert.equal(staged, before)
   assert.equal(s.lifecycle.context(), before)
   assert.ok(before.includes("send/reply --receipts asks for handed/acked receipts."))
+})
+
+// Review of #130: a notice is checked again when it is output, a pass sends one request, and the pass reads the native state
+// without side effect.
+
+test("a notice taken at most one cadence after the poll that staged it is output; an older one is dropped and offered again", async () => {
+  const feed = [row(1)]
+  for (const [age, output] of [[POLL_MS - 1, true], [POLL_MS, true], [POLL_MS + 1, false], [60_000, false]]) {
+    const s = await session({ rows: feed })
+    await s.tick(0)
+    s.clock.t += age
+    const requests = s.log.length
+    const taken = s.take()
+    assert.equal(taken !== null, output, `${age} ms after the poll`)
+    assert.equal(s.log.length, requests, "the output asks the server nothing")
+    if (taken) continue
+    assert.equal(s.count("receipts_delivered"), 0, "a dropped notice is not marked")
+    // Its id was released, so the next poll offers the same row; it is then output, confirmed and marked.
+    await s.tick(0)
+    assert.equal(s.count("receipts"), 2, `${age} ms: asked for again`)
+    const again = s.take()
+    assert.ok(again && again.text.includes(feed[0].message_id), `${age} ms: the same row`)
+    s.lifecycle.receiptsConfirmed(again.id)
+    await s.tick()
+    assert.deepEqual(s.marks(), [{ receipts: ids(feed) }])
+  }
+})
+
+test("a status answer that says muted between the poll and the output drops the notice: it is not marked and comes back once unmuted", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed })
+  await s.tick(0) // staged from an unmuted answer
+  // A claim's status read is an answer that carries the flag. A claim needs an idle agent, so the turn is idle for it.
+  s.native.state = null
+  s.server.delivery = peerMessage
+  s.server.status = () => ({ muted: true })
+  await s.tick(1)
+  assert.equal(s.delivered.length, 0, "the muted delivery is deferred")
+  assert.equal(s.log.find(entry => entry.op === "settle").fields.result.reason, "muted")
+  s.native.state = "busy"
+  const requests = s.log.length
+  assert.equal(s.take(), null, "the latest flag is muted: the staged notice is dropped")
+  assert.equal(s.log.length, requests, "and the output asked the server nothing")
+  assert.equal(s.count("receipts_delivered"), 0)
+  s.server.status = null
+  await s.tick()
+  assert.equal(s.count("receipts"), 2, "the id was never marked: the feed is asked again")
+  const again = s.take()
+  assert.ok(again && again.text.includes(feed[0].message_id))
+  s.lifecycle.receiptsConfirmed(again.id)
+  await s.tick()
+  assert.deepEqual(s.marks(), [{ receipts: ids(feed) }])
+})
+
+test("a staged notice is dropped at output unless the turn still runs outside Plan Mode, and its row comes back", async () => {
+  const feed = [row(1)]
+  const states = [
+    ["Plan Mode", "plan"], ["idle", null], ["unknown", "unknown"], ["stopped", "stopped"], ["offline", "offline"],
+    ["a stale binding", "stale_binding"], ["a state that throws", () => { throw new Error("native state unreadable") }],
+    ["a state that is not a string", () => 7],
+  ]
+  for (const [name, state] of states) {
+    const s = await session({ rows: feed })
+    await s.tick(0)
+    s.native.state = state
+    assert.equal(s.take(), null, `${name}: dropped`)
+    s.native.state = "busy"
+    await s.tick()
+    assert.equal(s.count("receipts"), 2, `${name}: the row is asked for again`)
+    assert.ok(s.take(), `${name}: and a running turn gets it`)
+  }
+  const control = await session({ rows: feed })
+  await control.tick(0)
+  assert.ok(control.take(), "a running turn outside Plan Mode gets the notice it was staged for")
+})
+
+test("a tick with a mark waiting sends no feed request and reads no native state: the mark takes it, and the feed waits for the next cadence", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed })
+  s.server.markReply = () => ({ refused: "SERVICE_UNAVAILABLE" }) // the mark does not land
+  await s.tick(0)
+  s.lifecycle.receiptsConfirmed(s.take().id)
+  assert.equal(s.count("receipts"), 1)
+  let reads = 0
+  s.native.state = () => { reads += 1; return "busy" }
+  const asked = () => s.count("receipts") + s.count("receipts_delivered")
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const before = asked()
+    await s.tick() // the feed is due too
+    assert.equal(asked() - before, 1, `tick ${attempt}: one receipts request`)
+    assert.equal(s.count("receipts"), 1, `tick ${attempt}: and it is no feed read`)
+    assert.equal(s.count("receipts_delivered"), attempt)
+  }
+  assert.equal(reads, 0, "a mark tick never reads the native state")
+  s.server.markReply = null
+  await s.tick() // the mark lands, and the feed still waits
+  assert.equal(s.count("receipts_delivered"), 4)
+  assert.equal(s.count("receipts"), 1, "the mark that landed took its tick")
+  await s.tick() // the next cadence reads the feed
+  assert.equal(s.count("receipts"), 2)
+  assert.equal(s.count("receipts_delivered"), 4)
+})
+
+// The real native half under the real lifecycle, for what a double cannot show: the delivery's stop latch. `world.status` is
+// the agent's turn, `world.plan` its Plan Mode projection, and `world.readable` whether that projection can be read.
+async function realSession({ rows = [] } = {}) {
+  const bus = fakeBus()
+  const world = { status: "running", plan: { active: false, pending: false }, readable: true }
+  const warnings = []
+  const steered = []
+  const agent = {
+    id: "native-1", session: { id: "native-1", header: {} },
+    get status() { return world.status },
+    inbox: { nextStep: [], nextTurn: [], remove: () => true },
+    steer(message) { steered.push(message); world.status = "running"; delivery.onClaimed(message) },
+  }
+  const ctx = {
+    agents: { get: id => (id === agent.id ? agent : undefined) },
+    logger: { warn: message => warnings.push(message) },
+    get: name => (name === "sessionProjections"
+      ? { snapshot: () => { if (!world.readable) throw new Error("plan unit unavailable"); return { values: { plan: world.plan } } } }
+      : undefined),
+  }
+  const clock = { t: 1_000_000 }
+  const delivery = createDelivery(ctx, agent, { now: () => clock.t })
+  const server = { rows, delivery: null }
+  const log = []
+  let claims = 0
+  const answer = (op, fields) => {
+    if (op === "receipts") return { receipts: server.rows, muted: false }
+    if (op === "receipts_delivered") return { delivered: fields.receipts }
+    if (op === "pending") return { messages: server.delivery ? [server.delivery.id] : [] }
+    if (op === "claim") return { dispatch: true, attempt_id: `44444444-4444-4444-8444-${String(++claims).padStart(12, "0")}`, reservation_ms: 20_000, messages: server.delivery ? [server.delivery] : [] }
+    if (op === "status") return { muted: false }
+    if (op === "settle") { server.delivery = null; return {} }
+    return {}
+  }
+  const worker = {
+    ready: Promise.resolve(joined), closed: new Promise(() => {}),
+    request(op, fields) { log.push({ op, fields }); return Promise.resolve(answer(op, fields)) },
+    stop() { return Promise.resolve({ code: 0, signal: null }) },
+  }
+  const lifecycle = createLifecycle(bus, delivery, config, { ...quietTimers, startProcess: () => worker, now: () => clock.t, random: () => 0 })
+  bus.fire("session_start", { nativeSessionId: "native-1" })
+  await flush()
+  // A Web prompt clears the stop latch, in the delivery and in the lifecycle.
+  delivery.onInserted({ source: { kind: "user", rpcId: "rpc-1" } })
+  bus.fire("input", { source: "local" })
+  return {
+    lifecycle, delivery, world, server, log, warnings, steered,
+    async tick(seconds = POLL_MS / 1000) { clock.t += seconds * 1000; log.push({ op: "tick" }); await lifecycle.poll(); await flush() },
+    count: op => log.filter(entry => entry.op === op).length,
+  }
+}
+
+test("a receipts pass that cannot read the native state holds receipts and latches nothing: the next delivery is handed with no new Web prompt", async () => {
+  const s = await realSession({ rows: [row(1)] })
+  s.world.readable = false
+  await s.tick(0)
+  assert.equal(s.count("receipts"), 0, "held: no feed read")
+  s.world.readable = true
+  s.world.status = "idle"
+  s.server.delivery = peerMessage
+  await s.tick()
+  assert.equal(s.steered.length, 1, "a delivery goes through with no second Web prompt")
+  assert.equal(s.log.find(entry => entry.op === "settle")?.fields.result.outcome, "handed")
+  assert.deepEqual(s.warnings, [], "and no agent was logged as unclassifiable")
+})
+
+test("with the real native half: Plan Mode that came on after staging drops the notice, and the row comes back once it is over", async () => {
+  const feed = [row(1)]
+  const s = await realSession({ rows: feed })
+  await s.tick(0) // staged for the running turn
+  s.world.plan = { active: true, pending: false }
+  assert.equal(s.lifecycle.receiptsNotice(), null, "Plan Mode: dropped")
+  s.world.plan = { active: false, pending: false }
+  await s.tick()
+  assert.equal(s.count("receipts"), 2, "Plan Mode is over: the row is asked for again")
+  const notice = s.lifecycle.receiptsNotice()
+  assert.ok(notice && notice.text.includes(feed[0].message_id), "a running turn outside Plan Mode gets the row")
+  assert.deepEqual(s.warnings, [])
+})
+
+test("with the real native half: a state that cannot be read at output drops the notice and latches nothing", async () => {
+  const feed = [row(1)]
+  const s = await realSession({ rows: feed })
+  await s.tick(0) // staged for the running turn
+  s.world.readable = false
+  assert.equal(s.lifecycle.receiptsNotice(), null, "an unreadable state: dropped")
+  s.world.readable = true
+  assert.deepEqual(s.warnings, [], "nothing was logged as unclassifiable")
+  assert.equal(s.delivery.state(), "busy", "and the delivery's own question still sees a running turn, not a latch")
+  await s.tick()
+  assert.equal(s.count("receipts"), 2, "the row is asked for again")
+  const notice = s.lifecycle.receiptsNotice()
+  assert.ok(notice && notice.text.includes(feed[0].message_id), "and the next step gets it")
 })

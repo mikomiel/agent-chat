@@ -189,9 +189,14 @@ or a stop. Only the idle-wake waiter exits 2.
   `additionalContext`. Only a reply that would otherwise carry nothing does, so
   a notice never shares an output or its cap with the binding or a delivery. It
   is never in a `Stop` reply, in the idle-wake waiter or in an exit 2, so it
-  cannot wake the session. When the hook's receipt says it wrote the text, the
+  cannot wake the session. The notice is checked again when a hook would carry
+  it, with no request: the latest mute flag any worker answer carried must be
+  `false` and the notice at most 5 seconds old, otherwise it is dropped, the
+  hook is answered as for any reply with nothing to carry, and its rows are
+  offered again. When the hook's receipt says it wrote the text, the
   receiver marks exactly those ids delivered at once; a refused or failed mark
-  is sent again at the next pass. A staged notice that was not shown is
+  is sent again at the next pass. A pass sends one request, the mark that waits
+  or else the poll. A staged notice that was not shown is
   released at `Stop`. The request runs after the hook's reply, queued like any
   other: it never replaces a claim, and a claim that follows it waits for it, so
   a slow server can delay that claim by up to the worker's deadline. The binding
@@ -331,7 +336,8 @@ the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors
 and the byte bound with the announcement counted, the socket and its start handshake, the receiver's state, delivery,
 settlement, rejoin and shutdown with a manual clock, the hook commands with
 payload doubles (output cap, write receipts, delegated refusal, idle wake exit
-code), sender receipts (the offer rules, the confirmation and the mark, that a
+code), sender receipts (the offer rules, the output-time check (mute and age),
+the confirmation and the mark, one request per pass, that a
 delivery and the binding are byte-identical with receipts pending, and that
 `Stop` and the waiter carry no notice), the plugin shape that Claude Code reads, and runs of the real hook and receiver
 processes against a fake worker. It needs no Claude Code install, no

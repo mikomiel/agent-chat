@@ -417,9 +417,14 @@ sends its request: it does not wait for the worker to end its instance.
   notice never shares an output or its 6,000-byte cap with the binding or a
   delivery. A hook that is out of patience, or whose connection has closed, gets
   no notice, and the notice stays staged. A wake carries none, and nothing polls
-  while the session is idle, so a receipt cannot wake the thread. When the
-  hook's receipt says it wrote the text, the receiver marks exactly those ids
+  while the session is idle, so a receipt cannot wake the thread. The notice is
+  checked again when a hook would carry it, with no request: the latest mute
+  flag any worker answer carried must be `false` and the notice at most 5
+  seconds old, otherwise it is dropped, the hook is answered as for any reply
+  with nothing to carry, and its rows are offered again. When the hook's
+  receipt says it wrote the text, the receiver marks exactly those ids
   delivered at once; a refused or failed mark is sent again at the next pass. A
+  pass sends one request, the mark that waits or else the poll. A
   staged notice that was not shown is released at `Stop` and at `Interrupt`. The
   request runs after the hook's reply, queued like any other: it never replaces a
   claim or a wake, and one that follows it waits for it, so a slow server can
@@ -1010,7 +1015,8 @@ the notice limits at the smallest bound, the socket, its stale-socket recovery, 
 on trusted and untrusted paths, the state directory resolved once behind a link and handed to the receiver, which refuses a directory that resolves differently, the WebSocket client against a
 fake control socket on a real Unix socket (the upgrade answer checked whole, status line and header values included, the bind, its queue probe and the newest-turn statuses and thread statuses that are not strings, a `thread/read` record that must be complete before an idle read goes on, the bind's commit fence for a retired worker, the wake's add, its fence only on an echoed client id, its confirmation and its deadlines, the socket identity across its two connections and through a final link, and the trust rule against real file systems, a path resolved the way the kernel walks it included), the receiver's state, delivery, the idle wake and its poll (the refresh after a start, single flight, the backoff, a heartbeat that counts as published only once it is confirmed), the wake text (the fixed line and the rows, no binding, and a claim sized by the same renderer), a wake's reservation that is too short (`failed`, nothing sent), a suspend before the add measured on the wall clock (and a wall clock stepped back), the budget after the add after a suspend, a wake's second status after its fresh reading (a mute committed meanwhile), a prompt that takes over from a wake poll that has not claimed and does not wait for one on its refresh read,
 settlement, rejoin and shutdown with a manual clock, sender receipts (the offer
-rules, the confirmation and the mark, that a delivery, the binding and a wake are
+rules, the output-time check (mute and age), the confirmation and the mark, one
+request per pass, that a delivery, the binding and a wake are
 byte-identical with receipts pending, and that a wake and `Stop` carry no
 notice), the hook commands
 with payload doubles (output cap, write receipts, delegated refusal, owner

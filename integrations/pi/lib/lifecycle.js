@@ -273,18 +273,22 @@ export function createAgentChat(pi, config, {
   }
 
   // The sender receipts pass. It runs inside drive's single flight, after the delivery poll, so it never overlaps a request
-  // of the claim, settle or heartbeat path and never runs between a claim and its settle. At most every POLL_MS it sends the
-  // mark that is waiting, then polls the feed while a turn runs; a pass with nothing to ask spends nothing. A request that
-  // is thrown because the worker stopped, died or timed out goes to handleFailure like any other. A refused or malformed
-  // answer, and every other error here, is held: it never ends chat and never reaches a delivery.
+  // of the claim, settle or heartbeat path and never runs between a claim and its settle. At most every POLL_MS it sends ONE
+  // request: the mark that is waiting, or, when none waits, the feed poll while a turn runs. Two in a row would hold the one
+  // worker flight, and a claim behind it, for both; so a mark that keeps failing also holds the poll, and the poll waits for
+  // the next cadence once the mark has landed. A pass with nothing to ask spends nothing. A request that is thrown because
+  // the worker stopped, died or timed out goes to handleFailure like any other. A refused or malformed answer, and every
+  // other error here, is held: it never ends chat and never reaches a delivery.
   async function receiptsPass() {
     try {
       if (!receipts.due(receiptState, now())) return
-      const marks = receipts.toMark(receiptState).length > 0
-      if (!marks && !offerable()) return
-      receiptState = receipts.polled(receiptState, now())
-      if (marks) await markReceipts()
-      if (live && offerable()) await offerReceipts()
+      if (receipts.toMark(receiptState).length > 0) {
+        receiptState = receipts.polled(receiptState, now())
+        await markReceipts()
+      } else if (offerable()) {
+        receiptState = receipts.polled(receiptState, now())
+        await offerReceipts()
+      }
     } catch (error) {
       if (error?.receipts === true && typeof error.code === "string" && error.code !== "CHAT_REQUEST_INVALID") throw error
     }

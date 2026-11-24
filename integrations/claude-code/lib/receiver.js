@@ -13,7 +13,8 @@
 // background after a prompt or tool event was answered, so it never delays a hook. It queues behind every other worker
 // request, is not counted in `inflight`, and never runs between a claim and its settle. Its notice is shown only in the
 // reply of a prompt or tool event that would otherwise carry nothing: never in a delivery, never in an announcement,
-// never from a Stop hook or the waiter, so it can neither wake the model nor change what a delivery carries.
+// never from a Stop hook or the waiter, so it can neither wake the model nor change what a delivery carries. A pass sends one
+// request, and a notice is checked again when it is output: the latest mute flag any answer carried, and its age.
 import { randomUUID } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { loadConfig } from "./config.js"
@@ -108,7 +109,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let tail = Promise.resolve()
   // Sender receipts. The first poll waits one cadence: a session that has just joined has sent nothing to receive receipts for.
   let receiptState = receipts.polled(receipts.createReceipts(), now())
-  let staged = null // { ids, text }: a notice waiting for a prompt or tool event that has nothing else to carry
+  let staged = null // { ids, text, at }: a notice waiting for a prompt or tool event that has nothing else to carry; `at` is when its answer came
   let handing = false // a notice is out on a hook's connection, not yet confirmed
   let receiptsBusy = false // a pass is queued or running
   let firstAttempt
@@ -334,6 +335,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         else {
           const state = await ask("status")
           if (!live) return false
+          receiptState = receipts.muteSeen(receiptState, state) // the latest mute flag known; it reads and never throws
           if (check(state, "status")) result = { outcome: "deferred", reason: "unknown" }
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
           else if (started + reservation - now() <= MIN_RESERVATION_MS) result = UNCERTAIN // the status call used the reservation
@@ -376,26 +378,34 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // The ids whose output a hook confirmed, and only those. The answer is not a success unless it says so; a failed mark keeps
-  // the ids for the next pass. The worker ends on an empty list, so there is no request without an id.
+  // the ids for the next pass. The worker ends on an empty list, so there is no request without an id. True when it asked.
   async function markReceipts() {
     const ids = receipts.toMark(receiptState)
-    if (ids.length && receipts.accepted(await receiptsAsk("receipts_delivered", { receipts: ids }))) receiptState = receipts.marked(receiptState, ids)
+    if (!ids.length) return false
+    if (receipts.accepted(await receiptsAsk("receipts_delivered", { receipts: ids }))) receiptState = receipts.marked(receiptState, ids)
+    return true
   }
 
   // Stage a notice for the next event, from the feed, while a turn runs. An answer for a turn that is over is dropped.
   async function pollReceipts() {
     const answer = await receiptsAsk("receipts")
+    // The flag of this answer is the latest known, whether or not the turn it was asked for is still running.
+    const answeredAt = now()
+    receiptState = receipts.muteSeen(receiptState, answer)
     if (chatState() !== "busy") return
     const rows = receipts.offer(receiptState, answer)
     const notice = rows.length ? renderReceiptNotice(rows, MAX_OUTPUT_BYTES) : null
     if (notice === null) return // nothing to show, or not whole within the budget: held, and still pending server-side
-    staged = { ids: notice.ids, text: notice.text }
+    staged = { ids: notice.ids, text: notice.text, at: answeredAt }
     receiptState = receipts.issued(receiptState, notice.ids)
   }
 
-  // A pass runs after the event's own reply was sent. A transport failure goes where any request's failure goes; a refused or
-  // malformed answer, and any fault of this code, is held: it never ends chat and never reaches a delivery. `force` is a
-  // mark right after a confirmation: a mark is not a poll, so the cadence does not apply.
+  // A pass runs after the event's own reply was sent. It sends ONE request: the mark that waits, or, when none waits, the feed
+  // poll. Two in a row would hold the one worker flight, and a delivery queued behind them, for both; so a mark that keeps
+  // failing also holds the poll, and the poll waits for the next cadence once the mark has landed. The lane decides when it
+  // gets there, so a confirmation that landed while the pass queued is marked first. A transport failure goes where any
+  // request's failure goes; a refused or malformed answer, and any fault of this code, is held: it never ends chat and never
+  // reaches a delivery. `force` is a mark right after a confirmation: a mark is not a poll, so the cadence does not apply.
   function receiptsPass({ force = false } = {}) {
     if (receiptsBusy || !live || !joined || closed || failure) return
     if (!force && !receipts.due(receiptState, now())) return
@@ -406,7 +416,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (!force) receiptState = receipts.polled(receiptState, now())
     lane(async () => {
       if (!live || !joined) return
-      await markReceipts()
+      if (await markReceipts()) return
       if (poll && live && joined && chatState() === "busy") await pollReceipts()
     }).catch(error => {
       // The worker module gives every transport failure a code; an error without one is a fault of this pass.
@@ -416,10 +426,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   // The one place a notice reaches the model: the reply of a prompt or tool event that would otherwise carry nothing. It
   // is confirmed by the same write receipt a delivery waits for. Anything else leaves the ids unmarked, so the feed offers
-  // them again: a duplicate notice is data; a lost one is not.
+  // them again: a duplicate notice is data; a lost one is not. It is checked again here and asks the server nothing: the
+  // latest mute flag any answer carried must be false and the answer that staged it at most one cadence old. Otherwise the
+  // notice is dropped, and the hook is answered as for any other reply with nothing to carry.
   async function receiptsReply(link) {
     const notice = staged
     if (!notice || !live || !joined || closed || failure || chatState() !== "busy") return link.send({ context: null })
+    if (!receipts.showable(receiptState, notice.at, now())) {
+      releaseReceipts()
+      return link.send({ context: null })
+    }
     staged = null
     handing = true
     try {

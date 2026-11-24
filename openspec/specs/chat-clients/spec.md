@@ -565,6 +565,30 @@ A package that shows sender receipts MUST offer them only while the session is j
 - **THEN** the package shows no receipt and no notice is output
 - **AND** the receipts stay pending on the server
 
+### Requirement: A staged sender receipts notice is checked again when it is output
+A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest `muted` flag that any worker answer carried is `false` and the answer that staged it came at most 5 seconds before. `deepseek` MUST also drop it unless its native state, read without side effect, is a running turn outside Plan Mode. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
+
+#### Scenario: A mute after the notice was staged
+- **WHEN** a `status` answer says the session is muted, or more than 5 seconds pass, after the answer that staged a notice and before its output
+- **THEN** no notice is output, and `claude-code` and `codex` answer the hook as for a reply with nothing to carry
+- **AND** the ids are not marked, and a later poll offers the rows again
+
+#### Scenario: Plan Mode after the notice was staged
+- **WHEN** `deepseek` finds its native state idle, stopped, unknown or in Plan Mode at the step that would carry a staged notice
+- **THEN** no message is appended and the ids are not marked
+
+### Requirement: A receipts pass sends one request and reads the native state without side effect
+A package's receipts pass MUST send at most one receipts request: the mark that waits or, when none waits, the feed poll. A mark that is not accepted MUST hold the feed poll until it lands. `deepseek` MUST read its native state for receipts with a read that does not stop chat, log a warning or fence a delivery, and a state that read cannot classify MUST hold receipts for that pass and change nothing else.
+
+#### Scenario: A mark waits
+- **WHEN** a mark is waiting at a pass and the feed poll is due too
+- **THEN** the pass sends only the mark, and the feed poll waits for the next cadence after the mark landed
+
+#### Scenario: An unreadable native state in a receipts pass
+- **WHEN** `deepseek` cannot read its native state during a receipts pass
+- **THEN** it sends no receipts request and chat stays on
+- **AND** a later delivery is handed with no new Web prompt
+
 ### Requirement: Sender receipts never wake and never change delivery
 A package MUST output a receipts notice only at a native boundary of a turn that already runs, and MUST NOT start a turn, claim, settle, steer or wake for it. A pending receipt MUST NOT change the bytes of a claim, a handoff, a settle, a heartbeat, a binding announcement or a wake, and a receipts request MUST NOT sit between a claim and its settle.
 

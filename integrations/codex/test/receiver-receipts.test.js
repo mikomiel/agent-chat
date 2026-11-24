@@ -77,7 +77,7 @@ function workerDouble({ events }) {
   const log = [] // every request in order: { op, boot, ...fields }
   const bootIds = []
   const server = {
-    rows: [], muted: false, receipts: null, mark: null, pending: [], failures: {}, gates: {}, heartbeat: null,
+    rows: [], muted: false, receipts: null, mark: null, pending: [], failures: {}, gates: {}, heartbeat: null, status: null,
   }
   let attempts = 0
   const answer = (op, fields) => {
@@ -87,7 +87,7 @@ function workerDouble({ events }) {
       case "heartbeat": return server.heartbeat ? server.heartbeat(fields) : {}
       case "pending": return { messages: server.pending }
       case "claim": return { dispatch: true, attempt_id: `attempt-${++attempts}`, reservation_ms: 30_000, messages: fields.messages.map(peerRow) }
-      case "status": return { muted: false }
+      case "status": return server.status ? server.status() : { muted: false }
       case "settle": server.pending = []; return {}
       case "receipts": return server.receipts ?? { receipts: server.rows, muted: server.muted }
       case "receipts_delivered": return server.mark ? server.mark(fields) : { delivered: fields.receipts }
@@ -468,6 +468,8 @@ test("a staged notice is not handed while chat is down, and is shown and marked 
   assert.equal(binding.length, 1)
   assert.match(binding[0].context, /^Agent Chat is available to this session/)
   assert.ok(!binding[0].context.includes(NOTICE_HEAD), "the binding goes alone")
+  // The notice staged before the outage is older than one cadence by now: this event drops it, and its pass asks the new instance.
+  await r.op(turn())
   const shown = (await r.op(turn())).sent[0]
   assert.ok(isNoticeText(shown.context), "and the notice follows")
   assert.deepEqual(r.worker.ops("receipts_delivered").map(entry => [entry.boot, entry.receipts]), [[2, [rcpt(1).id]]])
@@ -799,4 +801,92 @@ test("isolation: no receipts request sits between a claim and its settle", async
     const next = ops.slice(index + 1).find(op => op !== "status")
     assert.equal(next, "settle", `claim at ${index} is followed by status and settle only`)
   }
+})
+
+// Review of #130: a notice is checked again when it is output, and a pass sends one request.
+
+test("a notice is dropped at output when a later answer says muted: nothing is shown or marked, the hook is still answered, and the row comes back once unmuted", async () => {
+  const feed = [rcpt(1)]
+  const r = await staged({ rows: feed })
+  // The next event's delivery reads the session's status, and the operator has muted the session since the poll.
+  r.server.status = () => ({ muted: true })
+  r.server.pending = ["m1"]
+  const hook = await r.op(turn())
+  assert.deepEqual(hook.sent, [{ context: null }], "the hook is answered with no notice, and the muted delivery sends none")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "muted" }])
+  assert.equal(r.count("receipts_delivered"), 0, "nothing was shown, so nothing is marked")
+  // Unmuted again: the id was never marked, so the feed offers the same row, and it is shown and marked.
+  r.server.status = null
+  await r.clock.advance(POLL_MS)
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "this event's pass polls again")
+  const shown = (await r.op(turn())).sent[0]
+  assert.ok(isNoticeText(shown.context) && shown.context.includes(feed[0].message_id), "and the next event shows the row")
+  assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
+})
+
+test("a notice is shown only by an event at most one cadence after the poll that staged it; an older one is dropped and offered again", async () => {
+  const feed = [rcpt(1)]
+  const inside = await staged({ rows: feed })
+  await inside.clock.advance(POLL_MS)
+  const shown = (await inside.op(turn())).sent
+  assert.equal(shown.length, 1)
+  assert.ok(isNoticeText(shown[0].context), "at exactly one cadence it is still shown")
+
+  const late = await staged({ rows: feed })
+  await late.clock.advance(POLL_MS + 1)
+  const hook = hookDouble({ events: late.events })
+  const send = hook.send
+  hook.send = value => { late.events.push("reply"); return send(value) }
+  late.events.length = 0
+  assert.deepEqual((await late.op(turn(), hook)).sent, [{ context: null }], "one millisecond more and it is dropped, and the hook is still answered")
+  assert.deepEqual(late.events, ["pending", "reply", "receipts"], "the drop asks the server nothing before the reply; the pass that follows it asks for the row again")
+  assert.equal(late.count("receipts_delivered"), 0, "nothing was shown, so nothing is marked")
+  assert.equal(late.count("receipts"), 2, "the pass after it asks again: the row was never marked")
+  const again = (await late.op(turn())).sent[0]
+  assert.ok(isNoticeText(again.context) && again.context.includes(feed[0].message_id), "and the same row is shown by the next event")
+  assert.deepEqual(late.marks(), [{ receipts: [feed[0].id] }])
+})
+
+test("events more than one cadence apart show no notice, and an event inside one cadence of the poll does", async () => {
+  const slow = await ready({ rows: [rcpt(1)] })
+  const hooks = []
+  for (let index = 0; index < 5; index += 1) {
+    hooks.push(await slow.op(turn()))
+    await slow.clock.advance(6_000)
+  }
+  assert.ok(hooks.every(hook => hook.sent.length === 1 && hook.sent[0].context === null), "every notice was out of date at the next event")
+  assert.equal(slow.count("receipts_delivered"), 0)
+  assert.equal(slow.count("receipts"), 5, "and each event's pass asked again")
+
+  const quick = await ready({ rows: [rcpt(1)] })
+  await quick.op(turn())
+  await quick.clock.advance(4_000)
+  assert.ok(isNoticeText((await quick.op(turn())).sent[0].context), "an event 4 s after the poll shows it")
+})
+
+test("a pass with a mark waiting sends no feed request: the mark takes it, and the feed waits for the next cadence", async () => {
+  const feed = [rcpt(1)]
+  const r = await staged({ rows: feed })
+  r.server.mark = () => ({ refused: "SERVICE_UNAVAILABLE" }) // the mark does not land
+  await r.op(turn()) // shows the notice; the mark that follows at once is refused
+  assert.equal(r.count("receipts_delivered"), 1)
+  assert.equal(r.count("receipts"), 1)
+  const asked = () => r.count("receipts") + r.count("receipts_delivered")
+  for (let attempt = 2; attempt <= 4; attempt += 1) {
+    const before = asked()
+    await r.clock.advance(POLL_MS) // the feed is due too
+    await r.op(turn())
+    assert.equal(asked() - before, 1, `pass ${attempt}: one receipts request`)
+    assert.equal(r.count("receipts"), 1, `pass ${attempt}: and it is no feed read`)
+    assert.equal(r.count("receipts_delivered"), attempt)
+  }
+  r.server.mark = null
+  await r.clock.advance(POLL_MS)
+  await r.op(turn()) // the mark lands, and the feed still waits
+  assert.equal(r.count("receipts_delivered"), 5)
+  assert.equal(r.count("receipts"), 1, "the mark that landed took its pass")
+  await r.clock.advance(POLL_MS)
+  await r.op(turn()) // the next cadence reads the feed
+  assert.equal(r.count("receipts"), 2)
+  assert.equal(r.count("receipts_delivered"), 5)
 })

@@ -3,7 +3,8 @@
 // A receipt is a non-waking row the server keeps for the session that sent an addressed message. A package offers the rows
 // to its model at a native boundary of a turn that is already running, then tells the server which ones it output. The
 // rules are in integrations/README.md, "Sender receipts". This file holds only the decisions that do not depend on a
-// harness: when a poll is due, which rows of an answer may be shown, which ids to mark, and what has been tracked.
+// harness: when a poll is due, which rows of an answer may be shown, whether a staged notice may still be output, which ids
+// to mark, and what has been tracked.
 //
 // Every function is pure. A state is a plain value, a function returns the next state and never changes its argument, and
 // the clock is a parameter, so a test needs no timer. Nothing here does I/O, throws on a bad answer, or reads a global.
@@ -26,8 +27,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // An id is in flight (output, not yet confirmed), shown (confirmed, not yet marked) or marked, never back.
 const RANK = { inflight: 0, shown: 1, marked: 2 }
 
-/** The state of a session that has polled nothing and shown nothing. */
-export const createReceipts = () => ({ polledAt: null, entries: [] })
+/** The state of a session that has polled nothing, shown nothing and heard no mute flag. */
+export const createReceipts = () => ({ polledAt: null, muted: null, entries: [] })
 
 /** Whether a poll is due at `now` (milliseconds on the caller's clock): never polled, POLL_MS since, or a clock that went back. */
 export const due = (state, now) => state.polledAt === null || !(now >= state.polledAt) || now - state.polledAt >= POLL_MS
@@ -70,6 +71,22 @@ export function offer(state, answer) {
   }
   return rows
 }
+
+/**
+ * The state after a worker answer. An answer that carries a `muted` key, a `receipts` answer that has rows or a `status`
+ * answer, replaces the latest mute flag, whatever its value; every other answer, or a value that is no object, changes
+ * nothing. It reads and never throws, so a package may call it on any answer, between a claim and its settle too.
+ */
+export const muteSeen = (state, answer) => (answer !== null && typeof answer === "object" && "muted" in answer ? { ...state, muted: answer.muted } : state)
+
+/**
+ * Whether a notice staged at `stagedAt` may be output at `now` (both on the caller's clock). The latest flag any answer
+ * carried must be `false`: a muted, a missing and a non-boolean flag are all a no. The notice may be at most POLL_MS old:
+ * past that the flag is older than a poll, and a mute may have landed since. A clock that cannot be read, or that went
+ * back, is a no. This asks the server nothing, so a mute that lands after the last answer and less than POLL_MS before
+ * the output is the one it cannot see.
+ */
+export const showable = (state, stagedAt, now) => state.muted === false && now - stagedAt >= 0 && now - stagedAt <= POLL_MS
 
 /** The state after the native output of these ids was issued but not yet confirmed: they are not offered again. */
 export const issued = (state, ids) => advance(state, ids, "inflight")

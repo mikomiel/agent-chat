@@ -8,6 +8,10 @@
 //                             agent_settled.
 //   delivery.state()          null when a batch may be handed over now, or one
 //                             of busy/plan/stopped/offline/unknown/stale_binding.
+//                             It latches stop on a state it cannot classify.
+//   delivery.peek()           the same answer with no side effect. Only the receipts
+//                             pass and a notice's output read it; without it,
+//                             receipts are held.
 //   delivery.heartbeatState() the Heartbeat object published every 30 seconds.
 //   delivery.deliver(batch, deadline)
 //                             hands one rendered notice to the model and
@@ -19,7 +23,9 @@
 // hands them to `delivery`, so they never steer or wake. It stages one notice while a turn runs, and the native half
 // pulls it at a step boundary and reports the output back:
 //
-//   receiptsNotice()          { id, text } for the next step of the running turn, or null. Taken once.
+//   receiptsNotice()          { id, text } for the next step of the running turn, or null. Taken once. It is null, and the
+//                             notice is dropped, when the latest mute flag is not false, the notice is older than one poll,
+//                             or the turn is no longer running outside Plan Mode.
 //   receiptsConfirmed(id)     the native session logged the message with this id.
 //
 // This module never starts a model turn on its own and never treats a peer
@@ -77,7 +83,7 @@ export function createLifecycle(bus, delivery, config, {
   let pollDue = false
   let receiptsDue = false
   let receiptState = receipts.createReceipts()
-  let pendingReceipts = null // { ids, text, id }: a notice staged for the next step (id null) or taken by it (id set)
+  let pendingReceipts = null // { ids, text, id, at }: a notice staged for the next step (id null) or taken by it (id set); `at` is when its answer came
   let stopped = true
   let closed = false
   let disabled = false
@@ -87,13 +93,21 @@ export function createLifecycle(bus, delivery, config, {
     try { notice(text) } catch { /* advisory */ }
   }
 
-  function deliveryState() {
-    if (typeof delivery.state !== "function") return "unknown"
+  // One native read, normalized: a string, or null for an agent that may receive a delivery now. A missing method, a throw
+  // and any other value are `unknown`.
+  function nativeState(read) {
+    if (typeof delivery[read] !== "function") return "unknown"
     try {
-      const reason = delivery.state()
+      const reason = delivery[read]()
       return typeof reason === "string" || reason === null ? reason : "unknown"
     } catch { return "unknown" }
   }
+
+  // The delivery's question. `state` latches stop on a state it cannot classify, so only a delivery path asks it.
+  const deliveryState = () => nativeState("state")
+  // The receipts' question: `peek` is the same classification with no side effect, so a read that fails here holds receipts
+  // and changes nothing else.
+  const receiptsState = () => nativeState("peek")
 
   function heartbeatState() {
     let state
@@ -242,25 +256,30 @@ export function createLifecycle(bus, delivery, config, {
   }
 
   // The sender receipts pass. It runs inside drive's single flight, after the delivery poll, so it never overlaps a request
-  // of the claim, settle or heartbeat path and never runs between a claim and its settle. At most every POLL_MS it sends the
-  // mark that is waiting, then polls the feed while a turn runs; a pass with nothing to ask spends nothing. A request that
-  // is thrown because the worker stopped, died or timed out goes to handleFailure like any other. A refused or malformed
-  // answer, and every other error here, is held: it never ends chat and never reaches a delivery.
+  // of the claim, settle or heartbeat path and never runs between a claim and its settle. At most every POLL_MS it sends ONE
+  // request: the mark that is waiting, or, when none waits, the feed poll while a turn runs. Two in a row would hold the one
+  // worker flight, and a claim behind it, for both; so a mark that keeps failing also holds the poll, and the poll waits for
+  // the next cadence once the mark has landed. A pass with nothing to ask spends nothing, and a mark tick never reads the
+  // native state. A request that is thrown because the worker stopped, died or timed out goes to handleFailure like any
+  // other. A refused or malformed answer, and every other error here, is held: it never ends chat and never reaches a delivery.
   async function receiptsPass() {
     try {
       if (!receipts.due(receiptState, now())) return
-      const marks = receipts.toMark(receiptState).length > 0
-      if (!marks && !offerable()) return
-      receiptState = receipts.polled(receiptState, now())
-      if (marks) await markReceipts()
-      if (live && offerable()) await offerReceipts()
+      if (receipts.toMark(receiptState).length > 0) {
+        receiptState = receipts.polled(receiptState, now())
+        await markReceipts()
+      } else if (offerable()) {
+        receiptState = receipts.polled(receiptState, now())
+        await offerReceipts()
+      }
     } catch (error) {
       if (error?.receipts === true && typeof error.code === "string" && error.code !== "CHAT_REQUEST_INVALID") throw error
     }
   }
 
-  // Receipts are staged only for a turn that already runs, and one notice at a time.
-  function offerable() { return !pendingReceipts && !stopped && !closed && !disabled && deliveryState() === "busy" }
+  // Receipts are staged only for a turn that already runs, and one notice at a time. The native state is read with `peek`: a
+  // read that fails holds receipts for this pass and latches nothing.
+  function offerable() { return !pendingReceipts && !stopped && !closed && !disabled && receiptsState() === "busy" }
 
   async function receiptsRequest(operation, fields) {
     try { return await request(operation, fields) } catch (error) {
@@ -280,19 +299,31 @@ export function createLifecycle(bus, delivery, config, {
   async function offerReceipts() {
     const record = live
     const answer = await receiptsRequest("receipts")
-    if (live !== record || !offerable()) return
+    if (live !== record) return
+    // The flag of this answer is the latest known, whether or not the turn it was asked for is still running.
+    const answeredAt = now()
+    receiptState = receipts.muteSeen(receiptState, answer)
+    if (!offerable()) return
     const rows = receipts.offer(receiptState, answer)
     const notice = rows.length ? renderReceiptNotice(rows, MAX_CONTEXT_BYTES) : null
     if (notice === null) return
-    pendingReceipts = { ids: notice.ids, text: notice.text, id: null }
+    pendingReceipts = { ids: notice.ids, text: notice.text, id: null, at: answeredAt }
     receiptState = receipts.issued(receiptState, notice.ids)
   }
 
   // The native half asks at the pre-step of a running turn. The notice is handed over once, with the id the native
-  // message must carry, so only that message's log event confirms it.
+  // message must carry, so only that message's log event confirms it. This is the moment it reaches the model, so it is
+  // checked again, and asks the server nothing: the latest mute flag any answer carried must be false and the answer that
+  // staged it at most one cadence old, and the native state, read again without side effect, must be a running turn that is
+  // not in Plan Mode. Otherwise the notice is dropped: its ids stay unmarked, so the server keeps them and a later poll offers
+  // them again.
   function receiptsNotice() {
     const pending = pendingReceipts
     if (!pending || pending.id !== null || !live || !joined || stopped || closed || disabled) return null
+    if (!receipts.showable(receiptState, pending.at, now()) || receiptsState() !== "busy") {
+      dropReceipts()
+      return null
+    }
     pending.id = randomUUID()
     return { id: pending.id, text: pending.text }
   }
@@ -356,6 +387,7 @@ export function createLifecycle(bus, delivery, config, {
     } else {
       const status = await request("status")
       if (!live) return
+      receiptState = receipts.muteSeen(receiptState, status) // the latest mute flag known; it reads and never throws
       const statusRefusal = refused(status)
       if (statusRefusal) {
         if (REJOIN_AFTER.has(statusRefusal)) throw Object.assign(new Error(statusRefusal), { code: statusRefusal, operation: "status" })

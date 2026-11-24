@@ -542,3 +542,29 @@ test("the binding does not depend on receipts: same bytes before, during and aft
   assert.equal(s.lifecycle.binding(), before)
   assert.ok(before.includes("send/reply --receipts asks for handed/acked receipts."))
 })
+
+// Review of #130: a pass sends one request.
+
+test("a tick with a mark waiting sends no feed request: the mark takes it, and the feed waits for the next cadence", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed })
+  s.server.markReply = () => ({ refused: "SERVICE_UNAVAILABLE" }) // the mark does not land
+  await s.tick(0) // the poll shows the notice, and Pi confirms it inside the call
+  assert.equal(s.count("receipts"), 1)
+  const asked = () => s.count("receipts") + s.count("receipts_delivered")
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const before = asked()
+    await s.tick() // the feed is due too
+    assert.equal(asked() - before, 1, `tick ${attempt}: one receipts request`)
+    assert.equal(s.count("receipts"), 1, `tick ${attempt}: and it is no feed read`)
+    assert.equal(s.count("receipts_delivered"), attempt)
+  }
+  s.server.markReply = null
+  await s.tick() // the mark lands, and the feed still waits
+  assert.equal(s.count("receipts_delivered"), 4)
+  assert.equal(s.count("receipts"), 1, "the mark that landed took its tick")
+  await s.tick() // the next cadence reads the feed
+  assert.equal(s.count("receipts"), 2)
+  assert.equal(s.count("receipts_delivered"), 4)
+  assert.equal(s.receiptSends().length, 1, "and the row is not shown again")
+})

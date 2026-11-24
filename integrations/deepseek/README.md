@@ -192,7 +192,14 @@ fits on `cli` fits on every route.
   only when that step already has a message of its own, because a notice is
   never the reason for a step, and the plugin never calls `agent.steer` for a
   receipt. It asks only while the agent is busy and stages rows only when the
-  worker's answer says the session is not muted. The `session/event`
+  worker's answer says the session is not muted. At that step the notice is
+  checked again, with no request: the latest mute flag any worker answer
+  carried must be `false`, the notice must be at most 5 seconds old, and the
+  agent must still run a turn outside Plan Mode, read without side effect;
+  otherwise the notice is dropped and its rows are offered again. The pass
+  reads the agent the same way, so a state it cannot read holds receipts for
+  that pass and does not stop chat. A pass sends one request, the mark that
+  waits or else the poll. The `session/event`
   `user/message` that carries the appended message's id confirms the notice, and
   the next pass marks exactly those ids delivered. A notice that is not
   confirmed is released at `agent_settled`, and a refused or failed mark is sent
@@ -272,6 +279,8 @@ settlement with doubles, the shared notice vectors, the claim packing for bodies
 mode, and the delivery fence
 (claim, steer throw, retraction, discard, Plan Mode, unreadable projections,
 mute, expired reservation, throwing native call and disposal), and sender
-receipts: the offer rules, the `agent/pre-step` append, the confirmation and the
-mark, and that a delivery and the binding are byte-identical with receipts
-pending. It needs no DSH install, no PostgreSQL, no service and no credential.
+receipts: the offer rules, the `agent/pre-step` append, the output-time check
+(mute, age, Plan Mode), the confirmation and the mark, one request per pass, the
+read of the native state that latches nothing, and that a delivery and the
+binding are byte-identical with receipts pending. It needs no DSH install, no
+PostgreSQL, no service and no credential.

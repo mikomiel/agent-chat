@@ -291,6 +291,7 @@ async function integrated({ rows = [], native = { state: "busy" } } = {}) {
   const loadParts = async () => ({
     createDelivery: () => ({
       state: () => native.state,
+      peek: () => native.state,
       heartbeatState: () => ({ native_state: native.state === "busy" ? "busy" : "idle", stopped: false, plan_mode: false }),
       deliver(batch) { delivered.push(batch); return Promise.resolve({ outcome: "handed", reason: null }) },
       dispose() {},
@@ -418,4 +419,24 @@ test("end to end: the binding the pre-step appends is the same with receipts pen
     } finally { s.cleanup() }
   }
   assert.deepEqual(bindings[1], bindings[0])
+})
+
+test("end to end: a notice that went stale or met Plan Mode before its step is not appended, and the row is offered again", async () => {
+  const feed = [row(1)]
+  for (const [name, spoil] of [
+    ["stale", s => { s.clock.t += POLL_MS + 1 }],
+    ["Plan Mode", s => { s.native.state = "plan" }],
+  ]) {
+    const s = await integrated({ rows: feed })
+    try {
+      await s.tick(0)
+      spoil(s)
+      assert.equal(receiptOf(await s.preStep(2)), undefined, `${name}: not appended`)
+      s.native.state = "busy"
+      await s.tick()
+      const again = receiptOf(await s.preStep(3))
+      assert.ok(again, `${name}: the row is staged again and appended`)
+      assert.ok(again.content[0].text.includes(feed[0].message_id))
+    } finally { s.cleanup() }
+  }
 })
