@@ -56,10 +56,11 @@
 // (`session.execution.started`). It never creates a record and never runs on a session's chain: it takes the lifecycle's turn
 // at the worker, or claims nothing. Everything it awaits is under one budget, `IDLE_BUDGET_MS`: the host does not time a hook
 // out, so a hook that did not return would stall the session's end of turn. The budget is a deadline on the monotonic clock,
-// the hook's start plus the budget, and it is read again just before the claim and just before the admission: a timer can run
-// late. At the budget the hook returns and nothing moves forward from it. A grant held and not yet written to the session
-// settles deferred, so the server offers it again. An admission still in flight settles uncertain. An input that the host has
-// accepted is not the budget's: its delivered event or its own deadline settles it, whatever the hook's cleanup is doing.
+// the hook's start plus the budget. A timer armed for what is left of it releases the hook, and the hook reads the clock
+// itself as the last step before the claim and as the last step before the host call: a timer can run late. At the budget
+// the hook returns and nothing moves forward from it. A grant held and not yet written to the session settles deferred, so
+// the server offers it again. An admission still in flight settles uncertain. An input that the host has accepted is not the
+// budget's: its delivered event or its own deadline settles it, whatever the hook's cleanup is doing.
 //
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
 // rejection there, or in a signal applied on receipt, disables chat for that session only. A deleted session never rejoins in this process. A session
@@ -328,23 +329,31 @@ export function createManager(ctx, config, parts, {
   // starts one, which is the only way a plugin can hand input to a session it has just proved to be between model turns. A
   // rejection or a throw leaves the attempt uncertain: the input may exist already, and it cannot be taken back. A call that
   // returns hands the attempt over to its own event and deadline: from then on the budget does not end it, because the host
-  // has accepted the input and its delivered event can still come in time.
-  function admitter(record, turn) {
+  // has accepted the input and its delivered event can still come in time. The caller's time is asked once more as the last
+  // step before the host call, after the attempt is open and its timer armed, and nothing runs between that check and the
+  // call. A caller that is out of time makes no call: it closes the attempt, and answers that nothing was written.
+  function admitter(record, turn, open) {
     return async ({ text, attemptID, deadline }) => {
       const inboxID = inboxIDOf(attemptID)
       const attempt = delivery.open(record.id, { inboxID, deadline })
       turn.admitting = attempt
+      const input = {
+        id: inboxID,
+        sessionID: record.id,
+        text,
+        description: "Agent Chat",
+        metadata: { source: CHAT_SOURCE },
+        delivery: "steer",
+        resume: false,
+      }
+      if (!open()) {
+        turn.admitting = null
+        attempt.abandon()
+        return { written: false }
+      }
       let call
       try {
-        call = Promise.resolve(ctx.session.synthetic({
-          id: inboxID,
-          sessionID: record.id,
-          text,
-          description: "Agent Chat",
-          metadata: { source: CHAT_SOURCE },
-          delivery: "steer",
-          resume: false,
-        }))
+        call = Promise.resolve(ctx.session.synthetic(input))
       } catch {
         attempt.abandon()
         return attempt
@@ -364,7 +373,7 @@ export function createManager(ctx, config, parts, {
     const info = await lookup(record.id)
     if (!open() || !isRootSession(info, record.id) || info.agent === PLAN_AGENT) return
     if (!(await record.context.held()) || !open()) return
-    await record.lifecycle.idle(admitter(record, turn), open)
+    await record.lifecycle.idle(admitter(record, turn, open), open)
   }
 
   // `experimental.idle`. Returns undefined, with nothing awaited, when there is nothing to do: delivery is off, the manager
@@ -377,11 +386,12 @@ export function createManager(ctx, config, parts, {
     const turn = { over: false, admitting: null, until: monotonic() + idleBudgetMs }
     let timer
     const expired = new Promise(resolve => {
+      // For what is left of the deadline, not for a fresh budget: time that passed since the deadline was taken is not given back.
       timer = setTimeoutImpl(() => {
         turn.over = true
         turn.admitting?.abandon() // a call still in flight may land the input: it is uncertain, whatever the host answers later
         resolve()
-      }, idleBudgetMs)
+      }, Math.max(0, turn.until - monotonic()))
       timer?.unref?.() // the hook returns at the budget; the timer must not outlive it
     })
     const finished = deliver(record, turn).catch(() => { /* a failed read or step claims nothing */ })

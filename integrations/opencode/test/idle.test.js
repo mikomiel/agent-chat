@@ -3,6 +3,8 @@ import assert from "node:assert/strict"
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join as pathJoin } from "node:path"
+import crypto from "node:crypto"
+import { syncBuiltinESMExports } from "node:module"
 import { createMember, createRegistry } from "../lib/owner.js"
 import { createContext } from "../lib/context.js"
 import { createLifecycle } from "../lib/lifecycle.js"
@@ -174,7 +176,7 @@ function hostContext({ info, synthetic, hook = true, registration } = {}) {
 }
 
 // One member over the real parts. `worker` is one worker for every session, or a function of the join's identity.
-function build({ config = DELIVERING, host = hostContext(), worker, clock = fakeClock(), registry = createRegistry(), delivery = createDelivery(clock) } = {}) {
+function build({ config = DELIVERING, host = hostContext(), worker, clock = fakeClock(), registry = createRegistry(), delivery = createDelivery(clock), monotonic = clock.now } = {}) {
   const workers = []
   const ticks = []
   const parts = {
@@ -193,10 +195,25 @@ function build({ config = DELIVERING, host = hostContext(), worker, clock = fake
     },
   }
   const member = createMember(host, config, parts, {
-    managerOptions: { setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl, monotonic: clock.now, delivery },
+    managerOptions: { setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl, monotonic, delivery },
   })
   const detach = registry.attach(member)
   return { registry, member, detach, host, clock, workers, ticks }
+}
+
+// A delivery table over the test's clock that keeps each attempt it opens, and runs `after` right after the open: the attempt's
+// timer is armed by then, and the host has not been called.
+function watchedDelivery(clock, after = () => {}) {
+  const delivery = createDelivery(clock)
+  const opened = []
+  const open = delivery.open
+  delivery.open = (...args) => {
+    const attempt = open(...args)
+    opened.push(attempt)
+    after()
+    return attempt
+  }
+  return { delivery, opened }
 }
 
 async function join(h, sessionID = "ses_a") {
@@ -588,10 +605,12 @@ test("the hook's deadline is read on the clock before the admission: a pause bet
   // delivery: the hook is out of time as well, so the grant is still not written, and still deferred.
   for (const pause of [BUDGET_MS, BUDGET_MS + 1, 10_000, 19_499, 19_500, 60_000]) {
     const clock = fakeClock()
+    const { delivery, opened } = watchedDelivery(clock)
     const worker = strictWorker({ claim: answer(clock)(pause) })
-    const h = await eligible(t, { clock, worker })
+    const h = await eligible(t, { clock, worker, delivery })
     await idle(h)
     assert.equal(clock.fired(), 0, `${pause}: no timer has run`)
+    assert.equal(opened.length, 0, `${pause}: a hook that is out of time before the admission opens no attempt, and spends no allowance`)
     assert.deepEqual(h.host.calls.synthetic, [], `${pause}`)
     assert.deepEqual(h.host.calls.prompt, [], `${pause}`)
     assert.deepEqual(worker.ops(), ["heartbeat", "heartbeat", "pending", "claim", "settle", "heartbeat"], `${pause}`)
@@ -601,10 +620,100 @@ test("the hook's deadline is read on the clock before the admission: a pause bet
   }
   // The same fixture admits when the pause is shorter than the budget.
   const clock = fakeClock()
-  const h = await eligible(t, { clock, worker: strictWorker({ claim: answer(clock)(BUDGET_MS - 1) }) })
+  const { delivery, opened } = watchedDelivery(clock)
+  const h = await eligible(t, { clock, worker: strictWorker({ claim: answer(clock)(BUDGET_MS - 1) }), delivery })
   await idle(h)
   assert.equal(h.host.calls.synthetic.length, 1)
+  assert.equal(opened.length, 1)
   assert.equal(h.workers[0].ops().includes("settle"), false) // the background settles it later
+})
+
+test("the hook's deadline is read last, after the attempt is open and its timer armed: a pause in the attempt's setup admits nothing and settles the grant deferred offline", async t => {
+  // The pause comes inside `delivery.open`, after the lifecycle's own check before the admission: only a check made as the
+  // last step before the host call can see it.
+  const run = async pause => {
+    const clock = fakeClock()
+    const { delivery, opened } = watchedDelivery(clock, () => clock.jump(pause))
+    const worker = strictWorker()
+    const h = await eligible(t, { clock, worker, delivery })
+    await idle(h)
+    assert.equal(clock.fired(), 0, `${pause}: no timer has run`)
+    assert.equal(opened.length, 1, `${pause}: the attempt was opened`)
+    let ended = false
+    void opened[0].done.then(() => { ended = true })
+    await flush()
+    return { h, worker, ended }
+  }
+  for (const pause of [BUDGET_MS, BUDGET_MS + 1, 60_000]) {
+    const { h, worker, ended } = await run(pause)
+    assert.deepEqual(h.host.calls.synthetic, [], `${pause}`)
+    assert.deepEqual(h.host.calls.prompt, [], `${pause}`)
+    assert.deepEqual(worker.ops(), ["heartbeat", "heartbeat", "pending", "claim", "settle", "heartbeat"], `${pause}`)
+    assert.deepEqual(worker.requests[4].fields, { attempt: attemptID(1), result: DEFERRED }, `${pause}`) // nothing was written
+    assert.deepEqual(worker.requests[5].fields.state, UNKNOWN, `${pause}`)
+    assert.equal(worker.counters.overlaps, 0, `${pause}`)
+    assert.equal(ended, true, `${pause}: the attempt that was opened is closed again`)
+  }
+  // The same fixture admits when the pause is shorter than the budget, and then the attempt stays open for its event.
+  const { h, worker, ended } = await run(BUDGET_MS - 1)
+  assert.equal(h.host.calls.synthetic.length, 1)
+  assert.equal(worker.ops().includes("settle"), false)
+  assert.equal(ended, false)
+})
+
+test("the claim key is made before the last deadline check, so nothing runs between that check and the claim", async t => {
+  const real = crypto.randomUUID
+  let pausing = () => {}
+  crypto.randomUUID = (...args) => { const pause = pausing; pausing = () => {}; pause(); return real(...args) }
+  syncBuiltinESMExports() // the lifecycle imported the name: its binding follows the module's property only after this
+  t.after(() => { crypto.randomUUID = real; syncBuiltinESMExports() })
+  for (const pause of [BUDGET_MS, BUDGET_MS + 1, 60_000]) {
+    const clock = fakeClock()
+    const h = await eligible(t, { clock })
+    pausing = () => clock.jump(pause) // the next key made is the claim's
+    await idle(h)
+    assert.equal(clock.fired(), 0, `${pause}: no timer has run`)
+    assert.equal(claimsOf(h), 0, `${pause}: the pause came while the key was made, before the check`)
+    assert.deepEqual(h.host.calls.synthetic, [], `${pause}`)
+    assert.deepEqual(h.workers[0].ops(), ["heartbeat", "heartbeat", "pending", "heartbeat"], `${pause}`)
+  }
+  // The same fixture claims when the pause is shorter than the budget.
+  const clock = fakeClock()
+  const h = await eligible(t, { clock })
+  pausing = () => clock.jump(BUDGET_MS - 1)
+  await idle(h)
+  assert.equal(claimsOf(h), 1)
+})
+
+test("the budget's timer runs for what is left of the deadline: time that passed before it was armed is not given back", async t => {
+  for (const pause of [0, 400, BUDGET_MS - 1, BUDGET_MS, 5_000]) {
+    const clock = fakeClock()
+    const arm = clock.setTimeoutImpl
+    const delays = []
+    clock.setTimeoutImpl = (fn, delay) => { delays.push(delay); return arm(fn, delay) }
+    // Time passes after the hook has read its start and before it arms the timer: the next read sees it.
+    let passing = 0
+    const monotonic = () => { const value = clock.now(); clock.jump(passing); passing = 0; return value }
+    const h = await eligible(t, { clock, monotonic })
+    h.host.state.info = hangs // the hook finds the session read stalled, so only its timer can release it
+    const left = Math.max(0, BUDGET_MS - pause)
+    delays.length = 0
+    passing = pause
+    const running = idle(h)
+    assert.equal(delays[0], left, `${pause}: the timer is armed for what is left, never for less than nothing`)
+    const state = { done: false }
+    void running.then(() => { state.done = true })
+    if (left > 0) {
+      clock.advance(left - 1)
+      await flush()
+      assert.equal(state.done, false, `${pause}: the hook holds until the deadline`)
+    }
+    clock.advance(left > 0 ? 1 : 0)
+    await flush()
+    assert.equal(state.done, true, `${pause}: the hook is released at the deadline, and not a whole budget after it`)
+    assert.equal(h.workers[0].counters.overlaps, 0, `${pause}`)
+    assert.deepEqual(h.host.calls.synthetic, [], `${pause}`)
+  }
 })
 
 // ---------------------------------------------------------------------------------------------------------------------

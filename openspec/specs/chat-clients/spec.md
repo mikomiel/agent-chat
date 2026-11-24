@@ -598,7 +598,7 @@ The hook callback MUST NOT reject or throw, whatever fails inside it. It MUST re
 - **AND** `busy` does not outlive the hook
 
 ### Requirement: The hook's budget is a deadline that the hook reads on the clock
-The budget MUST be a deadline on the monotonic clock: the start of the hook plus 1,500 milliseconds. The hook MUST read the clock immediately before `claim` and immediately before `session.synthetic`, and MUST NOT rely on a timer alone.
+The budget MUST be a deadline on the monotonic clock: the start of the hook plus 1,500 milliseconds. The timer that enforces it MUST run for what is left of the deadline. The hook MUST read the clock as the last step before `claim` and as the last step before `session.synthetic`, and MUST NOT rely on a timer alone.
 
 #### Scenario: A pause delays the pending reply
 - **WHEN** the event loop pauses, the clock passes the deadline before the timer runs, and then the reply to `pending` arrives
@@ -609,6 +609,15 @@ The budget MUST be a deadline on the monotonic clock: the start of the hook plus
 - **WHEN** the clock passes the deadline after the claim and before the admission, and no timer has run
 - **THEN** the plugin makes no `synthetic` call
 - **AND** it settles the grant `deferred` with reason `offline`
+
+#### Scenario: A pause while the attempt is set up
+- **WHEN** the clock passes the deadline after the plugin has opened its attempt and before it would call `session.synthetic`, and no timer has run
+- **THEN** the plugin makes no `synthetic` call
+- **AND** it closes the attempt and settles the grant `deferred` with reason `offline`
+
+#### Scenario: Time passes before the timer is armed
+- **WHEN** time passes between the hook taking its deadline and arming its timer, and `session.get` never answers
+- **THEN** the callback returns at the deadline, and not a whole budget after it
 
 ### Requirement: A hook that runs out of time settles by what it has written
 A grant that the hook holds when the budget ends, and has not written to the session, MUST settle `deferred` with reason `offline`, whatever is left of its reservation. An admission that `session.synthetic` has not answered when the budget ends MUST settle `uncertain`. An input that `session.synthetic` has accepted MUST NOT be ended by the budget.

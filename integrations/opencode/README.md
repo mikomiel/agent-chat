@@ -391,20 +391,21 @@ sent after.
 turn with no catch and no time limit, so a rejection would fail the user's end
 of turn and a hang would stall it. The callback therefore never rejects, and it
 returns within 1,500 ms whatever is pending. The budget is a deadline on the
-monotonic clock, taken when the hook starts. A timer enforces it, and the hook
-also reads the clock immediately before `claim` and immediately before
-`synthetic`, because a timer can run late behind a paused event loop. When the
-budget runs out, a step already in flight finishes in the background and nothing
-moves forward after it. A grant already held, and not yet written to the
-session, settles `deferred` with reason `offline`, so the server offers the
-batch again. An admission still in flight, where `synthetic` was called and has
-not returned, settles `uncertain`. An input that `synthetic` has accepted is not
-ended by the budget: its exact delivered event or its deadline settles it, even
-when the hook's final heartbeat is still waiting. The callback returns before
-its first `await`, doing nothing, for a session with no record, a member that
-does not own the joins, a child or fork session, a session whose chat is off or
-not yet past its first heartbeat, and a session that has used its continuation
-allowance.
+monotonic clock, taken when the hook starts. A timer enforces it, armed for what
+is left of the deadline and not for a fresh budget. The hook also reads the
+clock itself, because a timer can run late behind a paused event loop: as the
+last step before `claim`, and as the last step before the `synthetic` call,
+after the hook has opened its attempt. When the budget runs out, a step already
+in flight finishes in the background and nothing moves forward after it. A grant
+already held, and not yet written to the session, settles `deferred` with reason
+`offline`, so the server offers the batch again. An admission still in flight,
+where `synthetic` was called and has not returned, settles `uncertain`. An input
+that `synthetic` has accepted is not ended by the budget: its exact delivered
+event or its deadline settles it, even when the hook's final heartbeat is still
+waiting. The callback returns before its first `await`, doing nothing, for a
+session with no record, a member that does not own the joins, a child or fork
+session, a session whose chat is off or not yet past its first heartbeat, and a
+session that has used its continuation allowance.
 
 **Settlement.** The host promotes an admitted input into the session's history
 after the hook has returned, so the plugin settles in the background. One
@@ -728,8 +729,9 @@ and binding context over a double of the host and a worker double that rejects
 an overlapping request, as the real worker does. It covers the `delivery`
 switch and the hook's registration and disposal; the property that no sequence
 of events makes a claim or an input; a hook that never rejects and is released
-at its budget; a budget that is read on the clock before the claim and before the
-admission, and that never ends an input the host accepted; the refusals (Plan, a failed or slow read, a missing entry, a
+at its budget; a budget that is read on the clock as the last step before the claim
+and before the host call, whose timer runs for what is left of the deadline, and that
+never ends an input the host accepted; the refusals (Plan, a failed or slow read, a missing entry, a
 child, a fork, a non-owner); the order of the worker's requests; the admitted
 call and its text; settlement; the turn that the hook, the tick and the
 settlements share; and the cap.
