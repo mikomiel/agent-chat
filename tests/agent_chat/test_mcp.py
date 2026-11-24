@@ -491,6 +491,7 @@ def test_internal_service_origin_authenticates_and_calls_a_tool(process_api, cre
 
     class Resolver:
         returncode = 0
+        stdout = None  # `_resolve` closes the real child's pipe; this double has none
 
         def __enter__(self):
             return self
