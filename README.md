@@ -165,6 +165,32 @@ Harness packages live in `integrations/`. The Pi package runs
 delivery, binding context and rejoin schedule; its test pins the policy
 constants to `agent_chat/models.py`. See [`integrations/pi/`](integrations/pi/).
 
+The worker resolves the server host name once, at join, after the binding
+record is written. The lookup runs in a child process that the join's time
+limit kills. The child also arms its own alarm for that limit, rounded up to a
+whole second, so a worker killed during the lookup leaves no process behind
+past it; on Linux the child dies with the worker at once. Until the child has
+started, though, a stalled `execve` of the interpreter can hold the worker past
+that limit (#171). A killed child is reaped by the system's init, so in a
+container whose PID 1 does not reap adopted children it stays a zombie until
+the container exits. A join that sends
+nothing, because the lookup fails or no address accepts a connection, fails
+with `TRANSPORT_UNAVAILABLE`. Its record stays, for a retry of the same boot or
+for the next start's stale sweep. A join that reuses a saved record marks it
+live before the lookup, so that sweep does not remove it. The sweep's own
+check and removal are separate calls, so a sweep that read the old time just
+before the retry marked the record can still remove it (#169). An IP-literal origin
+is not resolved. Every
+later request of that
+binding connects only to the addresses found at join, in the resolver's order,
+and performs no name resolution. TLS still verifies the server's host name,
+and the `Host` header still carries it. When none of the addresses accepts a
+connection, the request fails with `TRANSPORT_UNAVAILABLE`. A heartbeat or
+pending request answers it as a tolerated outage for less than the server
+lease; a status, claim or settle request still ends the worker. The worker
+never resolves again inside a request: an address change reaches a binding at
+its next join, which the rejoin below performs.
+
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,
 `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` starts a bounded rejoin with
 growing jittered waits, a two-hour episode window and three completed rejoins

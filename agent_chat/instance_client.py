@@ -6,6 +6,7 @@ credential discovery, automatic join or model work.
 """
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
 
-from .client import Client
+from .client import Address, Client, resolve_origin
 from .instance_file import InstanceSecret, prepare_instance
 from .models import RECEIPT_FEED_LIMIT, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 from .protocol import cursor, token_digest
@@ -27,6 +28,18 @@ class JoinedInstance:
     room_id: UUID
     host: str
     harness: str
+    # The server's addresses when the join resolved them (`resolve_by`), else empty. A binding with addresses
+    # connects only to them for its whole lifetime and never resolves the host again; only a new join does.
+    addresses: tuple[Address, ...] = field(default=(), repr=False)
+
+
+def _client(instance: JoinedInstance, deadline: float | None) -> Client:
+    """A binding's client: fixed to its join-time addresses, or resolving per request when it has none."""
+    origin, token = instance.binding.server_origin, instance.binding.token
+    addresses = getattr(instance, "addresses", ())  # a stand-in instance without the field has none
+    if addresses:
+        return Client(origin, token, deadline=deadline, addresses=addresses)
+    return Client(origin, token, deadline=deadline)
 
 
 def _uuid(value: Any) -> UUID:
@@ -45,6 +58,20 @@ def _not_refused(result: Any) -> None:
         raise ValueError("refused in a server reply")
 
 
+def _mark_live(directory: Path, boot_id: UUID) -> None:
+    """Refresh the record's mtime before the lookup, so a sibling's stale sweep sees an adopted record as live.
+
+    Best effort like `touch_instance`, except that a timeout, the caller's alarm included, ends the join: the
+    lookup that follows must not start, and the registration must not be sent, once the deadline has passed.
+    """
+    try:
+        os.utime(directory / f"{boot_id}.json", follow_symlinks=False)
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+
+
 def join_instance(
     directory: Path,
     native_session_id: str,
@@ -55,12 +82,21 @@ def join_instance(
     harness: Literal["pi", "codex", "claude", "deepseek", "opencode"],
     enabled: bool = False,
     deadline: float | None = None,
+    resolve_by: float | None = None,
 ) -> JoinedInstance:
     """Persist the instance secret before sending its digest with host authority.
 
     On uncertainty the owner may explicitly repeat this exact boot/origin/ID.
     It must not rotate the secret or turn a retry into a replacement process.
     A malformed response remains uncertain even if registration committed.
+
+    With `resolve_by`, a monotonic time, the server host is resolved once before that time, after the record's own
+    checks. The registration and every later request of the binding connect only to those addresses.
+
+    `TRANSPORT_UNAVAILABLE` here means nothing was sent: the lookup failed or no address accepted a connection. The
+    record stays, as on every other failure, and this call never removes it. A retry of the same boot may already
+    use it, so a removal here could take it from a live registration. The retry reuses it, or the stale sweep of the
+    next start removes it.
     """
     if enabled is not True:
         raise ChatError("INTEGRATION_DISABLED")
@@ -68,6 +104,11 @@ def join_instance(
         raise ChatError("INVALID_REQUEST")
     registration_client = Client(server_origin, host_token, deadline=deadline)
     secret = prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
+    addresses: tuple[Address, ...] = ()
+    if resolve_by is not None:
+        _mark_live(directory, boot_id)
+        addresses = resolve_origin(server_origin, deadline=resolve_by)
+        registration_client = Client(server_origin, host_token, deadline=deadline, addresses=addresses)
     result = registration_client.request(
         "POST",
         "/v1/sessions",
@@ -93,6 +134,7 @@ def join_instance(
             _uuid(result["room_id"]),
             result["host"],
             result["harness"],
+            addresses,
         )
     except (ValueError, TypeError, KeyError):
         raise ChatError("REQUEST_UNCERTAIN") from None
@@ -104,7 +146,7 @@ def _request(
 ) -> dict[str, Any]:
     # Each lifecycle operation has its own bounded response budget. Never retain
     # the host credential here or reopen/discover a different binding file.
-    client = Client(instance.binding.server_origin, instance.binding.token, deadline=deadline)
+    client = _client(instance, deadline)
     result = client.request(method, path, payload, invalid=invalid)
     try:
         if not isinstance(result, dict) or _uuid(result.get("instance_id")) != instance.instance_id:
@@ -216,7 +258,7 @@ def claim(
     deadline: float | None = None,
 ) -> dict[str, Any]:
     """Validate a grant and return metadata only; bodies stay in explicit history unless `bodies` asks."""
-    result = Client(instance.binding.server_origin, instance.binding.token, deadline=deadline).request(
+    result = _client(instance, deadline).request(
         "POST",
         "/v1/instance/deliveries/claim",
         request.model_dump(mode="json"),
@@ -341,7 +383,7 @@ def receipts_delivered(
 def settle(
     instance: JoinedInstance, attempt: UUID, request: DeliveryResult, *, deadline: float | None = None
 ) -> dict[str, Any]:
-    result = Client(instance.binding.server_origin, instance.binding.token, deadline=deadline).request(
+    result = _client(instance, deadline).request(
         "POST",
         f"/v1/instance/deliveries/{attempt}/result",
         request.model_dump(mode="json"),
