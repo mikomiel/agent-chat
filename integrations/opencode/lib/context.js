@@ -266,6 +266,16 @@ export function createContext(ctx, sessionID, {
     return call("list", { sessionID }).then(() => {}, () => {})
   }
 
+  // Does the session's binding entry hold the published text right now? The idle hook asks it before it claims anything.
+  // One read, off the serial queue like `probe`, that repairs nothing and proves nothing for later. It never rejects: a
+  // failed read, a timeout, an absent or different entry, and a binding that was withdrawn or replaced during the read are
+  // all false.
+  function held() {
+    const text = published
+    if (closed || disabled || text === null) return Promise.resolve(false)
+    return holds(text).then(found => found && !closed && !disabled && published === text, () => false)
+  }
+
   function disable() {
     // Chat-only and per session: the session and the other sessions are untouched.
     disabled = true
@@ -276,5 +286,5 @@ export function createContext(ctx, sessionID, {
     closed = true
   }
 
-  return { context, observe, reset, repair, refresh, probe, owed, proved, disable, dispose }
+  return { context, observe, reset, repair, refresh, probe, held, owed, proved, disable, dispose }
 }

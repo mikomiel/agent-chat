@@ -4,6 +4,9 @@
 // default path and no credential on a command line. Every failure returns null:
 // chat stays off and nothing is logged, so the host token never reaches a log
 // line. A delegated child never joins, even when it inherits the variable.
+//
+// `delivery` is the one switch for notice delivery: a boolean, absent or false by default. Off, the plugin joins and
+// delivers nothing, and no hook is registered (see lib/owner.js).
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs"
 import { isAbsolute } from "node:path"
 import { TOOL_ROUTES } from "./notice.js"
@@ -11,7 +14,7 @@ import { TOOL_ROUTES } from "./notice.js"
 export const OPENCODE_CHAT_CONFIG_ENV = "AGENT_CHAT_OPENCODE_CONFIG"
 const MAX_BYTES = 16 * 1024
 const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "python"]
-const OPTIONAL = ["toolRoute"]
+const OPTIONAL = ["toolRoute", "delivery"]
 
 export function loadConfig(env = process.env, name = OPENCODE_CHAT_CONFIG_ENV) {
   const raw = env[name]
@@ -38,6 +41,7 @@ export function loadConfig(env = process.env, name = OPENCODE_CHAT_CONFIG_ENV) {
   if (!Object.keys(data).every(key => REQUIRED.includes(key) || OPTIONAL.includes(key))) return null
   if (data.chatEnabled !== true) return null
   if ("toolRoute" in data && !TOOL_ROUTES.includes(data.toolRoute)) return null
+  if ("delivery" in data && typeof data.delivery !== "boolean") return null
   if (!REQUIRED.slice(1).every(key => typeof data[key] === "string" && data[key])) return null
   if (!["python", "directory"].every(key => isAbsolute(data[key]))) return null
   return data

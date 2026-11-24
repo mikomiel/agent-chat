@@ -1,7 +1,7 @@
 # chat-clients Specification
 
 ## Purpose
-Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, and the notice contract that puts a peer message body into a harness session.
+Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, and how the OpenCode plugin delivers from the host's idle hook.
 
 ## Requirements
 
@@ -546,7 +546,7 @@ The estimate assumes that a body renders to at most 3 bytes for each stored byte
 - **AND** each cut body carries its pointer line, and the notice is at most 8137 bytes
 
 ### Requirement: Every renderer passes the same vectors
-The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package that delivers notices MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs. A package that delivers no notice MAY ship the same byte-identical copy only for its binding text and tool-route names, and MUST NOT deliver a notice with it.
+The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer (`integrations/shared/notice.js`) MUST both pass the vectors in `integrations/notice-vectors.json`. Each package that delivers notices MUST ship `lib/notice.js` as a byte-identical copy of the shared renderer, and its tests MUST fail when the copy differs. A package that never delivers a notice MAY ship that copy only for its binding text and tool-route names, and MUST NOT deliver a notice with it.
 
 #### Scenario: Both implementations agree
 - **WHEN** the vectors run under the Python tests and under each package's tests
@@ -555,3 +555,171 @@ The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer
 #### Scenario: A package copy drifts
 - **WHEN** a delivering package's `lib/notice.js` differs by one byte from `integrations/shared/notice.js`
 - **THEN** that package's tests fail
+
+### Requirement: The OpenCode plugin delivers only when its config turns delivery on
+The OpenCode plugin MUST read an optional boolean config key `delivery` that defaults to `false`. With the key absent or `false`, it MUST register no hook, MUST NOT subscribe to `session.inbox.delivered`, and MUST send nothing to a session except its binding entry. Any other value MUST keep chat off.
+
+#### Scenario: Delivery is off
+- **WHEN** the config file has no `delivery` key, or `delivery` is `false`
+- **THEN** the plugin registers no hook and subscribes to the seven session events only
+- **AND** it sends no `pending`, `claim` or `settle` request and makes no `synthetic` or `prompt` call
+
+#### Scenario: A value that is not a boolean
+- **WHEN** the config file sets `delivery` to a string, a number, `null`, an array or an object
+- **THEN** the loader refuses the file and chat stays off
+
+#### Scenario: Delivery is on
+- **WHEN** `delivery` is `true` and the host has a `ctx.session.hook` function
+- **THEN** the plugin registers one `experimental.idle` hook and subscribes to `session.inbox.delivered` in addition to the seven session events
+- **AND** it disposes the hook when its instance ends, including a registration that the host answers after the instance ended
+
+#### Scenario: A host with no hook
+- **WHEN** `delivery` is `true` and the host has no `ctx.session.hook` function, or the registration fails
+- **THEN** the plugin registers nothing, delivers nothing, and joins and keeps the binding as with `delivery` off
+
+### Requirement: Only the idle hook claims, and no event does
+With `delivery` set to `true`, the OpenCode plugin MUST claim a message and MUST send input to a session only inside the host's `experimental.idle` hook. It MUST NOT build any state of a session from events, and no event MAY cause a claim or an input.
+
+#### Scenario: Events alone never deliver
+- **WHEN** any sequence of events arrives and the hook is never called, including bad envelopes, replays, compaction events, execution starts and `session.inbox.delivered` events
+- **THEN** the plugin sends no `pending`, `claim` or `settle` request and makes no `synthetic`, `prompt` or `wait` call
+- **AND** a later hook call for a session that the events left joined and eligible makes exactly one claim
+
+### Requirement: The idle hook never rejects and never holds the host
+The hook callback MUST NOT reject or throw, whatever fails inside it. It MUST return within one budget of 1,500 milliseconds, and every wait inside it MUST end by that budget. When the budget ends, the hook MUST send nothing further and MUST settle a grant it holds as `uncertain`.
+
+#### Scenario: A step fails
+- **WHEN** the worker, the host or the `session.get` call throws or rejects inside the hook
+- **THEN** the callback resolves and the host's end of turn is not failed
+
+#### Scenario: A step hangs
+- **WHEN** the worker, `session.get`, the entry read or `session.synthetic` never answers
+- **THEN** the callback returns when the budget ends
+- **AND** a grant the hook already held settles `uncertain`, and `busy` does not outlive the hook
+
+### Requirement: The idle hook returns at once when there is nothing to deliver
+The hook MUST return before its first wait, and do nothing, for a session with no joined record, a member that does not own the joins, a child or fork session, a session whose chat is off or has not sent its first heartbeat, and a session that has used its continuation allowance.
+
+#### Scenario: Nothing to do
+- **WHEN** the hook is called for an unknown session, a session that is not a root session, a session whose chat is off, or a member that is not the owner
+- **THEN** the callback returns without a wait, and no host or worker call is made
+
+### Requirement: The idle hook claims only for a session it has just proved eligible
+Inside the hook, the plugin MUST read the session with `session.get`. It MUST make no claim unless the read succeeds in time, the session is a root session and its `agent` is not `plan`. It MUST also require the session's binding entry to hold the published text.
+
+#### Scenario: Plan agent
+- **WHEN** the hook is called for a session whose `agent` is `plan`
+- **THEN** the plugin sends no heartbeat, no `pending` and no `claim`, and makes no `synthetic` call
+
+#### Scenario: An unreadable session
+- **WHEN** `session.get` throws, rejects or runs out of time inside the hook
+- **THEN** the plugin makes no claim and no `synthetic` call
+
+#### Scenario: The binding entry is not there
+- **WHEN** the entry list is missing, does not hold the published binding, or cannot be read
+- **THEN** the plugin makes no claim and no `synthetic` call
+
+### Requirement: The idle hook's requests to the worker keep one order and never overlap
+The hook MUST send a heartbeat with `native_state` `busy`, then `pending`, then `claim`, then the admission, and, in a `finally`, the regular non-eligible heartbeat. The sequence MUST run inside the worker's one request at a time. A hook that finds the worker busy MUST return and claim nothing, and a settlement that finds it busy MUST wait for it.
+
+#### Scenario: Order of the worker's requests
+- **WHEN** the hook delivers a batch
+- **THEN** the worker receives the `busy` heartbeat, then `pending`, then `claim`
+- **AND** the `unknown` heartbeat follows the admission, and the `settle` request, when there is one, follows it
+- **AND** no two requests overlap
+
+#### Scenario: The worker is busy
+- **WHEN** a heartbeat is in flight when the hook runs
+- **THEN** the hook returns at once and sends nothing
+
+### Requirement: The hook admits one steer input that does not resume the session
+The plugin MUST admit a claimed batch with one `session.synthetic` call that carries `delivery` `steer`, `resume` `false`, an `id` of `msg_` followed by the attempt id without its dashes, and the metadata `{ "source": "agent-chat" }`. It MUST NOT call `prompt` or `wait`.
+
+#### Scenario: Admission
+- **WHEN** the hook has a grant
+- **THEN** it makes exactly one `session.synthetic` call with the fields above
+
+### Requirement: The admitted text is a metadata notice within 8 KiB
+The text of the input MUST be a one-line delivery prefix and a notice in metadata mode, with identifiers and cursors and no body, and the two together MUST NOT exceed 8 KiB. The plugin MUST settle a batch whose notice the renderer cannot produce as `deferred` with reason `offline`, and MUST NOT admit anything for it.
+
+#### Scenario: A notice on the configured route
+- **WHEN** the hook admits a batch on the `cli`, `mcp` or `mcp-with-cli-fallback` tool route
+- **THEN** the text is the delivery prefix and the shared renderer's notice for that route, and carries no message body
+
+#### Scenario: A batch that does not fit
+- **WHEN** the metadata notice for the claimed batch is larger than the bound that the delivery prefix leaves
+- **THEN** the plugin settles the batch `deferred` with reason `offline`
+- **AND** it makes no `synthetic` call
+
+### Requirement: A hook delivery is handed only on the host's delivered event for the exact input
+The plugin MUST settle an admitted batch `handed` only when `session.inbox.delivered` arrives for exactly the inbox id that it passed to `session.synthetic`, before the attempt's deadline: the start of the claim plus the grant's `reservation_ms`. A delivered event for another id MUST NOT settle the attempt. It MUST settle every other case `uncertain` with reason `transport_ambiguous`.
+
+#### Scenario: The exact event arrives in time
+- **WHEN** `session.inbox.delivered` arrives for the inbox id of the open attempt before its deadline
+- **THEN** the plugin settles the attempt `handed`, in the background, after the hook has returned
+
+#### Scenario: Another id or a replay
+- **WHEN** a delivered event names another id, such as another plugin's input or the id of an earlier attempt
+- **THEN** the plugin does not settle the open attempt
+- **AND** the exact event, if it arrives before the deadline, still settles the attempt `handed`
+
+#### Scenario: A late event
+- **WHEN** the delivered event for the exact id arrives at or after the attempt's deadline
+- **THEN** the plugin settles the attempt `uncertain`
+- **AND** an exact event that arrives after the attempt has settled is ignored
+
+#### Scenario: A rejected admission
+- **WHEN** `session.synthetic` throws or rejects
+- **THEN** the plugin settles the attempt `uncertain`, because the input may exist and cannot be withdrawn
+
+#### Scenario: The event stream is lost
+- **WHEN** the plugin's event stream ends or restarts while an attempt is open
+- **THEN** the plugin settles the attempt `uncertain`
+
+#### Scenario: The deadline passes
+- **WHEN** the attempt's deadline passes with no delivered event, or the grant can no longer be admitted in time
+- **THEN** the plugin settles the attempt `uncertain`
+
+### Requirement: An attempt is settled once, and an event opens none
+The plugin MUST keep at most one open attempt for a session, and MUST settle each attempt once. A newer attempt for a session MUST settle the older one `uncertain`. A `session.inbox.delivered` event MUST NOT open an attempt, a record or any other state of a session.
+
+#### Scenario: A duplicate event
+- **WHEN** the exact delivered event arrives twice
+- **THEN** the plugin sends one `handed` settlement
+
+#### Scenario: An event for a session with no attempt
+- **WHEN** a delivered event arrives for a session with no open attempt, or for a session the plugin has never seen
+- **THEN** the plugin sends no request and makes no host call
+
+### Requirement: The hook delivers at most three inputs for each execution
+The plugin MUST admit at most 3 inputs for one execution of a session, and MUST count an input when it opens the attempt, whatever becomes of the input. `session.execution.started` for the session MUST clear the count. A start that the plugin never saw MUST leave the count where it was, so a missed start only reduces delivery.
+
+#### Scenario: The fourth delivery
+- **WHEN** the hook has admitted 3 inputs for a session and no execution has started since
+- **THEN** a fourth hook call for that session returns at once and makes no request and no host call
+
+#### Scenario: A new execution
+- **WHEN** `session.execution.started` arrives for the session
+- **THEN** the next hook call for that session may admit an input again
+
+#### Scenario: Another session starts
+- **WHEN** `session.execution.started` arrives for another session
+- **THEN** the count of the first session does not change
+
+### Requirement: The limits of idle delivery are stated and accepted
+The README of the OpenCode package MUST state each limit named in the scenario below, and the plugin MUST NOT claim to remove it. Idle delivery MUST stay `NOT RUN` in the compatibility matrix until a live run against a real OpenCode release has shown each point in the scenario "A live run".
+
+#### Scenario: Accepted limits
+- **WHEN** a reader asks what idle delivery does not do
+- **THEN** the README says that an idle session receives nothing until its next turn, because the hook runs only at the end of model work and the plugin never resumes a session
+- **AND** that an input admitted just after an interrupt, while the callback is still running, stays parked, is promoted at the session's next turn, and settles `uncertain` if that comes too late
+- **AND** that the agent can switch to Plan between the check and the admission, that a session with no `agent` counts as not in Plan, and that a custom agent with Plan's limits is not detected
+- **AND** that `handed` means the input was promoted into the session's history, not that the model read it
+- **AND** that the hook is experimental and the plugin is pinned to OpenCode `2.3.2`
+- **AND** that an admitted input cannot be withdrawn
+- **AND** that a session whose hook runs in an instance that does not own the joins gets no delivery
+- **AND** that a repeated `session.execution.started` clears the count early
+
+#### Scenario: A live run
+- **WHEN** the compatibility matrix is to record idle delivery as run
+- **THEN** a recorded run against one exact release shows that the hook fires, that the exact inbox id is delivered and settled `handed`, that an idle session gets no claim, that a session in Plan Mode gets no claim, that an Esc in the middle of a turn produces no hook call and no claim, that a forced error in the hook does not fail the turn, and the hook's measured latency

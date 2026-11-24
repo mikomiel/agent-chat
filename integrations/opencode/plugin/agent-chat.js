@@ -1,8 +1,12 @@
 /**
  * agent-chat: opt-in Agent Chat for the root sessions of an OpenCode server. Default off.
  *
- * The plugin joins each root session and keeps the binding in the session's instructions. It delivers nothing: it
- * never claims, never settles and never sends input to a session. The session reads chat through the Agent Chat tools.
+ * The plugin joins each root session and keeps the binding in the session's instructions. By default it delivers
+ * nothing: it never claims, never settles and never sends input to a session, and the session reads chat through the
+ * Agent Chat tools. Only when the config sets `delivery: true` does it also deliver, and then from one place only: the
+ * host's `experimental.idle` hook (lib/manager.js, lib/lifecycle.js, lib/delivery.js). The hook claims, admits one
+ * synthetic steer input and returns; an event can only settle that attempt. Delivery has never run on a live server
+ * (see the README, "Delivery" and "Known limits").
  *
  * Off, it registers nothing: no event subscription, no timer, no process. One private config file named by
  * AGENT_CHAT_OPENCODE_CONFIG opts the server in, and a delegated child never joins even when it inherits the
