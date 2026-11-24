@@ -169,7 +169,9 @@ The worker resolves the server host name once, at join, after the binding
 record is written. The lookup runs in a child process that the join's time
 limit kills. The child also arms its own alarm for that limit, rounded up to a
 whole second, so a worker killed during the lookup leaves no process behind
-past it; on Linux the child dies with the worker at once. A join that sends
+past it; on Linux the child dies with the worker at once. Until the child has
+started, though, a stalled `execve` of the interpreter can hold the worker past
+that limit (#171). A join that sends
 nothing, because the lookup fails or no address accepts a connection, fails
 with `TRANSPORT_UNAVAILABLE`. Its record stays, for a retry of the same boot or
 for the next start's stale sweep. A join that reuses a saved record marks it
