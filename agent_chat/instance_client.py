@@ -6,6 +6,7 @@ credential discovery, automatic join or model work.
 """
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -14,7 +15,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from .client import Address, Client, resolve_origin
-from .instance_file import InstanceSecret, prepare_instance, touch_instance
+from .instance_file import InstanceSecret, prepare_instance
 from .models import RECEIPT_FEED_LIMIT, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 from .protocol import cursor, token_digest
 
@@ -57,6 +58,20 @@ def _not_refused(result: Any) -> None:
         raise ValueError("refused in a server reply")
 
 
+def _mark_live(directory: Path, boot_id: UUID) -> None:
+    """Refresh the record's mtime before the lookup, so a sibling's stale sweep sees an adopted record as live.
+
+    Best effort like `touch_instance`, except that a timeout, the caller's alarm included, ends the join: the
+    lookup that follows must not start, and the registration must not be sent, once the deadline has passed.
+    """
+    try:
+        os.utime(directory / f"{boot_id}.json", follow_symlinks=False)
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
+
+
 def join_instance(
     directory: Path,
     native_session_id: str,
@@ -89,11 +104,9 @@ def join_instance(
         raise ChatError("INVALID_REQUEST")
     registration_client = Client(server_origin, host_token, deadline=deadline)
     secret = prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
-    # A retry of this boot adopts the saved record and may then wait for the lookup: mark it live first, or a
-    # sibling's stale sweep could remove a record older than its age gate before the registration uses its token.
-    touch_instance(directory, boot_id)
     addresses: tuple[Address, ...] = ()
     if resolve_by is not None:
+        _mark_live(directory, boot_id)
         addresses = resolve_origin(server_origin, deadline=resolve_by)
         registration_client = Client(server_origin, host_token, deadline=deadline, addresses=addresses)
     result = registration_client.request(

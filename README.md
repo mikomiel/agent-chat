@@ -173,7 +173,9 @@ past it; on Linux the child dies with the worker at once. A join that sends
 nothing, because the lookup fails or no address accepts a connection, fails
 with `TRANSPORT_UNAVAILABLE`. Its record stays, for a retry of the same boot or
 for the next start's stale sweep. A join that reuses a saved record marks it
-live before the lookup, so that sweep does not remove it. An IP-literal origin
+live before the lookup, so that sweep does not remove it. The sweep's own
+check and removal are separate calls, so a sweep that read the old time just
+before the retry marked the record can still remove it (#169). An IP-literal origin
 is not resolved. Every
 later request of that
 binding connects only to the addresses found at join, in the resolver's order,

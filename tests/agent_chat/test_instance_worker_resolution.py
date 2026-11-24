@@ -470,6 +470,33 @@ def test_a_same_boot_retry_marks_an_old_record_live_before_its_lookup(
     assert read_instance(path).token == joined.binding.token
 
 
+def test_an_alarm_while_marking_the_record_live_ends_the_join_before_any_request(
+    server: _Server, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fails on 209d620: the best-effort touch swallowed the alarm, and the join sent its registration late."""
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    real = os.utime
+
+    def alarm_in_utime(*args: Any, **kwargs: Any) -> None:
+        raise client.Interrupted("worker interrupted")
+
+    monkeypatch.setattr(os, "utime", alarm_in_utime)
+    with pytest.raises(client.Interrupted):
+        instance_client.join_instance(
+            directory,
+            "late-native",
+            uuid4(),
+            server_origin=f"http://127.0.0.1:{server.port}",
+            host_token=HOST_TOKEN,
+            harness="pi",
+            enabled=True,
+            resolve_by=time.monotonic() + 60,
+        )
+    monkeypatch.setattr(os, "utime", real)
+    assert server.hosts == []  # no registration was sent
+
+
 def test_an_alarm_in_the_record_step_ends_the_join_and_keeps_the_earlier_record(
     children: list[subprocess.Popen[bytes]], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
