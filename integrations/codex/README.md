@@ -437,9 +437,18 @@ sends its request: it does not wait for the worker to end its instance.
   pass sends one request, the mark that waits or else the poll. A
   staged notice that was not shown is released at `Stop` and at `Interrupt`. The
   request runs after the hook's reply, queued like any other: it never replaces a
-  claim or a wake, and one that follows it waits for it, so a slow server can
-  delay it by up to the worker's deadline. The binding ends its route lines with
-  one sentence that tells the model how to ask for receipts. The
+  claim or a wake, and one that follows it waits for it. The core's worker ends
+  a receipts request after 2 seconds, so a hook behind one keeps the 2.5 seconds
+  a claim needs. A hook gives the receiver at most 6 seconds, counted from its
+  arrival, and the receiver starts a claim only while 2.5 of them remain, so
+  behind a worker without that deadline, an older core, one that waited more
+  than 3.5 seconds skips the claim: it sends no claim request and spends no
+  attempt. A hook that arrives while a `Stop`'s state report waits behind the
+  request skips its claim at once, with the same result. The message stays
+  offered for 24 hours after it was stored, and the next prompt or tool hook
+  offers it again; once the session is idle, with `appServer` the wake does, and
+  hook-only the next prompt does. The binding ends its route lines
+  with one sentence that tells the model how to ask for receipts. The
   [receipts contract](../README.md#sender-receipts) has the rules.
 - **Delegated sessions.** A session that is not the main thread never joins:
   - A hook payload that carries `agent_id` is ignored: no join, no claim, no

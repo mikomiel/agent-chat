@@ -206,8 +206,17 @@ or a stop. Only the idle-wake waiter exits 2.
   is sent again at the next pass. A pass sends one request, the mark that waits
   or else the poll. A staged notice that was not shown is
   released at `Stop`. The request runs after the hook's reply, queued like any
-  other: it never replaces a claim, and a claim that follows it waits for it, so
-  a slow server can delay that claim by up to the worker's deadline. The binding
+  other: it never replaces a claim, and a claim that follows it waits for it.
+  The core's worker ends a receipts request after 2 seconds, so a hook behind
+  one keeps the 2.5 seconds a claim needs. A hook whose state is already
+  published has 6 seconds from its arrival and starts a claim only while 2.5 of
+  them remain, so behind a worker without that deadline, an older core, one that
+  waited more than 3.5 seconds skips the claim: it sends no claim request and
+  spends no attempt. A hook that arrives while a `Stop`'s state report waits
+  behind the request skips its claim at once, with the same result. The message
+  stays offered for 24 hours after it was stored, and the next prompt or tool
+  hook offers it again; once the session is idle the waiter does, and without a
+  waiter the next prompt does. The binding
   ends its route lines with one sentence that tells the model how to ask for
   receipts. The [receipts contract](../README.md#sender-receipts) has the rules.
 - **Delegated sessions.** A hook payload that carries `agent_id` (a subagent

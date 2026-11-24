@@ -270,9 +270,19 @@ The rules below bind every package that shows receipts.
   3,399 bytes, which every package's budget carries. A package holds a notice that does not fit whole; it never shrinks
   or defers a delivery or a binding to make room. The receipts request runs after the delivery poll in `pi` and
   `deepseek`, and after the hook's reply in `claude-code` and `codex`, so it never sits between a claim and its settle.
-  It shares the worker's single request slot, like every request: what follows it waits, so a slow server can delay the next
-  poll, heartbeat or claim by up to the worker's deadline. A pass sends one receipts request, never a mark and a poll in
-  a row, so what follows waits for one request.
+  It shares the worker's single request slot, like every request: what follows it waits. A pass sends one receipts
+  request, never a mark and a poll in a row, so what follows waits for one request. A hook gives its receiver at most
+  6 seconds, and the receiver starts a claim only while 2.5 of them remain. In `codex`, and in `claude-code` for a
+  hook whose state is already published, a hook that waited more than 3.5 seconds behind a receipts request therefore
+  skips its claim. The core's worker keeps a receipts request from holding the slot that long: it gives each one a
+  deadline of its own, 2 seconds (`RECEIPT_SECONDS` in `agent_chat/instance_worker.py`), and answers `refused` when
+  one runs out. Its other requests keep the 20-second alarm. A worker without that deadline, an older core, can still
+  make a hook skip. A hook that arrives while a `Stop`'s state report waits behind a receipts request skips its claim
+  at once, with the same result. A skipped claim sends no claim request, so no attempt is spent, and the message it
+  would have claimed stays offered for 24 hours after it was stored; after that it is no longer offered, and the
+  server settles it as `expired_undelivered`. The next prompt or tool hook offers it again. After the turn, the waiter
+  of `claude-code` and the app-server wake of `codex` deliver it. Hook-only `codex`, and `claude-code` without its
+  waiter, have no wake: the next prompt delivers it, and `Stop` delivers nothing (#175).
 - **Receipts never wake.** `pi` sends the message with `triggerTurn: false`. `deepseek` appends it at `agent/pre-step`
   and never calls `agent.steer`. `claude-code` uses only the reply of a `UserPromptSubmit` or `PostToolUse` hook: never
   `Stop`, never the idle-wake waiter, never exit code 2. `codex` uses only the reply of a prompt or tool hook of a running

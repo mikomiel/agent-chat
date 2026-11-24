@@ -29,6 +29,12 @@ from .models import LEASE_SECONDS, ChatError, DeliveryClaim, DeliveryResult, Hea
 
 MAX_FRAME = 128 * 1024
 REQUEST_SECONDS = 20
+# A receipts request holds the parent's one request slot, and a hook's delivery queues behind it with 6 s of
+# patience, of which a claim needs the last 2.5 s (`PATIENCE_MS` and `CLAIM_MARGIN_MS` in the Claude Code and Codex
+# packages). So it has its own deadline, well inside the remaining 3.5 s, and not the alarm's REQUEST_SECONDS: a
+# request that runs out answers `refused` like any other receipts failure, and the parent asks again at its next
+# poll.
+RECEIPT_SECONDS = 2.0
 IDLE_SECONDS = 90
 # A server restart fails a poll or a heartbeat without ending the session. Each op tolerates its own
 # unbroken failure streak for less than the server lease; one success of that op ends the streak.
@@ -184,7 +190,7 @@ def _delivery(instance: instance_client.JoinedInstance, request: dict[str, Any])
     raise ChatError("INVALID_REQUEST")
 
 
-def _receipts_with_mute(instance: instance_client.JoinedInstance) -> dict[str, Any]:
+def _receipts_with_mute(instance: instance_client.JoinedInstance, *, deadline: float) -> dict[str, Any]:
     """The receipt feed, and the session's `muted` flag when the feed has rows, as one answer.
 
     A receipt waits while the session is muted, so the parent needs the flag before it shows one. `status` is a
@@ -193,9 +199,9 @@ def _receipts_with_mute(instance: instance_client.JoinedInstance) -> dict[str, A
     `refused` for the whole request and the worker keeps serving. An empty feed has nothing to hold, so it needs no
     flag. An older worker never sends one, which a parent must read as muted.
     """
-    feed = instance_client.receipts(instance)
+    feed = instance_client.receipts(instance, deadline=deadline)
     if feed["receipts"]:
-        muted = instance_client.status(instance).get("muted")
+        muted = instance_client.status(instance, deadline=deadline).get("muted")
         if type(muted) is not bool:
             raise ChatError("INVALID_RESPONSE")
         feed["muted"] = muted
@@ -228,7 +234,7 @@ def main() -> int:
 
     def _receipt(call: Callable[..., Any], *arguments: Any) -> Any:
         try:
-            return call(*arguments)
+            return call(*arguments, deadline=monotonic() + RECEIPT_SECONDS)
         except ChatError as error:
             if terminated:  # SIGTERM interrupted the call: a stop still ends the worker
                 raise

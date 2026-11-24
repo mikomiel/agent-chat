@@ -927,3 +927,141 @@ test("a staged notice is aged on the wall clock alone: 6 s of monotonic time wit
   assert.ok(isNoticeText(shown.context) && shown.context.includes(feed[0].message_id), "the notice is shown")
   assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
 })
+
+// A receipts read that holds the worker past a hook's budget (#175). The pass starts after a hook's reply, so the next hook can
+// arrive while it is in flight, and the delivery that hook asks for waits in the queue behind it. A claim needs CLAIM_MARGIN_MS
+// (2.5 s) of the hook's 6 s patience, so a read that outlasts the other 3.5 s makes the hook skip its claim. The core's worker
+// ends a receipts request within 2 s (RECEIPT_SECONDS, agent_chat/instance_worker.py), so the shipped worker never holds one that
+// long. These tests give the receiver a worker that does, as a core without that deadline is, and advance the clock while the
+// read is held, which the gated test above does not. They pin what the receiver does then: what the skip costs and what follows.
+const HOOK_PATIENCE_MS = 6_000
+const CLAIM_MARGIN_MS = 2_500
+
+// A pass whose read is in flight, then a hook that arrives behind it. The read ends `after` ms later, on the receiver's clock.
+async function behindSlowRead(r, after) {
+  let open
+  r.server.gates.receipts = new Promise(resolve => { open = resolve })
+  await r.op(turn()) // its reply starts the pass, and the pass is held
+  assert.equal(r.count("receipts"), 1, "the read is in flight")
+  r.server.pending = [uid(1)]
+  const hook = hookDouble({ events: r.events })
+  const handled = r.receiver.handle(turn(), hook)
+  await settle()
+  assert.deepEqual(hook.sent, [], "the hook waits in the queue behind the read")
+  await r.clock.advance(after)
+  delete r.server.gates.receipts
+  open()
+  await handled
+  await settle()
+  return hook
+}
+
+test("a hook that waited behind a receipts read for more than its patience less the claim margin skips its claim: nothing is spent, and the next hook delivers", async () => {
+  const r = await ready({ rows: [] })
+  const hook = await behindSlowRead(r, HOOK_PATIENCE_MS - CLAIM_MARGIN_MS + 1)
+  assert.equal(r.count("pending"), 2, "the candidates were read for the hook that started the pass, and again for this one once the read ended")
+  assert.equal(r.count("claim"), 0, "no claim request: the ledger was asked for no attempt, so none is spent")
+  assert.equal(r.count("settle"), 0)
+  assert.deepEqual(hook.sent, [{ context: null }], "the hook was answered, with nothing")
+  const next = await r.op(turn())
+  assert.ok(isDeliveryText(next.sent[0].context), "the next hook has its own patience and delivers it")
+  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [[uid(1)]])
+  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+})
+
+test("a read that ends exactly at the patience less the claim margin does not make a hook skip: the budget is 3.5 s", async () => {
+  const r = await ready({ rows: [] })
+  const hook = await behindSlowRead(r, HOOK_PATIENCE_MS - CLAIM_MARGIN_MS)
+  assert.ok(isDeliveryText(hook.sent[0].context), "the claim was made")
+  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+})
+
+test("hook-only: after a skipped claim nothing delivers the message while the session is idle, and the next prompt does", async () => {
+  const r = await ready({ rows: [] })
+  await behindSlowRead(r, HOOK_PATIENCE_MS)
+  await r.op(stopEvent)
+  r.worker.log.length = 0
+  await r.clock.advance(3_600_000) // an hour idle
+  assert.deepEqual(r.worker.log.filter(entry => entry.op !== "heartbeat"), [], "no pending read, no claim: without an app-server nothing wakes an idle session")
+  const prompt = await r.op(turn())
+  assert.ok(isDeliveryText(prompt.sent[0].context), "the next prompt delivers it")
+  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+})
+
+test("with an app-server, the wake delivers a message whose claim a hook skipped, as soon as the session is idle", async () => {
+  const thread = threadDouble()
+  const r = await ready({ rows: [], thread })
+  await behindSlowRead(r, HOOK_PATIENCE_MS)
+  assert.equal(r.count("claim"), 0, "the hook claimed nothing")
+  await r.op(stopEvent)
+  await r.clock.advance(WAKE_POLL_MS)
+  assert.equal(thread.adds.length, 1, "the wake queued the message")
+  assert.equal(r.worker.ops("claim").length, 1)
+  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+})
+
+// A second way for a hook to skip its claim, whatever its patience: the Stop's state report is a counted request, and a hook
+// that arrives while one is queued answers at once, so that a slow request never stacks up behind every tool call. A receipts
+// read ahead of that report keeps it queued until the read ends, so the next prompt skips until then.
+test("a Stop's state report queued behind a receipts read makes the next prompt skip its claim at once: nothing is spent, and the next hook delivers", async () => {
+  const r = await ready({ rows: [] })
+  let open
+  r.server.gates.receipts = new Promise(resolve => { open = resolve })
+  await r.op(turn()) // its reply starts the pass, and the pass is held
+  assert.equal(r.count("receipts"), 1, "the read is in flight")
+  r.server.pending = [uid(1)]
+  const stopped = hookDouble({ events: r.events })
+  const stopping = r.receiver.handle(stopEvent, stopped)
+  await settle()
+  await r.clock.advance(3_000) // the Stop stops waiting for its report, which stays queued behind the read
+  await stopping
+  assert.deepEqual(stopped.sent, [{ ok: true }])
+  const prompt = hookDouble({ events: r.events })
+  const handled = r.receiver.handle(turn(), prompt)
+  await settle()
+  assert.deepEqual(prompt.sent, [{ context: null }], "answered at once, while the read is still held")
+  assert.equal(r.count("pending"), 1, "no candidates were read for it: only the first hook's read")
+  assert.equal(r.count("claim"), 0)
+  delete r.server.gates.receipts
+  open()
+  await handled
+  await settle()
+  assert.equal(r.count("claim"), 0, "the skipped prompt claimed nothing")
+  const next = await r.op(turn())
+  assert.ok(isDeliveryText(next.sent[0].context), "once the read has ended the next hook delivers it")
+  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [[uid(1)]])
+  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+})
+
+// The loop that a worker without a receipts deadline can sustain. A pass is due again once a cadence has passed, and a hook's
+// reply starts it: when every read lasts longer than a cadence, the hook that waited behind one starts the next, and the next
+// hook waits behind that. The receiver cannot end a read; only the worker's deadline can. This pins the receiver against a
+// hung worker, not the shipped one, and is why the worker's receipts deadline must stay under the 3.5 s of budget.
+test("against a worker that holds every receipts read for longer than a cadence, every hook skips its claim; the first quick read ends it", async () => {
+  const r = await ready({ rows: [] })
+  let release
+  const hold = () => { r.server.gates.receipts = new Promise(resolve => { release = resolve }) }
+  hold()
+  await r.op(turn()) // its reply starts a pass, held
+  r.server.pending = [uid(1)]
+  for (let round = 1; round <= 3; round += 1) {
+    const hook = hookDouble({ events: r.events })
+    const handled = r.receiver.handle(turn(), hook)
+    await settle()
+    await r.clock.advance(POLL_MS + 500)
+    const open = release
+    hold() // the pass that this hook's reply starts is held as well
+    open()
+    await handled
+    await settle()
+    assert.deepEqual(hook.sent, [{ context: null }], `hook ${round}: answered with nothing`)
+    assert.equal(r.count("receipts"), round + 1, `hook ${round}: its reply started the next read`)
+  }
+  assert.equal(r.count("claim"), 0, "three hooks in a row, and nothing was claimed")
+  delete r.server.gates.receipts
+  release()
+  await settle()
+  const next = await r.op(turn())
+  assert.ok(isDeliveryText(next.sent[0].context), "the first hook that finds no read in flight delivers it")
+  assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
+})

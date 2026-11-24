@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1157,3 +1158,165 @@ def test_receipt_frames_are_whitelisted_before_any_call(
     code, frames, calls = _timed_worker(monkeypatch, [(0, frame)], [])
     assert code == 1 and frames[-1] == {"id": 1, "error": {"code": "INVALID_REQUEST"}}
     assert [path for _at, path in calls if "receipts" in path] == []
+
+
+# A receipts request holds the parent's one request slot, and a hook's delivery queues behind it. It has a deadline
+# of its own, inside what a hook has left for its claim, and a request that runs out is a soft refusal like any
+# receipts failure.
+def test_the_receipts_deadline_leaves_a_hook_the_time_a_claim_needs() -> None:
+    # A hook has 6 s of patience and a claim needs the last 2.5 s (PATIENCE_MS and CLAIM_MARGIN_MS in the Claude
+    # Code and Codex packages), so a request that holds the slot for its whole deadline must still leave room for
+    # the hook's own pending read.
+    assert 0 < instance_worker.RECEIPT_SECONDS <= 6.0 - 2.5 - 1.0
+
+
+def test_only_the_receipts_operations_carry_the_receipts_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    deadlines: list[float | None] = []
+    real_client = instance_client._client
+
+    def recording(instance: Any, deadline: float | None) -> Any:
+        deadlines.append(deadline)
+        return real_client(instance, deadline)
+
+    monkeypatch.setattr(instance_client, "_client", recording)
+    state = {"native_state": "idle", "stopped": False, "plan_mode": False}
+    code, _frames, calls = _timed_worker(
+        monkeypatch,
+        [
+            (1, {"op": "heartbeat", "state": state}),
+            (2, {"op": "pending"}),
+            (3, {"op": "receipts"}),
+            (4, {"op": "receipts_delivered", "receipts": [str(uuid4())]}),
+            (5, {"op": "status"}),
+        ],
+        [{"messages": []}],
+        feed=[_receipt_row()],
+        muted=False,
+    )
+    assert code == 0
+    assert [path.rsplit("/", 1)[-1] for _at, path in calls] == [
+        "heartbeat", "pending", "receipts", "status", "delivered", "status", "end",
+    ]
+    bound = instance_worker.RECEIPT_SECONDS
+    # The feed and the mute read inside the `receipts` answer share one deadline, taken when the request was read;
+    # the mark has its own. Nothing else has one: the alarm bounds them.
+    assert deadlines == [None, None, 3 + bound, 3 + bound, 4 + bound, None, None]
+
+
+class _ReceiptsServer(BaseHTTPRequestHandler):
+    """The server's routes for the receipts requests, and for the status and end that follow them.
+
+    A path in `stalled` answers its headers at once and then keeps the body back one byte at a time, each well
+    inside the socket timeout and for much longer than the receipts deadline: only a deadline ends such a read.
+    """
+
+    stalled: frozenset[str] = frozenset()
+    identity: dict[str, str] = {}
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - the stdlib signature
+        pass
+
+    def _answer(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        posted = json.loads(self.rfile.read(length)) if length else {}
+        if self.path in self.stalled:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "4096")
+            self.end_headers()
+            try:
+                for _ in range(160):
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                    time.sleep(0.05)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        extra: dict[str, Any] = {}
+        if self.path == "/v1/instance/receipts":
+            extra = {"receipts": []}
+        elif self.path == "/v1/instance/receipts/delivered":
+            extra = {"delivered": posted["receipts"]}
+        body = json.dumps({**self.identity, **extra}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _answer
+
+
+@pytest.mark.parametrize("stalled", [False, True], ids=["prompt-server", "stalled-server"])
+@pytest.mark.parametrize("operation", sorted(RECEIPT_OPERATIONS))
+def test_a_stalled_receipts_request_is_refused_inside_its_deadline_and_the_worker_serves_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, operation: str, stalled: bool
+) -> None:
+    """A real socket and the real clock: the worker's own clock stub would make every deadline look long past."""
+    frame, _key = RECEIPT_OPERATIONS[operation]
+    path = "/v1/instance/receipts" if operation == "receipts" else "/v1/instance/receipts/delivered"
+    instance = instance_client.JoinedInstance(
+        InstanceSecret("stalled-native", uuid4(), "1" * 64, "http://127.0.0.1:1"),
+        uuid4(), uuid4(), uuid4(), "synthetic-host", "pi",
+    )
+    _ReceiptsServer.identity = {"instance_id": str(instance.instance_id), "session_id": str(instance.session_id)}
+    _ReceiptsServer.stalled = frozenset({path}) if stalled else frozenset()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ReceiptsServer)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        port = server.server_address[1]
+        # The addresses a join resolved, as every real worker request has them: no lookup, no resolver child.
+        pinned = ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", port)),)
+        bound = instance_client.JoinedInstance(
+            InstanceSecret("stalled-native", instance.binding.boot_id, "1" * 64, f"http://127.0.0.1:{port}"),
+            instance.session_id, instance.instance_id, instance.room_id, "synthetic-host", "pi", pinned,
+        )
+        frames = iter(
+            [{"id": 0, "op": "join", "directory": str(tmp_path), "host_token": "synthetic-host-secret"}]
+            + [{"id": 1, **frame}, {"id": 2, "op": "status"}]
+        )
+        read_at: list[float] = []
+        wrote_at: list[float] = []
+        output = io.BytesIO()
+
+        def readline(_size: int) -> bytes:
+            read_at.append(time.monotonic())
+            item = next(frames, None)
+            return b"" if item is None else (json.dumps(item) + "\n").encode()
+
+        class Stdout:
+            def write(self, view: memoryview) -> int:
+                wrote_at.append(time.monotonic())
+                return output.write(view)
+
+        monkeypatch.setattr(instance_worker, "RECEIPT_SECONDS", 0.3)
+        monkeypatch.setattr(instance_worker, "_join", lambda _request: bound)
+        monkeypatch.setattr(
+            instance_worker, "sys",
+            SimpleNamespace(stdin=SimpleNamespace(buffer=SimpleNamespace(readline=readline)),
+                            stdout=SimpleNamespace(buffer=Stdout())),
+        )
+        monkeypatch.setattr(
+            instance_worker, "signal",
+            SimpleNamespace(SIGALRM=14, SIGTERM=15, ITIMER_REAL=0, signal=lambda *_args: None,
+                            setitimer=lambda *_args: None),
+        )
+        code = instance_worker.main()
+    finally:
+        server.shutdown()
+        server.server_close()
+    replies = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert code == 0
+    if stalled:
+        assert replies[1]["result"] == {"refused": "CLI_INTERRUPTED"}
+        # The stall lasts 8 s. The deadline, not the end of the stall, answered; the slack is for a loaded host.
+        assert wrote_at[1] - read_at[1] < 4.0
+    else:
+        # The control: a server that answers gets its real answer, so the refusal above is the deadline and not a clock
+        # or a connection that always fails.
+        expected = {"receipts": []} if operation == "receipts" else {"delivered": frame["receipts"]}
+        assert {key: value for key, value in replies[1]["result"].items() if key in expected} == expected
+        assert "refused" not in replies[1]["result"]
+    # The next request is served by the same worker.
+    assert replies[2]["result"] == _ReceiptsServer.identity
