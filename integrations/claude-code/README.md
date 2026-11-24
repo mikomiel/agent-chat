@@ -165,9 +165,17 @@ or a stop. Only the idle-wake waiter exits 2.
   non-string `permission_mode` is `unknown` and claims nothing.
 - **Settlement.** `handed` is reported only after the hook has written the
   output and its write callback has fired, and said so over the socket. A
-  refused output settles `failed`; a failed write, a missing receipt or a
-  reservation too short to write inside settles `uncertain`. Nothing is ever
-  replayed.
+  refused output settles `failed`, and so does a claimed batch whose hook
+  connection (a prompt or tool hook, or the idle-wake waiter) was already
+  closed when the receiver came to write it, after the claim and the status
+  request: nothing was sent, so it is retryable. The ledger accepts
+  that settlement only while the reservation holds; one that reaches it after
+  the reservation expired is closed by the ledger as `uncertain`
+  (`claim_expired`, `agent_chat/deliveries.py`), like any expired claim. A
+  failed write, a missing receipt, a connection that closed once the notice was
+  sent, or a reservation too short to write inside settles `uncertain`, and the
+  ledger does not offer that batch again. The receiver never writes the same
+  attempt twice.
 - **Output cap.** Claude Code caps each hook `additionalContext`,
   `systemMessage` and plain output string at 10,000 characters and replaces a
   longer one with a file and a preview. Nothing here relies on that. The

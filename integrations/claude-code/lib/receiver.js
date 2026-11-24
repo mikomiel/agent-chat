@@ -35,6 +35,9 @@ const OWNER_CHECK_MS = 30_000
 const QUIET_MS = 180_000
 const STOP_GRACE_MS = 6_000
 const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
+// Nothing reached the hook's output: the hook refused it, or its connection was closed before anything was sent to it.
+// The ledger offers such a batch again. A write that may have happened is uncertain instead, and is not offered again.
+const NOT_WRITTEN = { outcome: "failed", reason: "native_unavailable" }
 
 // A join conflict is the previous instance's lease; the rejoin policy owns the wait.
 const REJOIN_AFTER = new Set([
@@ -291,6 +294,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // hook wrote and flushed the output; it does not mean the model has read it.
   async function hand(link, text, until, wake, announce) {
     if (!eligible(wake)) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
+    // The hook may have gone while the claim and the status request ran. A closed connection takes no write, so nothing was
+    // sent and the batch can be offered again. Nothing is awaited between this check and the write, so a send that fails
+    // below was attempted and may have reached the hook: that stays uncertain.
+    if (link.closed) return { result: NOT_WRITTEN, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
@@ -299,7 +306,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       if (wake) native = "busy" // the notice starts a turn; the next Stop reports idle
       return { result: { outcome: "handed", reason: null }, replied: true }
     }
-    if (isDone(done, "refused")) return { result: { outcome: "failed", reason: "native_unavailable" }, replied: true }
+    if (isDone(done, "refused")) return { result: NOT_WRITTEN, replied: true }
     return { result: UNCERTAIN, replied: true }
   }
 

@@ -409,6 +409,70 @@ test("a write that failed or went unconfirmed settles uncertain, never handed", 
   }
 })
 
+// A batch as the ledger keeps it (agent_chat/deliveries.py): offered again after an attempt settles failed or deferred, and never
+// after handed or uncertain. The backoff between attempts is the ledger's clock; it is not modelled here.
+function ledger(ids, { arrived = true } = {}) {
+  let offered = arrived
+  return {
+    arrive: () => { offered = true },
+    handlers: {
+      pending: () => ({ messages: offered ? ids : [] }),
+      settle: fields => { offered = fields.result.outcome === "failed" || fields.result.outcome === "deferred"; return {} },
+    },
+  }
+}
+
+// The handlers of that ledger, with a claim or a status request that finds `hook` gone. Every claim is a new attempt.
+function goneDuring(request, hook, books) {
+  let attempts = 0
+  return {
+    ...books.handlers,
+    claim: fields => {
+      attempts += 1
+      if (request === "claim") hook.close()
+      return { dispatch: true, attempt_id: `attempt-${attempts}`, reservation_ms: 30_000, messages: fields.messages.map(row) }
+    },
+    status: () => { if (request === "status") hook.close(); return { muted: false } },
+  }
+}
+
+// The hook can exit while the claim and the status request run. Nothing is sent to a connection that is closed by then, so the
+// batch is not handed and settles failed, which the ledger offers again, never uncertain, which it does not. A reservation that
+// ran short settles uncertain before any write is tried (see "a reservation too short to write inside"); these reservations hold.
+for (const request of ["claim", "status"]) {
+  test(`a hook that goes during the ${request} request is sent nothing, and the batch settles failed and reaches the next hook`, async () => {
+    const gone = hookDouble()
+    const r = await rig({ handlers: goneDuring(request, gone, ledger(["m1"])) })
+    await r.begin()
+    await r.op(turn(), gone)
+    assert.deepEqual(gone.sent, [], "nothing was sent to the hook that went")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+    const next = await r.op(turn())
+    assert.match(next.sent[0].context, /"id":"m1"/, "the ledger offered the batch again, and the next hook was handed it")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result.outcome), ["failed", "handed"])
+  })
+}
+
+// A write that may have happened is uncertain, and the ledger does not offer that batch again: the frame went out and the
+// connection then closed, before the receipt or on the write itself. The connection was open when the write began.
+test("a connection that closes once the notice was written settles uncertain, and the batch is not offered again", async () => {
+  const closing = {
+    "before the receipt": async (hook, write) => { const sent = await write(); hook.close(); return sent },
+    "on the write itself": async (hook, write) => { await write(); hook.close(); return false },
+  }
+  for (const [when, close] of Object.entries(closing)) {
+    const hook = hookDouble({ answer: false })
+    const write = hook.send
+    hook.send = value => close(hook, () => write(value))
+    const r = await rig({ handlers: ledger(["m1"]).handlers })
+    await r.begin()
+    await r.op(turn(), hook)
+    assert.match(hook.sent[0].context, /"id":"m1"/, `the notice went out (${when})`)
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "uncertain", reason: "transport_ambiguous" }], when)
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }], `an uncertain batch is not offered again (${when})`)
+  }
+})
+
 test("Plan Mode is reported and nothing is claimed", async () => {
   const r = await rig({ handlers: { pending: () => ({ messages: ["m1"] }) } })
   await r.begin()
@@ -675,6 +739,26 @@ test("a wake whose write failed settles uncertain and leaves no waiter", async (
   await r.clock.advance(10_000)
   assert.equal(r.worker.ops("pending").length, before)
   wake.close()
+})
+
+test("an idle waiter that goes during the claim request is sent nothing, and the batch reaches the next waiter", async () => {
+  const gone = hookDouble()
+  const books = ledger(["m7"], { arrived: false })
+  const r = await rig({ handlers: goneDuring("claim", gone, books) })
+  await idle(r)
+  void r.receiver.handle({ op: "wait" }, gone)
+  books.arrive()
+  await r.clock.advance(2000)
+  assert.deepEqual(gone.sent, [], "nothing was sent to the waiter that went")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+  assert.equal(r.receiver.state(), null, "nothing was handed: still idle")
+  const next = hookDouble({ events: r.events })
+  const waiting = r.receiver.handle({ op: "wait" }, next)
+  await r.clock.advance(2000)
+  assert.match(next.sent[0].context, /"id":"m7"/, "the ledger offered the batch again, and the next waiter was handed it")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result.outcome), ["failed", "handed"])
+  next.close()
+  await waiting
 })
 
 test("a worker refusal that proves the lease gone starts the bounded rejoin and re-announces the binding", async () => {
