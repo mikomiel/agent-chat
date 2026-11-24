@@ -1,12 +1,13 @@
 // One manager per OpenCode server process: it turns the plugin event stream into one binding context and one
-// lifecycle per root session. The plugin joins and keeps the binding in place. It never sends input to a session.
+// lifecycle per root session. The plugin joins and keeps the binding in place. It sends input to a session in one place
+// only, the idle hook (`idle`, below), and only when the config turns delivery on.
 //
 // ROOT SESSIONS ONLY. A session joins only when `session.get` shows no `parentID` and no `fork`. A subagent runs
 // only in a child session and a child has a `parentID`. Whether a fork sets `parentID` is not confirmed, so a fork
 // is refused too: when in doubt a session stays out. A parent pointer is not trusted as a root test either way.
 //
 // THE FIRST EVENT OF A SESSION ONLY SAYS THAT IT EXISTS. The first event the manager handles for a session it has not
-// seen, of any subscribed kind, starts the lookup and the join. It says nothing about what the session is doing, and
+// seen, of any subscribed kind but `session.inbox.delivered`, starts the lookup and the join. It says nothing about what the session is doing, and
 // nothing here keeps such a state.
 //
 // A GAP OWES A READ-BACK. The binding context owes it from the reset, and the manager asks for it at the next event the
@@ -48,11 +49,26 @@
 // also ends at the call time limit as a failed lookup, so the later events of its session are not queued behind it
 // for ever: the cooldown below applies, and the next event after it asks afresh.
 //
+// THE IDLE HOOK DELIVERS, AND NOTHING ELSE DOES. `idle(sessionID)` is what OpenCode's `experimental.idle` hook calls when
+// a session has finished model work and has no input left. It claims and admits only there, so no state of the session is
+// kept from events: the hook asks the host about the session at that moment, and the worker's own reply decides the rest. An
+// event is read only against the attempt the hook made (`session.inbox.delivered`, lib/delivery.js) or as a reset of the cap
+// (`session.execution.started`). It never creates a record and never runs on a session's chain: it takes the lifecycle's turn
+// at the worker, or claims nothing. Everything it awaits is under one budget, `IDLE_BUDGET_MS`: the host does not time a hook
+// out, so a hook that did not return would stall the session's end of turn. The budget is a deadline on the monotonic clock,
+// the hook's start plus the budget. A timer armed for what is left of it releases the hook, and the hook reads the clock
+// itself as the last step before the claim and as the last step before the host call: a timer can run late. At the budget
+// the hook returns and nothing moves forward from it. A grant held and not yet written to the session settles deferred, so
+// the server offers it again. An admission still in flight settles uncertain. An input that the host has accepted is not the
+// budget's: its delivered event or its own deadline settles it, whatever the hook's cleanup is doing.
+//
 // ONE FAULT BOUNDARY PER SESSION. Events of one session run in order on that session's own chain, and a throw or
 // rejection there, or in a signal applied on receipt, disables chat for that session only. A deleted session never rejoins in this process. A session
 // that faulted stays out while its refusal is in the bounded lookup cache, so a worker that is still ending is not
 // raced by a second join until that entry is evicted.
+import { CHAT_SOURCE, monotonicNow } from "./channel.js"
 import { CALL_TIMEOUT_MS, isMissing } from "./context.js"
+import { createDelivery, inboxIDOf } from "./delivery.js"
 import { describeFailure } from "./worker.js"
 
 // The events the manager reads. Session events of other kinds, such as every tool call, are never subscribed to.
@@ -63,6 +79,15 @@ export const EVENT_TYPES = Object.freeze([
   "session.created", "session.execution.started", "session.forked", "session.deleted",
   "session.compaction.started", "session.compaction.ended", "session.compaction.failed",
 ])
+
+// The event of an input promoted into a session's history. Subscribed only when the config turns delivery on, and read only
+// against an attempt the idle hook made. Not one of EVENT_TYPES: none of those is read as a state of the session.
+export const DELIVERY_EVENT = "session.inbox.delivered"
+
+// Every await of one idle hook runs under this budget, from the first host call to the admission.
+export const IDLE_BUDGET_MS = 1_500
+// The built-in agent that denies edits. A custom agent with the same limits is not detected.
+const PLAN_AGENT = "plan"
 
 const RETRY_LOOKUP_MS = 60_000
 const MAX_REFUSED = 1024
@@ -102,6 +127,11 @@ export function createManager(ctx, config, parts, {
   // sets both, so the evidence reaches the current owner, which may not be this one. Alone, the manager acts on its own.
   reportDeleted = null,
   reportNotRoot = null,
+  idleBudgetMs = IDLE_BUDGET_MS,
+  // The clock of the hook's own deadline, the hook's start plus the budget. Monotonic, so a wall-clock step cannot move it.
+  monotonic = monotonicNow,
+  // The open attempt of each session and the cap. Its clock is the lifecycle's, not `now` above: a deadline is on that one.
+  delivery = createDelivery(),
 } = {}) {
   const records = new Map() // session id -> { id, context, lifecycle, chain, dead, closing }
   const refused = new Map() // session id -> time until which it is not looked up again (Infinity: never)
@@ -129,6 +159,7 @@ export function createManager(ctx, config, parts, {
     if (record.closing) return record.closing
     record.dead = true
     records.delete(record.id)
+    delivery.forget(record.id)
     let ended
     try { ended = record.lifecycle ? Promise.resolve(record.lifecycle.stop()) : Promise.resolve({ code: 0 }) }
     catch { ended = Promise.resolve(null) }
@@ -252,6 +283,13 @@ export function createManager(ctx, config, parts, {
     if (!active) return
     const id = sessionOf(event)
     if (id === null) return
+    // An input promoted into a session settles the attempt the hook made for it, and nothing else. It opens no record.
+    if (event.type === DELIVERY_EVENT) {
+      delivery.delivered(id, event.data?.inboxID)
+      return
+    }
+    // A new execution has its own allowance of hook deliveries.
+    if (event.type === "session.execution.started") delivery.restart(id)
     if (event.type === "session.deleted") {
       markDeleted(id)
       return
@@ -275,6 +313,7 @@ export function createManager(ctx, config, parts, {
   // The event stream broke or restarted: events may be missing, so every observation is stale. A read-back is owed now,
   // and asked for at the next event or tick.
   function reset() {
+    delivery.reset() // a delivered event may have been lost with the stream: an open attempt can no longer be proved
     for (const record of [...records.values()]) {
       if (applyNow(record, context => context.reset())) continue
       record.chain = record.chain.then(() => {
@@ -282,6 +321,81 @@ export function createManager(ctx, config, parts, {
         record.context.reset()
       }).catch(error => isolate(record, error))
     }
+  }
+
+  // The function the lifecycle calls to admit the rendered notice. The attempt is opened before the host is asked, so an event
+  // that arrives early finds it, and the call is not awaited past the attempt's own end: a call that never answers ends with
+  // the hook's budget. The input is a steer input admitted with `resume: false`: it joins a run that is going on and never
+  // starts one, which is the only way a plugin can hand input to a session it has just proved to be between model turns. A
+  // rejection or a throw leaves the attempt uncertain: the input may exist already, and it cannot be taken back. A call that
+  // returns hands the attempt over to its own event and deadline: from then on the budget does not end it, because the host
+  // has accepted the input and its delivered event can still come in time. The caller's time is asked once more as the last
+  // step before the host call, after the attempt is open and its timer armed, and nothing runs between that check and the
+  // call. A caller that is out of time makes no call: it closes the attempt, and answers that nothing was written.
+  function admitter(record, turn, open) {
+    return async ({ text, attemptID, deadline }) => {
+      const inboxID = inboxIDOf(attemptID)
+      const attempt = delivery.open(record.id, { inboxID, deadline })
+      turn.admitting = attempt
+      const input = {
+        id: inboxID,
+        sessionID: record.id,
+        text,
+        description: "Agent Chat",
+        metadata: { source: CHAT_SOURCE },
+        delivery: "steer",
+        resume: false,
+      }
+      if (!open()) {
+        turn.admitting = null
+        attempt.abandon()
+        return { written: false }
+      }
+      let call
+      try {
+        call = Promise.resolve(ctx.session.synthetic(input))
+      } catch {
+        attempt.abandon()
+        return attempt
+      }
+      call.then(() => { turn.admitting = null }, () => attempt.abandon())
+      await Promise.race([call.then(undefined, () => {}), attempt.done])
+      return attempt
+    }
+  }
+
+  // One hook's work, up to the lifecycle's own sequence. Every host answer is checked against the turn before the next step.
+  // The turn is over when the budget's timer has run, and also when the clock is at the deadline: a timer can run late, and
+  // a reply can be read before it does.
+  async function deliver(record, turn) {
+    const open = () => !turn.over && active && !record.dead && monotonic() < turn.until
+    // The same lookup as a join, so a session the host no longer has, or one that is a child or a fork, is reported as always.
+    const info = await lookup(record.id)
+    if (!open() || !isRootSession(info, record.id) || info.agent === PLAN_AGENT) return
+    if (!(await record.context.held()) || !open()) return
+    await record.lifecycle.idle(admitter(record, turn, open), open)
+  }
+
+  // `experimental.idle`. Returns undefined, with nothing awaited, when there is nothing to do: delivery is off, the manager
+  // is stopped, the session has no joined record (a child, a fork, an unseen or a refused session), its chat is off, or it has
+  // used its allowance for this execution. Otherwise a promise that never rejects and settles within the budget.
+  function idle(sessionID) {
+    if (!active || config?.delivery !== true || typeof sessionID !== "string" || !sessionID || isRefused(sessionID)) return undefined
+    const record = records.get(sessionID)
+    if (!record || record.dead || !record.context || !record.lifecycle?.ready?.() || !delivery.allowed(sessionID)) return undefined
+    const turn = { over: false, admitting: null, until: monotonic() + idleBudgetMs }
+    let timer
+    const expired = new Promise(resolve => {
+      // For what is left of the deadline, not for a fresh budget: time that passed since the deadline was taken is not given back.
+      timer = setTimeoutImpl(() => {
+        turn.over = true
+        turn.admitting?.abandon() // a call still in flight may land the input: it is uncertain, whatever the host answers later
+        resolve()
+      }, Math.max(0, turn.until - monotonic()))
+      timer?.unref?.() // the hook returns at the budget; the timer must not outlive it
+    })
+    const finished = deliver(record, turn).catch(() => { /* a failed read or step claims nothing */ })
+    return Promise.race([finished, expired]).then(() => { clearTimeoutImpl(timer) })
   }
 
   // Ends every session, and waits for every end already in flight. Resolves true only when every worker end is proved.
@@ -296,5 +410,5 @@ export function createManager(ctx, config, parts, {
     return results.every(proved => proved === true)
   }
 
-  return { feed, reset, stop, sessions: () => [...records.keys()] }
+  return { feed, reset, idle, stop, sessions: () => [...records.keys()] }
 }
