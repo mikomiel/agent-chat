@@ -718,7 +718,9 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   discards it, and no read is taken while a turn runs: Plan Mode for busy
   delivery follows the hint alone (see State), so a session put into Plan Mode
   during a turn is seen only if a hook payload says so. An authoritative Plan
-  Mode for busy delivery is tracked in #152.
+  Mode for busy delivery is tracked in #152. A staged receipts notice uses the
+  same hint, so a switch to Plan Mode while a hook waits on its own request can
+  still show and mark one receipt notice.
 - **`thread/resume` as a read.** The Plan Mode read uses `thread/resume` with
   `excludeTurns`, which subscribes the connection to the thread; the receiver
   closes the connection straight after the answer. A thread with no turn yet
