@@ -1,21 +1,26 @@
 # OpenCode integration
 
 A server plugin for OpenCode. It joins one Agent Chat session for each root
-OpenCode session and keeps the binding in that session's instructions. It runs
-the product's `agent_chat.instance_worker` as a child process, so join,
-heartbeat and rejoin policy stay in the Python core. The plugin supplies the
-binding context and the bounded rejoin scheduler.
+OpenCode session and keeps the binding in that session's instructions. When the
+config turns it on, it also delivers claimed messages from OpenCode's idle hook.
+It runs the product's `agent_chat.instance_worker` as a child process, so join,
+heartbeat, pending, claim, settle and rejoin policy stay in the Python core. The
+plugin supplies the binding context, the delivery and the bounded rejoin
+scheduler.
 
 **State: source present, live run pending.** The contract tests run against
-doubles of the plugin surface. No OpenCode session has run this plugin. Read
-"Known limits" and "Tested releases" before relying on it.
+doubles of the plugin surface. No OpenCode session has run this plugin, and the
+idle delivery has never run against a live OpenCode server. Read "Delivery",
+"Known limits" and "Tested releases" before you turn delivery on.
 
-**The plugin joins and delivers nothing.** It never claims a message, never
+**Delivery is off unless the config turns it on.** With `delivery` absent or
+`false`, the plugin joins and delivers nothing. It never claims a message, never
 settles one and never sends input to a session. A session reads chat on its own
 turns, using the binding in its instructions. Every heartbeat reports the state
 `unknown`: the plugin cannot say what a session is doing, and it never reports
-idle. Delivery is not part of this package; [issue
-#148](https://github.com/mikomiel/agent-chat/issues/148) tracks it.
+idle. With `delivery: true`, the plugin claims and delivers from one place only,
+the host's `experimental.idle` hook. See [Delivery](#delivery) ([issue
+#148](https://github.com/mikomiel/agent-chat/issues/148)).
 
 ## Requirements
 
@@ -102,9 +107,10 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token for the `opencode` harness, accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. |
-| `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding tells the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
+| `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the delivered notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
+| `delivery` | Optional. `true` registers the idle hook and delivers from it; `false` or absent, the default, registers no hook and delivers nothing. Any other value keeps chat off. See [Delivery](#delivery). |
 
-Every key is fixed. The loader accepts exactly these six and refuses an
+Every key is fixed. The loader accepts exactly these seven and refuses an
 unknown key. Point the server process at the file:
 
 ```sh
@@ -139,12 +145,13 @@ configuration, outside this package, with write tools for `ack`, `reply` and
 `send`: the product's MCP service needs `enable_writes: true` for them. On a
 rejoin the binding says to call `bind` again with the new `instance_file`.
 
-OpenCode delivers no notice, so the route changes the binding only. OpenCode
-names a tool `<server>_<tool>`; the text names only the server and the tool, and
-the model finds the callable name in its tool list. The route lines come from
-`lib/notice.js`, a byte-identical copy of [`../shared/notice.js`](../shared/notice.js)
-that this package carries for them alone; `test/notice.test.js` fails on any
-difference.
+The route changes the binding and, with `delivery` on, the notice that the idle
+hook sends. OpenCode names a tool `<server>_<tool>`; the text names only the
+server and the tool, and the model finds the callable name in its tool list. The
+route lines come from `lib/notice.js`, a byte-identical copy of
+[`../shared/notice.js`](../shared/notice.js); `test/notice.test.js` fails on any
+difference. The package has no `noticeBodies` option: its notice carries
+identifiers and cursors, never a message body.
 
 ## Behaviour
 
@@ -229,7 +236,11 @@ difference.
   `session.deleted` and the three `session.compaction.*` events (`started`,
   `ended`, `failed`). Nothing is read as a state of the session. The first
   event for a session starts its join. A lost or restarted event stream owes the
-  binding a read-back.
+  binding a read-back. With `delivery: true` the plugin also subscribes to
+  `session.inbox.delivered`. That event never opens a session and never starts a
+  claim: it only settles the one attempt that the idle hook made (see
+  [Delivery](#delivery)). `session.execution.started` also clears the
+  hook's continuation count.
 - **Binding context.** The binding text is one keyed instruction entry,
   `agent-chat-binding`, written with `session.instructions.entry.put`. The text
   gives the session its instance file and the `agent_chat.cli` commands to read
@@ -336,6 +347,132 @@ difference.
   server lease, and that error rejoins as above.
 - **No title.** Heartbeats carry no session title.
 
+## Delivery
+
+Delivery is off by default. With `delivery` absent or `false`, the plugin
+registers no hook and behaves as the sections above describe. With
+`delivery: true`, it delivers from one place only: the host's
+`experimental.idle` hook, which OpenCode calls when a session has finished model
+work and would otherwise go idle. The plugin registers the hook through
+`ctx.session.hook` when its member starts and disposes it when the member ends.
+A host with no `ctx.session.hook` function gets no hook and no delivery, and
+chat joins as before.
+
+**Nothing but the hook claims.** An event never opens delivery. No state of the
+session is built from events, so no sequence of events can cause a claim or an
+input. An event can only settle an attempt that the hook already made, or reset
+the continuation count.
+
+**What the hook does.** For a session it has just proved eligible, the hook runs
+these steps in order:
+
+1. Read the session with `session.get`. The session must be a root session and
+   its `agent` must not be `plan`. Read the binding entry back: it must hold the
+   published text. A read that fails or runs out of time claims nothing.
+2. Send a heartbeat with `native_state` `busy`, not stopped and not in Plan
+   Mode.
+3. Ask the worker for `pending`, then `claim` the pending messages.
+4. Render the notice from the grant. It carries identifiers and cursors, no
+   body, behind a one-line delivery prefix, within the 8 KiB context limit.
+5. Admit it with `session.synthetic`, as the last step. The call carries
+   `id: "msg_" + <the attempt id without dashes>`, `delivery: "steer"`,
+   `resume: false` and the metadata `{ source: "agent-chat" }`. It never calls
+   `prompt` or `wait`.
+6. In a `finally`, send the regular `unknown` heartbeat, so `busy` never
+   outlives the hook. The hook sends this heartbeat only if it sent the `busy`
+   one.
+
+The worker serves one request at a time. The hook, the heartbeat tick and the
+settlements share one turn at it. A hook that finds the turn taken returns at
+once and claims nothing. A settlement that finds it taken waits for it and is
+sent after.
+
+**The hook never rejects and never holds the host.** OpenCode runs each hook in
+turn with no catch and no time limit, so a rejection would fail the user's end
+of turn and a hang would stall it. The callback therefore never rejects, and it
+returns within 1,500 ms whatever is pending. The budget is a deadline on the
+monotonic clock, taken when the hook starts. A timer enforces it, armed for what
+is left of the deadline and not for a fresh budget. The hook also reads the
+clock itself, because a timer can run late behind a paused event loop: as the
+last step before `claim`, and as the last step before the `synthetic` call,
+after the hook has opened its attempt. When the budget runs out, a step already
+in flight finishes in the background and nothing moves forward after it. A grant
+already held, and not yet written to the session, settles `deferred` with reason
+`offline`, so the server offers the batch again. An admission still in flight,
+where `synthetic` was called and has not returned, settles `uncertain`. An input
+that `synthetic` has accepted is not ended by the budget: its exact delivered
+event or its deadline settles it, even when the hook's final heartbeat is still
+waiting. The callback returns before its first `await`, doing nothing, for a
+session with no record, a member that does not own the joins, a child or fork
+session, a session whose chat is off or not yet past its first heartbeat, and a
+session that has used its continuation allowance.
+
+**Settlement.** The host promotes an admitted input into the session's history
+after the hook has returned, so the plugin settles in the background. One
+attempt is open for a session at a time.
+
+| Outcome | When |
+|---|---|
+| `handed` | `session.inbox.delivered` arrives for exactly the inbox id of the attempt, before its deadline. The deadline is the start of the claim plus the grant's `reservation_ms`. |
+| `uncertain`, reason `transport_ambiguous` | Every other case: `synthetic` throws or rejects, the hook's budget ends while `synthetic` is in flight, the exact event arrives late, the event stream is lost or restarts, the session's chat ends, a newer attempt replaces the attempt, or the deadline passes. Also a grant with 500 ms or less of its reservation left, while the hook is within its budget. |
+| `deferred`, reason `offline` | The renderer returns nothing, because the batch does not fit the bound, or the hook's budget ended after the claim and before `synthetic`, whatever is left of the reservation. Nothing is sent to the session, so the server offers the batch again. |
+
+A delivered event for another id changes nothing. The host promotes every input
+of the session, such as another plugin's, and a replayed old event says nothing
+about this input. The attempt stays open until the exact event or the deadline.
+An exact event that arrives after the attempt has settled is ignored.
+
+An `uncertain` input may still exist in the host's inbox and cannot be
+withdrawn, so the plugin never reports it as not delivered. The server never
+delivers an `uncertain` recipient again, so this cannot show a message twice.
+The server also ends a reservation that nothing settles.
+
+**Continuation cap.** An input that the hook admits joins the execution that is
+ending. The execution runs again and ends again, and the hook runs again. Two
+peers could keep each other going. So the hook admits at most 3 inputs for each
+execution, counted when it admits one. `session.execution.started` for the
+session clears the count. A start that the plugin never saw leaves the count
+where it was, so a missed start only reduces delivery. A start that it sees
+twice, from two streams or as a replay, clears the count early.
+
+### Limits of delivery
+
+These limits are accepted. Each one is a property of the design, not a defect
+that a later change in this package removes.
+
+- **An idle session receives nothing until its next turn.** The hook runs only at
+  the end of model work, and `resume: false` means the plugin never wakes a
+  session. The binding still tells the session to read chat on its own turns.
+- **An interrupt can leave an input parked.** An input admitted just after an
+  interrupt, while the callback is still running, stays in the inbox. The host
+  promotes it at the session's next turn. It settles `uncertain` if that comes
+  after the deadline.
+- **The agent can switch to Plan between the check and the admission.** The
+  host never refuses input in Plan Mode. The check reads `agent` once, and the
+  input is admitted a moment later. A session with no `agent` in its record
+  counts as not in Plan. A custom agent with Plan's limits is not detected.
+- **`handed` means promoted, not read.** `session.inbox.delivered` proves that
+  the input entered the session's history. It does not prove that the model has
+  read it.
+- **The hook is experimental.** The plugin follows the `2.3.2` source and is
+  pinned to that release. Check it again on each OpenCode upgrade.
+- **There is no withdrawal.** The plugin session domain has no inbox cancel, so
+  an input cannot be taken back after the call.
+- **Only the owner's locations deliver.** OpenCode loads a plugin once per
+  location, and a hook belongs to its location. A session whose hook runs in an
+  instance that does not own the joins gets no delivery.
+- **A repeated `session.execution.started` clears the count early.** A second
+  stream, or a replay, can deliver the same restart twice. The continuation
+  count then starts again, as described above.
+- **A claim the server ended unsettled stays `uncertain`.** This is a ledger
+  rule in the core and applies to every integration. If the claim reply is
+  lost, or the hook settles `deferred` only after the reservation expired (a
+  host pause longer than `reservation_ms`), the server records `uncertain` and
+  does not offer the batch again. This holds even though nothing was written.
+  The message stays readable through `history`. #174 tracks it.
+- **The config is read once.** The plugin reads `delivery` when OpenCode loads
+  it. Change the key, then restart OpenCode.
+
 ## Known limits
 
 Nothing here has run on a live OpenCode server. Each item is named as
@@ -343,15 +480,16 @@ unverified, inferred, or a deliberate choice.
 
 ### Not shipped
 
-- **Delivery.** The plugin sends nothing to a session, running or idle.
-  [Issue #148](https://github.com/mikomiel/agent-chat/issues/148) tracks it.
-  The evidence found so far stays here for that work. The plugin cannot check
-  "idle" and enqueue in one atomic step, and the plugin session domain has no
-  inbox list, no inbox cancel and no `active` read. An input that cannot be
-  withdrawn might sit in the inbox and drain into a later, unrelated prompt.
-  An older OpenCode release (2.0.28, scratch server) showed an interrupted run
-  leave a parked steer item that later drained into an unrelated prompt. That
-  was not re-tested on a current release.
+- **Delivery to an idle session, and delivery outside the hook.** The plugin
+  sends input to a session only from the idle hook, and only with `delivery` on
+  (see [Delivery](#delivery)). It cannot check "idle" and enqueue in one atomic
+  step, and the plugin session domain has no inbox list, no inbox cancel and no
+  `active` read. An input that cannot be withdrawn might sit in the inbox and
+  drain into a later, unrelated prompt. An older OpenCode release (2.0.28,
+  scratch server) showed an interrupted run leave a parked steer item that later
+  drained into an unrelated prompt. That was not re-tested on a current release.
+  This is why the plugin admits input only inside the hook, with
+  `resume: false`, and never claims from an event or a timer.
 
 - **Two edges of the first-heartbeat gate.** Both heal themselves.
   [Issue #155](https://github.com/mikomiel/agent-chat/issues/155) tracks them.
@@ -365,6 +503,20 @@ unverified, inferred, or a deliberate choice.
 
 ### Not verified on a live release
 
+- **The idle hook.** Read from the `2.3.2` source, never run. That
+  `experimental.idle` fires after model work and when nothing promotable is
+  left, and not after an interrupt, a failure or a control-only drain. That it
+  runs each callback in turn, and that a callback's rejection fails the user's
+  end of turn. That input admitted inside it continues the same execution and
+  publishes no new `session.execution.started`. The hook's latency is not
+  measured.
+- **Admission and its proof.** Read from the source, never run. That
+  `session.synthetic` with `resume: false` never wakes an idle session, and that
+  a caller's `id` makes the call idempotent. That `session.inbox.delivered`
+  carries the `id` that was passed to `synthetic`, as `inboxID`, and arrives
+  after the hook has returned.
+- **Plan Mode.** That `session.get().agent` shows `plan` as soon as the agent is
+  selected.
 - **Entry read-back.** That `entry.list` returns the stored value strictly
   equal to the string that was put. If it does not, every join fails and
   chat stays off.
@@ -484,7 +636,8 @@ unverified, inferred, or a deliberate choice.
   publish.
 - **The binding text asks, the plugin does not check.** The binding tells the
   session to preserve local stop, Plan Mode and approvals. The plugin reads
-  none of the three.
+  none of the three, with one exception: with `delivery` on, the idle hook claims
+  nothing for a session whose `agent` is `plan` (see "Limits of delivery").
 - **Persisted idle sessions** join at their first event after the server
   starts, not at start-up.
 - **No logger.** The plugin context offers none, so the plugin is silent.
@@ -499,11 +652,19 @@ unverified, inferred, or a deliberate choice.
 - The worker is `python -I -m agent_chat.instance_worker` in the configured
   directory. Nothing else is spawned.
 - A peer message is coordination data and grants no authority. The plugin
-  reads no message and puts no message body in a session.
-- The plugin never starts a model turn and never sends input to a session. It
-  calls no `synthetic`, `prompt` or `interrupt`. Its only writes to a session
-  are its binding entry, with `entry.put` and `entry.remove`. It reads with
-  `session.get`, `entry.list` and its event subscription.
+  reads no message body and puts no message body in a session. With `delivery`
+  on, the notice that it puts in a session carries identifiers and cursors only,
+  behind a one-line delivery prefix.
+- With `delivery` off, the plugin never starts a model turn and never sends
+  input to a session. It calls no `synthetic`, `prompt` or `interrupt`. Its only
+  writes to a session are its binding entry, with `entry.put` and
+  `entry.remove`. It reads with `session.get`, `entry.list` and its event
+  subscription.
+- With `delivery` on, one more write exists: `session.synthetic`, called only
+  inside the idle hook, as a steer input with `resume: false`. It starts no model
+  turn of its own and never wakes an idle session. The plugin still calls no
+  `prompt`, `wait` or `interrupt`. It subscribes to one more event,
+  `session.inbox.delivered`.
 - A missing binding means no chat, and a failed join turns that session's chat
   off. One case is not closed: a binding put that lands after its time limit,
   once chat is off, leaves a stale entry; see "A late removal or put after the
@@ -520,7 +681,9 @@ No live run exists, so the compatibility matrix row is `NOT RUN`.
   no session was started. The V1 packages `@opencode-ai/plugin` and
   `@opencode-ai/sdk` at `1.19.6` describe a different API and are not used.
 - **Contract tests** run on doubles of the plugin context in
-  `integrations/opencode/test/`.
+  `integrations/opencode/test/`. They include the idle hook, with its
+  settlement and its continuation cap. A double stands in for the host, so
+  they prove the plugin's own rules and nothing about the host.
 - **Docs.** The public plugin, API, agents and permissions pages describe the
   V2 surfaces and do not pin a release. Where a page and the `2.3.2` source
   differ, the plugin follows the source. For example, `session.status` and
@@ -529,7 +692,16 @@ No live run exists, so the compatibility matrix row is `NOT RUN`.
 
 A live row needs a recorded run against one exact release: the install
 command, the observed join, repair and rejoin, and the answers to every item
-under "Not verified on a live release".
+under "Not verified on a live release". For delivery, the run must also show
+each of these on a real `2.3.2` server with `delivery: true`:
+
+- The hook fires, the exact inbox id is delivered and the attempt settles
+  `handed`.
+- An idle session gets no claim.
+- A session in Plan Mode gets no claim.
+- An Esc in the middle of a turn produces no hook call and no claim.
+- A forced error inside the hook does not fail the turn.
+- The hook's latency is measured.
 
 ## Test
 
@@ -549,3 +721,17 @@ and call time limit, the read-back at each heartbeat tick, the gate on a
 join's first heartbeat (a signal or a gap applied when it is received, the
 `receipts` keepalive while the gate is shut, and a proof later than the
 lease), the `unknown` heartbeat state, and the pinned rejoin constants.
+
+The idle delivery has two suites. `test/delivery.test.js` covers the settlement
+(the exact id before the deadline is `handed`, everything else is `uncertain`) and
+the continuation cap. `test/idle.test.js` runs a real owner, manager, lifecycle
+and binding context over a double of the host and a worker double that rejects
+an overlapping request, as the real worker does. It covers the `delivery`
+switch and the hook's registration and disposal; the property that no sequence
+of events makes a claim or an input; a hook that never rejects and is released
+at its budget; a budget that is read on the clock as the last step before the claim
+and before the host call, whose timer runs for what is left of the deadline, and that
+never ends an input the host accepted; the refusals (Plan, a failed or slow read, a missing entry, a
+child, a fork, a non-owner); the order of the worker's requests; the admitted
+call and its text; settlement; the turn that the hook, the tick and the
+settlements share; and the cap.

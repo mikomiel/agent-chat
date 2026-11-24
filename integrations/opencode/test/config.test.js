@@ -32,7 +32,7 @@ test("a private complete record is accepted", () => {
   assert.deepEqual(withConfig(base), base)
 })
 
-test("the removed noticeBodies flag is an unknown key: the plugin delivers nothing, so it has no such option", () => {
+test("the removed noticeBodies flag is an unknown key: the plugin delivers notices without bodies, so it has no such option", () => {
   assert.equal(withConfig({ ...base, noticeBodies: true }), null)
   assert.equal(withConfig({ ...base, noticeBodies: false }), null)
 })

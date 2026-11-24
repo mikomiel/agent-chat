@@ -1,7 +1,7 @@
-// One harness-neutral Agent Chat lifecycle, for one OpenCode session. The product's worker owns join and heartbeat; this
-// module supplies the binding text, the bounded rejoin scheduler and the heartbeat timer around a native half. It
-// claims nothing, settles nothing and sends nothing to the session. The native half supplies the bus and the binding
-// context:
+// One harness-neutral Agent Chat lifecycle, for one OpenCode session. The product's worker owns join, heartbeat, pending,
+// claim and settle; this module supplies the binding text, the bounded rejoin scheduler and the heartbeat timer around a
+// native half. Left alone it claims nothing, settles nothing and sends nothing to the session. The native half supplies the
+// bus and the binding context:
 //
 //   bus.on(name, fn)       receives session_start ({ nativeSessionId }) and session_shutdown.
 //   native.context(text)   publishes (replacing) or clears the binding text. It resolves only when the text is
@@ -12,20 +12,46 @@
 //   native.probe()         asked once before a retry starts a replacement worker: one bounded read that never rejects.
 //   native.disable()       latches the native half off.
 //
-// The plugin reads no session state, so every heartbeat reports the unknown state: never idle, never busy.
+// The plugin reads no session state between hooks, so every heartbeat reports the unknown state: never idle, never busy.
+//
+// THE IDLE DELIVERY (`idle`). The one exception, and the only place this module claims. The host's `experimental.idle`
+// hook calls it when the session has just finished model work and has no input left, and the caller has already checked
+// the session and its binding entry. The hook runs in a fixed order: report `busy`, ask for the pending messages, claim, render,
+// and admit the notice as the last step, through the `admit` the caller passes. A `finally` then reports the unknown state
+// again, so `busy` does not outlive the hook. The server refuses `pending` and `claim` while the last heartbeat says stopped,
+// Plan Mode or unknown, so the `busy` report is what lets them through.
+// The settlement of an admitted input comes later and in the background (see lib/delivery.js): `settleLater`.
+// Every worker request of this sequence, and of the settlement, takes the same turn as the heartbeat (`beating`): the
+// worker serves one request at a time, and a second one ends it. A hook that finds the turn taken claims nothing. A
+// settlement that finds it taken waits for it and is never dropped.
 // This module never starts a model turn and never treats a peer message as authorization.
 import { randomUUID } from "node:crypto"
-import { monotonicNow } from "./channel.js"
-import { bindingRouteLines } from "./notice.js"
+import { CHAT_PREFIX, NOTICE_BOUND, monotonicNow } from "./channel.js"
+import { bindingRouteLines, renderNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
 import { describeFailure, startWorker } from "./worker.js"
 
 const HEARTBEAT_MS = 30_000
+// A reservation with less than this left is not worth an admission: the input could not be proved delivered in time.
+const MIN_RESERVATION_MS = 500
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 const requestFailure = (error, operation) => Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation })
 
-// What every heartbeat reports: the plugin cannot say what the session is doing, so it is unknown and stopped, never idle.
+// What every heartbeat reports between hooks: the plugin cannot say what the session is doing, so it is unknown and stopped,
+// never idle.
 const UNKNOWN_STATE = Object.freeze({ native_state: "unknown", stopped: true, plan_mode: false })
+// What the idle hook reports for its own duration: the session is between model work and idle, not stopped, not in Plan Mode.
+const BUSY_STATE = Object.freeze({ native_state: "busy", stopped: false, plan_mode: false })
+// The settlements this module makes itself, from the worker's vocabulary (`agent_chat/models.py`, DELIVERY_REASONS). The
+// settlement of an admitted input is lib/delivery.js's.
+const UNCERTAIN = Object.freeze({ outcome: "uncertain", reason: "transport_ambiguous" })
+const NOT_RENDERED = Object.freeze({ outcome: "deferred", reason: "offline" })
+
+// A worker answer that refuses the request without ending the worker: its code, or null for any other answer.
+const refusedBy = result => (result && typeof result === "object" && typeof result.refused === "string" ? result.refused : null)
+
+const refusedFailure = (code, operation) => Object.assign(new Error(code), { code, operation })
 
 const contextUnavailable = () => Object.assign(new Error("CHAT_CONTEXT_UNAVAILABLE"), { code: "CHAT_CONTEXT_UNAVAILABLE", operation: "join" })
 
@@ -47,7 +73,11 @@ export function createLifecycle(bus, native, config, {
   let ending = null
   let drainFailed = false
   const draining = new Set()
+  // The turn at the worker, which serves one request at a time: a second request is CHAT_WORKER_BUSY and ends the worker.
+  // The heartbeat, the keepalive and the idle delivery take it and give it up in `release`. A settlement that finds it
+  // taken waits in `parked` and is sent, in order, as the turn is released: never dropped, never overlapping.
   let beating = false
+  const parked = []
   let closed = false
   let disabled = false
   const policy = createRejoinPolicy({ now, random })
@@ -146,6 +176,13 @@ export function createLifecycle(bus, native, config, {
     return live.worker.request(operation, fields)
   }
 
+  // Gives up the turn at the worker. The next parked settlement takes it over at once, with `beating` still set.
+  function release() {
+    const next = parked.shift()
+    if (next) next()
+    else beating = false
+  }
+
   // Is this join's binding not proved right now? Asked synchronously, at the moment of a send, and never remembered: a gap or
   // a compaction signal that landed since the last proof takes it back. A native half without `proved()` has no gate beyond
   // the join's publish.
@@ -167,7 +204,7 @@ export function createLifecycle(bus, native, config, {
       await request("heartbeat", { state: UNKNOWN_STATE })
     } catch (error) {
       handleFailure(requestFailure(error, error?.operation))
-    } finally { beating = false }
+    } finally { release() }
   }
 
   // The same tick asks the native half to read its binding entry back and repair it. An entry can change with no event
@@ -190,7 +227,7 @@ export function createLifecycle(bus, native, config, {
       await request("receipts")
     } catch (error) {
       handleFailure(requestFailure(error, error?.operation))
-    } finally { beating = false }
+    } finally { release() }
   }
 
   // While the gate is shut, a heartbeat that finds no proof is asked once more when this tick's keepalive and read-back
@@ -203,6 +240,99 @@ export function createLifecycle(bus, native, config, {
     const sent = shut ? keepAlive() : heartbeat()
     const readBack = refreshContext()
     if (shut) void Promise.all([sent, readBack]).then(() => { if (live === record && !record.opened) return heartbeat() })
+  }
+
+  // May the idle hook claim for this session now? Joined, on, and past the first heartbeat: a join's binding is proved before
+  // anything is reported (`gateShut`), and the hook's own `busy` report must not skip that gate. Reads state only.
+  const ready = () => live !== null && joined !== null && live.opened === true && !closed && !disabled
+
+  // One settlement, as an answer the worker takes. A refusal is the ledger's answer, not a failed transport: a reservation that
+  // lapsed already reads as uncertain at the server. Only the codes that end an instance rejoin it.
+  async function settle(attemptID, result) {
+    const refusal = refusedBy(await request("settle", { attempt: attemptID, result }))
+    if (refusal !== null && REJOIN_AFTER.has(refusal)) throw refusedFailure(refusal, "settle")
+  }
+
+  // Runs one step of the sequence on the record it began on. A step that finds the record replaced or gone sends nothing:
+  // `request` would reach the next worker. A failed step is the worker's failure, handled as a failed heartbeat is.
+  async function quietly(record, step) {
+    if (live !== record) return
+    try { await step() } catch (error) { handleFailure(requestFailure(error, error?.operation)) }
+  }
+
+  // The settlement of an admitted input, once lib/delivery.js has the answer. It waits for the turn at the worker.
+  function settleLater(record, attemptID, result) {
+    const send = async () => {
+      try { await quietly(record, () => settle(attemptID, result)) } finally { release() }
+    }
+    if (!beating) { beating = true; void send() } else parked.push(() => { void send() })
+  }
+
+  // The idle delivery. `admit({ text, attemptID, deadline })` is the caller's: it asks the host to admit the notice and
+  // resolves, once the host has answered or the attempt has ended, to `{ done }`, where `done` resolves to the settlement
+  // for the worker. It resolves to `{ written: false }` when it found itself out of time and made no host call. `open()` says
+  // whether the caller is still within its time, and it reads the caller's clock: it is asked as the last step before the
+  // claim and just before the admission, as well as after each answer, because a timer can run late, and the caller asks
+  // again as the last step before its host call. After it turns false nothing moves forward. A grant already held and not
+  // yet admitted is settled deferred: nothing was written to the session, so the server may offer it again. The returned
+  // promise resolves when the turn at the worker is released.
+  async function idle(admit, open = () => true) {
+    if (!ready() || beating) return
+    const record = live
+    beating = true
+    const current = () => live === record && !closed && !disabled
+    let announced = false
+    let reservation = null // the grant's attempt id, from the claim on
+    let settlement = null // what this turn settles itself; null once an input is admitted, because the background settles it
+    let admitted = null
+    try {
+      announced = true
+      const busy = await request("heartbeat", { state: BUSY_STATE })
+      if (!current() || !open() || refusedBy(busy) !== null) return
+      const candidates = await request("pending")
+      if (!current() || refusedBy(candidates) !== null) return
+      const ids = Array.isArray(candidates?.messages) ? candidates.messages.filter(id => typeof id === "string") : []
+      if (!ids.length) return
+      // The claim reserves the batch at the server. What it needs is made first, and the caller's time is asked last, on the
+      // clock, so that nothing runs between the check and the request. `started` is read before the check too: a start that is a
+      // little early only makes the reservation that the plugin assumes a little shorter.
+      const key = randomUUID()
+      const started = now()
+      if (!open()) return
+      const grant = await request("claim", { key, messages: ids })
+      // A worker that was replaced or ended while the claim ran cannot settle it: the server ends the reservation itself.
+      if (!current()) return
+      const refusal = refusedBy(grant)
+      if (refusal !== null) {
+        if (REJOIN_AFTER.has(refusal)) throw refusedFailure(refusal, "claim")
+        return
+      }
+      if (grant?.dispatch !== true || typeof grant.attempt_id !== "string" || !UUID.test(grant.attempt_id)) return
+      // A reservation is held from here on, and every way out of this function settles it.
+      reservation = grant.attempt_id
+      settlement = UNCERTAIN
+      const deadline = started + Number(grant.reservation_ms)
+      // Too little of the reservation is left to prove a delivery, and the server may have ended it already: uncertain. A caller
+      // that is out of time as well has written nothing, so the grant is deferred, as at the admission below.
+      if (!(deadline - now() > MIN_RESERVATION_MS)) { if (!open()) settlement = NOT_RENDERED; return }
+      let text = null
+      try { text = renderNotice(joined, config.python, grant.messages ?? [], { bound: NOTICE_BOUND, route: config.toolRoute }) } catch { /* not rendered */ }
+      // Nothing has been written to the session yet, so a batch that is not rendered, or whose caller is out of time, is not
+      // uncertain: the server offers it again. The caller's time is asked immediately before the admission, on the clock.
+      if (text === null || !open()) { settlement = NOT_RENDERED; return }
+      // Admission is the last step. From the call on the input may exist and cannot be taken back, so a throw is uncertain.
+      try { admitted = await admit({ text: CHAT_PREFIX + text, attemptID: reservation, deadline }) } catch { admitted = null }
+      if (admitted?.done) settlement = null
+      else if (admitted?.written === false) settlement = NOT_RENDERED // the caller was out of time and made no host call
+    } catch (error) {
+      handleFailure(requestFailure(error, error?.operation))
+    } finally {
+      if (reservation !== null && settlement !== null) await quietly(record, () => settle(reservation, settlement))
+      // `busy` must not outlive the hook, whatever happened. Only a hook that reported it reports again.
+      if (announced) await quietly(record, () => request("heartbeat", { state: UNKNOWN_STATE }))
+      release()
+      if (admitted?.done) void admitted.done.then(result => settleLater(record, reservation, result))
+    }
   }
 
   // A retry asks the host once before it starts a replacement worker: the session can be deleted during the backoff with
@@ -297,7 +427,7 @@ export function createLifecycle(bus, native, config, {
   }
 
   return {
-    connect, disconnect, disable: disableChat, stop, context: bindingText,
+    connect, disconnect, disable: disableChat, stop, context: bindingText, ready, idle,
     // Contract-test hook. The plugin drives the heartbeat through the timer only.
     heartbeat,
   }

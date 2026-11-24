@@ -6,8 +6,8 @@ the product's worker protocol; the Python core stays authoritative for join,
 heartbeat, poll, claim, settle, rejoin and binding replacement. A package
 supplies native eligibility, delivery, binding context and wake behavior. The
 OpenCode package is the exception: it joins and keeps the binding in place, and
-it delivers nothing ([issue #148](https://github.com/mikomiel/agent-chat/issues/148)
-tracks delivery).
+it delivers only when its `delivery` key is `true`, and then only from the host's
+idle hook ([issue #148](https://github.com/mikomiel/agent-chat/issues/148)).
 
 ## Packages
 
@@ -16,7 +16,7 @@ tracks delivery).
 | Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
 | Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
-| OpenCode | [`opencode/`](opencode/) | Source present; live run pending. Join only: it delivers nothing |
+| OpenCode | [`opencode/`](opencode/) | Source present; live run pending. Delivery is off by default; with `delivery: true` it delivers only from the idle hook |
 | Codex | [`codex/`](codex/) | Source present; live run pending |
 
 Vibe is outside the initial admission set.
@@ -40,7 +40,7 @@ OpenCode and Codex rows record no run, so no core version applies.
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | eligibility: `ctx.agents.get` and the session header `origin`, plus `roots()` and `isOwnedBy()` where the registry has them | `NOT RUN` on `0.2.2-rc.5` | No run. The published type declarations were compared; nothing was executed. `@deepseek-ai/dsh-agent` `0.2.2-rc.1` declares `AgentRegistry.roots()`, `AgentRegistry.isOwnedBy(id, owner)` and `CreateAgentOptions.parentAgent`. `0.2.2-rc.2` to `0.2.2-rc.5` declare none of them, and `enter(agent)` takes no owner; `get(id)` and `list()` remain. In `0.2.2-rc.5` the host's own subagent test is `session.header.origin === 'subagent'`, and the subagent child factory sets that value. The package reads which registry surface it finds and uses that header test where `roots()` and `isOwnedBy()` are both absent; a registry with only one of them refuses every agent. |
-| `agent-chat-opencode` 0.8.0 | OpenCode server plugin, join only: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.created`, `session.execution.started`, `session.forked`, `session.deleted`, `session.compaction.started`/`ended`/`failed` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin |
+| `agent-chat-opencode` 0.8.0 | OpenCode server plugin: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.created`, `session.execution.started`, `session.forked`, `session.deleted`, `session.compaction.started`/`ended`/`failed`; with `delivery: true` also `ctx.session.hook("experimental.idle")`, `ctx.session.synthetic` and the event `session.inbox.delivered` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin, and the idle delivery has never run live |
 | `agent-chat-codex` 0.8.0 | plugin hooks `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `Interrupt`, `SessionEnd`; app-server `thread/loaded/list`, `thread/read`, `thread/resume`, `thread/turns/list`, `thread/items/list`, and the experimental `thread/queue/add` and `thread/queue/delete` | `NOT RUN` | One app-server shape probe and one idle wake against codex-cli 0.171.0, with the library before this version (see [Tested releases](codex/README.md#tested-releases)). The wake of this version has not run live, and no hook, worker or join ran. Contract tests use hook-payload, worker and app-server doubles |
 
 Adding a row for a live release needs a recorded run against that exact
@@ -93,14 +93,14 @@ tracks live-harness CI and the Claude Code and Codex live runs.
 ## Notice contract
 
 With `noticeBodies: true`, a peer's message body is written into the model's context. Every package that delivers a
-notice renders it with one contract, so the body stays recognizable as untrusted peer data. The OpenCode package
-delivers nothing and has no notice. The contract has two implementations that pass
+notice renders it with one contract, so the body stays recognizable as untrusted peer data. The OpenCode package has no
+`noticeBodies` option: with `delivery: true` it delivers a metadata notice only, never a body. The contract has two implementations that pass
 the same vectors in [`notice-vectors.json`](notice-vectors.json): the Python reference
 [`agent_chat/notice.py`](../agent_chat/notice.py) and the dependency-free JavaScript module
 [`shared/notice.js`](shared/notice.js). A package keeps no dependency and reads nothing outside its own directory
-at run time, so each package ships a byte-identical copy as `lib/notice.js`. OpenCode renders no notice and uses its
-copy for the [tool route](#tool-route) lines of its binding only. A test in each package fails when its copy differs from
-the shared source.
+at run time, so each package ships a byte-identical copy as `lib/notice.js`. OpenCode uses its copy for the
+[tool route](#tool-route) lines of its binding and for the metadata notice of its idle delivery. A test in each package
+fails when its copy differs from the shared source.
 After you edit `shared/notice.js`, copy it over each `lib/notice.js`. The normative text is the notice requirements in
 [`openspec/specs/chat-clients/spec.md`](../openspec/specs/chat-clients/spec.md).
 
@@ -139,8 +139,8 @@ or a `pending` reply without `sizes`, is claimed whole, because the server refus
 A missing or invalid size counts as a full body.
 
 The parts that differ per package stay in the package. `lib/channel.js` holds the delivery line, the limit and the
-bound, and the lifecycle makes the claim and the delivery call. `pi` and `deepseek` allow 8 KiB for the delivery line
-and the notice together. `claude-code` allows 10,000 bytes for its announcement, the delivery line and the notice
+bound, and the lifecycle makes the claim and the delivery call. `pi`, `deepseek` and `opencode` allow 8 KiB for the
+delivery line and the notice together. `claude-code` allows 10,000 bytes for its announcement, the delivery line and the notice
 together, and `codex` allows 6,000.
 
 Limits that remain:

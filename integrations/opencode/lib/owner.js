@@ -25,9 +25,15 @@
 // only then promotes the next member. A session rejoins at its next event. Registry changes run one at a time.
 // A member that leaves without being the owner is a continuity break for the owner, as a lost stream is.
 //
+// THE IDLE HOOK. Only when the config turns delivery on, and only when the host offers `session.hook`, a member registers
+// `experimental.idle`, and it disposes the registration when it is torn down. The hook is per location, like the stream:
+// a member that is not the owner has no manager, so its hook returns at once and its sessions get no delivery. The callback
+// never rejects and never throws: the host runs hooks one after another with no catch, so a rejection would fail the
+// session's end of turn. The manager keeps the budget (lib/manager.js).
+//
 // The registry holds members and their callbacks. The config, and with it the host token, lives only in the
 // closures a member was built from; no property of the registry or of a member carries it.
-import { EVENT_TYPES, createManager, deletedSessionOf, notRootSessionOf, sessionOf } from "./manager.js"
+import { DELIVERY_EVENT, EVENT_TYPES, createManager, deletedSessionOf, notRootSessionOf, sessionOf } from "./manager.js"
 
 const REGISTRY_KEY = Symbol.for("agent-chat.opencode.registry.v1")
 const RECONNECT_MIN_MS = 1_000
@@ -109,6 +115,33 @@ const abortable = (ms, signal) => new Promise(resolve => {
 export function createMember(ctx, config, parts, { managerOptions = {}, sleep = abortable } = {}) {
   let manager = null
   const controller = new AbortController()
+  // Off unless the config says so and the host has the hook: then nothing below changes what this member does.
+  const delivering = config?.delivery === true && typeof ctx.session?.hook === "function"
+  const types = delivering ? [...EVENT_TYPES, DELIVERY_EVENT] : [...EVENT_TYPES]
+
+  // The callback is a plain function: it returns undefined, with nothing awaited, when there is nothing to do.
+  function onIdle(input) {
+    try {
+      const running = manager?.idle(input?.sessionID)
+      return running === undefined ? undefined : running.then(undefined, () => {})
+    } catch { return undefined }
+  }
+
+  // Registers the hook and returns what disposes it. A registration that is still pending when the member is torn down is
+  // disposed when it arrives. Nothing here may throw.
+  function hook() {
+    if (!delivering) return () => {}
+    let registration = null
+    let stopped = false
+    const dispose = held => { try { void Promise.resolve(held?.dispose?.()).catch(() => {}) } catch { /* already gone */ } }
+    try {
+      Promise.resolve(ctx.session.hook("experimental.idle", onIdle)).then(held => {
+        registration = held
+        if (stopped) dispose(held)
+      }, () => {})
+    } catch { /* the host refused the hook: this member delivers nothing */ }
+    return () => { stopped = true; if (registration) dispose(registration) }
+  }
 
   // Reads this instance's stream until it is torn down. A stream that ends or throws is lost events: every
   // observation is stale, so the owner resets. The first connect of a stream is not a loss; a later one is.
@@ -118,7 +151,7 @@ export function createMember(ctx, config, parts, { managerOptions = {}, sleep = 
     let wait = RECONNECT_MIN_MS
     while (!signal.aborted) {
       try {
-        for await (const event of ctx.event.subscribe({ types: [...EVENT_TYPES], signal })) {
+        for await (const event of ctx.event.subscribe({ types, signal })) {
           if (signal.aborted) return
           if (event?.type === "server.connected") {
             if (connected) reset()
@@ -138,8 +171,9 @@ export function createMember(ctx, config, parts, { managerOptions = {}, sleep = 
 
   return {
     pump(dispatch, reset) {
+      const unhook = hook()
       void pump(dispatch, reset).catch(() => {})
-      return () => controller.abort()
+      return () => { controller.abort(); unhook() }
     },
     activate(forked, deleted, reports) { manager = createManager(ctx, config, parts, { ...managerOptions, forked, deleted, ...reports }) },
     async deactivate() {
