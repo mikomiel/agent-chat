@@ -14,7 +14,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from .client import Address, Client, resolve_origin
-from .instance_file import InstanceSecret, prepare_instance
+from .instance_file import InstanceSecret, prepare_instance, touch_instance
 from .models import RECEIPT_FEED_LIMIT, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 from .protocol import cursor, token_digest
 
@@ -89,6 +89,9 @@ def join_instance(
         raise ChatError("INVALID_REQUEST")
     registration_client = Client(server_origin, host_token, deadline=deadline)
     secret = prepare_instance(directory, native_session_id, boot_id, server_origin=server_origin)
+    # A retry of this boot adopts the saved record and may then wait for the lookup: mark it live first, or a
+    # sibling's stale sweep could remove a record older than its age gate before the registration uses its token.
+    touch_instance(directory, boot_id)
     addresses: tuple[Address, ...] = ()
     if resolve_by is not None:
         addresses = resolve_origin(server_origin, deadline=resolve_by)

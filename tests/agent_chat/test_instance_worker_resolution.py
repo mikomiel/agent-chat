@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from agent_chat import client, instance_client, instance_worker
+from agent_chat import client, instance_client, instance_file, instance_worker
 from agent_chat.instance_file import InstanceSecret, prepare_instance, read_instance
 from agent_chat.models import ChatError, Heartbeat
 
@@ -434,6 +434,40 @@ def test_a_failed_join_leaves_the_record_that_a_retry_of_the_same_boot_registere
     path = directory / f"{boot_id}.json"
     assert path.exists(), "the first join removed the record of the instance that the retry registered"
     assert read_instance(path).token == retries[0].binding.token
+
+
+def test_a_same_boot_retry_marks_an_old_record_live_before_its_lookup(
+    server: _Server, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fails on 584ab63: the retry adopted an hour-old record and a sibling's sweep removed it during the lookup."""
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    boot_id = uuid4()
+    origin = f"http://127.0.0.1:{server.port}"
+    path = directory / f"{boot_id}.json"
+    prepare_instance(directory, "old-native", boot_id, server_origin=origin)
+    old = time.time() - 2 * instance_file.SWEEP_STALE_SECONDS
+    os.utime(path, (old, old))
+    swept: list[int] = []
+
+    def lookup_during_which_a_sibling_sweeps(_origin: str, *, deadline: float) -> tuple[client.Address, ...]:
+        swept.append(instance_file.sweep_stale(directory, uuid4()))
+        return ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", server.port)),)
+
+    monkeypatch.setattr(instance_client, "resolve_origin", lookup_during_which_a_sibling_sweeps)
+    joined = instance_client.join_instance(
+        directory,
+        "old-native",
+        boot_id,
+        server_origin=origin,
+        host_token=HOST_TOKEN,
+        harness="pi",
+        enabled=True,
+        resolve_by=time.monotonic() + 60,
+    )
+    assert swept == [0]
+    assert path.exists(), "a sibling's sweep removed the record the retry registered with"
+    assert read_instance(path).token == joined.binding.token
 
 
 def test_an_alarm_in_the_record_step_ends_the_join_and_keeps_the_earlier_record(
