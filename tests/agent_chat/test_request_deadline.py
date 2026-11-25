@@ -34,6 +34,10 @@ SERVER_BUDGET = 2.25
 #: Seconds from the deadline beyond which a release has a fixed outcome: granted before, refused after.
 FIXED_SIDE = 0.7
 
+#: Seconds charged per round trip in the backlog test: a clean full batch (48 round trips) fits the deadline, the
+#: same batch with 20 expiry receipts first does not.
+BACKLOG_ROUND_TRIP = 0.04
+
 CLOCK = "agent_chat.event_clock WHERE singleton FOR UPDATE"
 
 
@@ -409,8 +413,10 @@ def test_a_claim_refused_at_its_deadline_keeps_its_expiry_work_and_the_next_clai
 ):
     """A backlog of 20 undelivered items past the age limit makes the claim expire them first, one receipt each.
 
-    The admission ends past the deadline and is refused, and records no attempt, but the expiry commits: it is true
-    whenever it commits. The next claim of the same batch has no backlog left and is granted.
+    Both claims pay the same cost per round trip, chosen so that the clean batch (48 round trips, 1.92 s) fits the
+    2.25 s deadline and the backlog's 20 receipts push only the first claim past it. The first admission is refused
+    and records no attempt, but the expiry commits: it is true whenever it commits. The next claim of the same batch
+    has no backlog left, so clearing it is what lets that claim fit.
     """
     token, binding = target
     for _ in range(20):
@@ -422,7 +428,7 @@ def test_a_claim_refused_at_its_deadline_keeps_its_expiry_work_and_the_next_clai
     _, request = full_batch(process_api, credentials, target, db)
     receipts_before = db.execute("SELECT count(*) AS n FROM agent_chat.events WHERE kind = 'receipt'").fetchone()["n"]
     with connect(database) as bounded, monkeypatch.context() as patched:
-        clock, _ = charged(patched, bounded, 0.05)  # about 70 round trips: past the 2.25 s deadline
+        clock, _ = charged(patched, bounded, BACKLOG_ROUND_TRIP)
         with bounded.request_deadline(clock()), pytest.raises(ChatError) as refused:
             deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
     assert refused.value.code == "DATABASE_UNAVAILABLE"
@@ -434,8 +440,48 @@ def test_a_claim_refused_at_its_deadline_keeps_its_expiry_work_and_the_next_clai
     receipts = db.execute("SELECT count(*) AS n FROM agent_chat.events WHERE kind = 'receipt'").fetchone()["n"]
     assert receipts == receipts_before + 20
     with connect(database) as bounded, monkeypatch.context() as patched:
-        clock, _ = charged(patched, bounded, 0)
+        clock, _ = charged(patched, bounded, BACKLOG_ROUND_TRIP)
         with bounded.request_deadline(clock()):
             granted = deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
     assert granted["dispatch"] and len(granted["messages"]) == 16
     assert attempts(db) == 1
+
+
+def test_a_late_claim_keeps_a_full_expiry_pass_while_the_next_backlog_row_is_held(
+    process_api, credentials, target, send, db, database, monkeypatch
+):
+    """An expiry pass settles at most 100 items. With 101 due, the claim's pass settles the oldest 100 and never
+    reaches the last, which another transaction holds. A refusal at the deadline asks nothing more of the database,
+    so it cannot wait on that row and roll the 100 back.
+    """
+    token, binding = target
+    backlog = [question(process_api, credentials, send, binding)["id"] for _ in range(101)]
+    db.execute(
+        "UPDATE agent_chat.recipients SET stored_at = stored_at - make_interval(secs => %s) WHERE session_id = %s",
+        (DELIVERY_MAX_AGE_SECONDS + 120, binding["session_id"]),
+    )
+    # The youngest of the due items sorts last, past the pass's limit of 100.
+    db.execute(
+        "UPDATE agent_chat.recipients SET stored_at = clock_timestamp() - make_interval(secs => %s) "
+        "WHERE message_id = %s AND session_id = %s",
+        (DELIVERY_MAX_AGE_SECONDS + 60, backlog[-1], binding["session_id"]),
+    )
+    _, request = full_batch(process_api, credentials, target, db)
+    with (
+        held(
+            database,
+            "SELECT 1 FROM agent_chat.recipients WHERE message_id = %s AND session_id = %s FOR UPDATE",
+            (backlog[-1], binding["session_id"]),
+        ),
+        connect(database) as bounded,
+        monkeypatch.context() as patched,
+    ):
+        clock, _ = charged(patched, bounded, 0.05)
+        with bounded.request_deadline(clock()), pytest.raises(ChatError) as refused:
+            deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
+    assert refused.value.code == "DATABASE_UNAVAILABLE"
+    assert attempts(db) == 0
+    expired = db.execute(
+        "SELECT count(*) AS n FROM agent_chat.recipients WHERE uncertainty_reason = 'expired_undelivered'"
+    ).fetchone()["n"]
+    assert expired == 100

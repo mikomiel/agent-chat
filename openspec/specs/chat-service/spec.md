@@ -494,6 +494,11 @@ The service MUST take one deadline per delivery claim when the request reaches i
 - **THEN** the claim is refused and records no attempt, and the expiry and its receipts commit
 - **AND** a later claim of the same messages no longer repeats that expiry and is granted
 
+#### Scenario: A refusal at the deadline runs no further clean-up
+- **WHEN** a claim's expiry pass settles its limit of items, another transaction holds the next due item, and the admission then ends past the deadline
+- **THEN** the claim is refused without another reconciliation or expiry pass, so it waits on no further lock
+- **AND** the items that pass settled stay settled
+
 #### Scenario: A claim slower than its deadline
 - **WHEN** an uncontended claim's admission ends after the deadline, as a large batch on a slow database can
 - **THEN** the claim is refused, and the client reads it as uncertain
