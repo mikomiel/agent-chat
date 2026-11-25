@@ -224,7 +224,8 @@ def test_one_deadline_bounds_sequential_lock_waits(
 ):
     """Each wait alone is shorter than the per-lock limit; together they outlast the client step.
 
-    The clock is released at 1.2 s and the grant at 3.5 s, so a per-lock limit alone would let the grant wait end
+    The clock is released at 1.2 s and the grant at 3.5 s at the latest, or as soon as the request has ended
+    (`release_at`), so a per-lock limit alone would let the grant wait end
     in a commit after the client gave up. The test does not try to observe the grant wait, which lasts only from
     the clock release to the deadline: a request that ends refused, no earlier than the deadline, was held past the
     clock release by the only other lock, and nothing else can refuse it.

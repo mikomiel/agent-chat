@@ -469,7 +469,7 @@ The service MUST answer every refusal made before a response starts with `{"erro
 - **WHEN** the service refuses with a code that has no assigned status
 - **THEN** the HTTP status is 503
 
-### Requirement: A claim or settle ends before the client step
+### Requirement: Lock waits end a claim or settle before the client step
 The service MUST take one deadline per delivery claim and result when the request reaches its route, before connecting: the configured lock limit (3 s, the client's socket step) less a 1 s margin for commit and response, read without a query. Past the deadline it MUST NOT send a statement or open a transaction or savepoint; with work left it MUST roll back and answer 503 `DATABASE_UNAVAILABLE`. A statement already sent may finish within its drift, and a request with no work left completes.
 
 #### Scenario: Lock released after the deadline
@@ -492,7 +492,7 @@ The service MUST take one deadline per delivery claim and result when the reques
 - **THEN** the service grants the claim or records the result as usual
 
 ### Requirement: Each bounded statement's limits are measured at most 250 milliseconds before it is sent
-In a bounded claim or result, authentication included, every statement MUST run under lock and statement limits its transaction lowered to the time left, measured at most 250 milliseconds before the statement is sent (a statement outside a transaction gets its own), never above the session's limits; its transit to the database uses the margin. If two replies in a row that set them take longer, the service MUST NOT send the statement and MUST answer 503 `DATABASE_UNAVAILABLE`.
+In a bounded claim or result, authentication included, every statement but the query that sets its limits MUST run under lock and statement limits its transaction lowered to the time left, measured at most 250 ms before it is sent (a statement outside a transaction gets its own), never above the session's limits; its transit uses the margin. If two setting replies in a row take longer, the service MUST NOT send the statement and MUST answer 503 `DATABASE_UNAVAILABLE`.
 
 #### Scenario: Slow reply to setting the limits
 - **WHEN** the reply that sets a statement's limits arrives more than 250 milliseconds late, and the next one does not
@@ -501,6 +501,11 @@ In a bounded claim or result, authentication included, every statement MUST run 
 #### Scenario: Two slow replies
 - **WHEN** both replies that set a statement's limits arrive more than 250 milliseconds late, while time is still left
 - **THEN** the statement is not sent, and the service answers 503 `DATABASE_UNAVAILABLE`
+
+#### Scenario: Stalled reply to setting the limits
+- **WHEN** the query that sets a statement's limits, which takes no lock and runs under the limits before it, replies after the deadline
+- **THEN** the statement is not sent, the transaction rolls back, and the service answers 503 `DATABASE_UNAVAILABLE`, which can arrive after the client's step
+- **AND** nothing is committed: a claim records no attempt, and a result leaves the attempt open and the message not handed
 
 #### Scenario: Many statements at steady latency
 - **WHEN** an uncontended claim runs many statements, each round trip taking a few milliseconds
