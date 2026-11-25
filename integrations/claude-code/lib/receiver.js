@@ -27,6 +27,7 @@ const OWNER_CHECK_MS = 30_000
 const QUIET_MS = 180_000
 const STOP_GRACE_MS = 6_000
 const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
+const GONE = { outcome: "deferred", reason: "offline" } // the consumer left before anything was written
 
 // A join conflict is the previous instance's lease; the rejoin policy owns the wait.
 const REJOIN_AFTER = new Set([
@@ -275,7 +276,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (!eligible(wake)) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
     // A consumer that left before the write has seen nothing, so the claimed batch stays offerable. Once a write
     // was attempted, a missing receipt is ambiguous and stays uncertain.
-    if (link.closed) return { result: { outcome: "deferred", reason: "offline" }, replied: false }
+    if (link.closed) return { result: GONE, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
@@ -316,13 +317,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const reservation = Number(grant.reservation_ms)
         let result
         let replied = false
-        if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = UNCERTAIN
+        // Before a write, a known close means nothing was shown, so the batch stays offerable (see hand).
+        if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = link.closed ? GONE : UNCERTAIN
         else {
           const state = await ask("status")
           if (!live) return false
           if (check(state, "status")) result = { outcome: "deferred", reason: "unknown" }
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
-          else if (started + reservation - now() <= MIN_RESERVATION_MS) result = UNCERTAIN // the status call used the reservation
+          else if (started + reservation - now() <= MIN_RESERVATION_MS) result = link.closed ? GONE : UNCERTAIN // the status call used the reservation
           else {
             const notice = renderNotice(joined, config.python, grant.messages ?? [], {
               bodies, bound, admittedAt: grant.admitted_at, route: config.toolRoute,

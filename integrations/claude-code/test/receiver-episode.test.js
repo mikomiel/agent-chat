@@ -49,7 +49,7 @@ function scheduler() {
         timer.fn()
         await settle()
       }
-      clock = end
+      clock = Math.max(clock, end) // a timer callback may advance the clock itself; time never runs back
       await settle()
     },
   }
@@ -379,25 +379,27 @@ test("a waiter whose connection closes mid-hold exits 0 at once, with no output 
 // A waiter that leaves between the claim and the notice has been shown nothing. The claimed batch must settle
 // `deferred`, not `uncertain`: an uncertain batch is excluded from later delivery. A write that was attempted and
 // never confirmed stays uncertain; `receiver.test.js` pins that ("a write that failed or went unconfirmed settles
-// uncertain, never handed", and "a wake whose write failed settles uncertain and leaves no waiter").
+// uncertain, never handed", and "a wake whose write failed settles uncertain and leaves no waiter"). The worker
+// double applies no deferral backoff or attempt limit; the ledger owns them (1 s after the first attempt, 5 s after
+// the second, three attempts in all).
 for (const [later, again] of [
   ["a later turn", async r => {
     const next = await r.op(turn())
-    assert.match(next.sent[0].context, /"id":"m1"/, "the turn is offered the same message")
+    assert.match(next.sent[0].context, /"id":"m1"/, "the turn can claim the same message")
     return next
   }],
   ["a later waiter", async r => {
     const wake = hookDouble()
     const waiting = r.receiver.handle({ op: "wait" }, wake)
     await r.clock.advance(2000)
-    assert.equal(wake.sent.length, 1, "the waiter is offered the same message")
+    assert.equal(wake.sent.length, 1, "the waiter can claim the same message")
     assert.match(wake.sent[0].context, /"id":"m1"/)
     wake.close()
     await waiting
     return wake
   }],
 ]) {
-  test(`a waiter that leaves after the claim but before the notice is written defers the batch, and ${later} is offered it again`, async () => {
+  test(`a waiter that leaves after the claim but before the notice is written defers the batch, and ${later} can claim it again`, async () => {
     const control = { onStatus: () => {} }
     const r = await rig({
       handlers: { pending: () => ({ messages: ["m1"] }), status: () => { control.onStatus(); return { muted: false } } },
@@ -418,4 +420,47 @@ for (const [later, again] of [
       { outcome: "deferred", reason: "offline" }, { outcome: "handed", reason: null },
     ])
   })
+}
+
+// The two pre-write timeout branches of a delivery settle `uncertain` only when the consumer is still there: with the
+// link already closed, nothing was written and nothing can have been shown, so the batch settles `deferred`, exactly as
+// it does when the close comes just before the write. Each case ends the hold at the point the branch tests the clock.
+for (const [branch, reservation, setup] of [
+  ["the claim leaves less than the minimum reservation", 400,
+    (control, wake) => { control.onClaim = () => wake.close() }],
+  ["the status call used the reservation", 700,
+    (control, wake) => {
+      control.onStatus = async () => { wake.close(); await control.clock.advance(450) } // 250 ms of 700 are left
+    }],
+]) {
+  for (const [link, expected] of [
+    ["closed", { outcome: "deferred", reason: "offline" }],
+    ["open", { outcome: "uncertain", reason: "transport_ambiguous" }],
+  ]) {
+    test(`${branch} and the waiter's link is ${link}: the batch settles ${expected.outcome}, with no write attempted`, async () => {
+      const control = { onClaim: () => {}, onStatus: () => {}, clock: null }
+      const r = await rig({
+        handlers: {
+          pending: () => ({ messages: ["m1"] }),
+          claim: fields => {
+            control.onClaim()
+            return { dispatch: true, attempt_id: "attempt-1", reservation_ms: reservation, messages: fields.messages.map(row) }
+          },
+          status: async () => { await control.onStatus(); return { muted: false } },
+        },
+      })
+      control.clock = r.clock
+      await idle(r)
+      const wake = hookDouble()
+      if (link === "closed") setup(control, wake)
+      else if (reservation === 700) control.onStatus = () => r.clock.advance(450)
+      const waiting = r.receiver.handle({ op: "wait" }, wake)
+      await r.clock.advance(2000)
+      if (link === "open") wake.close()
+      await waiting
+      assert.equal(r.worker.ops("claim").length, 1, "the message was claimed while the waiter was open")
+      assert.deepEqual(wake.sent, [], "no notice was written")
+      assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [expected])
+    })
+  }
 }
