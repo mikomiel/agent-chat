@@ -321,12 +321,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const candidates = await ask("pending", bodies ? { bodies: true } : {})
         if (!live || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
-        if (!ids.length || link.closed || !eligible(wake) || short()) return false
+        if (!ids.length || link.closed || !eligible(wake)) return false
         // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply
         // without sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
         const claimIds = bodies
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound, route: config.toolRoute })
           : ids
+        // The floor is checked last, with no await and no other work before the claim is sent.
+        if (short()) return false
         const started = now()
         const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
         if (!live || check(grant, "claim")) return false

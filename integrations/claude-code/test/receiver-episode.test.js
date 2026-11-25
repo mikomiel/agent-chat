@@ -14,6 +14,7 @@ import { CHAT_PREFIX } from "../lib/channel.js"
 // claim needs a live worker and a registered consumer. `receiver.test.js` holds the waiter cases that need no episode
 // and the rejoin cases that need no waiter; the rig below is a copy of its rig without the event log.
 const ROOM = "33333333-3333-4333-8333-333333333333"
+const BODY_ID = "aaaaaaaa-aaaa-4aaa-8aaa-000000000001"
 const baseConfig = { python: "/usr/bin/python3", directory: "/tmp/agent-chat-state", serverOrigin: "https://chat.example", hostToken: "synthetic-host-token" }
 const row = id => ({
   id, kind: "question", room_id: ROOM, history_after: `cursor-${id}`, body: `body of ${id}`,
@@ -119,10 +120,10 @@ function hookDouble({ receipt = "written", answer = true, sendOk = true } = {}) 
   }
 }
 
-async function rig({ handlers, joinErrors, joinHold } = {}) {
+async function rig({ handlers, joinErrors, joinHold, config = {} } = {}) {
   const clock = scheduler()
   const worker = workerDouble({ handlers, joinErrors, joinHold })
-  const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
+  const receiver = createReceiver({ ...baseConfig, ...config }, { sessionId: "session-1", ownerPid: 4242 }, {
     startProcess: worker.startProcess,
     now: clock.now,
     mono: clock.mono,
@@ -558,17 +559,31 @@ for (const [branch, reservation, setup] of [
 // socket's close are separate events), so the receiver cannot rely on seeing it. The rig below keeps the link open
 // throughout: only the clock moves. A hold of 10,000 ms ends the receiver's view of the waiter at +9,000 ms (a 1,000 ms
 // safety for the hook's start-up and the IPC lag), and the first poll is at +2,000 ms.
-const holdRig = async ({ onPending = () => {}, onClaim = () => {}, onStatus = () => {}, receipt = "written" } = {}) => {
+const holdRig = async ({ onPending = () => {}, onClaim = () => {}, onStatus = () => {}, receipt = "written", config = {} } = {}) => {
   const control = { onPending, onClaim, onStatus, clock: null }
+  // Bodies mode needs the core's bodies shape: a full row, its size on `pending`, and the grant's admission time.
+  const bodies = config.noticeBodies === true
+  const rows = {
+    [BODY_ID]: {
+      id: BODY_ID, kind: "question", room_id: ROOM, history_after: "101", body: "synthetic body", body_truncated: false,
+      sender_session_id: "66666666-6666-4666-8666-666666666666", sender_principal_id: "77777777-7777-4777-8777-777777777777",
+      created_at: "2026-01-01T00:00:00+00:00", thread_id: "88888888-8888-4888-8888-888888888888",
+    },
+  }
   const r = await rig({
     handlers: {
-      pending: async () => { await control.onPending(control); return { messages: ["m1"] } },
+      pending: async () => {
+        await control.onPending(control)
+        return bodies ? { messages: [BODY_ID], sizes: { [BODY_ID]: Buffer.byteLength(rows[BODY_ID].body) }, retry: false } : { messages: ["m1"] }
+      },
       claim: async fields => {
         await control.onClaim(control)
-        return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(row) }
+        const messages = fields.messages.map(id => rows[id] ?? row(id))
+        return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages, ...(bodies ? { admitted_at: "2026-01-01T00:00:42+00:00" } : {}) }
       },
       status: async () => { await control.onStatus(control); return { muted: false } },
     },
+    config,
   })
   control.clock = r.clock
   await idle(r)
@@ -630,10 +645,13 @@ for (const [holdMs, claims] of [[6_999, false], [7_000, true]]) {
 
 // The floor is checked again right before the claim: a slow pending read can use up the time the poll saw. The poll at
 // +2,000 ms of a 10,000 ms hold sees 7,000 ms left; a pending read of 3,000 ms leaves exactly the floor, one of 3,001 ms
-// leaves less, and a claim then could finish with too little time to answer.
+// leaves less, and a claim then could finish with too little time to answer. In bodies mode the check follows the
+// candidate packing, so nothing runs between it and the claim.
+for (const noticeBodies of [false, true])
 for (const [pendingMs, claims] of [[3_000, true], [3_001, false]]) {
-  test(`a pending read of ${pendingMs} ms that leaves ${claims ? "exactly the floor" : "less than the floor"} ${claims ? "is followed by a claim" : "is followed by no claim"}`, async () => {
-    const { r, control, wake } = await holdRig({ onPending: control => control.clock.advance(pendingMs) })
+  test(`a pending read of ${pendingMs} ms that leaves ${claims ? "exactly the floor" : "less than the floor"} ${claims ? "is followed by a claim" : "is followed by no claim"}${noticeBodies ? " (notice bodies)" : ""}`, async () => {
+    const { r, control, wake } = await holdRig({ onPending: control => control.clock.advance(pendingMs), config: noticeBodies ? { noticeBodies: true } : {} })
+    const id = noticeBodies ? BODY_ID : "m1"
     const waiting = r.receiver.handle({ op: "wait", hold_ms: 10_000 }, wake)
     await r.clock.advance(2000)
     await drain()
@@ -647,7 +665,7 @@ for (const [pendingMs, claims] of [[3_000, true], [3_001, false]]) {
     control.onPending = () => {}
     r.worker.log.length = 0
     const next = await r.op(turn())
-    assert.match(next.sent[0].context, /"id":"m1"/, "the message stays claimable by a later consumer")
+    assert.ok(next.sent[0].context.includes(id), "the message stays claimable by a later consumer")
     assert.deepEqual(settled(r), [{ outcome: "handed", reason: null }])
   })
 }
