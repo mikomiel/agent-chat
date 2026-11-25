@@ -43,7 +43,7 @@ HEARTBEAT_OUTAGE = PENDING_OUTAGE | {"REQUEST_UNCERTAIN"}
 # A settlement with no answer is sent again after this pause. One try can take 3 s (the client's step), so the
 # pause only keeps a refused connection from spinning; it is not a back-off.
 SETTLE_PAUSE_SECONDS = 0.5
-# The tries end this long before the request's alarm, so the worker answers its parent before the alarm fires.
+# The tries end this long before the alarm that is armed, so the worker answers its parent before the alarm fires.
 SETTLE_MARGIN_SECONDS = 1.0
 
 
@@ -152,27 +152,31 @@ def _settle(
 ) -> dict[str, Any]:
     """Settle, and send the same attempt and result again while the request has no answer and has time left.
 
-    No answer is an uncertain or unavailable transport, the codes of `HEARTBEAT_OUTAGE`. A settlement with no answer
-    may have committed, and a server that waits too long for a lock answers it with a 5xx that did not. The client
-    reports both as `REQUEST_UNCERTAIN`. Ending the worker there would leave the reservation to lapse as `uncertain`,
-    and the message would never be offered again (#176). The server answers a repeat of the same outcome with the
-    recorded one, and another outcome or a lapsed reservation with `DELIVERY_CLOSED`, so a repeat can neither settle
-    twice nor change the record. A definite refusal, any other code and a stop (`stopping`, the worker's SIGTERM)
-    end the tries at once.
+    A try has no answer when the client marks its error `unanswered` (a connection that failed or ended early, or a
+    5xx) and its code is one of `HEARTBEAT_OUTAGE`. Such a settlement may have committed, and a server that waits too
+    long for a lock answers it with a 5xx that did not. The client reports both as `REQUEST_UNCERTAIN`. Ending the
+    worker there would leave the reservation to lapse as `uncertain`, and the message would never be offered again
+    (#176). The server answers a repeat of the same outcome with the recorded one, and another outcome or a lapsed
+    reservation with `DELIVERY_CLOSED`, so a repeat can neither settle twice nor change the record. A complete reply
+    below 500 that cannot be accepted (a redirect, a body that is not the service's, a 200 that names another
+    attempt) is an answer even where its code is `REQUEST_UNCERTAIN`. It is never sent again, and neither are a
+    definite refusal, any other code and a stop (`stopping`, the worker's SIGTERM).
 
-    All tries share one deadline, `SETTLE_MARGIN_SECONDS` before the request's alarm. When it is spent the last
-    error propagates and ends the worker. The client ends a try that crosses the deadline with `CLI_INTERRUPTED`,
-    which the parent does not know, so it leaves as `REQUEST_UNCERTAIN`, the code of a request that may have been
-    sent (`Adapter._failed_operation` maps it the same way).
+    All tries share one deadline, `SETTLE_MARGIN_SECONDS` before the alarm armed for the request (`REQUEST_SECONDS`
+    when none is, as in `_join`). When it is spent the last error propagates and ends the worker. The client ends a
+    try that crosses the deadline with `CLI_INTERRUPTED`, which the parent does not know, so it leaves as
+    `REQUEST_UNCERTAIN`, the code of a request that may have been sent (`Adapter._failed_operation` maps it the same
+    way).
     """
-    deadline = monotonic() + REQUEST_SECONDS - SETTLE_MARGIN_SECONDS
+    deadline = monotonic() + (signal.getitimer(signal.ITIMER_REAL)[0] or REQUEST_SECONDS) - SETTLE_MARGIN_SECONDS
     while True:
         try:
             return instance_client.settle(instance, attempt, result, deadline=deadline)
         except ChatError as error:
             if error.code == "CLI_INTERRUPTED":
                 raise ChatError("REQUEST_UNCERTAIN") from None
-            if stopping() or error.code not in HEARTBEAT_OUTAGE or monotonic() + SETTLE_PAUSE_SECONDS >= deadline:
+            no_answer = error.unanswered and error.code in HEARTBEAT_OUTAGE
+            if stopping() or not no_answer or monotonic() + SETTLE_PAUSE_SECONDS >= deadline:
                 raise
         sleep(SETTLE_PAUSE_SECONDS)
 

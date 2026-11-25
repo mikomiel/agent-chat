@@ -375,7 +375,7 @@ class Client:
                 if isinstance(code, str) and HTTP_ERROR_STATUS.get(code) == response.status:
                     raise ChatError(code)
                 if response.status >= 500:
-                    raise ChatError("REQUEST_UNCERTAIN" if submitted else "SERVICE_UNAVAILABLE")
+                    raise ChatError("REQUEST_UNCERTAIN" if submitted else "SERVICE_UNAVAILABLE", unanswered=True)
                 # A caller that tells refusals from outages (`refused`) reads an unnamed 408 or 429 as an outage.
                 if refused is not None and response.status in (408, 429) and not submitted:
                     raise ChatError("SERVICE_UNAVAILABLE")
@@ -409,7 +409,13 @@ class Client:
                 and isinstance(error, (ValueError, RecursionError))
             ):
                 raise ChatError(refused) from None
-            raise ChatError("REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE") from None
+            # A connection that failed or ended early, and a 5xx whose body is not the service's, got no complete
+            # answer. A complete reply below 500 that breaks the protocol is an answer, which no caller may send again.
+            transport_lost = isinstance(error, (OSError, http.client.HTTPException))
+            unanswered = transport_lost or (status is not None and status >= 500)
+            raise ChatError(
+                "REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE", unanswered=unanswered
+            ) from None
         finally:
             if watchdog is not None:
                 watchdog.cancel()

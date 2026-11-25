@@ -4,21 +4,27 @@ import json
 import socket
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from threading import Thread
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
-from agent_chat import instance_client
-from agent_chat.instance_file import read_instance
+from agent_chat import instance_client, instance_worker
+from agent_chat.instance_file import InstanceSecret, read_instance
 from agent_chat.models import ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def envelope(code):
+    """The service's error body."""
+    return {"error": {"code": code, "message": code}}
 
 
 @pytest.fixture
@@ -62,6 +68,23 @@ def peer(process_api, credentials, tmp_path):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if mode in ("unavailable", "redirect", "html_403", "unknown_code"):
+                # Complete replies a gateway or the service itself gives: its own 503 for a database failure, a
+                # redirect, a proxy's HTML refusal, and the envelope of a code this client does not know.
+                status, content_type, data = {
+                    "unavailable": (503, "application/json", json.dumps(envelope("DATABASE_UNAVAILABLE")).encode()),
+                    "redirect": (302, "text/plain", b""),
+                    "html_403": (403, "text/html", b"<html><body>Forbidden</body></html>"),
+                    "unknown_code": (409, "application/json", json.dumps(envelope("SYNTHETIC_UNKNOWN")).encode()),
+                }[mode]
+                self.send_response(status)
+                if mode == "redirect":
+                    self.send_header("Location", "/elsewhere")
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             if mode == "truncated":
                 # A 200 whose body stops before its declared length: a read failure, not a malformed body.
                 data = json.dumps(result).encode()
@@ -95,6 +118,8 @@ def peer(process_api, credentials, tmp_path):
                 result["instance_id"] = "not-a-uuid"
             elif mode == "different_id":
                 result["instance_id"] = str(uuid4())
+            elif mode == "other_attempt":
+                result["id"] = str(uuid4())
             elif mode == "wrong_harness":
                 result["harness"] = "codex"
             data = json.dumps(result).encode()
@@ -368,6 +393,104 @@ def test_a_live_worker_ends_on_a_malformed_200_but_rides_out_a_lost_connection(
                 process.wait(timeout=3)
     assert [call["path"] for call in peer.state.calls] == ["/v1/sessions", path, "/v1/instance/end"]
     assert db.execute("SELECT ended_at FROM agent_chat.instances").fetchone()["ended_at"] is not None
+
+
+# #176: the worker sends a settlement again only when the request got no complete answer. Each test below runs the
+# worker's settle through the real client and server, with the faulted reply set before it, and counts the POSTs that
+# the server saw. `tests/agent_chat/test_instance_worker.py` tests the loop itself against a scripted client.
+SETTLEMENT = {"outcome": "handed", "reason": None}
+
+
+def _open_attempt(peer, process_api, credentials, send):
+    """A joined instance that holds one granted attempt, and the attempt's id."""
+    joined = peer.join()
+    instance_client.heartbeat(joined, Heartbeat(native_state="idle", stopped=False, plan_mode=False))
+    send(process_api, credentials, "synthetic coordination", kind="question", recipients=[str(joined.session_id)])
+    # The boundary forwards no request headers, so the claim, which needs an Idempotency-Key, goes to the service.
+    status, grant = process_api.request(
+        "POST",
+        "/v1/instance/deliveries/claim",
+        {"messages": instance_client.pending(joined)["messages"]},
+        joined.binding.token,
+        {"Idempotency-Key": str(uuid4())},
+    )
+    assert (status, grant["dispatch"]) == (200, True)
+    return joined, grant["attempt"]["id"]
+
+
+def _settle_frame(attempt, result=SETTLEMENT):
+    return {"id": 1, "op": "settle", "attempt": attempt, "result": result}
+
+
+def _settle_posts(peer):
+    return [call for call in peer.state.calls if call["path"].endswith("/result")]
+
+
+def test_a_chat_error_is_answered_unless_the_client_marks_it_unanswered():
+    assert ChatError("REQUEST_UNCERTAIN").unanswered is False
+    assert ChatError("REQUEST_UNCERTAIN", unanswered=True).unanswered is True
+
+
+@pytest.mark.parametrize("shape", ["unpinned", "unpinned_with_deadline", "pinned_with_deadline"])
+def test_a_connection_that_is_refused_is_unanswered(shape):
+    # The three ways the client connects: with the standard library's own connect, with a name that a child resolves
+    # before a deadline, and to the addresses of a join before a deadline, which is how the worker's settle connects.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    pinned = ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", port)),)
+    instance = instance_client.JoinedInstance(
+        InstanceSecret("refused-native", uuid4(), "1" * 64, f"http://127.0.0.1:{port}"),
+        uuid4(), uuid4(), uuid4(), "synthetic-host", "pi",
+        addresses=pinned if shape == "pinned_with_deadline" else (),
+    )
+    deadline = None if shape == "unpinned" else time.monotonic() + 10
+    with pytest.raises(ChatError) as caught:
+        instance_client.settle(instance, uuid4(), DeliveryResult(outcome="handed", reason=None), deadline=deadline)
+    assert (caught.value.code, caught.value.unanswered) == ("TRANSPORT_UNAVAILABLE", True)
+
+
+@pytest.mark.parametrize("delivery_enabled", [True])
+@pytest.mark.parametrize("mode", ["unavailable", "drop", "truncated", "bad_gateway"])
+def test_the_worker_sends_a_settle_again_when_the_server_gave_no_complete_answer(
+    peer, process_api, credentials, send, db, mode
+):
+    # A 503 with the service's envelope, a lost connection, a body cut short and a proxy's 502. The server has already
+    # settled the attempt, as it has when a reply is lost, so the second POST gets the recorded result.
+    joined, attempt = _open_attempt(peer, process_api, credentials, send)
+    peer.state.mode = mode
+    assert instance_worker._delivery(joined, _settle_frame(attempt)) == {"attempt_id": attempt, **SETTLEMENT}
+    assert len(_settle_posts(peer)) == 2
+    stored = db.execute("SELECT outcome, reason FROM agent_chat.delivery_attempts WHERE id = %s", (attempt,))
+    assert stored.fetchone() == SETTLEMENT
+
+
+@pytest.mark.parametrize("delivery_enabled", [True])
+@pytest.mark.parametrize("mode", ["redirect", "html_403", "unknown_code", "other_attempt"])
+def test_the_worker_does_not_send_a_settle_again_after_a_complete_reply_it_cannot_accept(
+    peer, process_api, credentials, send, mode
+):
+    # A redirect, a proxy's HTML 403, a 4xx with a code this client does not know and a 200 that names another
+    # attempt. The client gives each the code of a request that may have been sent, but each is an answer, so the
+    # error ends the worker after one POST.
+    joined, attempt = _open_attempt(peer, process_api, credentials, send)
+    peer.state.mode = mode
+    with pytest.raises(ChatError) as caught:
+        instance_worker._delivery(joined, _settle_frame(attempt))
+    assert caught.value.code == "REQUEST_UNCERTAIN" and caught.value.unanswered is False
+    assert len(_settle_posts(peer)) == 1
+
+
+@pytest.mark.parametrize("delivery_enabled", [True])
+def test_the_worker_answers_a_settle_that_the_server_refused_as_refused_and_sends_it_once(
+    peer, process_api, credentials, send
+):
+    joined, attempt = _open_attempt(peer, process_api, credentials, send)
+    instance_client.settle(joined, UUID(attempt), DeliveryResult(outcome="deferred", reason="busy"))
+    peer.state.calls.clear()
+    # Another outcome for a settled attempt is the ledger's definite refusal, DELIVERY_CLOSED.
+    assert instance_worker._delivery(joined, _settle_frame(attempt)) == {"refused": "DELIVERY_CLOSED"}
+    assert len(_settle_posts(peer)) == 1
 
 
 def test_origin_conflict_and_invalid_host_token_refuse_before_registration(peer):

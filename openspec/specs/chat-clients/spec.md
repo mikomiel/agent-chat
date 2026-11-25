@@ -426,10 +426,10 @@ An episode begins at the first failure that calls for a rejoin and ends at the n
 - **THEN** the adapter fails with that code and does not rejoin
 
 ### Requirement: The instance worker sends a settlement again until its request deadline
-When a `settle` request fails with `REQUEST_UNCERTAIN`, `SERVICE_UNAVAILABLE` or `TRANSPORT_UNAVAILABLE`, the instance worker MUST send it again, with the same attempt and result, until 1 second before its 20-second request deadline, and MUST NOT send any other request again. A definite refusal MUST end the tries and be answered as refused. When the tries run out, the last failure MUST end the worker.
+Only a `settle` try that gets no complete answer, because the connection fails or ends early, or that gets a 5xx reply, MUST be sent again by the instance worker, with the same attempt and result, until 1 second before its 20-second request deadline, when the last failure MUST end the worker. A try the deadline cuts MUST report `REQUEST_UNCERTAIN`. A definite delivery refusal MUST be answered as refused. Any other failure MUST end the worker at once.
 
 #### Scenario: The service answers after a brief outage
-- **WHEN** a `settle` fails with `REQUEST_UNCERTAIN` and a later try before the deadline is answered
+- **WHEN** a `settle` gets no complete answer or a 5xx reply, and a later try before the deadline is answered
 - **THEN** the worker answers its parent with that answer
 - **AND** each try carries the same attempt and the same result
 
@@ -437,9 +437,17 @@ When a `settle` request fails with `REQUEST_UNCERTAIN`, `SERVICE_UNAVAILABLE` or
 - **WHEN** the service refuses a `settle` with a definite code such as `DELIVERY_CLOSED`
 - **THEN** the worker sends no further try and answers its parent as refused
 
+#### Scenario: A complete reply that cannot be accepted
+- **WHEN** a `settle` gets a complete reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know or a 200 that names another attempt
+- **THEN** the worker sends no further try and ends at once
+
 #### Scenario: The deadline is spent
-- **WHEN** every try fails without an answer until 1 second before the request deadline
+- **WHEN** every try gets no complete answer or a 5xx reply until 1 second before the request deadline
 - **THEN** the worker sends no further try, answers its parent with the code of the last failure and ends
+
+#### Scenario: The deadline cuts a try
+- **WHEN** the request deadline cuts a try short
+- **THEN** the worker answers its parent with `REQUEST_UNCERTAIN` and ends
 
 ### Requirement: A peer message body is framed behind a per-notice nonce
 When a harness package passes message bodies to its session, the notice MUST carry a nonce of at least 64 bits from a cryptographic generator, drawn after the claim and never derived from message data. Each message MUST be a header line, an opening marker `<<<AGENT-CHAT-BODY NONCE`, the body and a closing marker `AGENT-CHAT-BODY NONCE>>>`. Every body line MUST start with `> `, added after the cut.

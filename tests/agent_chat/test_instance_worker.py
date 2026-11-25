@@ -418,7 +418,8 @@ def _timed_worker(
             instance_worker, "signal",
             SimpleNamespace(SIGALRM=14, SIGTERM=15, ITIMER_REAL=0,
                             signal=(lambda number, handler: None) if handlers is None
-                            else handlers.__setitem__, setitimer=lambda *_args: None),
+                            else handlers.__setitem__, setitimer=lambda *_args: None,
+                            getitimer=lambda *_args: (0.0, 0.0)),  # no alarm is armed, as in the worker's unit tests
         )
         patch.setattr(instance_client.Client, "request", request)
         patch.setattr(time, "sleep", lambda *_args: pytest.fail("worker must not sleep between frames"))
@@ -580,13 +581,13 @@ def _ends(calls: list[tuple[float, str]]) -> int:
     return sum(1 for _at, path in calls if path == "/v1/instance/end")
 
 
-def _sigterm(handlers: dict[int, Any], code: str = "TRANSPORT_UNAVAILABLE") -> Any:
-    """A request that fails the way the HTTP client does when SIGTERM interrupts it."""
+def _sigterm(handlers: dict[int, Any], code: str = "TRANSPORT_UNAVAILABLE", *, unanswered: bool = False) -> Any:
+    """A request that fails the way the HTTP client does when SIGTERM interrupts it (`unanswered`: with no answer)."""
 
     def interrupted() -> ChatError:
         with pytest.raises(TimeoutError):
             handlers[15](15, None)
-        return ChatError(code)
+        return ChatError(code, unanswered=unanswered)
 
     return interrupted
 
@@ -804,8 +805,13 @@ def test_a_definite_settlement_refusal_is_soft_and_the_worker_keeps_serving(
 
 # #176: a settlement that gets no answer is sent again, with the same attempt and result, inside the request's
 # deadline. These tests call `_delivery` on a clock they own: the worker's `monotonic` reads it and its `sleep`
-# advances it.
+# advances it. `tests/agent_chat/test_instance_client.py` runs the same loop against the real client and server.
 SETTLE_NO_ANSWER = ["REQUEST_UNCERTAIN", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE"]
+
+
+def _no_answer(code: str) -> ChatError:
+    """What the client raises when the request got no complete answer."""
+    return ChatError(code, unanswered=True)
 
 
 class _Clock:
@@ -822,12 +828,16 @@ class _Clock:
 
 
 def _scripted_settle(
-    monkeypatch: pytest.MonkeyPatch, script: list[str | dict[str, Any]], *, cost: float = 0.0,
+    monkeypatch: pytest.MonkeyPatch,
+    script: list[ChatError | dict[str, Any]],
+    *,
+    cost: float = 0.0,
+    armed: float = 0.0,
 ) -> tuple[_Clock, list[SimpleNamespace]]:
-    """`instance_client.settle` replaced by a script: a string is the code of a ChatError, a dict is the answer.
+    """`instance_client.settle` replaced by a script: an error is raised, a dict is the answer.
 
     The last entry repeats. Each try takes `cost` seconds. A try that would cross its deadline ends at it with
-    CLI_INTERRUPTED, as the client does.
+    CLI_INTERRUPTED, as the client does. `armed` is what the process alarm has left; 0 means none is armed.
     """
     clock = _Clock()
     calls: list[SimpleNamespace] = []
@@ -841,13 +851,14 @@ def _scripted_settle(
             clock.now = deadline
             raise ChatError("CLI_INTERRUPTED")
         clock.now += cost
-        if isinstance(step, str):
-            raise ChatError(step)
+        if isinstance(step, ChatError):
+            raise step
         return step
 
     monkeypatch.setattr(instance_worker.instance_client, "settle", settle)
     monkeypatch.setattr(instance_worker, "monotonic", clock)
     monkeypatch.setattr(instance_worker, "sleep", clock.sleep, raising=False)  # the worker imports it for the retry
+    monkeypatch.setattr(instance_worker.signal, "getitimer", lambda _which: (armed, 0.0))
     return clock, calls
 
 
@@ -862,7 +873,7 @@ def test_a_settle_with_no_answer_is_sent_again_with_the_same_attempt_and_result(
 ) -> None:
     attempt = uuid4()
     settled = {"attempt_id": str(attempt), "outcome": "handed", "reason": None}
-    clock, calls = _scripted_settle(monkeypatch, [code, code, settled], cost=3.0)
+    clock, calls = _scripted_settle(monkeypatch, [_no_answer(code), _no_answer(code), settled], cost=3.0)
     assert _deliver_settle(attempt) == settled
     result = DeliveryResult(outcome="handed", reason=None)
     assert [(call.attempt, call.result) for call in calls] == [(attempt, result)] * 3
@@ -877,7 +888,8 @@ def test_a_settle_with_no_answer_is_sent_again_with_the_same_attempt_and_result(
 def test_the_tries_of_a_settle_stop_at_the_deadline_and_the_last_error_propagates(
     monkeypatch: pytest.MonkeyPatch, code: str,
 ) -> None:
-    clock, calls = _scripted_settle(monkeypatch, [code])  # every try fails at once, as a refused connection does
+    # Every try fails at once, as a refused connection does.
+    clock, calls = _scripted_settle(monkeypatch, [_no_answer(code)])
     with pytest.raises(ChatError) as caught:
         _deliver_settle(uuid4())
     assert caught.value.code == code
@@ -888,10 +900,24 @@ def test_the_tries_of_a_settle_stop_at_the_deadline_and_the_last_error_propagate
     assert clock.now <= deadline  # and the worker is done before its alarm
 
 
+@pytest.mark.parametrize("armed", [0.0, 7.0, 12.5])
+def test_the_deadline_of_a_settle_follows_the_alarm_that_is_armed(
+    monkeypatch: pytest.MonkeyPatch, armed: float,
+) -> None:
+    # `getitimer` reports what is left of the alarm armed for the request; 0 means none is armed, and the worker then
+    # assumes a whole request. The tries end the margin before the alarm, wherever it stands.
+    clock, calls = _scripted_settle(monkeypatch, [_no_answer("REQUEST_UNCERTAIN")], armed=armed)
+    with pytest.raises(ChatError):
+        _deliver_settle(uuid4())
+    deadline = clock.start + (armed or instance_worker.REQUEST_SECONDS) - instance_worker.SETTLE_MARGIN_SECONDS
+    assert {call.deadline for call in calls} == {deadline}
+    assert len(calls) > 2 and all(call.at < deadline for call in calls) and clock.now <= deadline
+
+
 def test_a_try_that_the_deadline_cut_short_leaves_as_request_uncertain(monkeypatch: pytest.MonkeyPatch) -> None:
     # The client ends such a try with CLI_INTERRUPTED. The parent knows no such code, so it would fail where it rejoins
     # for REQUEST_UNCERTAIN, the code of a request that may have been sent.
-    clock, calls = _scripted_settle(monkeypatch, ["REQUEST_UNCERTAIN"], cost=100.0)
+    clock, calls = _scripted_settle(monkeypatch, [_no_answer("REQUEST_UNCERTAIN")], cost=100.0)
     with pytest.raises(ChatError) as caught:
         _deliver_settle(uuid4())
     assert caught.value.code == "REQUEST_UNCERTAIN"
@@ -903,29 +929,46 @@ def test_a_try_that_the_deadline_cut_short_leaves_as_request_uncertain(monkeypat
 def test_a_definite_refusal_ends_the_tries_of_a_settle_and_is_answered_as_refused(
     monkeypatch: pytest.MonkeyPatch, code: str, sent_before: int,
 ) -> None:
-    _clock, calls = _scripted_settle(monkeypatch, ["REQUEST_UNCERTAIN"] * sent_before + [code], cost=3.0)
+    script = [_no_answer("REQUEST_UNCERTAIN")] * sent_before + [ChatError(code)]
+    _clock, calls = _scripted_settle(monkeypatch, script, cost=3.0)
     assert _deliver_settle(uuid4()) == {"refused": code}
     assert len(calls) == sent_before + 1
 
 
+@pytest.mark.parametrize("code", SETTLE_NO_ANSWER)
+def test_a_complete_reply_that_cannot_be_accepted_is_not_sent_again(
+    monkeypatch: pytest.MonkeyPatch, code: str,
+) -> None:
+    # A redirect, a body that is not the service's or a 200 that names another attempt is an answer. The client still
+    # gives it the code of a request that may have been sent, but does not mark it unanswered.
+    _clock, calls = _scripted_settle(monkeypatch, [ChatError(code)])
+    with pytest.raises(ChatError) as caught:
+        _deliver_settle(uuid4())
+    assert caught.value.code == code and len(calls) == 1
+
+
+@pytest.mark.parametrize("unanswered", [False, True])
 @pytest.mark.parametrize(
     "code",
     ["STALE_INSTANCE", "UNAUTHENTICATED", "INVALID_RESPONSE", "HTTP_REFUSED", "REDIRECT_REFUSED", "INVALID_REQUEST"],
 )
-def test_any_other_failure_of_a_settle_is_not_sent_again(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
-    _clock, calls = _scripted_settle(monkeypatch, [code])
+def test_any_other_failure_of_a_settle_is_not_sent_again(
+    monkeypatch: pytest.MonkeyPatch, code: str, unanswered: bool,
+) -> None:
+    _clock, calls = _scripted_settle(monkeypatch, [ChatError(code, unanswered=unanswered)])
     with pytest.raises(ChatError) as caught:
         _deliver_settle(uuid4())
     assert caught.value.code == code and len(calls) == 1
 
 
 def test_sigterm_during_a_settle_still_ends_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
-    # SIGTERM fails the request in flight as REQUEST_UNCERTAIN, a code that is sent again. A stop is not an outage.
+    # SIGTERM fails the request in flight as an unanswered REQUEST_UNCERTAIN, which is sent again. A stop is not an
+    # outage.
     handlers: dict[int, Any] = {}
     settle = {"op": "settle", "attempt": str(uuid4()), "result": {"outcome": "handed", "reason": None}}
     code, frames, calls = _timed_worker(
         monkeypatch, [(1, settle), (2, {"op": "status"})], [],
-        failures={"result": [_sigterm(handlers, "REQUEST_UNCERTAIN")]}, handlers=handlers,
+        failures={"result": [_sigterm(handlers, "REQUEST_UNCERTAIN", unanswered=True)]}, handlers=handlers,
     )
     assert code == 1 and frames[-1] == {"id": 1, "error": {"code": "REQUEST_UNCERTAIN"}}
     assert len(frames) == 2  # no second try answered, and the second frame was never read
