@@ -428,6 +428,16 @@ HTTP_ERROR_STATUS = {
 
 
 class ChatError(Exception):
-    def __init__(self, code: str):
+    """A failure with a stable code.
+
+    `unanswered` is True only when the request got no status or a 5xx. The client has no status when the connection
+    failed before the status line and headers were read, or ended before a three-digit status code. The request may
+    or may not have been applied. Only the HTTP client sets it. A reply below 500 leaves it False even when the
+    client cannot accept it, such as a redirect, a body that is not the service's or is cut, and so does a reply the
+    parser rejects (a bad status line, too many headers).
+    """
+
+    def __init__(self, code: str, *, unanswered: bool = False):
         super().__init__(code)
         self.code = code
+        self.unanswered = unanswered

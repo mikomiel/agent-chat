@@ -7,6 +7,8 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from psycopg import Connection
+from psycopg.errors import DeadlockDetected, LockNotAvailable, QueryCanceled
+from psycopg.pq import TransactionStatus
 
 from . import events, receipts
 from .auth import authorize_message_room, lock_agent, require_live
@@ -26,6 +28,7 @@ from .models import (
     DeliveryClaim,
     DeliveryResult,
 )
+from .storage import deadline_spent
 
 # The one judgement of a thread's consultation limit, for publication, pending and claim. `direct` is the thread's
 # class (008_direct_threads.sql), counting the sessions `joining` would add; a thread that existed before the
@@ -487,6 +490,10 @@ def _claim(
     return {"dispatch": True, "attempt": _view(attempt), "messages": messages}
 
 
+class _LateAdmission(Exception):
+    """A claim's admission ended past its request deadline; `claim` rolls back only the admission."""
+
+
 def claim(db: Connection[dict[str, Any]], actor: Actor, key: UUID, request: DeliveryClaim) -> dict[str, Any]:
     with db.transaction():
         events.lock(db)
@@ -498,12 +505,38 @@ def claim(db: Connection[dict[str, Any]], actor: Actor, key: UUID, request: Deli
             rows = _recipient_state(db, actor, rows)
             # A refusal rolls back only this admission, not expiry reconciliation.
             with db.transaction():
-                return _claim(db, actor, key, request, rows)
+                granted = _claim(db, actor, key, request, rows)
+                # Issue #177: an admission that ends past the request deadline is refused after its last statement,
+                # so its attempt never commits after the client gave the claim up. The reconciliation and expiry above
+                # are true whenever they commit, and they stay.
+                if deadline_spent(db):
+                    raise _LateAdmission
+                return granted
+        except _LateAdmission:
+            # Past the deadline nothing more is asked of the database: running the clean-up again could wait on a
+            # lock the first pass did not reach and, refused there, roll back the work this transaction keeps.
+            error = ChatError("DATABASE_UNAVAILABLE")
         except ChatError as caught:
-            reconcile(db, session=actor.session_id)
-            expire_undelivered(db, session=actor.session_id)
+            _refusal_sweep(db, actor)
             error = caught
     raise error
+
+
+def _refusal_sweep(db: Connection[dict[str, Any]], actor: Actor) -> None:
+    """Settle, after a refusal, what became due during the call, such as a reservation that expired while it waited.
+
+    The sweep runs in its own savepoint. When it cannot get a lock in time, only the sweep rolls back: the call keeps
+    the reconciliation and expiry it already did and answers with its refusal (issue #186). The error is absorbed only
+    when the savepoint did roll back and the transaction can still commit. A failure of the savepoint's own release
+    leaves the transaction failed, and its COMMIT would silently discard the earlier work, so that error propagates.
+    """
+    try:
+        with db.transaction():
+            reconcile(db, session=actor.session_id)
+            expire_undelivered(db, session=actor.session_id)
+    except (LockNotAvailable, QueryCanceled, DeadlockDetected):
+        if db.info.transaction_status != TransactionStatus.INTRANS:
+            raise
 
 
 def result(db: Connection[dict[str, Any]], actor: Actor, attempt_id: UUID, request: DeliveryResult) -> dict[str, Any]:
@@ -549,7 +582,6 @@ def result(db: Connection[dict[str, Any]], actor: Actor, attempt_id: UUID, reque
                     raise ChatError("DELIVERY_CLOSED")
                 return _view(settled)
         except ChatError as caught:
-            reconcile(db, session=actor.session_id)
-            expire_undelivered(db, session=actor.session_id)
+            _refusal_sweep(db, actor)
             error = caught
     raise error

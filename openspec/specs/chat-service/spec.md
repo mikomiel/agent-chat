@@ -393,7 +393,8 @@ The service MUST settle an eligible recipient entry of a retained `question`, `c
 #### Scenario: Settlement is not clock-driven
 - **WHEN** a claim made while delivery is enabled, or a result call, runs for the session
 - **THEN** the oldest retained `question`, `consultation` and `reply` entries of that session with a body, past 24 hours, that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep
-- **AND** a call runs up to two sweeps. A refusal handled before the normal sweep runs only the refusal-path sweep. A refusal handled after the normal sweep runs both
+- **AND** a call runs up to two sweeps. A refusal handled before the normal sweep runs only the refusal-path sweep. A refusal handled after the normal sweep runs both, except a claim refused at its deadline, which runs only the normal sweep
+- **AND** a refusal-path sweep that cannot get a lock in time rolls back alone: the call keeps the normal sweep's work and answers with its refusal
 - **AND** later sweeps continue with the oldest remaining eligible entries
 - **AND** an entry covered by an open attempt is not settled
 
@@ -468,6 +469,52 @@ The service MUST answer every refusal made before a response starts with `{"erro
 #### Scenario: Unmapped code
 - **WHEN** the service refuses with a code that has no assigned status
 - **THEN** the HTTP status is 503
+
+### Requirement: A claim records no attempt after its deadline
+The service MUST take one deadline per delivery claim when the request reaches its route, before connecting: the configured lock limit (3 s, the client's socket step) less 0.75 s for the commit, response and transit, read without a query. A claim whose admission ends past it MUST be refused with 503 `DATABASE_UNAVAILABLE` and MUST NOT record its attempt; reconciliation and expiry done before the admission still commit. A delivery result is not bounded by it.
+
+#### Scenario: Lock released after the deadline
+- **WHEN** another transaction holds a lock that a claim waits on until after the claim's deadline
+- **THEN** the claim is refused with 503 `DATABASE_UNAVAILABLE`, which can arrive after the client's 3-second step
+- **AND** no delivery attempt is recorded, and the pending view offers the message again
+
+#### Scenario: Several waits that each fit the lock limit
+- **WHEN** a claim waits on several locks in turn, in separate statements or within one statement, each for less than the lock limit, and together until after the deadline
+- **THEN** the claim is refused, and no delivery attempt is recorded
+
+#### Scenario: Authentication waits on a lock
+- **WHEN** another transaction holds a lock on the principals that the authentication of a claim waits on, and releases it after the claim's deadline but before the lock limit and the client's step
+- **THEN** the claim is refused with 503 `DATABASE_UNAVAILABLE` and records no delivery attempt
+
+#### Scenario: Lock released before the deadline
+- **WHEN** the lock is released early enough for the claim's admission to end before the deadline
+- **THEN** the service grants the claim as usual
+
+#### Scenario: Expiry before a refused admission
+- **WHEN** a claim first expires undelivered items past the age limit, and its admission then ends past the deadline
+- **THEN** the claim is refused and records no attempt, and the expiry and its receipts commit
+- **AND** a later claim of the same messages no longer repeats that expiry and is granted
+
+#### Scenario: A refusal at the deadline runs no further clean-up
+- **WHEN** a claim's expiry pass settles its limit of items, another transaction holds the next due item, and the admission then ends past the deadline
+- **THEN** the claim is refused without another reconciliation or expiry pass, so it waits on no further lock
+- **AND** the items that pass settled stay settled
+
+#### Scenario: A claim slower than its deadline
+- **WHEN** an uncontended claim's admission ends after the deadline, as a large batch on a slow database can
+- **THEN** the claim is refused, and the client reads it as uncertain
+- **AND** nothing is lost: no attempt is recorded, and the pending view offers the messages again
+
+#### Scenario: A result waits past the claim deadline
+- **WHEN** a delivery result waits on a lock that is released after the claim deadline and before the client's step ends
+- **THEN** the service records the result and answers 200, as it did before the deadline existed
+
+### Requirement: The claim deadline adds no round trip
+Taking and checking the claim deadline MUST NOT add a round trip to the database: a claim makes as many round trips with the deadline as without it.
+
+#### Scenario: No round trip added
+- **WHEN** the same full batch claim runs with and without the deadline
+- **THEN** both make the same number of round trips to the database
 
 ### Requirement: Handled refusals are logged with fixed fields only
 The service MUST log a handled refusal with only its code, route, status and exception class. A refusal that follows the start of an event stream MUST also carry a `phase=stream` marker, and its status is the 200 already sent.
