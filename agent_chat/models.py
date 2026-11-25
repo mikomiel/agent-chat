@@ -432,8 +432,8 @@ class ChatError(Exception):
 
     `unanswered` is True only when the request got no complete answer, because the connection failed or ended early,
     or the reply was a 5xx. The request may or may not have been applied. Only the HTTP client sets it. A complete
-    reply below 500 that the client could not accept, such as a redirect or a body that is not the service's, leaves
-    it False.
+    reply below 500 that the client could not accept, such as a redirect or a body that is not the service's, and a
+    reply the HTTP parser rejects (a bad status line, too many headers) leave it False.
     """
 
     def __init__(self, code: str, *, unanswered: bool = False):

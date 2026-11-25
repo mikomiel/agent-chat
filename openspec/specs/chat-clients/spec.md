@@ -438,7 +438,7 @@ Only a `settle` try that gets no complete answer, because the connection fails o
 - **THEN** the worker sends no further try and answers its parent as refused
 
 #### Scenario: A complete reply that cannot be accepted
-- **WHEN** a `settle` gets a complete reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know or a 200 that names another attempt
+- **WHEN** a `settle` gets a complete reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know or a 200 that names another attempt, or a reply the HTTP parser rejects, such as one with too many headers
 - **THEN** the worker sends no further try and ends at once
 
 #### Scenario: The deadline is spent

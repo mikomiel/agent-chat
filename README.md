@@ -192,8 +192,9 @@ gets no complete answer, because the connection fails or ends early, or that
 gets a 5xx reply, is sent again, with the same attempt and result, until 1
 second before the request's deadline (#176); the last failure then ends the
 worker, and a try the deadline cuts reports `REQUEST_UNCERTAIN`. A definite
-delivery refusal is answered as refused. Any other failure, such as a redirect
-or a reply below 500 that is not the service's, ends the worker at once. The
+delivery refusal is answered as refused. Any other failure, such as a redirect,
+a reply below 500 that is not the service's or a reply the HTTP parser rejects,
+ends the worker at once. The
 worker never resolves again inside a request: an address change reaches a
 binding at its next join, which the rejoin below performs.
 

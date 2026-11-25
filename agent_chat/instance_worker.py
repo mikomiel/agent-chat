@@ -159,8 +159,8 @@ def _settle(
     (#176). The server answers a repeat of the same outcome with the recorded one, and another outcome or a lapsed
     reservation with `DELIVERY_CLOSED`, so a repeat can neither settle twice nor change the record. A complete reply
     below 500 that cannot be accepted (a redirect, a body that is not the service's, a 200 that names another
-    attempt) is an answer even where its code is `REQUEST_UNCERTAIN`. It is never sent again, and neither are a
-    definite refusal, any other code and a stop (`stopping`, the worker's SIGTERM).
+    attempt), or one the HTTP parser rejects, is an answer even where its code is `REQUEST_UNCERTAIN`. It is never
+    sent again, and neither are a definite refusal, any other code and a stop (`stopping`, the worker's SIGTERM).
 
     All tries share one deadline, `SETTLE_MARGIN_SECONDS` before the alarm armed for the request (`REQUEST_SECONDS`
     when none is, as in `_join`). When it is spent the last error propagates and ends the worker. The client ends a

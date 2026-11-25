@@ -410,8 +410,10 @@ class Client:
             ):
                 raise ChatError(refused) from None
             # A connection that failed or ended early, and a 5xx whose body is not the service's, got no complete
-            # answer. A complete reply below 500 that breaks the protocol is an answer, which no caller may send again.
-            transport_lost = isinstance(error, (OSError, http.client.HTTPException))
+            # answer. A complete reply below 500 that breaks the protocol is an answer, which no caller may send again,
+            # and so is one the HTTP parser rejects (a bad status line, too many headers): only a socket error (an
+            # OSError, which includes a peer that closed before the status line) and a body cut short are lost.
+            transport_lost = isinstance(error, (OSError, http.client.IncompleteRead))
             unanswered = transport_lost or (status is not None and status >= 500)
             raise ChatError(
                 "REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE", unanswered=unanswered
