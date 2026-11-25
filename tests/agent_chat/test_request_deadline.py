@@ -12,6 +12,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import closing, contextmanager
+from hashlib import sha256
 from http.client import HTTPConnection
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -32,9 +33,12 @@ CLIENT_STEP = 3.0
 SERVER_BUDGET = 2.25
 #: Seconds from the deadline beyond which a release has a fixed outcome: granted before, refused after.
 FIXED_SIDE = 0.7
-#: The database round trip at which a full batch claim is supported: every one of its round trips costing this
-#: much still sends COMMIT before the deadline. A slower database can refuse a full batch.
-SUPPORTED_ROUND_TRIP = 0.04
+#: The database round trip at which every full batch claim is supported, the worst case being 16 messages from 16
+#: rooms: every round trip costing this much, the connection's included, still sends COMMIT before the deadline. A
+#: slower database can refuse such a batch.
+SUPPORTED_ROUND_TRIP = 0.015
+#: Round trips `storage.connect` spends after `accepted` and before the first query: TCP, TLS and a SCRAM exchange.
+CONNECT_ROUND_TRIPS = 6
 
 CLOCK = "agent_chat.event_clock WHERE singleton FOR UPDATE"
 
@@ -397,29 +401,55 @@ def test_a_deadline_passed_inside_a_transaction_rolls_it_back_instead_of_committ
         assert bounded.execute("SELECT count(*) AS n FROM deadline_probe").fetchone()["n"] == 0
 
 
-def full_batch(process_api, credentials, send, target):
+def full_batch(process_api, credentials, target, db, rooms=1):
+    """Sixteen questions to `target`, spread over `rooms` rooms (the first is the credentials' room), offered at once.
+
+    A claim authorizes each room of its batch separately, so a batch across more rooms costs more round trips.
+    """
     token, binding = target
-    for _ in range(16):
-        question(process_api, credentials, send, binding)
+    spread = [credentials.room]
+    operator = db.execute(
+        "SELECT id FROM agent_chat.principals WHERE kind = 'operator' AND credential_hash = %s",
+        (sha256(credentials.operator.encode()).hexdigest(),),
+    ).fetchone()["id"]
+    for _ in range(rooms - 1):
+        room = uuid4()
+        db.execute("INSERT INTO agent_chat.rooms VALUES (%s, %s, 'Batch')", (room, "batch-" + room.hex[:8]))
+        for principal in (credentials.principal, operator):
+            db.execute("INSERT INTO agent_chat.principal_rooms VALUES (%s, %s)", (principal, room))
+        db.execute("INSERT INTO agent_chat.memberships VALUES (%s, %s)", (room, binding["session_id"]))
+        spread.append(str(room))
+    for index in range(16):
+        status, _ = process_api.request(
+            "POST",
+            f"/v1/rooms/{spread[index % rooms]}/messages",
+            {"kind": "question", "body": "synthetic coordination", "recipients": [binding["session_id"]]},
+            credentials.operator,
+            {"Idempotency-Key": str(uuid4())},
+        )
+        assert status == 200
     ids = tuple(UUID(message) for message in offered(process_api, token))
     assert len(ids) == 16
     return token, DeliveryClaim(messages=ids)
 
 
+@pytest.mark.parametrize("rooms", [1, 16], ids=["one_room", "sixteen_rooms"])
 def test_a_full_batch_claim_fits_the_deadline_at_the_supported_round_trip(
-    process_api, credentials, target, send, database, monkeypatch
+    process_api, credentials, target, db, database, monkeypatch, rooms
 ):
-    token, request = full_batch(process_api, credentials, send, target)
+    """The worst case is a batch whose 16 messages come from 16 rooms. The clock starts before the connection is made,
+    as `accepted` does, and the connection's own round trips are counted as `CONNECT_ROUND_TRIPS`."""
+    token, request = full_batch(process_api, credentials, target, db, rooms)
     with connect(database) as bounded:
         clock, trips = charged(monkeypatch, bounded, SUPPORTED_ROUND_TRIP)
-        with bounded.request_deadline(clock()):
+        accepted = clock() - CONNECT_ROUND_TRIPS * SUPPORTED_ROUND_TRIP
+        with bounded.request_deadline(accepted):
             granted = deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
     assert granted["dispatch"] and len(granted["messages"]) == 16
-    assert len(trips) * SUPPORTED_ROUND_TRIP < SERVER_BUDGET, len(trips)
 
 
 def test_the_deadline_adds_no_round_trip_to_a_full_batch_claim(
-    process_api, credentials, target, send, database, monkeypatch, register
+    process_api, credentials, target, db, database, monkeypatch, register
 ):
     """The deadline is read without a query and checked on the client, so a claim costs what it costs without it.
 
@@ -429,7 +459,7 @@ def test_the_deadline_adds_no_round_trip_to_a_full_batch_claim(
     ready(process_api, other[0])
     counted = []
     for bounded_claim, recipient in ((True, target), (False, other)):
-        token, request = full_batch(process_api, credentials, send, recipient)
+        token, request = full_batch(process_api, credentials, recipient, db)
         with connect(database) as bounded, monkeypatch.context() as patched:
             clock, trips = charged(patched, bounded, 0)
             if bounded_claim:

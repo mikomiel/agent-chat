@@ -469,7 +469,7 @@ The service MUST answer every refusal made before a response starts with `{"erro
 - **WHEN** the service refuses with a code that has no assigned status
 - **THEN** the HTTP status is 503
 
-### Requirement: A claim commits nothing after its deadline
+### Requirement: A claim sends no COMMIT after its deadline
 The service MUST take one deadline per delivery claim when the request reaches its route, before connecting: the configured lock limit (3 s, the client's socket step) less 0.75 s for COMMIT, response and transit, read without a query. Past it the service MUST NOT send a statement, BEGIN, SAVEPOINT or COMMIT for the claim, and a claim with work left MUST roll back and answer 503 `DATABASE_UNAVAILABLE`. A delivery result is not bounded by it.
 
 #### Scenario: Lock released after the deadline
@@ -494,11 +494,11 @@ The service MUST take one deadline per delivery claim when the request reaches i
 - **WHEN** a delivery result waits on a lock that is released after the claim deadline and before the client's step ends
 - **THEN** the service records the result and answers 200, as it did before the deadline existed
 
-### Requirement: A full batch claim fits its deadline at a 40 ms database round trip
-The deadline MUST add no round trip to a claim. An uncontended claim of 16 messages MUST send its COMMIT before the deadline when every round trip to the database takes 40 milliseconds. A slower database can refuse a full batch, and the client then reads the claim as uncertain.
+### Requirement: A full batch claim fits its deadline at a 15 ms database round trip
+The deadline MUST add no round trip to a claim. An uncontended claim of 16 messages, from one room or from 16 rooms, MUST send its COMMIT before the deadline when every round trip to the database, the connection's included, takes 15 milliseconds. A slower database can refuse a full batch, and the client then reads the claim as uncertain.
 
 #### Scenario: Full batch at the supported round trip
-- **WHEN** an uncontended claim of 16 messages runs, and every round trip to the database takes 40 milliseconds
+- **WHEN** an uncontended claim of 16 messages from 16 rooms runs, and every round trip to the database takes 15 milliseconds
 - **THEN** the claim is granted
 
 #### Scenario: No round trip added
