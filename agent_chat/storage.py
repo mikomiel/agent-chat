@@ -40,17 +40,24 @@ LEGACY_DIGESTS: dict[int, frozenset[str]] = {
 #: client step and reopens #177. tests/agent_chat/test_request_deadline.py pins the production budget.
 REQUEST_MARGIN_SECONDS = 1.0
 
+#: Milliseconds the round trip that arms a statement's limits may take before they are armed again. The limits are
+#: measured before that round trip, so a slow reply would leave the next statement a limit that ends after the
+#: deadline by the delay. Re-arming bounds that overrun to this value; it and the statement's own transit to the
+#: server fall inside `REQUEST_MARGIN_SECONDS`.
+ARM_DRIFT_MS = 50
+
 
 class RequestDeadlineSpent(psycopg.OperationalError):
     """Raised before a bounded statement when the request deadline has passed; nothing more reaches the database."""
 
 
 class BoundedConnection(psycopg.Connection[dict[str, Any]]):
-    """A connection whose transaction statements can share one request deadline.
+    """A connection whose statements can share one request deadline.
 
     PostgreSQL 16 has no transaction-wide timeout, and `lock_timeout` bounds each wait on its own, so a request with
-    several sequential lock waits can outlast its client. While `request_deadline` is active, every statement inside
-    a transaction first lowers `lock_timeout` and `statement_timeout`, for the transaction only, to the time left.
+    several sequential lock waits can outlast its client. While `request_deadline` is active, every statement first
+    lowers `lock_timeout` and `statement_timeout`, for its transaction only, to the time left. A statement outside a
+    transaction runs in a transaction of its own, so a lowered limit never outlives it.
     """
 
     _deadline: float | None = None
@@ -58,7 +65,7 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
 
     @contextmanager
     def request_deadline(self, accepted: float) -> Generator[None, None, None]:
-        """Bound the transactions run in this block to end before `accepted` plus the session's lock limit, less
+        """Bound the statements run in this block to end before `accepted` plus the session's lock limit, less
         `REQUEST_MARGIN_SECONDS`. `accepted` is a `time.monotonic()` reading taken when the request arrived.
 
         The budget comes from this session's own limits, so a connection whose limits were raised or lowered keeps
@@ -78,17 +85,47 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
 
     # Pass-through arguments: psycopg's own execute still checks and runs every call; only the bound is added.
     def execute(self, *args: Any, **kwargs: Any) -> psycopg.Cursor[dict[str, Any]]:
-        if self._deadline is not None and self.info.transaction_status == TransactionStatus.INTRANS:
-            left = int((self._deadline - time.monotonic()) * 1000)
-            # 0 would mean no limit at all, so a spent deadline refuses instead.
-            if left < 1:
-                raise RequestDeadlineSpent("request deadline spent")
-            lock_ms, statement_ms = self._limits
+        if self._deadline is None:
+            return super().execute(*args, **kwargs)
+        status = self.info.transaction_status
+        if status == TransactionStatus.INTRANS:
+            self._arm()
+            return super().execute(*args, **kwargs)
+        if status == TransactionStatus.IDLE:
+            # An autocommit statement, such as authentication, has no transaction to scope a local limit, and a
+            # session limit would outlive the block. Refuse a spent deadline before BEGIN.
+            self._left()
+            with self.transaction():
+                self._arm()
+                return super().execute(*args, **kwargs)
+        return super().execute(*args, **kwargs)
+
+    def _left(self) -> int:
+        """Milliseconds to the deadline. 0 would mean no limit at all, so a spent deadline refuses instead."""
+        assert self._deadline is not None
+        left = int((self._deadline - time.monotonic()) * 1000)
+        if left < 1:
+            raise RequestDeadlineSpent("request deadline spent")
+        return left
+
+    def _arm(self) -> None:
+        """Lower this transaction's limits to the time left, measured again after the round trip that set them.
+
+        A reply slower than `ARM_DRIFT_MS` arms again with the time then left, so the statement never runs under a
+        limit taken before a long delay. Each retry spends more than `ARM_DRIFT_MS`, so the loop ends: armed, or
+        `RequestDeadlineSpent` once the deadline passes.
+        """
+        lock_ms, statement_ms = self._limits
+        left = self._left()
+        while True:
             super().execute(
                 "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)",
                 (str(min(left, lock_ms)), str(min(left, statement_ms) if statement_ms else left)),
             )
-        return super().execute(*args, **kwargs)
+            now = self._left()
+            if left - now <= ARM_DRIFT_MS:
+                return
+            left = now
 
 
 def connect(dsn: str) -> BoundedConnection:

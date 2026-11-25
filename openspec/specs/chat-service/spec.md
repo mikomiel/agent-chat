@@ -470,7 +470,7 @@ The service MUST answer every refusal made before a response starts with `{"erro
 - **THEN** the HTTP status is 503
 
 ### Requirement: A claim or settle ends before the client step
-The service MUST take one deadline for each delivery claim and each delivery result when the request reaches its route, before it connects to the database. The deadline is the session's lock limit, 3 seconds in production and equal to the client's socket step, less a 1-second margin for the commit and the response. Before each statement in the transaction, the service MUST lower the lock and statement limits of that transaction to the time left, and MUST NOT lower them below 1 millisecond or raise them above the session's limits. When the deadline has passed, the service MUST NOT send another statement, MUST roll the transaction back and MUST answer 503 `DATABASE_UNAVAILABLE`. The deadline bounds the sum of the lock waits, not each wait alone.
+The service MUST take one deadline for each delivery claim and each delivery result when the request reaches its route, before it connects to the database. The deadline is the session's lock limit, 3 seconds in production and equal to the client's socket step, less a 1-second margin for the commit and the response. Before each statement of the request, authentication included, the service MUST lower the lock and statement limits of the statement's transaction (a statement outside a transaction runs in one of its own) to no more than 50 milliseconds above the time left after they are set, and MUST NOT lower them below 1 millisecond or raise them above the session's limits. When the deadline has passed, the service MUST NOT send another statement, MUST roll the transaction back and MUST answer 503 `DATABASE_UNAVAILABLE`. The deadline bounds the sum of the lock waits, not each wait alone.
 
 #### Scenario: Lock released after the deadline
 - **WHEN** another transaction holds a lock that a claim waits on until after the claim's deadline
@@ -481,6 +481,15 @@ The service MUST take one deadline for each delivery claim and each delivery res
 - **WHEN** a claim or a result waits on two locks in turn, each for less than the lock limit, and together for longer than the deadline
 - **THEN** the service answers 503 `DATABASE_UNAVAILABLE` before the client's step ends
 - **AND** a claim records no attempt, and a result leaves the attempt open and the message not handed
+
+#### Scenario: Authentication waits on a lock
+- **WHEN** another transaction holds a lock on the principals that the authentication of a claim or a result waits on until after the client's step
+- **THEN** the service answers 503 `DATABASE_UNAVAILABLE` before the client's step ends
+- **AND** a claim records no attempt, and a result leaves the attempt open and the message not handed
+
+#### Scenario: Slow reply to setting the limits
+- **WHEN** the reply that sets a statement's limits arrives late
+- **THEN** the statement runs under limits no longer than the time left after that reply, or is not sent when the deadline has passed
 
 #### Scenario: Lock released before the deadline
 - **WHEN** the lock is released early enough for the claim or result to finish before the deadline
