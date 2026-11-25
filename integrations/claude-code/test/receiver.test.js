@@ -437,19 +437,19 @@ function goneDuring(request, hook, books) {
 }
 
 // The hook can exit while the claim and the status request run. Nothing is sent to a connection that is closed by then, so the
-// batch is not handed and settles failed, which the ledger offers again, never uncertain, which it does not. A reservation that
+// batch is not handed and settles deferred (`offline`), which the ledger offers again, never uncertain, which it does not. A reservation that
 // ran short settles uncertain before any write is tried (see "a reservation too short to write inside"); these reservations hold.
 for (const request of ["claim", "status"]) {
-  test(`a hook that goes during the ${request} request is sent nothing, and the batch settles failed and reaches the next hook`, async () => {
+  test(`a hook that goes during the ${request} request is sent nothing, and the batch settles deferred and reaches the next hook`, async () => {
     const gone = hookDouble()
     const r = await rig({ handlers: goneDuring(request, gone, ledger(["m1"])) })
     await r.begin()
     await r.op(turn(), gone)
     assert.deepEqual(gone.sent, [], "nothing was sent to the hook that went")
-    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "offline" }])
     const next = await r.op(turn())
     assert.match(next.sent[0].context, /"id":"m1"/, "the ledger offered the batch again, and the next hook was handed it")
-    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result.outcome), ["failed", "handed"])
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result.outcome), ["deferred", "handed"])
   })
 }
 
@@ -750,13 +750,13 @@ test("an idle waiter that goes during the claim request is sent nothing, and the
   books.arrive()
   await r.clock.advance(2000)
   assert.deepEqual(gone.sent, [], "nothing was sent to the waiter that went")
-  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "failed", reason: "native_unavailable" }])
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "offline" }])
   assert.equal(r.receiver.state(), null, "nothing was handed: still idle")
   const next = hookDouble({ events: r.events })
   const waiting = r.receiver.handle({ op: "wait" }, next)
   await r.clock.advance(2000)
   assert.match(next.sent[0].context, /"id":"m7"/, "the ledger offered the batch again, and the next waiter was handed it")
-  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result.outcome), ["failed", "handed"])
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result.outcome), ["deferred", "handed"])
   next.close()
   await waiting
 })
