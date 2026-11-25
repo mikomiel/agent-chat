@@ -1899,7 +1899,9 @@ def test_a_cancel_sent_before_the_worker_reads_a_mark_retry_ends_it_when_the_par
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     installed: list[Any] = []
-    handled = threading.Event()  # the worker has run its handler for a signal
+    # The worker has run its handler for a signal. A plain list, not an Event: the handler runs on the main thread,
+    # and an Event's lock taken there could be the one that thread already holds inside `wait()`.
+    handled: list[bool] = []
     retry_asked = threading.Event()  # the parent has written the retry: the worker is about to read it
     retry_answered = threading.Event()  # the parent has read the retry's answer and signals no more
     repeats = sender == "repeats until answered"
@@ -1935,7 +1937,10 @@ def test_a_cancel_sent_before_the_worker_reads_a_mark_retry_ends_it_when_the_par
             if number == 2:
                 # The retry is written and the first signal is sent; it is handled before the worker reads the frame.
                 retry_asked.set()
-                assert handled.wait(10)
+                until = time.monotonic() + 10
+                while not handled and time.monotonic() < until:
+                    time.sleep(0.001)
+                assert handled
             if number == 3:
                 # The parent writes the next request only once it has read the retry's answer and stopped signalling. A
                 # repeat that was already on its way lands now, after that answer and before this read.
@@ -1955,7 +1960,7 @@ def test_a_cancel_sent_before_the_worker_reads_a_mark_retry_ends_it_when_the_par
             if number == CANCEL:  # the real handler for the real signal; the alarm and SIGTERM stay off
 
                 def counted(signum: int, frame: Any) -> None:
-                    handled.set()
+                    handled.append(True)
                     handler(signum, frame)
 
                 installed.append(signal.signal(number, counted))
