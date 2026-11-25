@@ -14,10 +14,26 @@ import { CLAUDE_CHAT_CONFIG_ENV, loadConfig } from "./config.js"
 import { assertPrivateDirectory, connect, connectOrStart, paths } from "./ipc.js"
 import { MAX_OUTPUT_BYTES } from "./channel.js"
 
-// hooks/hooks.json sets the matching `timeout` values in seconds. The waiter
-// holds for less than its timeout, because Claude Code kills an asyncRewake hook
-// at the timeout; test/plugin.test.js pins both relations.
+// hooks/hooks.json sets the matching `timeout` values in seconds. Claude Code
+// enforces the timeout of an asyncRewake hook, so the waiter always leaves before
+// it: after HOLD_MS by default, and after at most MAX_HOLD_MS when the config asks
+// for a longer hold. MIN_HOLD_MS is the other end: the receiver's first poll comes
+// 2,000 ms after the waiter registers (POLL_MS in lib/receiver.js), so a shorter
+// hold could end before a message that was already queued is ever seen.
+// test/plugin.test.js pins these relations.
 export const HOLD_MS = 3_540_000
+export const MIN_HOLD_MS = 10_000
+export const MAX_HOLD_MS = 8_385_000
+
+// The hold, in milliseconds, for a configured number of seconds: the default when
+// none is configured, raised to the minimum and cut to the maximum otherwise. It
+// names no harness and reads no state, so another package can copy it. The config
+// loader refuses a value that is not a positive integer; this falls back to the
+// default for one, so a bad value can never make the hold zero or NaN.
+export const effectiveHoldMs = seconds => (
+  Number.isInteger(seconds) && seconds > 0 ? Math.min(Math.max(seconds * 1000, MIN_HOLD_MS), MAX_HOLD_MS) : HOLD_MS
+)
+
 export const LIMITS_MS = { "session-start": 13_000, prompt: 9_000, tool: 9_000, stop: 4_000, "session-end": 1_000 }
 const PATIENCE_MS = 6_000
 const MAX_STDIN = 32 * 1024 * 1024
@@ -66,15 +82,23 @@ async function quiet(link, request, waitMs) {
 // The asyncRewake waiter: it holds the connection open and exits 2 with the
 // notice on stderr when the receiver delivers one. Everything else, including
 // the hold running out and a vanished parent process, exits 0 without output.
-async function waitForWake(link, io) {
+// The hold is the configured `idleWakeHoldSeconds`, clamped to the limits; `io.holdMs` is the
+// test seam and wins when set.
+async function waitForWake(link, io, config) {
   const origin = io.ppid()
+  // The receiver cannot see this hook's timer, so the wait frame names the hold it is about to take.
+  const hold = io.holdMs ?? effectiveHoldMs(config.idleWakeHoldSeconds)
+  // The hold starts before the frame is sent. The receiver starts its view of the hold when it handles the frame,
+  // which is never earlier, so it never stops waking this hook more than its 1-second safety before the hook leaves.
+  const mono = io.mono ?? (() => performance.now())
+  const started = mono()
   let watch
   try {
-    if (!(await link.send({ op: "wait" }))) return 0
+    if (!(await link.send({ op: "wait", hold_ms: hold }))) return 0
     const orphan = new Promise(resolve => {
       watch = setInterval(() => { if (io.ppid() !== origin) resolve(null) }, io.orphanMs ?? ORPHAN_MS)
     })
-    const reply = await Promise.race([link.next(io.holdMs ?? HOLD_MS), orphan])
+    const reply = await Promise.race([link.next(Math.max(0, hold - Math.floor(mono() - started))), orphan])
     const context = reply?.context
     if (typeof context !== "string" || !context) return 0
     const ok = fits(context)
@@ -106,7 +130,7 @@ async function dispatch(name, { payload, config, where, io }) {
     case "prompt": return converse(await open(2_500), "UserPromptSubmit", turn(), 7_500, io)
     case "tool": return converse(await open(0), "PostToolUse", turn(), 7_500, io)
     case "stop": return quiet(await open(0), { op: "stop", permission_mode: mode }, 3_500)
-    case "wait": return waitForWake(await open(0), io)
+    case "wait": return waitForWake(await open(0), io, config)
     default: return quiet(await open(0), { op: "end" }, 800)
   }
 }
@@ -139,6 +163,7 @@ export function nodeIo() {
     env: process.env,
     connect,
     ppid: () => process.ppid,
+    mono: () => performance.now(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     write: (stream, text) => new Promise(resolve => {
       try { process[stream].write(text, error => resolve(!error)) } catch { resolve(false) }
