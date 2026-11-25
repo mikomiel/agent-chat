@@ -236,9 +236,13 @@ or a stop. Only the idle-wake waiter exits 2.
   Before any write, a waiter that has left or whose hold has ended defers the
   batch: it has shown nothing, so the batch settles `deferred`. The waiter sends
   its hold in the `wait` frame (`hold_ms`), and the receiver counts the hold as
-  ended 1 second early, so a close it has not yet seen cannot lead to a write
-  to a hook that left. It starts no claim when less than 4 seconds of the hold
-  remain. A deferred batch becomes eligible again at a later turn or waiter,
+  ended 1 second early, from when it handles that frame. That margin covers the
+  usual local socket lag, so a close the receiver has not yet seen does not lead
+  to a write to a hook that left. If the receiver handles the frame more than
+  1 second after the hook started its timer, the receiver's view of the hold
+  ends late. A write in that gap can reach a hook that left, and it settles
+  `uncertain` like any unconfirmed write (#182). It starts no claim when less than
+  4 seconds of the hold remain, by its own count. A deferred batch becomes eligible again at a later turn or waiter,
   after the ledger's deferral backoff (1 second after the first attempt, 5
   seconds after the second); a batch that has used its third delivery attempt is
   not offered again. A write that may have reached the hook and was never

@@ -327,7 +327,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const claimIds = bodies
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound, route: config.toolRoute })
           : ids
-        // The floor is checked last, with no await and no other work before the claim is sent.
+        // The floor is checked after the candidate packing, with no await before the claim is sent.
         if (short()) return false
         const started = now()
         const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
