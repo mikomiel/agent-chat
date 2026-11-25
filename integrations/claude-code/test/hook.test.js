@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Readable } from "node:stream"
-import { HOLD_MS, MAX_HOLD_MS, effectiveHoldMs, runHook } from "../lib/hook.js"
+import { HOLD_MS, MAX_HOLD_MS, MIN_HOLD_MS, effectiveHoldMs, runHook } from "../lib/hook.js"
 import { MAX_OUTPUT_BYTES } from "../lib/channel.js"
 
 const absent = () => Object.assign(new Error("absent"), { code: "ENOENT" })
@@ -315,15 +315,19 @@ test("a waiter whose parent process vanished leaves without waiting out the hold
   assert.ok(Date.now() - started < 1500, "the orphan check, not the hold, ended the wait")
 })
 
-// Issue #133: the waiter holds for the configured `idleWakeHoldSeconds`, clamped to the longest hold. A refused config
+// Issue #133: the waiter holds for the configured `idleWakeHoldSeconds`, clamped between the shortest and the longest hold. A refused config
 // also exits 0 and says nothing, the same as a waiter that held, so these cases check what a refusal cannot show: the
 // waiter connected and sent its `wait` frame (`sent`), and it asked the connection for the hold the config names
 // (`holds`). `holdMs: null` takes the test seam away, so the config alone decides.
-test("the effective hold is the configured seconds, never past the longest hold, and the default when none is usable", () => {
+test("the effective hold is the configured seconds, raised to the shortest hold, cut to the longest, and the default when none is usable", () => {
   assert.equal(HOLD_MS, 3_540_000, "59 minutes by default")
+  assert.equal(MIN_HOLD_MS, 10_000, "10 seconds at least")
   assert.equal(MAX_HOLD_MS, 8_385_000, "8,385 seconds at most")
   assert.equal(effectiveHoldMs(undefined), HOLD_MS)
-  assert.equal(effectiveHoldMs(1), 1000)
+  // A hold below the floor is raised, never refused.
+  for (const seconds of [1, 2, 9]) assert.equal(effectiveHoldMs(seconds), MIN_HOLD_MS, String(seconds))
+  assert.equal(effectiveHoldMs(MIN_HOLD_MS / 1000), MIN_HOLD_MS)
+  assert.equal(effectiveHoldMs(MIN_HOLD_MS / 1000 + 1), MIN_HOLD_MS + 1000)
   assert.equal(effectiveHoldMs(MAX_HOLD_MS / 1000), MAX_HOLD_MS)
   for (const seconds of [MAX_HOLD_MS / 1000 + 1, 10_000, 86_400, Number.MAX_SAFE_INTEGER]) {
     assert.equal(effectiveHoldMs(seconds), MAX_HOLD_MS, String(seconds))
@@ -334,10 +338,10 @@ test("the effective hold is the configured seconds, never past the longest hold,
   }
 })
 
-test("the waiter holds for the configured seconds, clamps a longer hold and keeps the default when none is set", async () => {
+test("the waiter holds for the configured seconds, raises a shorter hold, clamps a longer one and keeps the default when none is set", async () => {
   const cap = MAX_HOLD_MS / 1000
   for (const [seconds, expected] of [
-    [undefined, HOLD_MS], [1, 1000], [120, 120_000], [3540, HOLD_MS],
+    [undefined, HOLD_MS], [1, MIN_HOLD_MS], [9, MIN_HOLD_MS], [10, 10_000], [11, 11_000], [120, 120_000], [3540, HOLD_MS],
     [cap, MAX_HOLD_MS], [cap + 1, MAX_HOLD_MS], [86_400, MAX_HOLD_MS], [Number.MAX_SAFE_INTEGER, MAX_HOLD_MS],
   ]) {
     // A cancel frame ends the wait at once, so the case does not wait out the hold it measures.
@@ -350,16 +354,14 @@ test("the waiter holds for the configured seconds, clamps a longer hold and keep
   }
 })
 
-test("with a one-second hold the waiter leaves quietly at the hold and sends no receipt", { timeout: 15_000 }, async () => {
-  const began = Date.now()
-  const result = await run("wait", base, { config: { idleWakeHoldSeconds: 1 }, holdMs: null })
-  const elapsed = Date.now() - began
+// The test seam `holdMs` wins over the config, so a case that must see the hold run out does not wait for the
+// 10-second floor. The e2e suite runs the real 10-second hold.
+test("when the hold runs out the waiter leaves quietly and sends no receipt, and the seam wins over the config", async () => {
+  const result = await run("wait", base, { config: { idleWakeHoldSeconds: 1 }, holdMs: 50 })
   assert.equal(result.code, 0)
   assert.deepEqual(result.stdout.concat(result.stderr), [])
   assert.deepEqual(result.sent, [{ op: "wait" }], "it registered, waited and acknowledged nothing: no done frame")
-  assert.deepEqual(result.holds, [1000])
-  assert.ok(elapsed >= 900, `the hold ended the wait, not an early refusal (${elapsed} ms)`)
-  assert.ok(elapsed < 5000, `the one-second hold, not the default, ended the wait (${elapsed} ms)`)
+  assert.deepEqual(result.holds, [50])
 })
 
 test("a bad idleWakeHoldSeconds keeps the waiter silent: no connection, no wait, no output", async () => {

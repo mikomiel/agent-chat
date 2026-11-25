@@ -263,15 +263,15 @@ test("a hook whose output pipe was closed exits 0, and the delivery it could not
   }
 })
 
-// Issue #133: with `idleWakeHoldSeconds: 1` the real waiter holds for one second, then leaves with exit 0 and no
-// output. A config that was refused would also exit 0 and print nothing, so the test also needs the join and the time
-// the wait took. The guard turns a hold that was not applied into a failure in seconds, not an hour.
+// Issue #133: with `idleWakeHoldSeconds: 1` the real waiter holds for the 10-second floor, then leaves with exit 0 and
+// no output. A config that was refused would also exit 0 and print nothing, so the test also needs the join and the
+// time the wait took. The guard turns a hold that was not applied into a failure in seconds, not an hour.
 const within = (promise, ms) => new Promise(resolve => {
   const timer = setTimeout(() => resolve(null), ms)
   promise.then(value => { clearTimeout(timer); resolve(value) })
 })
 
-test("a waiter with a one-second hold leaves quietly at the hold, with no claim and no output", { timeout: 90_000 }, async t => {
+test("a waiter configured for a one-second hold holds for the 10-second floor, then leaves quietly with no claim and no output", { timeout: 90_000 }, async t => {
   if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
   const f = fixture({ idleWakeHoldSeconds: 1 })
   const common = { session_id: "e2e-short-hold", permission_mode: "default" }
@@ -282,19 +282,54 @@ test("a waiter with a one-second hold leaves quietly at the hold, with no claim 
     await hook(f.env, "stop", { ...common, hook_event_name: "Stop" })
     await f.until(() => f.ops("heartbeat").some(entry => entry.state.native_state === "idle"), "an idle heartbeat")
     const began = Date.now()
-    const waited = await within(hook(f.env, "wait", { ...common, hook_event_name: "Stop" }), 20_000)
+    const waited = await within(hook(f.env, "wait", { ...common, hook_event_name: "Stop" }), 30_000)
     const elapsed = Date.now() - began
-    assert.notEqual(waited, null, "the waiter did not leave within 20 seconds: the one-second hold was not applied")
+    assert.notEqual(waited, null, "the waiter did not leave within 30 seconds: the configured hold was not applied")
     assert.equal(waited.code, 0)
     assert.equal(waited.stderr, "")
     assert.equal(waited.stdout, "")
-    assert.ok(elapsed >= 900, `the hold ended the wait, not an early refusal (${elapsed} ms)`)
+    assert.ok(elapsed >= 9_500, `the 10-second floor ended the wait, not an early exit at the configured second (${elapsed} ms)`)
     assert.equal(f.ops("claim").length, 0)
     assert.equal(f.ops("settle").length, 0)
   } finally {
     // The receiver's end cancels a waiter that is still registered, so a failed run leaves no hook behind.
     await hook(f.env, "session-end", { ...common, hook_event_name: "SessionEnd", reason: "other" })
     // A failed test must not leave processes behind: stop exactly the two this test started.
+    const [first] = f.ops("join")
+    for (const pid of [first?.pid, first?.ppid]) {
+      if (Number.isInteger(pid) && pid > 1 && alive(pid)) reap(pid)
+    }
+    rmSync(f.root, { recursive: true, force: true })
+  }
+})
+
+// Issue #133: the shortest configured hold (`idleWakeHoldSeconds: 1`, effective 10 s) must still reach a message that
+// was queued before the waiter registered. The receiver's first poll comes after 2 s, so a one-second hold would have
+// ended first; the floor leaves room for it.
+test("a waiter with the shortest configured hold delivers a message that was already queued, before the hold ends", { timeout: 90_000 }, async t => {
+  if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
+  const f = fixture({ idleWakeHoldSeconds: 1 })
+  const common = { session_id: "e2e-min-hold-queued", permission_mode: "default" }
+  try {
+    const started = await hook(f.env, "session-start", { ...common, hook_event_name: "SessionStart", source: "startup" })
+    assert.equal(started.code, 0)
+    assert.equal(f.ops("join").length, 1, "the config was accepted: the receiver started and joined")
+    f.queue("msg-queued")
+    await hook(f.env, "stop", { ...common, hook_event_name: "Stop" })
+    await f.until(() => f.ops("heartbeat").some(entry => entry.state.native_state === "idle"), "an idle heartbeat")
+    const began = Date.now()
+    const woken = await within(hook(f.env, "wait", { ...common, hook_event_name: "Stop" }), 30_000)
+    const elapsed = Date.now() - began
+    assert.notEqual(woken, null, "the waiter did not leave within 30 seconds")
+    assert.equal(woken.code, 2)
+    assert.equal(woken.stdout, "")
+    assert.ok(woken.stderr.startsWith(CHAT_PREFIX))
+    assert.match(woken.stderr, /"history_after":"cursor-msg-queued"/)
+    assert.ok(elapsed < 9_000, `the message arrived before the 10-second hold ended (${elapsed} ms)`)
+    await f.until(() => f.ops("settle").length === 1, "the settle after the wake")
+    assert.deepEqual(f.ops("settle")[0].result, { outcome: "handed", reason: null })
+  } finally {
+    await hook(f.env, "session-end", { ...common, hook_event_name: "SessionEnd", reason: "other" })
     const [first] = f.ops("join")
     for (const pid of [first?.pid, first?.ppid]) {
       if (Number.isInteger(pid) && pid > 1 && alive(pid)) reap(pid)

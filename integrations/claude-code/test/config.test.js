@@ -176,6 +176,14 @@ test("any other idleWakeHoldSeconds keeps chat off", () => {
   }
 })
 
+// The loader validates the parsed number, not the JSON text. JSON.parse turns 1.0000000000000001 into 1 (it is
+// beyond double precision), so this literal is the whole number 1 by JSON number semantics. Accepted on purpose.
+test("a literal that JSON parses to a whole number is accepted as that number", () => {
+  const { dir, file } = fixture(undefined, 0o600, `${JSON.stringify(base).slice(0, -1)},"idleWakeHoldSeconds":1.0000000000000001}`)
+  try { assert.equal(loadConfig({ [ENV]: file }).idleWakeHoldSeconds, 1) }
+  finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
 test("a valid idleWakeHoldSeconds does not open the key set: a misspelled sibling still keeps chat off", () => {
   assert.equal(withConfig({ ...base, idleWakeHoldSeconds: 60, idleWakeHoldSecond: 60 }), null)
   assert.equal(withConfig({ ...base, idleWakeHold: 60 }), null)

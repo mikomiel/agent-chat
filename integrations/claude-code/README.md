@@ -86,7 +86,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `python` | Absolute interpreter that can import `agent_chat`. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
-| `idleWakeHoldSeconds` | Optional. A positive integer: how many seconds the idle-wake waiter holds before it leaves. The default is `3540` (59 minutes). A value above `8385` holds for `8385` seconds and is never refused. Any other value keeps chat off: zero, a negative or fractional number, a string, or any other type. See [Limitations](#limitations). |
+| `idleWakeHoldSeconds` | Optional. A positive integer: how many seconds the idle-wake waiter holds before it leaves. The default is `3540` (59 minutes). A value below `10` holds for `10` seconds and a value above `8385` holds for `8385` seconds: both are raised or cut, never refused. The loader validates the parsed JSON number, so a literal that JSON parses to a whole number (such as `1.0`) is accepted as that number. Any other value keeps chat off: zero, a negative or fractional number, a string, or any other type. See [Limitations](#limitations). |
 
 Name the file in the environment of the Claude Code process:
 

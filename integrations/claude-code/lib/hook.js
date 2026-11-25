@@ -17,17 +17,21 @@ import { MAX_OUTPUT_BYTES } from "./channel.js"
 // hooks/hooks.json sets the matching `timeout` values in seconds. Claude Code
 // enforces the timeout of an asyncRewake hook, so the waiter always leaves before
 // it: after HOLD_MS by default, and after at most MAX_HOLD_MS when the config asks
-// for a longer hold. test/plugin.test.js pins both relations.
+// for a longer hold. MIN_HOLD_MS is the other end: the receiver's first poll comes
+// 2,000 ms after the waiter registers (POLL_MS in lib/receiver.js), so a shorter
+// hold could end before a message that was already queued is ever seen.
+// test/plugin.test.js pins these relations.
 export const HOLD_MS = 3_540_000
+export const MIN_HOLD_MS = 10_000
 export const MAX_HOLD_MS = 8_385_000
 
 // The hold, in milliseconds, for a configured number of seconds: the default when
-// none is configured, never more than the maximum. It names no harness and reads
-// no state, so another package can copy it. The config loader refuses a value
-// that is not a positive integer; this falls back to the default for one, so a
-// bad value can never make the hold zero or NaN.
+// none is configured, raised to the minimum and cut to the maximum otherwise. It
+// names no harness and reads no state, so another package can copy it. The config
+// loader refuses a value that is not a positive integer; this falls back to the
+// default for one, so a bad value can never make the hold zero or NaN.
 export const effectiveHoldMs = seconds => (
-  Number.isInteger(seconds) && seconds > 0 ? Math.min(seconds * 1000, MAX_HOLD_MS) : HOLD_MS
+  Number.isInteger(seconds) && seconds > 0 ? Math.min(Math.max(seconds * 1000, MIN_HOLD_MS), MAX_HOLD_MS) : HOLD_MS
 )
 
 export const LIMITS_MS = { "session-start": 13_000, prompt: 9_000, tool: 9_000, stop: 4_000, "session-end": 1_000 }
@@ -78,7 +82,7 @@ async function quiet(link, request, waitMs) {
 // The asyncRewake waiter: it holds the connection open and exits 2 with the
 // notice on stderr when the receiver delivers one. Everything else, including
 // the hold running out and a vanished parent process, exits 0 without output.
-// The hold is the configured `idleWakeHoldSeconds`, clamped; `io.holdMs` is the
+// The hold is the configured `idleWakeHoldSeconds`, clamped to the limits; `io.holdMs` is the
 // test seam and wins when set.
 async function waitForWake(link, io, config) {
   const origin = io.ppid()

@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
-import { HOLD_MS, LIMITS_MS, MAX_HOLD_MS } from "../lib/hook.js"
+import { HOLD_MS, LIMITS_MS, MAX_HOLD_MS, MIN_HOLD_MS } from "../lib/hook.js"
 
 // The plugin surface is pinned here because Claude Code reads it, not this
 // package: a renamed event, a dropped `asyncRewake` or a hook timeout that the
@@ -74,6 +74,19 @@ test("the longest hold that the config allows also ends well before the waiter's
   const timeout = timeoutMs("Stop", "wait")
   assert.ok(HOLD_MS <= MAX_HOLD_MS, "the default hold is inside the cap")
   assert.ok(MAX_HOLD_MS + 600_000 <= timeout, "10 minutes to flush a notice and to exit before Claude Code enforces the timeout")
+})
+
+// The receiver does not export its poll interval, and lib/receiver.js is not to change for this, so the constant is
+// read from its source (`const POLL_MS = 2_000`). A hold shorter than two polls can end before a message that was
+// already queued at registration is seen.
+test("the shortest hold is at least two receiver poll intervals, so a queued message is seen before the hold ends", () => {
+  const source = readFileSync(`${root}lib/receiver.js`, "utf8")
+  const match = /^const POLL_MS = (\d[\d_]*)\s*$/m.exec(source)
+  assert.ok(match, "POLL_MS is declared in lib/receiver.js")
+  const pollMs = Number(match[1].replaceAll("_", ""))
+  assert.ok(pollMs > 0)
+  assert.ok(MIN_HOLD_MS >= 2 * pollMs, `MIN_HOLD_MS ${MIN_HOLD_MS} is under two polls of ${pollMs} ms`)
+  assert.ok(MIN_HOLD_MS < HOLD_MS, "the floor is below the default hold")
 })
 
 test("every in-process time limit ends before the hook's own timeout", () => {
