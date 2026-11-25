@@ -1,10 +1,14 @@
 """Explicit migrations and bounded PostgreSQL connections, never implicit startup DDL."""
 
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 
 from .models import ChatError
@@ -28,8 +32,67 @@ LEGACY_DIGESTS: dict[int, frozenset[str]] = {
 }
 
 
-def connect(dsn: str) -> psycopg.Connection[dict[str, Any]]:
-    return psycopg.Connection[dict[str, Any]].connect(
+#: Seconds a request deadline keeps free below the session's lock limit, for the work after the last bounded
+#: statement: the commit, the response and its transport. Production's 3 s lock limit equals the CLI's 3 s socket
+#: step (`agent_chat/client.py`), so a bounded request ends its last statement at most 2 s after it was accepted
+#: and answers before the client gives it up as uncertain (issue #177). The two values are coupled only by this
+#: comment: raising the lock limit in `connect`, or lowering the client step, moves the deadline to or past the
+#: client step and reopens #177. tests/agent_chat/test_request_deadline.py pins the production budget.
+REQUEST_MARGIN_SECONDS = 1.0
+
+
+class RequestDeadlineSpent(psycopg.OperationalError):
+    """Raised before a bounded statement when the request deadline has passed; nothing more reaches the database."""
+
+
+class BoundedConnection(psycopg.Connection[dict[str, Any]]):
+    """A connection whose transaction statements can share one request deadline.
+
+    PostgreSQL 16 has no transaction-wide timeout, and `lock_timeout` bounds each wait on its own, so a request with
+    several sequential lock waits can outlast its client. While `request_deadline` is active, every statement inside
+    a transaction first lowers `lock_timeout` and `statement_timeout`, for the transaction only, to the time left.
+    """
+
+    _deadline: float | None = None
+    _limits: tuple[int, int] = (0, 0)
+
+    @contextmanager
+    def request_deadline(self, accepted: float) -> Generator[None, None, None]:
+        """Bound the transactions run in this block to end before `accepted` plus the session's lock limit, less
+        `REQUEST_MARGIN_SECONDS`. `accepted` is a `time.monotonic()` reading taken when the request arrived.
+
+        The budget comes from this session's own limits, so a connection whose limits were raised or lowered keeps
+        that change; a limit of 0 (none) stays unbounded.
+        """
+        rows = super().execute(
+            "SELECT name, setting::integer AS ms FROM pg_settings WHERE name IN ('lock_timeout', 'statement_timeout')"
+        ).fetchall()
+        limits = {row["name"]: row["ms"] for row in rows}
+        self._limits = (limits["lock_timeout"], limits["statement_timeout"])
+        lock_ms = self._limits[0]
+        self._deadline = accepted + lock_ms / 1000 - REQUEST_MARGIN_SECONDS if lock_ms else None
+        try:
+            yield
+        finally:
+            self._deadline = None
+
+    # Pass-through arguments: psycopg's own execute still checks and runs every call; only the bound is added.
+    def execute(self, *args: Any, **kwargs: Any) -> psycopg.Cursor[dict[str, Any]]:
+        if self._deadline is not None and self.info.transaction_status == TransactionStatus.INTRANS:
+            left = int((self._deadline - time.monotonic()) * 1000)
+            # 0 would mean no limit at all, so a spent deadline refuses instead.
+            if left < 1:
+                raise RequestDeadlineSpent("request deadline spent")
+            lock_ms, statement_ms = self._limits
+            super().execute(
+                "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)",
+                (str(min(left, lock_ms)), str(min(left, statement_ms) if statement_ms else left)),
+            )
+        return super().execute(*args, **kwargs)
+
+
+def connect(dsn: str) -> BoundedConnection:
+    return BoundedConnection.connect(
         dsn,
         autocommit=True,
         row_factory=dict_row,

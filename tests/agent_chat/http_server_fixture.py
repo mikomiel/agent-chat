@@ -11,7 +11,11 @@ from agent_chat.api import create_app
 
 
 def connect_with_budget(seconds):
-    """`storage.connect` with its lock and statement limits replaced by one budget."""
+    """`storage.connect` with its lock and statement limits replaced by one budget.
+
+    The session lock limit also sets the claim and settle request deadline (`storage.BoundedConnection`), so this
+    budget moves that deadline too.
+    """
 
     def connect(dsn):
         db = storage.connect(dsn)
