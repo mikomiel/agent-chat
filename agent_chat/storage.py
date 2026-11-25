@@ -77,7 +77,9 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
         self, savepoint_name: str | None = None, force_rollback: bool = False
     ) -> Generator[Transaction, None, None]:
         # Limits set inside a transaction end with it, and a savepoint that rolls back undoes its own: the next
-        # statement measures again.
+        # statement measures again. A spent deadline sends no BEGIN or SAVEPOINT either.
+        if self._deadline is not None:
+            self._left()
         self._measured = None
         try:
             with super().transaction(savepoint_name, force_rollback) as transaction:

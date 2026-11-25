@@ -519,3 +519,14 @@ def test_a_fast_arming_reply_that_uses_up_the_time_left_refuses_the_statement(da
             bounded.execute(LOCK_LIMIT)
         assert delayed
         assert LOCK_LIMIT not in others
+
+
+@pytest.mark.parametrize("nested", [False, True], ids=["transaction", "savepoint"])
+def test_a_spent_deadline_opens_no_transaction_or_savepoint(database, monkeypatch, nested):
+    with connect(database) as bounded:
+        clock, _, _ = slow_first_arm(monkeypatch, bounded, 0)
+        outer = bounded.transaction() if nested else nullcontext()
+        with bounded.request_deadline(clock() - SERVER_BUDGET + 0.5), outer:
+            monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: clock() + 1))
+            with pytest.raises(RequestDeadlineSpent), bounded.transaction():
+                pytest.fail("the block must not run")
