@@ -88,13 +88,17 @@ async function waitForWake(link, io, config) {
   const origin = io.ppid()
   // The receiver cannot see this hook's timer, so the wait frame names the hold it is about to take.
   const hold = io.holdMs ?? effectiveHoldMs(config.idleWakeHoldSeconds)
+  // The hold starts before the frame is sent. The receiver starts its view of the hold when it handles the frame,
+  // which is never earlier, so it never stops waking this hook more than its 1-second safety before the hook leaves.
+  const mono = io.mono ?? (() => performance.now())
+  const started = mono()
   let watch
   try {
     if (!(await link.send({ op: "wait", hold_ms: hold }))) return 0
     const orphan = new Promise(resolve => {
       watch = setInterval(() => { if (io.ppid() !== origin) resolve(null) }, io.orphanMs ?? ORPHAN_MS)
     })
-    const reply = await Promise.race([link.next(hold), orphan])
+    const reply = await Promise.race([link.next(Math.max(0, hold - Math.floor(mono() - started))), orphan])
     const context = reply?.context
     if (typeof context !== "string" || !context) return 0
     const ok = fits(context)
@@ -159,6 +163,7 @@ export function nodeIo() {
     env: process.env,
     connect,
     ppid: () => process.ppid,
+    mono: () => performance.now(),
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
     write: (stream, text) => new Promise(resolve => {
       try { process[stream].write(text, error => resolve(!error)) } catch { resolve(false) }

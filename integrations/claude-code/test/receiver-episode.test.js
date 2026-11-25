@@ -166,7 +166,7 @@ async function idle(r) {
 // A stopped session with an idle-wake waiter registered. `control.stale` makes the next heartbeat answer
 // STALE_INSTANCE, which starts a rejoin episode while the waiter is registered; `control.queued` is what the service
 // holds for the session, and the waiter would claim it on its next poll if a worker were live.
-async function armed({ joinErrors, joinHold } = {}) {
+async function armed({ joinErrors, joinHold, holdMs = 3_540_000 } = {}) {
   const control = { stale: false, queued: [] }
   const r = await rig({
     joinErrors, joinHold,
@@ -177,7 +177,7 @@ async function armed({ joinErrors, joinHold } = {}) {
   })
   await idle(r)
   const wake = hookDouble()
-  const waiting = r.receiver.handle({ op: "wait" }, wake)
+  const waiting = r.receiver.handle({ op: "wait", hold_ms: holdMs }, wake)
   await settle()
   return { r, control, wake, waiting }
 }
@@ -233,7 +233,7 @@ test("a waiter armed during a lease-lost episode wakes after the join", async ()
   await idle(r)
   const wake = hookDouble()
   await leaseGone({ r, control, wake })
-  const waiting = r.receiver.handle({ op: "wait" }, wake)
+  const waiting = r.receiver.handle({ op: "wait", hold_ms: 3_540_000 }, wake)
   await settle()
   control.stale = false // the lease that the rejoin gets is good
   control.queued = ["m1"] // and a message is waiting
@@ -351,6 +351,7 @@ test("a rejoin that starts just before the episode window ends and completes aft
   const outage = Array.from({ length: 200 }, () => joinRefusal("SERVICE_UNAVAILABLE"))
   const a = await armed({
     joinErrors: [undefined, ...outage],
+    holdMs: 8_385_000, // the longest hold outlasts the 7,150-second episode
     joinHold: () => {
       if (control.episodeStart === null || control.startedAt !== null) return undefined
       if (control.clock.now() - control.episodeStart < 7_100_000) return undefined

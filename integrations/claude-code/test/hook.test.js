@@ -34,11 +34,13 @@ function world(extra = {}) {
 // records each wait the waiter asked the connection for.
 async function run(name, payload, {
   env, config = {}, reply = { context: null }, frames = [], up = true, writeOk = true, writeDelay = 0,
-  hang = false, holdMs = 50, orphanMs = 10, ppid = () => 100, sleep = never,
+  hang = false, holdMs = 50, orphanMs = 10, ppid = () => 100, sleep = never, sendElapsedMs = 0,
 } = {}) {
   const w = world(config)
   const out = { stdout: [], stderr: [], started: [], calls: [], sent: [], log: [], connects: 0, holds: [] }
   const pending = [...frames]
+  // A monotonic clock that moves only when a send takes time, so a test can delay the send's completion.
+  let clock = 0
   const link = {
     async call(request) {
       out.calls.push(request)
@@ -46,7 +48,7 @@ async function run(name, payload, {
       if (hang) await never()
       return typeof reply === "function" ? reply(request) : reply
     },
-    async send(frame) { out.sent.push(frame); out.log.push(`send:${frame.op}`); return true },
+    async send(frame) { out.sent.push(frame); out.log.push(`send:${frame.op}`); clock += sendElapsedMs; return true },
     // A hold that the code under test got wrong must fail a test, not stall the run for the hour it asked for.
     next: ms => {
       out.holds.push(ms)
@@ -70,7 +72,7 @@ async function run(name, payload, {
       out[stream].push(text)
       return writeOk
     },
-    ppid, orphanMs, holdMs, sleep,
+    ppid, orphanMs, holdMs, sleep, mono: () => clock,
   }
   try {
     out.code = await runHook(name, io)
@@ -362,6 +364,15 @@ test("the wait frame carries hold_ms equal to the effective hold the waiter asks
     assert.equal(result.holds.length, 1)
     assert.deepEqual(result.sent, [{ op: "wait", hold_ms: result.holds[0] }], JSON.stringify([config, holdMs]))
   }
+})
+
+// The receiver registers the waiter when it handles the frame, which can be before the hook's send completes. The
+// hook's hold therefore starts before the send: a send that completes 30 s late leaves 30 s less to wait, so the hook
+// never outlasts the receiver's view of its hold by more than the receiver's safety margin.
+test("the hold starts before the wait frame is sent: a send that completes late shortens the wait by that time", async () => {
+  const result = await run("wait", base, { holdMs: 3_540_000, sendElapsedMs: 30_000, frames: [{ cancelled: true }] })
+  assert.deepEqual(result.sent, [{ op: "wait", hold_ms: 3_540_000 }])
+  assert.deepEqual(result.holds, [3_510_000])
 })
 
 // The test seam `holdMs` wins over the config, so a case that must see the hold run out does not wait for the
