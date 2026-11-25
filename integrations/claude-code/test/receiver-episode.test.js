@@ -56,7 +56,8 @@ function scheduler() {
 }
 
 // The product's worker, as a double. `handlers` override one operation each; `joinErrors[n]` refuses the (n+1)th join.
-function workerDouble({ handlers = {}, joinErrors = [] } = {}) {
+// `joinHold()` runs as each worker starts; a promise it returns holds that join open until the promise settles.
+function workerDouble({ handlers = {}, joinErrors = [], joinHold = () => undefined } = {}) {
   const log = []
   const bootIds = []
   const state = { stops: 0 }
@@ -77,8 +78,9 @@ function workerDouble({ handlers = {}, joinErrors = [] } = {}) {
       room_id: ROOM, host: "synthetic-host", harness: "claude", instance_file: `/tmp/agent-chat-state/${identity.bootId}.json`,
     }
     const refusal = joinErrors[bootIds.length - 1]
+    const hold = joinHold()
     return {
-      ready: refusal ? Promise.reject(refusal) : Promise.resolve(joined),
+      ready: hold ? hold.then(() => joined) : refusal ? Promise.reject(refusal) : Promise.resolve(joined),
       async request(op, fields = {}) {
         log.push({ op, ...fields })
         return answers[op](fields)
@@ -113,9 +115,9 @@ function hookDouble({ receipt = "written", answer = true, sendOk = true } = {}) 
   }
 }
 
-async function rig({ handlers, joinErrors } = {}) {
+async function rig({ handlers, joinErrors, joinHold } = {}) {
   const clock = scheduler()
-  const worker = workerDouble({ handlers, joinErrors })
+  const worker = workerDouble({ handlers, joinErrors, joinHold })
   const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
     startProcess: worker.startProcess,
     now: clock.now,
@@ -158,10 +160,10 @@ async function idle(r) {
 // A stopped session with an idle-wake waiter registered. `control.stale` makes the next heartbeat answer
 // STALE_INSTANCE, which starts a rejoin episode while the waiter is registered; `control.queued` is what the service
 // holds for the session, and the waiter would claim it on its next poll if a worker were live.
-async function armed({ joinErrors } = {}) {
+async function armed({ joinErrors, joinHold } = {}) {
   const control = { stale: false, queued: [] }
   const r = await rig({
-    joinErrors,
+    joinErrors, joinHold,
     handlers: {
       heartbeat: () => (control.stale ? { refused: "STALE_INSTANCE" } : {}),
       pending: () => ({ messages: control.queued }),
@@ -333,6 +335,55 @@ test("an episode that outlives its window sends disabled to a registered waiter 
   assert.deepEqual((await r.op(turn())).sent, [stopped("REJOIN_WINDOW")])
 })
 
+// The two-hour window bounds when a retry may start (the core policy, pinned by policy.test.js). A retry that started
+// inside the window and completes after it is served normally: the join stands and a registered waiter can be woken.
+test("a rejoin that starts just before the episode window ends and completes after it joins, and a registered waiter wakes", async () => {
+  const control = { clock: null, episodeStart: null, startedAt: null }
+  let release
+  const hold = new Promise(resolve => { release = resolve })
+  // Every rejoin is refused with an outage code until one starts more than 7,100 s into the episode; that one is held open.
+  const outage = Array.from({ length: 200 }, () => joinRefusal("SERVICE_UNAVAILABLE"))
+  const a = await armed({
+    joinErrors: [undefined, ...outage],
+    joinHold: () => {
+      if (control.episodeStart === null || control.startedAt !== null) return undefined
+      if (control.clock.now() - control.episodeStart < 7_100_000) return undefined
+      control.startedAt = control.clock.now()
+      return hold
+    },
+  })
+  const { r, control: service, wake, waiting } = a
+  control.clock = r.clock
+  await leaseGone(a)
+  control.episodeStart = r.clock.now()
+  service.queued = ["m1"]
+  r.worker.log.length = 0
+  await r.clock.advance(7_150_000)
+  const offset = control.startedAt - control.episodeStart
+  assert.ok(offset > 7_100_000 && offset < 7_200_000, `a retry started inside the window (${offset} ms into the episode)`)
+  const boots = r.worker.bootIds.length
+  assert.ok(boots > 2, "earlier retries were refused")
+  await r.clock.advance(100_000) // the window ends while that retry is still joining
+  assert.ok(r.clock.now() - control.episodeStart >= 7_200_000, "the window has ended")
+  assert.equal(r.worker.bootIds.length, boots, "no retry starts after the window")
+  assert.deepEqual(wake.sent, [], "the waiter is still registered and unanswered")
+  assert.equal(wake.closed, false)
+  assert.notEqual(r.receiver.state(), "offline", "the episode has not latched chat off")
+  service.stale = false // the lease that this join got is good
+  release()
+  await settle()
+  assert.equal(r.worker.bootIds.length, boots, "the late join did not start another worker")
+  assert.equal(wake.closed, false, "the join was not turned into disabled")
+  await r.clock.advance(2000) // the next poll on the core cadence
+  assert.equal(wake.sent.length, 1)
+  const [frame] = wake.sent
+  assert.match(frame.context, /"id":"m1"/)
+  assert.ok(frame.context.includes(`"instance_file":"/tmp/agent-chat-state/${r.worker.bootIds[boots - 1]}.json"`), "the notice names the late join's boot id")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+  wake.close()
+  await waiting
+})
+
 // The receiver owns both the episode and the waiter's socket, so a receiver that dies takes the socket with it. The
 // hook sees the connection close, not a frame: it must leave at once, print nothing and send no receipt. This runs
 // the real hook over the real socket layer, with the receiver's end closing 100 ms into a 30-second hold.
@@ -421,6 +472,37 @@ for (const [later, again] of [
     ])
   })
 }
+
+// The close can also come while the claim is in flight, with the reservation still ample. The delivery checks the link
+// as soon as the grant is valid: it makes no status call, which a transient failure could turn into an unsettled batch,
+// and it settles the batch `deferred`, so a later claim gets it.
+test("a waiter that closes while the claim is in flight settles the batch deferred without a status call, and a later turn claims it again", async () => {
+  const control = { onClaim: () => {} }
+  const r = await rig({
+    handlers: {
+      pending: () => ({ messages: ["m1"] }),
+      claim: fields => {
+        control.onClaim()
+        return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(row) }
+      },
+    },
+  })
+  await idle(r)
+  const wake = hookDouble()
+  control.onClaim = () => wake.close() // the hold ends while the claim is in flight
+  const waiting = r.receiver.handle({ op: "wait" }, wake)
+  await r.clock.advance(2000)
+  await waiting
+  assert.equal(r.worker.ops("claim").length, 1, "the message was claimed while the waiter was open")
+  assert.deepEqual(r.worker.ops("status"), [], "no status call for a consumer that is already gone")
+  assert.deepEqual(wake.sent, [], "no notice was written")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "offline" }])
+  control.onClaim = () => {}
+  r.worker.log.length = 0
+  const next = await r.op(turn())
+  assert.equal(r.worker.ops("claim").length, 1, "a later turn claims the same message")
+  assert.match(next.sent[0].context, /"id":"m1"/)
+})
 
 // The two pre-write timeout branches of a delivery settle `uncertain` only when the consumer is still there: with the
 // link already closed, nothing was written and nothing can have been shown, so the batch settles `deferred`, exactly as

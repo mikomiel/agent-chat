@@ -317,8 +317,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const reservation = Number(grant.reservation_ms)
         let result
         let replied = false
-        // Before a write, a known close means nothing was shown, so the batch stays offerable (see hand).
-        if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = link.closed ? GONE : UNCERTAIN
+        // Before a write, a known close means nothing was shown, so the batch stays offerable (see hand). A consumer
+        // that left during the claim needs no status call: a failed one would end the delivery with no settlement.
+        if (link.closed) result = GONE
+        else if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = UNCERTAIN
         else {
           const state = await ask("status")
           if (!live) return false

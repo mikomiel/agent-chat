@@ -249,7 +249,9 @@ or a stop. Only the idle-wake waiter exits 2.
   during an episode causes no claim after the join. An episode that spends its
   budget or its window latches chat off, answers a registered waiter with
   `disabled` (the hook then exits 0 without output) and claims nothing after
-  that.
+  that. The two-hour window bounds when a retry may start. A retry that started
+  before the window ended and finishes after it still joins, and a registered
+  waiter can then be woken: the receiver does not discard a completed join.
 - **The first release with `asyncRewake` is not documented.** A release that
   ignores the field would run the waiter as an ordinary `Stop` hook and hold
   every stop until the hold ends. Remove the `wait` entry from
