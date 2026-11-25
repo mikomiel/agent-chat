@@ -478,7 +478,7 @@ The service MUST take one deadline per delivery claim and result when the reques
 - **AND** no delivery attempt is recorded, and the pending view offers the message again
 
 #### Scenario: Several waits that each fit the lock limit
-- **WHEN** a claim or a result waits on two locks in turn, each for less than the lock limit, and together for longer than the deadline
+- **WHEN** a claim or a result waits on two locks in turn, each for less than the lock limit, and the second wait lasts until more than 250 milliseconds, plus the statement's transit to the database, after the deadline
 - **THEN** the service answers 503 `DATABASE_UNAVAILABLE` before the client's step ends
 - **AND** a claim records no attempt, and a result leaves the attempt open and the message not handed
 

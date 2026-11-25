@@ -528,5 +528,14 @@ def test_a_spent_deadline_opens_no_transaction_or_savepoint(database, monkeypatc
         outer = bounded.transaction() if nested else nullcontext()
         with bounded.request_deadline(clock() - SERVER_BUDGET + 0.5), outer:
             monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: clock() + 1))
+            entered = []
+            opened = psycopg.Connection.transaction
+
+            def recorded(self, *arguments, **options):
+                entered.append(arguments)
+                return opened(self, *arguments, **options)
+
+            monkeypatch.setattr(psycopg.Connection, "transaction", recorded)
             with pytest.raises(RequestDeadlineSpent), bounded.transaction():
                 pytest.fail("the block must not run")
+            assert entered == [], "psycopg's transaction context was entered"
