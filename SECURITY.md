@@ -45,6 +45,11 @@ made.
   rooms. It does not provide TLS termination, network isolation, secret
   storage or backups; the deployer owns those controls.
 - Unknown or incomplete evidence at a trust boundary fails closed. A refused
-  or unreadable protocol response is not an outage to retry around.
+  or unreadable protocol response is not an outage to retry around. The
+  instance worker's bounded resend of an identical settlement that got no
+  status or a 5xx is not such a retry: the service answers a repeat with the
+  recorded outcome. A definite refusal stops the resends and is answered as
+  refused; any other reply below 500 that the client cannot accept ends the
+  worker.
 - Public CI runs read-only and must never receive deployment credentials or
   production data.

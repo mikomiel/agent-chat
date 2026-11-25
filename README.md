@@ -187,9 +187,20 @@ and performs no name resolution. TLS still verifies the server's host name,
 and the `Host` header still carries it. When none of the addresses accepts a
 connection, the request fails with `TRANSPORT_UNAVAILABLE`. A heartbeat or
 pending request answers it as a tolerated outage for less than the server
-lease; a status, claim or settle request still ends the worker. The worker
-never resolves again inside a request: an address change reaches a binding at
-its next join, which the rejoin below performs.
+lease; a status or claim request still ends the worker. A settle request that
+gets no status, because the connection fails before the status line and headers
+are read or ends before a three-digit status code, or that gets a 5xx reply, is
+sent again, with the same attempt and
+result, until 1 second before the request's deadline (#176); the last failure
+then ends the worker, and a try the deadline cuts reports `REQUEST_UNCERTAIN`.
+The service sends a status below 500 only once a settlement is committed or
+definitely refused, so a definite delivery refusal is answered as refused, and
+any other reply below 500 that the client cannot accept, such as a redirect, a
+reply that is not the service's or is cut, or a reply the parser rejects, ends
+the worker at once. SIGTERM during a pause between tries ends the worker with
+`REQUEST_UNCERTAIN`. The worker never resolves again inside a request: an
+address change reaches a binding at its next join, which the rejoin below
+performs.
 
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,
 `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` starts a bounded rejoin with

@@ -375,7 +375,9 @@ class Client:
                 if isinstance(code, str) and HTTP_ERROR_STATUS.get(code) == response.status:
                     raise ChatError(code)
                 if response.status >= 500:
-                    raise ChatError("REQUEST_UNCERTAIN" if submitted else "SERVICE_UNAVAILABLE")
+                    raise ChatError(
+                        "REQUEST_UNCERTAIN" if submitted else "SERVICE_UNAVAILABLE", unanswered=response.status < 600
+                    )
                 # A caller that tells refusals from outages (`refused`) reads an unnamed 408 or 429 as an outage.
                 if refused is not None and response.status in (408, 429) and not submitted:
                     raise ChatError("SERVICE_UNAVAILABLE")
@@ -409,7 +411,21 @@ class Client:
                 and isinstance(error, (ValueError, RecursionError))
             ):
                 raise ChatError(refused) from None
-            raise ChatError("REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE") from None
+            # `unanswered`: the try got no status, or a 5xx. http.client gives the status only once it has read the
+            # status line and headers, so no status means the connection failed before then (an OSError, which
+            # includes a peer that closed before the status line or reset it inside the headers) or ended before a
+            # three-digit status code (a BadStatusLine without a line end). The service sends a status below 500 only
+            # once a request is committed or definitely refused, so such a reply is an answer even when its body is
+            # cut or breaks the protocol, as is any reply the parser rejects (a bad status line, too many headers).
+            # http.client cannot show the end of a header block, a chunked trailer or an unframed body, so the status
+            # is the boundary.
+            # BadStatusLine carries the line it read (typeshed omits its `line` attribute); a cut one has no newline.
+            cut_status = isinstance(error, http.client.BadStatusLine) and not str(error.args[0]).endswith("\n")
+            no_status = status is None and (isinstance(error, OSError) or cut_status)
+            unanswered = no_status or (status is not None and 500 <= status < 600)
+            raise ChatError(
+                "REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE", unanswered=unanswered
+            ) from None
         finally:
             if watchdog is not None:
                 watchdog.cancel()
