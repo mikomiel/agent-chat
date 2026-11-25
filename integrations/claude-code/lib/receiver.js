@@ -27,6 +27,9 @@ const CLAIM_MARGIN_MS = 2_500 // a hook consumer needs this long left to claim a
 // batch to a later consumer, while one that is late writes to a hook that has left. No claim starts with less than
 // WAKE_FLOOR_MS of that left: CLAIM_MARGIN_MS to claim and answer, plus 1.5 s for the status call and the write
 // receipt. The shortest hold (MIN_HOLD_MS, 10 s in lib/hook.js) less the safety and the first poll still leaves 7 s.
+// The floor is checked at the poll and again after the pending read, immediately before the claim. The hook's timeout
+// measures elapsed time, so the hold's end and every comparison against it use the monotonic clock (`mono`), never a
+// wall clock that a step could move.
 const WAIT_SAFETY_MS = 1_000
 const WAKE_FLOOR_MS = CLAIM_MARGIN_MS + 1_500
 const MAX_BINDING_BYTES = 4_096
@@ -75,6 +78,7 @@ export function processStartTime(pid, read = path => readFileSync(path, "utf8"))
 export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
   now = Date.now,
+  mono = () => performance.now(),
   random = Math.random,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
@@ -300,7 +304,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   function deliver({ link, wake, announce = null, deadline = Infinity, holder = null }) {
     // The consumer has left: its socket closed, or the hold it announced has ended. The receiver can see the hold's
     // end before the close event arrives, so it checks both.
-    const gone = () => link.closed || (holder?.ends != null && now() >= holder.ends)
+    const gone = () => link.closed || (holder?.ends != null && mono() >= holder.ends)
+    // Too little left to claim and answer. A waiter that knows its hold needs the whole wake floor; any other consumer
+    // needs the claim margin before its deadline.
+    const short = () => (holder?.ends != null ? holder.ends - mono() < WAKE_FLOOR_MS : deadline - now() < CLAIM_MARGIN_MS)
     if (!live || !joined || closed || failure || delivering || inflight || !eligible(wake)) return Promise.resolve(false)
     return exclusive(async () => {
       if (!live || closed) return false
@@ -314,7 +321,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const candidates = await ask("pending", bodies ? { bodies: true } : {})
         if (!live || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
-        if (!ids.length || link.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
+        if (!ids.length || link.closed || !eligible(wake) || short()) return false
         // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply
         // without sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
         const claimIds = bodies
@@ -359,8 +366,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const current = waiter
     if (!current || current.delivering || inflight || chatState() !== null) return
     // Not worth a claim that the hook may leave before it settles; the batch waits for the next consumer.
-    if (current.ends !== null && current.ends - now() < WAKE_FLOOR_MS) return
-    const replied = await guard(deliver({ link: current.link, wake: true, holder: current, deadline: current.ends ?? Infinity }))
+    if (current.ends !== null && current.ends - mono() < WAKE_FLOOR_MS) return
+    const replied = await guard(deliver({ link: current.link, wake: true, holder: current }))
     if (replied === true && waiter === current) dropWaiter()
     await report()
   }
@@ -426,7 +433,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (waiter) return link.send({ cancelled: true })
     // An older hook sends no hold, and a malformed one is no better: the receiver then knows no deadline.
     const hold = Number.isSafeInteger(request.hold_ms) && request.hold_ms > 0 ? request.hold_ms : null
-    const current = { link, delivering: false, ends: hold === null ? null : now() + hold - WAIT_SAFETY_MS }
+    const current = { link, delivering: false, ends: hold === null ? null : mono() + hold - WAIT_SAFETY_MS }
     waiter = current
     pollTimer = setIntervalImpl(() => { void wakePoll() }, POLL_MS)
     return new Promise(resolve => link.onClose(() => {

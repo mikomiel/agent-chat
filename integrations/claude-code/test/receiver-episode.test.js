@@ -25,14 +25,18 @@ const settle = async () => {
 }
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-// A manual scheduler: nothing runs until the test advances the clock.
+// A manual scheduler: nothing runs until the test advances the clock. `clock` is the monotonic clock and drives the
+// timers; the wall clock is `clock` plus a `skew` that only `stepWall` moves, as an NTP step would.
 function scheduler() {
   let clock = 1_000_000
+  let skew = 0
   let next = 1
   const timers = new Map()
   const add = (fn, ms, repeat) => { const id = next++; timers.set(id, { fn, at: clock + ms, ms, repeat }); return id }
   return {
-    now: () => clock,
+    now: () => clock + skew,
+    mono: () => clock,
+    stepWall: ms => { skew += ms },
     setTimeoutImpl: (fn, ms) => add(fn, ms, false),
     clearTimeoutImpl: id => { timers.delete(id) },
     setIntervalImpl: (fn, ms) => add(fn, ms, true),
@@ -121,6 +125,7 @@ async function rig({ handlers, joinErrors, joinHold } = {}) {
   const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
     startProcess: worker.startProcess,
     now: clock.now,
+    mono: clock.mono,
     random: () => 0.5,
     setTimeoutImpl: clock.setTimeoutImpl,
     clearTimeoutImpl: clock.clearTimeoutImpl,
@@ -553,11 +558,11 @@ for (const [branch, reservation, setup] of [
 // socket's close are separate events), so the receiver cannot rely on seeing it. The rig below keeps the link open
 // throughout: only the clock moves. A hold of 10,000 ms ends the receiver's view of the waiter at +9,000 ms (a 1,000 ms
 // safety for the hook's start-up and the IPC lag), and the first poll is at +2,000 ms.
-const holdRig = async ({ onClaim = () => {}, onStatus = () => {}, receipt = "written" } = {}) => {
-  const control = { onClaim, onStatus, clock: null }
+const holdRig = async ({ onPending = () => {}, onClaim = () => {}, onStatus = () => {}, receipt = "written" } = {}) => {
+  const control = { onPending, onClaim, onStatus, clock: null }
   const r = await rig({
     handlers: {
-      pending: () => ({ messages: ["m1"] }),
+      pending: async () => { await control.onPending(control); return { messages: ["m1"] } },
       claim: async fields => {
         await control.onClaim(control)
         return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(row) }
@@ -622,6 +627,48 @@ for (const [holdMs, claims] of [[6_999, false], [7_000, true]]) {
     assert.match(next.sent[0].context, /"id":"m1"/, "the message stays claimable by a later consumer")
   })
 }
+
+// The floor is checked again right before the claim: a slow pending read can use up the time the poll saw. The poll at
+// +2,000 ms of a 10,000 ms hold sees 7,000 ms left; a pending read of 3,000 ms leaves exactly the floor, one of 3,001 ms
+// leaves less, and a claim then could finish with too little time to answer.
+for (const [pendingMs, claims] of [[3_000, true], [3_001, false]]) {
+  test(`a pending read of ${pendingMs} ms that leaves ${claims ? "exactly the floor" : "less than the floor"} ${claims ? "is followed by a claim" : "is followed by no claim"}`, async () => {
+    const { r, control, wake } = await holdRig({ onPending: control => control.clock.advance(pendingMs) })
+    const waiting = r.receiver.handle({ op: "wait", hold_ms: 10_000 }, wake)
+    await r.clock.advance(2000)
+    await drain()
+    assert.equal(r.worker.ops("pending").length, 1, "the poll saw enough time and read the pending list")
+    assert.equal(r.worker.ops("claim").length, claims ? 1 : 0)
+    assert.equal(wake.sent.length, claims ? 1 : 0)
+    assert.deepEqual(settled(r), claims ? [{ outcome: "handed", reason: null }] : [], "an unclaimed batch has nothing to settle")
+    wake.close()
+    await waiting
+    if (claims) return
+    control.onPending = () => {}
+    r.worker.log.length = 0
+    const next = await r.op(turn())
+    assert.match(next.sent[0].context, /"id":"m1"/, "the message stays claimable by a later consumer")
+    assert.deepEqual(settled(r), [{ outcome: "handed", reason: null }])
+  })
+}
+
+// The hook's timeout measures elapsed time, so the receiver measures the hold on a monotonic clock. A wall-clock step
+// back while the status call is in flight must not hide that the hold has ended.
+test("a wall-clock step back while the hold runs out does not hide that the waiter is gone: no write, and a later claim gets the batch", async () => {
+  const { r, wake } = await holdRig({ onStatus: control => { control.clock.stepWall(-60_000); return control.clock.advance(8_000) } })
+  const waiting = r.receiver.handle({ op: "wait", hold_ms: 10_000 }, wake)
+  await r.clock.advance(2000)
+  await drain()
+  assert.equal(wake.closed, false, "the receiver has not seen the socket close")
+  assert.equal(r.worker.ops("claim").length, 1, "the message was claimed while the hold had time left")
+  assert.deepEqual(wake.sent, [], "no notice was written to a hook that has already left")
+  assert.deepEqual(settled(r), [{ outcome: "deferred", reason: "offline" }])
+  wake.close()
+  await waiting
+  r.worker.log.length = 0
+  const next = await r.op(turn())
+  assert.match(next.sent[0].context, /"id":"m1"/, "a later claim gets the same batch")
+})
 
 // An older hook sends no hold; a malformed one is no better. Either way the receiver knows no deadline and behaves as
 // before: it writes even when the clock has run well past any hold.
