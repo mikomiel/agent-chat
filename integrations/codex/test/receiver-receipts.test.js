@@ -1,10 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { EventEmitter } from "node:events"
 import { readFileSync } from "node:fs"
+import { PassThrough } from "node:stream"
 import { createReceiver } from "../lib/receiver.js"
 import { MAX_OUTPUT_BYTES, WAKE_PREFIX } from "../lib/channel.js"
 import { renderReceiptNotice } from "../lib/notice.js"
 import { POLL_MS } from "../lib/receipts.js"
+import { startWorker } from "../lib/worker.js"
 
 // Sender receipts in the Codex receiver (#130). The shared state machine and notice have their own suites (notice.test.js,
 // receipts.test.js). These tests hold what the receiver decides: when it asks for receipts, where a notice may appear, what
@@ -1507,4 +1510,164 @@ test("wire order: a wake poll that queues behind a read the worker has not yet e
   await settle()
   assert.equal(thread.adds.length, 1, "the wake queued the message")
   assert.deepEqual(wireAfter(r, heldAt, "the wake"), ["heartbeat", "pending", "claim", "status", "settle", "heartbeat"])
+})
+
+// Issue #183, with the package's real lib/worker.js in front of a double of the core's worker process. The doubles above
+// replace lib/worker.js whole, so they cannot show what its cancel does. This one does what agent_chat/instance_worker.py
+// does with the cancel signal, on the test clock. It reads a frame as soon as it is idle, unless `hold` keeps the next frame
+// unread until `release()`. A receipts request is open from its read to its answer: SIGUSR1 then answers it
+// `refused: CLI_INTERRUPTED`, and without one it is refused at the 2 s receipt deadline. Anywhere else the signal is
+// dropped after a receipts answer, until the next read, and kept once otherwise for a receipts request read next. Every
+// other request answers after `delays[op]` ms.
+const RECEIPT_MS = 2_000
+function coreChild(clock) {
+  const child = new EventEmitter()
+  child.stdin = new PassThrough()
+  child.stdout = new PassThrough()
+  const server = { rows: [], pending: [], mark: fields => ({ delivered: fields.receipts }) }
+  const delays = {}
+  const log = [] // every request the double read, in order
+  const signals = [] // what each SIGUSR1 did: "ended", "dropped" or "kept"
+  const queue = []
+  let buffered = ""
+  let busy = false
+  let afterReceipts = false // a receipts request has its answer and the next frame is not read yet
+  let kept = false
+  let open = null // ends the receipts request that is open
+  let hold = false
+  let attempts = 0
+  const write = (id, result) => {
+    busy = false
+    child.stdout.write(`${JSON.stringify({ id, result })}\n`)
+    pump()
+  }
+  const answer = frame => {
+    switch (frame.op) {
+      case "join": return {
+        session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+        room_id: ROOM, host: "synthetic-host", harness: "codex", instance_file: `/tmp/agent-chat-state/${frame.boot_id}.json`,
+        capabilities: ["receipts-cancel"],
+      }
+      case "pending": return { messages: server.pending }
+      case "claim": return { dispatch: true, attempt_id: `attempt-${++attempts}`, reservation_ms: 30_000, messages: frame.messages.map(peerRow) }
+      case "status": return { muted: false }
+      case "settle": server.pending = []; return {}
+      default: return {}
+    }
+  }
+  function read(frame) {
+    log.push(frame.op)
+    afterReceipts = false
+    if (!RECEIPTS_OPERATIONS.has(frame.op)) {
+      kept = false
+      const reply = () => write(frame.id, answer(frame))
+      if (delays[frame.op]) clock.setTimeoutImpl(reply, delays[frame.op])
+      else reply()
+      return
+    }
+    const done = result => {
+      open = null
+      afterReceipts = true
+      write(frame.id, result)
+    }
+    if (kept) {
+      kept = false
+      done({ refused: "CLI_INTERRUPTED" })
+      return
+    }
+    const deadline = clock.setTimeoutImpl(() => done({ refused: "CLI_INTERRUPTED" }), RECEIPT_MS)
+    open = () => { clock.clearTimeoutImpl(deadline); done({ refused: "CLI_INTERRUPTED" }) }
+    if (frame.op === "receipts_delivered") {
+      // A mark the server answers at once; a refused one is still held open for its deadline, as a stalled server holds it.
+      const result = server.mark(frame)
+      if (!result.refused) { clock.clearTimeoutImpl(deadline); done(result) }
+    } else {
+      clock.clearTimeoutImpl(deadline)
+      done({ receipts: server.rows, muted: false })
+    }
+  }
+  function pump() {
+    if (busy || hold || !queue.length) return
+    busy = true
+    read(queue.shift())
+  }
+  child.stdin.on("data", chunk => {
+    buffered += chunk.toString()
+    for (let newline = buffered.indexOf("\n"); newline >= 0; newline = buffered.indexOf("\n")) {
+      queue.push(JSON.parse(buffered.slice(0, newline)))
+      buffered = buffered.slice(newline + 1)
+    }
+    pump()
+  })
+  child.stdin.on("finish", () => child.emit("close", 0, null))
+  child.kill = signal => {
+    if (signal !== "SIGUSR1") { child.emit("close", null, signal); return true }
+    if (open) { signals.push("ended"); open() }
+    else if (afterReceipts) signals.push("dropped")
+    else { signals.push("kept"); kept = true }
+    return true
+  }
+  return {
+    child, server, delays, log, signals,
+    set hold(value) { hold = value },
+    release() { hold = false; pump() },
+  }
+}
+
+// The reviewer's case on PR #170. Plan Mode hooks retry a mark that the server keeps refusing, with nothing between the
+// retries: the state is published, and a Plan Mode hook claims nothing. A normal prompt then arrives right after a retry was
+// written and before the worker read it, so its cancel lands where the worker drops a signal. Sent once, the cancel is lost:
+// the retry holds the worker for its 2 s deadline, the 2 s pending after it leaves the 6 s hook less than the claim margin,
+// and the hook returns without claiming. Repeated until the answer, the cancel ends the retry within milliseconds.
+test("a prompt that cancels a mark retry before the worker read it still claims: the real worker module repeats the cancel", async () => {
+  const clock = scheduler()
+  const core = coreChild(clock)
+  core.server.rows = [rcpt(1)]
+  core.server.mark = () => ({ refused: "SERVICE_UNAVAILABLE" }) // every mark is refused, after the deadline a stall takes
+  const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
+    startProcess: (config, identity) => startWorker(config, identity, {
+      spawnImpl: () => core.child, setIntervalImpl: clock.setIntervalImpl, clearIntervalImpl: clock.clearIntervalImpl,
+    }),
+    now: clock.now, wall: clock.now, random: () => 0.5,
+    setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl,
+    setIntervalImpl: clock.setIntervalImpl, clearIntervalImpl: clock.clearIntervalImpl,
+    alive: () => true, startTime: () => null, release: () => {}, exit: () => {},
+  })
+  void receiver.start()
+  await settle()
+  // A hook that the test drives on the clock: a refused mark holds the worker until its deadline.
+  const drive = async (request, ms = RECEIPT_MS) => {
+    const hook = hookDouble()
+    const handled = receiver.handle(request, hook)
+    await settle()
+    await clock.advance(ms)
+    await handled
+    await settle()
+    return hook
+  }
+  assert.match((await drive({ op: "start", wait_ms: 5000 }, 0)).sent[0].context, /Agent Chat is available/)
+  await drive(turn(), 0)
+  await clock.advance(POLL_MS)
+  await drive(turn(), 0) // its pass reads the feed: a notice is staged
+  assert.ok(isNoticeText((await drive(turn())).sent[0].context), "the next prompt shows it, and its mark is refused")
+  await clock.advance(POLL_MS)
+  await drive(turn({ permission_mode: "plan" })) // reports Plan Mode, and its pass retries the mark
+  await clock.advance(POLL_MS)
+  core.hold = true
+  const before = core.log.length
+  await drive(turn({ permission_mode: "plan" }), 0) // the state is published: its pass sends the retry alone, unread
+  core.server.pending = [uid(1)]
+  core.delays.pending = 2_000
+  const hook = hookDouble()
+  const handled = receiver.handle(turn(), hook) // a normal prompt: it cancels the retry, which the worker has not read
+  await settle()
+  assert.deepEqual(core.signals, ["dropped"], "the first signal landed before the read, and the worker dropped it")
+  core.release()
+  await clock.advance(6_000)
+  await handled
+  await settle()
+  assert.deepEqual(core.log.slice(before - 1, before + 1), ["receipts_delivered", "receipts_delivered"], "two marks with nothing between")
+  assert.deepEqual(core.log.slice(before + 1), ["heartbeat", "pending", "claim", "status", "settle"], "the prompt hook claimed")
+  assert.ok(isDeliveryText(hook.sent[0]?.context), "and delivered")
+  assert.equal(core.signals.at(-1), "ended", "a repeat ended the retry")
 })

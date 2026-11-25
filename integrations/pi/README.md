@@ -145,9 +145,10 @@ fits on `cli` fits on every route.
   change the bytes of a delivery, a heartbeat or the binding. It gives way: a
   heartbeat or a delivery poll that falls due while the request is in flight
   ends it with the worker's cancel signal, and the pass sends no request while
-  either is due. A cancel that reaches the worker before it has read the
-  request is dropped, and that request then ends within 2 seconds (#183).
-  That is client-side only: a receipts read that stalls inside
+  either is due. The signal is repeated every 5 milliseconds until the worker
+  answers, so a cancel that reaches the worker before it has read the request,
+  which the worker drops, is followed by one that ends it. That is client-side
+  only: a receipts read that stalls inside
   the server keeps the row of the instance, so the heartbeat or the `pending`
   that goes first after the cancel waits for it, up to 3 seconds, and is refused
   if the row is still held. Nothing is delivered then, and the message stays on

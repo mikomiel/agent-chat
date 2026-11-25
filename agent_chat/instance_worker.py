@@ -15,9 +15,11 @@ with TRANSPORT_UNAVAILABLE. Only the next join, the parent's rejoin, resolves ag
 The join reply names what this worker can do beyond the base requests (`capabilities`). `receipts-cancel` means
 that SIGUSR1 ends a receipts request that is running, which then answers `refused`, so that a delivery never waits
 in this worker behind advisory work; the server finishes the request. Nothing else ends on it, and it never ends the
-worker. A signal that lands after a receipts request has its answer and before the next frame is read was meant for
+worker. A signal that lands after a receipts request has its answer and before the next frame is read may be late for
 that request, and is dropped. Anywhere else outside a receipts request it is remembered once: a receipts request
-read next answers `refused` without asking, and any other request read next forgets it.
+read next answers `refused` without asking, and any other request read next forgets it. A signal names no request, so a
+parent repeats it every few milliseconds until the request answers: the first one that lands after this worker read the
+request ends it, and one that crosses the answer is dropped.
 """
 
 import json
@@ -237,9 +239,10 @@ def main() -> int:
     terminated = False
     alarmed = False  # the alarm fired in the receipts request that runs; the client reports it as a failed transport
     # What CANCEL_SIGNAL does now. "open": a receipts request runs, and the signal ends it. "answered": a receipts
-    # request has its answer and the next frame is not read yet, so the signal was meant for that request and is
-    # dropped. "latch": anywhere else, the signal is remembered for a receipts request that comes next. One store moves
-    # between them, so no signal can land between two of them.
+    # request has its answer and the next frame is not read yet, so the signal may be late for that request and is
+    # dropped; a parent that meant it for the next request repeats it until that one answers. "latch": anywhere else,
+    # the signal is remembered for a receipts request that comes next. One store moves between them, so no signal can
+    # land between two of them.
     cancel_window = "latch"
     cancel_latched = False  # a cancel arrived that no request has answered; a receipts request that follows answers it
 

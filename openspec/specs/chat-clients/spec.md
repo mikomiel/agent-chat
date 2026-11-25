@@ -609,7 +609,7 @@ A package's receipts pass MUST send at most one receipts request: the mark that 
 - **AND** the delivery still counts the agent as busy and starts no turn
 
 ### Requirement: A receipts request gives way to every other request
-A package MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused. A cancel that the worker drops leaves a receipts request to its 2 s deadline: latency only, no message is lost.
+A package MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, MUST repeat the cancel every few milliseconds until that request answers, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
 
 #### Scenario: A request falls due while a receipts request is in flight
 - **WHEN** a heartbeat, a state report, a delivery poll or a claim falls due while a receipts request is in flight and nothing releases that request
@@ -635,11 +635,11 @@ A package MUST send a receipts request only to a worker whose join reply lists `
 - **THEN** the worker drops the signal
 - **AND** the next request, a retry of the same mark included, is sent to the server and answered
 
-#### Scenario: A cancel arrives before the worker reads the receipts request it was sent for
-- **WHEN** a package writes a receipts request right after the answer to another one and cancels it, and the signal lands before the worker has read that request
-- **THEN** the worker drops the signal, as it does for any cancel in that window
-- **AND** the request ends at its answer or at the worker's 2-second receipt deadline, and a deadline answers `refused`, which the package holds like any refusal
-- **AND** the wait costs latency only, and no message is lost
+#### Scenario: A cancel lands before the worker reads the receipts request it was sent for
+- **WHEN** a package writes a receipts request right after the answer to another one and cancels it, and the first signal lands before the worker has read that request
+- **THEN** the worker drops that signal, as it does for any cancel in that window, and the package sends it again every few milliseconds until the request answers
+- **AND** the first signal that lands after the worker read the request ends it, so a request queued behind it waits milliseconds, not the 2-second receipt deadline
+- **AND** a repeat that lands after the answer is dropped, and the next request is sent to the server and answered
 
 #### Scenario: The alarm fires during a receipts request
 - **WHEN** the worker's alarm fires while a receipts request runs, also while the HTTP client waits for the answer

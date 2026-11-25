@@ -275,8 +275,7 @@ The rules below bind every package that shows receipts.
   It shares the worker's single request slot, like every request, so it gives way: see the next rule. A pass sends one
   receipts request, never a mark and a poll in a row.
 - **A receipts request gives way (#175), client-side.** In a package and its worker, nothing waits behind a receipts
-  request except for the cancel latency, a signal and the worker's answer to it, and except when the worker drops a
-  cancel for a request it has not read yet (#183, *Known race* below). Two rules make that so, and a package
+  request except for the cancel latency, a signal and the worker's answer to it. Two rules make that so, and a package
   keeps no other receipts path. The server is a separate wait, and these rules do not remove it. A receipts read that
   stalls inside the server keeps the row of its instance after the cancel, so the first request after the cancel waits
   for that row, up to the server's `lock_timeout` of 3 seconds, and is refused if the row is still held. That request is
@@ -287,21 +286,22 @@ The rules below bind every package that shows receipts.
   no `receipts` and no `receipts_delivered` request unless the join reply of its current worker lists it. A worker that
   does not, an older core, is sent no receipts request: nothing is shown, and nothing else changes. A package sets a
   worker's capability from its join reply only, so a rejoin onto another worker follows that worker's reply.
-  *Cancel.* `worker.cancel()` sends `SIGUSR1` to a worker that listed the capability, once for the receipts request that
-  is pending, and never for any other request. Inside a receipts request the worker raises an interrupt that only this
+  *Cancel.* `worker.cancel()` sends `SIGUSR1` to a worker that listed the capability, for the receipts request that is
+  pending, and never for any other request. It signals at once and again every 5 milliseconds until the answer to that
+  request is read; a second call adds nothing. Inside a receipts request the worker raises an interrupt that only this
   signal raises, answers `refused: CLI_INTERRUPTED`, and serves on. Outside a receipts request the signal does nothing;
   one that arrives just before a receipts request is kept by one latch, so that request answers `refused` at once. One
-  that arrives after a receipts request has its answer, and before the worker reads the next request, was sent for the
+  that arrives after a receipts request has its answer, and before the worker reads the next request, may be late for the
   request that has just been answered, and the worker drops it: it never refuses the request after it, such as a retry of
   the same mark. During a receipts request, `SIGTERM` and the 20-second alarm end the worker, also when the HTTP client reports
   their interrupt as a failed transport. Other requests keep their existing outage handling. The package holds the answer like any refusal: no state changes, a
   feed read is asked again at a later pass, and a mark that was ended keeps its ids.
-  *Known race (#183).* A package can send a receipts request right after the answer to another one, a retried mark for
-  example, and cancel it. A signal for that request that lands after the package wrote it and before the worker has read
-  it is dropped the same way, because the worker cannot tell it from a signal for the request just answered. Nothing ends
-  the request then but its answer or the 2-second deadline below, so what queued behind it waits up to 2 seconds, not the
-  cancel latency. That is latency only, and no message is lost: a deadline answers `refused`, which the package holds like
-  any refusal, and a hook that runs short of time delivers nothing and leaves its message on the server.
+  *Repeat (#183).* A signal names no request. A package can send a receipts request right after the answer to another
+  one, a retried mark for example, and cancel it before the worker has read it; the worker drops that signal, because it
+  cannot tell it from a late one for the request just answered. The repeat is what ends such a request: the first signal
+  that lands after the worker read it ends it, so what queued behind it waits the cancel latency and at most one repeat
+  period more, never the 2-second deadline. A repeat is sent only until the package reads the answer, so before it writes
+  the next request, and it reaches the worker before the worker reads that request: the worker drops it.
   `claude-code` and `codex` cancel when a counted request queues behind a receipts request: a hook's or a wake's claim
   sequence, a heartbeat or a state report. A receipts task that reaches the head of the queue while a counted request
   is in flight sends nothing, and a later pass asks again. The hook's check for a slow request does not count a

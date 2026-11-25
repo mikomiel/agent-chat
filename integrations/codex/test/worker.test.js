@@ -233,22 +233,37 @@ test("a failure of a receipts operation names the operation, and no other label"
 })
 
 // Issue #175: a receipts request is the only one a signal may end, and only a worker whose join reply lists the capability is
-// signalled: one without the handler would die of SIGUSR1. The signal is sent once per request, and the answer comes back as
-// any other frame, so a cancel changes nothing about what the module reads.
+// signalled: one without the handler would die of SIGUSR1. A cancel signals at once and again every few milliseconds until
+// the answer is read, and the answer comes back as any other frame, so a cancel changes nothing about what the module reads.
 const CANCEL_JOINED = { session_id: "s", instance_id: "i", room_id: "r", host: "h", harness: "synthetic", instance_file: "/tmp/s.json", capabilities: ["receipts-cancel"] }
 const CANCEL_BEAT = { state: { native_state: "idle", stopped: false, plan_mode: false } }
 const CANCEL_MARK = { receipts: ["aaaaaaaa-aaaa-4aaa-8aaa-000000000001"] }
 const reply = (id, result) => `${JSON.stringify({ id, result })}\n`
 
+// The repeat timers of a cancel, which the test fires by hand: `tick()` is one period.
+function ticker() {
+  const timers = new Map()
+  let next = 1
+  return {
+    setIntervalImpl: (fn, ms) => { const id = next++; timers.set(id, { fn, ms }); return id },
+    clearIntervalImpl: id => { timers.delete(id) },
+    live: () => [...timers.values()],
+    tick: () => { for (const timer of [...timers.values()]) timer.fn() },
+  }
+}
+
 // A joined worker whose child records the signals it is sent.
 async function signalled(joined = CANCEL_JOINED) {
   const { child, frames } = harness()
   const kills = []
+  const timers = ticker()
   child.kill = signal => { kills.push(signal) }
-  const worker = startWorker(config, { nativeSessionId: "native-1", bootId: "boot-1" }, { spawnImpl: () => child })
+  const worker = startWorker(config, { nativeSessionId: "native-1", bootId: "boot-1" }, {
+    spawnImpl: () => child, setIntervalImpl: timers.setIntervalImpl, clearIntervalImpl: timers.clearIntervalImpl,
+  })
   child.stdout.write(reply(0, joined))
   assert.deepEqual(await worker.ready, joined, "the join reply is the worker's, whatever keys it carries")
-  return { child, frames, kills, worker }
+  return { child, frames, kills, timers, worker }
 }
 
 test("a worker is signalled only when its join reply lists the capability", () => {
@@ -260,14 +275,16 @@ test("a worker is signalled only when its join reply lists the capability", () =
   }
 })
 
-test("cancel signals the worker once for each receipts request in flight, and the answer is read as any other", async () => {
-  const { child, kills, worker } = await signalled()
+test("cancel signals at once and starts one repeat for each receipts request in flight, and the answer is read as any other", async () => {
+  const { child, kills, timers, worker } = await signalled()
   const feed = worker.request("receipts")
   worker.cancel()
   worker.cancel()
-  assert.deepEqual(kills, ["SIGUSR1"], "one signal for the request, however often it is asked")
+  assert.deepEqual(kills, ["SIGUSR1"], "one signal at once, however often it is asked")
+  assert.equal(timers.live().length, 1, "and one repeat for the request")
   child.stdout.write(reply(1, { refused: "CLI_INTERRUPTED" }))
   assert.deepEqual(await feed, { refused: "CLI_INTERRUPTED" })
+  assert.equal(timers.live().length, 0, "the answer ends the repeat")
   const mark = worker.request("receipts_delivered", CANCEL_MARK)
   worker.cancel()
   assert.deepEqual(kills, ["SIGUSR1", "SIGUSR1"], "the next receipts request is signalled on its own")
@@ -275,9 +292,60 @@ test("cancel signals the worker once for each receipts request in flight, and th
   assert.deepEqual(await mark, { refused: "CLI_INTERRUPTED" })
   const next = worker.request("heartbeat", CANCEL_BEAT)
   worker.cancel()
+  timers.tick()
   child.stdout.write(reply(3, {}))
   assert.deepEqual(await next, {})
   assert.equal(kills.length, 2, "the request that is not a receipts request was not signalled")
+  assert.equal(timers.live().length, 0)
+})
+
+// Issue #183. The worker drops a signal that lands after it answered one receipts request and before it read the next: it
+// cannot tell a late signal for the answered request from an early one for the next. A parent that writes a mark retry right
+// after the answer to the mark before it, and cancels it at once, can land its signal there. So the signal is repeated every
+// few milliseconds until the answer is read: the first one the worker takes after it reads the request ends it.
+test("a cancel that the worker drops before it reads the request is repeated, and a repeat ends the request", async () => {
+  const { child, kills, timers, worker } = await signalled()
+  let read = false // the worker has read the retry: a signal from now on ends it
+  child.kill = signal => {
+    kills.push(signal)
+    if (read) setImmediate(() => child.stdout.write(reply(2, { refused: "CLI_INTERRUPTED" })))
+  }
+  const first = worker.request("receipts_delivered", CANCEL_MARK)
+  child.stdout.write(reply(1, { refused: "SERVICE_UNAVAILABLE" }))
+  assert.deepEqual(await first, { refused: "SERVICE_UNAVAILABLE" })
+  const retry = worker.request("receipts_delivered", CANCEL_MARK)
+  worker.cancel() // before the worker reads the retry: dropped
+  assert.deepEqual(kills, ["SIGUSR1"])
+  assert.equal(timers.live().length, 1)
+  assert.ok(timers.live()[0].ms > 0 && timers.live()[0].ms <= 10, "the repeat period is a few milliseconds")
+  timers.tick() // still not read: dropped as well
+  read = true
+  timers.tick()
+  assert.deepEqual(await retry, { refused: "CLI_INTERRUPTED" })
+  assert.deepEqual(kills, ["SIGUSR1", "SIGUSR1", "SIGUSR1"])
+  assert.equal(timers.live().length, 0, "the answer ends the repeat")
+  const next = worker.request("receipts_delivered", CANCEL_MARK)
+  timers.tick()
+  assert.equal(kills.length, 3, "a request that is not cancelled is never signalled, the next mark included")
+  child.stdout.write(reply(3, { delivered: CANCEL_MARK.receipts }))
+  assert.deepEqual(await next, { delivered: CANCEL_MARK.receipts })
+})
+
+test("the repeat ends however the request ends: a protocol failure, a stop or the worker's exit", async () => {
+  for (const end of ["protocol", "stop", "exit"]) {
+    const { child, kills, timers, worker } = await signalled()
+    const feed = worker.request("receipts")
+    const outcome = feed.then(() => null, error => error)
+    worker.cancel()
+    assert.equal(timers.live().length, 1, end)
+    if (end === "protocol") child.stdout.write(reply(7, {}))
+    else if (end === "stop") void worker.stop()
+    else child.emit("close", 1, null)
+    assert.ok((await outcome) instanceof Error, end)
+    assert.equal(timers.live().length, 0, end)
+    timers.tick()
+    assert.deepEqual(kills, ["SIGUSR1"], end)
+  }
 })
 
 test("cancel signals nothing while no request is in flight, during the join, or for a request that is not a receipts request", async () => {
@@ -326,7 +394,7 @@ for (const [name, capabilities] of [["no capabilities", undefined], ["an empty l
 }
 
 test("a cancel while the answer is read in pieces changes nothing: one frame answers the request, and the next is served", async () => {
-  const { child, kills, worker } = await signalled()
+  const { child, kills, timers, worker } = await signalled()
   const feed = worker.request("receipts")
   const frame = reply(1, { refused: "CLI_INTERRUPTED" })
   child.stdout.write(frame.slice(0, 9))
@@ -336,6 +404,7 @@ test("a cancel while the answer is read in pieces changes nothing: one frame ans
   child.stdout.write(frame.slice(24))
   assert.deepEqual(await feed, { refused: "CLI_INTERRUPTED" })
   assert.deepEqual(kills, ["SIGUSR1"])
+  assert.equal(timers.live().length, 0, "the whole frame ended the repeat")
   const next = worker.request("heartbeat", CANCEL_BEAT)
   child.stdout.write(reply(2, {}))
   assert.deepEqual(await next, {})

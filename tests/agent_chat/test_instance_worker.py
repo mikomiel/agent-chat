@@ -1856,3 +1856,141 @@ def test_a_real_alarm_during_a_held_receipts_request_still_ends_the_worker(
     assert replies[1]["id"] == 1 and replies[1]["error"]["code"] in {"TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"}
     assert len(read_at) == 2  # the join and the receipts request: the status after it was never read
     assert wrote_at[1] - read_at[1] < 4.0  # the alarm ended it, not the end of the 8 s answer
+
+
+class _SecondHeldServer(_ReceiptsServer):
+    """The receipts server, holding only the second request to a path: the first and the third are answered at once."""
+
+    hits: dict[str, int] = {}
+    reached = threading.Event()
+
+    def _answer(self) -> None:
+        hit = type(self).hits[self.path] = type(self).hits.get(self.path, 0) + 1
+        if hit == 2:
+            self.stalled = frozenset({self.path})  # this request only; its answer drips for 8 s
+            type(self).reached.set()
+        super()._answer()
+
+    do_GET = do_POST = _answer
+
+
+@pytest.mark.parametrize("sender", ["repeats until answered", "signals once"])
+def test_a_cancel_sent_before_the_worker_reads_a_mark_retry_ends_it_when_the_parent_repeats_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, sender: str
+) -> None:
+    """The race of a mark retry written right after the answer to the mark before it.
+
+    The parent writes the retry and signals at once, before the worker has read it. That first signal lands where a
+    signal for the answered mark lands, and the worker drops it, as it must: it cannot tell the two apart. A parent
+    that repeats the signal until the request answers (`lib/worker.js`) ends the retry within milliseconds; the
+    control, a parent that signals once, leaves it to its receipt deadline. A repeat that lands after the retry's
+    answer is dropped too, so the mark after it is asked and answered. Real signals, a real socket and the real clock.
+    """
+    frame, _key = RECEIPT_OPERATIONS["receipts_delivered"]
+    instance = instance_client.JoinedInstance(
+        InstanceSecret("retry-native", uuid4(), "1" * 64, "http://127.0.0.1:1"), uuid4(), uuid4(), uuid4(),
+        "synthetic-host", "pi",
+    )
+    _SecondHeldServer.identity = {"instance_id": str(instance.instance_id), "session_id": str(instance.session_id)}
+    _SecondHeldServer.stalled = frozenset()  # an earlier test may have stalled a path on the base class
+    _SecondHeldServer.hits = {}
+    _SecondHeldServer.reached = threading.Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SecondHeldServer)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    installed: list[Any] = []
+    handled = threading.Event()  # the worker has run its handler for a signal
+    retry_asked = threading.Event()  # the parent has written the retry: the worker is about to read it
+    retry_answered = threading.Event()  # the parent has read the retry's answer and signals no more
+    repeats = sender == "repeats until answered"
+    deadline = 0.6 if not repeats else instance_worker.RECEIPT_SECONDS
+
+    def parent() -> None:
+        # What `cancel()` in lib/worker.js does: signal at once and, when it repeats, every 5 ms until the answer is
+        # read.
+        assert retry_asked.wait(10)
+        os.kill(os.getpid(), CANCEL)
+        while repeats and not retry_answered.wait(0.005):
+            os.kill(os.getpid(), CANCEL)
+
+    signaller = threading.Thread(target=parent, daemon=True)
+    try:
+        port = server.server_address[1]
+        pinned = ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", port)),)
+        bound = instance_client.JoinedInstance(
+            InstanceSecret("retry-native", instance.binding.boot_id, "1" * 64, f"http://127.0.0.1:{port}"),
+            instance.session_id, instance.instance_id, instance.room_id, "synthetic-host", "pi", pinned,
+        )
+        frames = [
+            {"id": 0, "op": "join", "directory": str(tmp_path), "host_token": "synthetic-host-secret"},
+            {"id": 1, **frame}, {"id": 2, **frame}, {"id": 3, **frame},
+        ]
+        read_at: list[float] = []
+        wrote_at: list[float] = []
+        output = io.BytesIO()
+
+        def readline(_size: int) -> bytes:
+            number = len(read_at)
+            read_at.append(time.monotonic())
+            if number == 2:
+                # The retry is written and the first signal is sent; it is handled before the worker reads the frame.
+                retry_asked.set()
+                assert handled.wait(10)
+            if number == 3:
+                # The parent writes the next request only once it has read the retry's answer and stopped signalling. A
+                # repeat that was already on its way lands now, after that answer and before this read.
+                signaller.join(10)
+                os.kill(os.getpid(), CANCEL)
+            return b"" if number >= len(frames) else (json.dumps(frames[number]) + "\n").encode()
+
+        class Stdout:
+            def write(self, view: memoryview) -> int:
+                wrote_at.append(time.monotonic())
+                written = output.write(view)
+                if len(wrote_at) == 3:  # the join reply, the first mark's, then the retry's
+                    retry_answered.set()
+                return written
+
+        def install(number: int, handler: Any) -> None:
+            if number == CANCEL:  # the real handler for the real signal; the alarm and SIGTERM stay off
+
+                def counted(signum: int, frame: Any) -> None:
+                    handled.set()
+                    handler(signum, frame)
+
+                installed.append(signal.signal(number, counted))
+
+        monkeypatch.setattr(instance_worker, "RECEIPT_SECONDS", deadline)
+        monkeypatch.setattr(instance_worker, "_join", lambda _request: bound)
+        monkeypatch.setattr(
+            instance_worker, "sys",
+            SimpleNamespace(stdin=SimpleNamespace(buffer=SimpleNamespace(readline=readline)),
+                            stdout=SimpleNamespace(buffer=Stdout())),
+        )
+        monkeypatch.setattr(
+            instance_worker, "signal",
+            SimpleNamespace(SIGALRM=14, SIGTERM=15, ITIMER_REAL=0, signal=install, setitimer=lambda *_args: None),
+        )
+        signaller.start()
+        code = instance_worker.main()
+    finally:
+        retry_answered.set()
+        signaller.join(10)
+        for previous in installed:
+            signal.signal(CANCEL, previous)
+        server.shutdown()
+        server.server_close()
+    replies = [json.loads(line) for line in output.getvalue().splitlines()]
+    answered = {"delivered": frame["receipts"]}
+    assert code == 0
+    _assert_one_frame_each(replies, 3)
+    assert {key: replies[1]["result"][key] for key in answered} == answered  # the mark before the retry was answered
+    assert replies[2]["result"] == CANCELLED
+    took = wrote_at[2] - read_at[2]
+    if repeats:
+        assert took < 0.5  # a repeat ended it: the server holds it for 8 s and the deadline is 2 s
+    else:
+        assert _SecondHeldServer.reached.is_set()  # the control: the retry reached the server, which held it,
+        assert took >= deadline - 0.05  # and the one signal was dropped, so only the deadline ended it
+    # The mark after it was asked and answered: no signal, the late repeat included, reached it.
+    assert {key: replies[3]["result"][key] for key in answered} == answered
