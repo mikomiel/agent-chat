@@ -188,19 +188,18 @@ and the `Host` header still carries it. When none of the addresses accepts a
 connection, the request fails with `TRANSPORT_UNAVAILABLE`. A heartbeat or
 pending request answers it as a tolerated outage for less than the server
 lease; a status or claim request still ends the worker. A settle request that
-gets no complete answer, because the connection fails or ends early, or that
-gets a 5xx reply, is sent again, with the same attempt and result, until 1
-second before the request's deadline (#176); the last failure then ends the
-worker, and a try the deadline cuts reports `REQUEST_UNCERTAIN`. A reply ends
-early when it stops inside its status line, short of its declared length, inside
-chunked framing (a chunk size that is not hex looks the same to the client), or
-before a reply that declares no length can be accepted. A definite delivery
-refusal is answered as refused. Any other failure, such as a redirect, a reply
-below 500 that is not the service's, or a complete status line or headers that
-the HTTP parser rejects, ends the worker at once. A redirect follows the same
-rule: the client reads its body to show it complete, never its destination.
-SIGTERM during a pause between tries ends the worker with `REQUEST_UNCERTAIN`. The worker never resolves again inside a request: an address change reaches a
-binding at its next join, which the rejoin below performs.
+gets no status, because the connection fails or ends before the status line is
+complete, or that gets a 5xx reply, is sent again, with the same attempt and
+result, until 1 second before the request's deadline (#176); the last failure
+then ends the worker, and a try the deadline cuts reports `REQUEST_UNCERTAIN`.
+The service sends a status below 500 only once a settlement is committed or
+definitely refused, so a definite delivery refusal is answered as refused, and
+any other reply below 500, such as a redirect, a reply that is not the
+service's, or one cut or rejected by the parser after its status line, ends the
+worker at once. SIGTERM during a pause between tries ends the worker with
+`REQUEST_UNCERTAIN`. The worker never resolves again inside a request: an
+address change reaches a binding at its next join, which the rejoin below
+performs.
 
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,
 `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` starts a bounded rejoin with

@@ -426,10 +426,10 @@ An episode begins at the first failure that calls for a rejoin and ends at the n
 - **THEN** the adapter fails with that code and does not rejoin
 
 ### Requirement: The instance worker sends a settlement again until its request deadline
-Only a `settle` try that gets no complete answer, because the connection fails or ends early, or that gets a 5xx reply, MUST be sent again by the instance worker, with the same attempt and result, until 1 second before its 20-second request deadline, when the last failure MUST end the worker. A try the deadline cuts MUST report `REQUEST_UNCERTAIN`. A definite delivery refusal MUST be answered as refused. Any other failure MUST end the worker at once.
+Only a `settle` try that gets no status, because the connection fails or ends before the status line is complete, or that gets a 5xx reply, MUST be sent again by the instance worker, with the same attempt and result, until 1 second before its 20-second request deadline, when the last failure MUST end the worker. A try the deadline cuts MUST report `REQUEST_UNCERTAIN`. A definite delivery refusal MUST be answered as refused. Any other failure MUST end the worker at once.
 
 #### Scenario: The service answers after a brief outage
-- **WHEN** a `settle` gets no complete answer or a 5xx reply, and a later try before the deadline is answered
+- **WHEN** a `settle` gets no status or a 5xx reply, and a later try before the deadline is answered
 - **THEN** the worker answers its parent with that answer
 - **AND** each try carries the same attempt and the same result
 
@@ -437,18 +437,17 @@ Only a `settle` try that gets no complete answer, because the connection fails o
 - **WHEN** the service refuses a `settle` with a definite code such as `DELIVERY_CLOSED`
 - **THEN** the worker sends no further try and answers its parent as refused
 
-#### Scenario: A reply that ends early
-- **WHEN** a `settle` reply stops inside its status line, short of its declared length, inside chunked framing, or before a reply that declares no length can be accepted
-- **THEN** the try counts as one that got no complete answer
-- **AND** a chunk size that is not hex counts the same, because the client cannot tell it from framing that stops
-- **AND** a redirect follows the same rule: the client reads its body to show it complete, and never reads or follows its destination
+#### Scenario: A reply that ends in its status line
+- **WHEN** a `settle` reply stops inside its status line
+- **THEN** the try counts as one that got no status
 
-#### Scenario: A complete reply that cannot be accepted
-- **WHEN** a `settle` gets a complete reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know, a 200 that names another attempt, or a complete status line or headers that the HTTP parser rejects
+#### Scenario: A reply below 500 that cannot be accepted
+- **WHEN** a `settle` gets a reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know, a 200 that names another attempt, or a reply cut or rejected by the parser after its status line
 - **THEN** the worker sends no further try and ends at once
+- **AND** this holds because the service sends a status below 500 only once a settlement is committed or definitely refused
 
 #### Scenario: The deadline is spent
-- **WHEN** every try gets no complete answer or a 5xx reply until 1 second before the request deadline
+- **WHEN** every try gets no status or a 5xx reply until 1 second before the request deadline
 - **THEN** the worker sends no further try, answers its parent with the code of the last failure and ends
 
 #### Scenario: The deadline cuts a try

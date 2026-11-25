@@ -152,17 +152,18 @@ def _settle(
 ) -> dict[str, Any]:
     """Settle, and send the same attempt and result again while the request has no answer and has time left.
 
-    A try has no answer when the client marks its error `unanswered` (a connection that failed or ended early, or a
-    5xx) and its code is one of `HEARTBEAT_OUTAGE`. Such a settlement may have committed, and a server that waits too
+    A try has no answer when the client marks its error `unanswered` (it got no status, or a 5xx) and its code is
+    one of `HEARTBEAT_OUTAGE`. Such a settlement may have committed, and a server that waits too
     long for a lock answers it with a 5xx that did not. The client reports both as `REQUEST_UNCERTAIN`. Ending the
     worker there would leave the reservation to lapse as `uncertain`, and the message would never be offered again
     (#176). The server answers a repeat of the same outcome with the recorded one, and another outcome or a lapsed
-    reservation with `DELIVERY_CLOSED`, so a repeat can neither settle twice nor change the record. A complete reply
-    below 500 that cannot be accepted (a redirect, a body that is not the service's, a 200 that names another
-    attempt, a complete status line or headers the parser rejects) is an answer even where its code is
-    `REQUEST_UNCERTAIN`. It is never sent again, and neither are a definite refusal, any other code and a stop
-    (`stopping`, the worker's SIGTERM). A stop during a pause ends the worker with `REQUEST_UNCERTAIN`, as it ends
-    any request it interrupts; a pause that ends after the deadline starts no try, and the last failure propagates.
+    reservation with `DELIVERY_CLOSED`, so a repeat can neither settle twice nor change the record. The service
+    sends a status below 500 only once the settlement is committed or definitely refused, so a reply below 500 that
+    cannot be accepted (a redirect, a body that is not the service's or is cut, a 200 that names another attempt) is
+    an answer even where its code is `REQUEST_UNCERTAIN`. It is never sent again, and neither are a definite
+    refusal, any other code and a stop (`stopping`, the worker's SIGTERM). A stop during a pause ends the worker with
+    `REQUEST_UNCERTAIN`, as it ends any request it interrupts; a pause that ends after the deadline starts no try,
+    and the last failure propagates.
 
     All tries share one deadline, `SETTLE_MARGIN_SECONDS` before the alarm armed for the request (`REQUEST_SECONDS`
     when none is, as in `_join`). When it is spent the last error propagates and ends the worker. The client ends a

@@ -810,7 +810,7 @@ SETTLE_NO_ANSWER = ["REQUEST_UNCERTAIN", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVA
 
 
 def _no_answer(code: str) -> ChatError:
-    """What the client raises when the request got no complete answer."""
+    """What the client raises when the request got no status, or a 5xx."""
     return ChatError(code, unanswered=True)
 
 

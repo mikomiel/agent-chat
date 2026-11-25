@@ -47,8 +47,8 @@ made.
 - Unknown or incomplete evidence at a trust boundary fails closed. A refused
   or unreadable protocol response is not an outage to retry around. The
   instance worker's bounded resend of an identical settlement that got no
-  complete answer is not such a retry: the service answers a repeat with the
+  status or a 5xx is not such a retry: the service answers a repeat with the
   recorded outcome. A definite refusal stops the resends and is answered as
-  refused; a complete reply that breaks the protocol ends the worker.
+  refused; any other reply below 500 ends the worker.
 - Public CI runs read-only and must never receive deployment credentials or
   production data.
