@@ -61,14 +61,15 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
     """A connection whose statements can share one request deadline.
 
     PostgreSQL 16 has no transaction-wide timeout, and `lock_timeout` bounds each wait on its own, so a request with
-    several sequential lock waits can outlast its client. While `request_deadline` is active, every statement runs
-    under `lock_timeout` and `statement_timeout` lowered, for its transaction only, to the time left as measured at
+    several sequential lock waits can outlast its client. While `request_deadline` is active, every statement sent
+    through `execute` runs under `lock_timeout` lowered, for its transaction only, to the time left as measured at
     most `ARM_DRIFT_MS` before it starts. A statement outside a transaction runs in a transaction of its own, so a
-    lowered limit never outlives it.
+    lowered limit never outlives it. Only lock waits are bounded: `statement_timeout` stays the session's, so COMMIT,
+    the query that lowers the limit and a statement that runs long without waiting on a lock keep the session limits.
     """
 
     _deadline: float | None = None
-    _limits: tuple[int, int] = (0, 0)
+    _lock_ms: int = 0
     #: When the current transaction's limits were measured; None when this transaction has not lowered them yet.
     _measured: float | None = None
 
@@ -95,7 +96,7 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
         The budget comes from the limits this connection was given (`connect`, `set_limits`), so it costs no query
         before the deadline applies; a lock limit of 0 (none) stays unbounded.
         """
-        lock_ms = self._limits[0]
+        lock_ms = self._lock_ms
         self._deadline = accepted + lock_ms / 1000 - REQUEST_MARGIN_SECONDS if lock_ms else None
         try:
             yield
@@ -135,10 +136,10 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
             "SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
             (f"{lock_ms}ms", f"{statement_ms}ms"),
         )
-        self._limits = (lock_ms, statement_ms)
+        self._lock_ms = lock_ms
 
     def _arm(self) -> None:
-        """Lower this transaction's limits to the time left, and record when it was measured.
+        """Lower this transaction's lock limit to the time left, and record when it was measured.
 
         A reply slower than `ARM_DRIFT_MS` would leave a measurement too old for the statement that follows: the limits
         are set once more. A second slow reply raises `RequestDeadlineSpent`, as a deadline that passed does, so the
@@ -154,11 +155,7 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
         raise RequestDeadlineSpent("request deadline: arming replies too slow to bound the statement")
 
     def _set_local(self, left: int) -> None:
-        lock_ms, statement_ms = self._limits
-        super().execute(
-            "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)",
-            (str(min(left, lock_ms)), str(min(left, statement_ms) if statement_ms else left)),
-        )
+        super().execute("SELECT set_config('lock_timeout', %s, true)", (str(min(left, self._lock_ms)),))
 
 
 def connect(dsn: str) -> BoundedConnection:
@@ -172,7 +169,7 @@ def connect(dsn: str) -> BoundedConnection:
             "-c idle_in_transaction_session_timeout=15000"
         ),
     )
-    db._limits = (LOCK_TIMEOUT_MS, STATEMENT_TIMEOUT_MS)
+    db._lock_ms = LOCK_TIMEOUT_MS
     return db
 
 

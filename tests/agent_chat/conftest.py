@@ -130,7 +130,7 @@ EXPIRY_MARGIN = 2
 
 #: Seconds a service child may wait for a lock, or run a statement, while its test waits out `EXPIRY_MARGIN`.
 #: Production ends a lock wait after 3 s and a statement after 5 s (`agent_chat.storage.connect`). That left
-#: the test 1 s to release its lock after the crossing. This budget leaves 4 s per wait. For claim and settle it
+#: the test 1 s to release its lock after the crossing. This budget leaves 4 s per wait. For a claim it
 #: also sets the whole-request deadline: 6 s less `agent_chat.storage.REQUEST_MARGIN_SECONDS`, so 5 s from
 #: acceptance, about 3 s after the crossing. It stays below the 8 s timeout of `http_request`, which covers the
 #: whole request.

@@ -330,8 +330,9 @@ def create_app(
             raise ChatError("DELIVERY_DISABLED")
         return deliveries.pending(db, actor)
 
-    # A claim or settle the client gives up as uncertain must not commit (issue #177): its statements, authentication
-    # included, end under one deadline from `accepted`, declared first so it is read before the connection is made.
+    # A claim the client gives up as uncertain must not commit (issue #177): its lock waits, authentication included,
+    # end under one deadline from `accepted`, declared first so it is read before the connection is made. A result is
+    # not bounded so: a late settle commits the outcome the worker reported, and `/end` then finds it settled.
     @app.post("/v1/instance/deliveries/claim")
     def claim_delivery(
         started: Annotated[float, Depends(accepted)],
@@ -348,15 +349,13 @@ def create_app(
 
     @app.post("/v1/instance/deliveries/{attempt}/result")
     def delivery_result(
-        started: Annotated[float, Depends(accepted)],
         attempt: UUID,
         payload: DeliveryResult,
         token: Annotated[str, Depends(bearer)],
-        db: Annotated[BoundedConnection, Depends(connection)],
+        db: Annotated[Connection[dict[str, Any]], Depends(connection)],
     ):
         # Disabling new admissions must not discard an already-issued reservation's evidence.
-        with db.request_deadline(started):
-            return deliveries.result(db, authenticate(db, token), attempt, payload)
+        return deliveries.result(db, authenticate(db, token), attempt, payload)
 
     @app.get("/v1/instance/receipts")
     def sender_receipts(
