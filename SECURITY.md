@@ -48,6 +48,7 @@ made.
   or unreadable protocol response is not an outage to retry around. The
   instance worker's bounded resend of an identical settlement that got no
   complete answer is not such a retry: the service answers a repeat with the
-  recorded outcome, and a complete refusal or protocol error ends the worker.
+  recorded outcome. A definite refusal stops the resends and is answered as
+  refused; a complete reply that breaks the protocol ends the worker.
 - Public CI runs read-only and must never receive deployment credentials or
   production data.

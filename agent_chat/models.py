@@ -434,8 +434,8 @@ class ChatError(Exception):
     cannot be shown complete (it stopped in its status line, short of its declared length, inside chunked framing,
     or before a reply that declares no length could be accepted), or the reply was a 5xx. The request may or may
     not have been applied. Only the HTTP client sets it. A complete reply below 500 that the client could not
-    accept, such as a redirect (an answer once its headers arrive; its body is never read), a body that is not the
-    service's, or a complete status line or headers that the HTTP parser rejects, leaves it False.
+    accept, such as a redirect, a body that is not the service's, or a complete status line or headers that the HTTP
+    parser rejects, leaves it False.
     """
 
     def __init__(self, code: str, *, unanswered: bool = False):

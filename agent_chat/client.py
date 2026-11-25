@@ -335,9 +335,6 @@ class Client:
             response = connection.getresponse()
             status = response.status
             framed = response.length is not None or response.chunked
-            # Never inspect a redirect destination or relay a credential to it.
-            if 300 <= response.status < 400:
-                raise ChatError("REQUEST_UNCERTAIN" if submitted else "REDIRECT_REFUSED")
             chunks: list[bytes] = []
             total = 0
             while True:
@@ -360,6 +357,12 @@ class Client:
             self._remaining -= len(data)
             if self._remaining < 0:
                 raise ValueError("response too large")
+            # Never inspect a redirect destination or relay a credential to it. Its body is read only to show the reply
+            # complete: a POST's redirect that stops short of its declared length, or declares none (it may have been
+            # cut inside its headers), got no complete answer.
+            if 300 <= response.status < 400:
+                cut = not framed or response.length not in (None, 0)
+                raise ChatError("REQUEST_UNCERTAIN" if submitted else "REDIRECT_REFUSED", unanswered=submitted and cut)
             if response.length not in (None, 0):
                 # The peer closed before the declared length: a read failure, not a malformed body.
                 raise http.client.IncompleteRead(data, response.length)
@@ -418,8 +421,8 @@ class Client:
             # shorter than its declared length or whose chunked framing breaks off (http.client raises IncompleteRead
             # for both, so a broken chunk size counts as cut), and a reply that declares no length and whose body
             # cannot be accepted. A complete reply below 500 is an answer, which no caller may send again, even when
-            # it breaks the protocol or the parser rejects its complete status line or headers. A redirect is refused
-            # above once its headers arrive, before its body is read: it is an answer, and the service never sends one.
+            # it breaks the protocol or the parser rejects its complete status line or headers. A redirect is judged
+            # the same way above.
             # BadStatusLine carries the line it read (typeshed omits its `line` attribute); a cut one has no newline.
             cut_status = isinstance(error, http.client.BadStatusLine) and not str(error.args[0]).endswith("\n")
             unframed = framed is False and isinstance(error, (ValueError, RecursionError))

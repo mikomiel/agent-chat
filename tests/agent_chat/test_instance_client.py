@@ -85,12 +85,14 @@ def peer(process_api, credentials, tmp_path):
                 self.end_headers()
                 self.wfile.write(data)
                 return
-            if mode == "redirect_cut":
-                # A redirect that closes before its declared body: an answer once its headers arrive.
-                self.send_response(302)
-                self.send_header("Location", "/elsewhere")
-                self.send_header("Content-Length", "64")
-                self.end_headers()
+            if mode in ("redirect_cut", "redirect_header_cut"):
+                # Redirects that stop before they can be shown complete: short of the body their headers declare, and
+                # inside their headers, before any length is declared.
+                self.wfile.write(
+                    b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 64\r\n\r\n"
+                    if mode == "redirect_cut"
+                    else b"HTTP/1.1 302 Found\r\nLocation: /elsew"
+                )
                 self.wfile.flush()
                 self.connection.shutdown(socket.SHUT_WR)
                 self.close_connection = True
@@ -502,6 +504,8 @@ def test_a_connection_that_is_refused_is_unanswered(shape):
         "unframed_cut",
         "chunked_cut",
         "chunked_bad_size",
+        "redirect_cut",
+        "redirect_header_cut",
     ],
 )
 def test_the_worker_sends_a_settle_again_when_the_server_gave_no_complete_answer(
@@ -509,8 +513,8 @@ def test_the_worker_sends_a_settle_again_when_the_server_gave_no_complete_answer
 ):
     # A 503 with the service's envelope, a lost connection, a body cut short, a proxy's 502, a status line cut short,
     # a reply cut in its headers before it declared a length, and chunked framing that stops or has a chunk size that
-    # is not hex, which http.client cannot tell apart. The server has already settled the attempt, as it has when a
-    # reply is lost, so the second POST gets the recorded result.
+    # is not hex, which http.client cannot tell apart, and redirects cut in their body or headers. The server has
+    # already settled the attempt, as it has when a reply is lost, so the second POST gets the recorded result.
     joined, attempt = _open_attempt(peer, process_api, credentials, send)
     peer.state.mode = mode
     assert instance_worker._delivery(joined, _settle_frame(attempt)) == {"attempt_id": attempt, **SETTLEMENT}
@@ -521,15 +525,15 @@ def test_the_worker_sends_a_settle_again_when_the_server_gave_no_complete_answer
 
 @pytest.mark.parametrize("delivery_enabled", [True])
 @pytest.mark.parametrize(
-    "mode", ["redirect", "redirect_cut", "html_403", "unknown_code", "other_attempt", "many_headers", "bad_status"]
+    "mode", ["redirect", "html_403", "unknown_code", "other_attempt", "many_headers", "bad_status"]
 )
 def test_the_worker_does_not_send_a_settle_again_after_a_complete_reply_it_cannot_accept(
     peer, process_api, credentials, send, mode
 ):
-    # A redirect, also one cut before its body, a proxy's HTML 403, a 4xx with a code this client does not know, a
-    # 200 that names another attempt, and replies the HTTP parser rejects (too many headers, a status line that is
-    # not HTTP). The client gives each the code of a request that may have been sent, but each is an answer, so the
-    # error ends the worker after one POST.
+    # A complete redirect, a proxy's HTML 403, a 4xx with a code this client does not know, a 200 that names another
+    # attempt, and replies the HTTP parser rejects (too many headers, a status line that is not HTTP). The client
+    # gives each the code of a request that may have been sent, but each is an answer, so the error ends the worker
+    # after one POST.
     joined, attempt = _open_attempt(peer, process_api, credentials, send)
     peer.state.mode = mode
     with pytest.raises(ChatError) as caught:
