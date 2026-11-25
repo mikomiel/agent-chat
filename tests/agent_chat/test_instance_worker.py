@@ -16,13 +16,14 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from agent_chat import instance_client, instance_worker
 from agent_chat.instance_file import InstanceSecret, prepare_instance
-from agent_chat.models import ChatError
+from agent_chat.models import ChatError, DeliveryResult
+from agent_chat.storage import connect
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -763,17 +764,17 @@ def test_pending_request_uncertain_stays_fatal(monkeypatch: pytest.MonkeyPatch) 
 
 
 @pytest.mark.parametrize("code", ["TRANSPORT_UNAVAILABLE", "SERVICE_UNAVAILABLE", "REQUEST_UNCERTAIN"])
-@pytest.mark.parametrize("operation", ["claim", "settle", "status", "end"])
-def test_claim_settle_status_and_end_outages_stay_fatal(
+@pytest.mark.parametrize("operation", ["claim", "status", "end"])
+def test_claim_status_and_end_outages_stay_fatal(
     monkeypatch: pytest.MonkeyPatch, operation: str, code: str,
 ) -> None:
+    """A settle outage is sent again until the request deadline instead (#176); its tests follow below."""
     frames_in = {
         "claim": {"op": "claim", "key": str(uuid4()), "messages": [str(uuid4())]},
-        "settle": {"op": "settle", "attempt": str(uuid4()), "result": {"outcome": "deferred", "reason": "busy"}},
         "status": {"op": "status"},
         "end": {"op": "end"},
     }
-    key = {"claim": "claim", "settle": "result", "status": "status", "end": "end"}[operation]
+    key = {"claim": "claim", "status": "status", "end": "end"}[operation]
     code_, frames, calls = _timed_worker(
         monkeypatch, [(1, frames_in[operation])], [], failures={key: [ChatError(code)] * 2}
     )
@@ -799,6 +800,136 @@ def test_a_definite_settlement_refusal_is_soft_and_the_worker_keeps_serving(
     assert frames[1]["result"] == {"refused": code}
     assert frames[2]["result"]["instance_id"]
     assert calls[-1] == (2, "/v1/instance/end")
+
+
+# #176: a settlement that gets no answer is sent again, with the same attempt and result, inside the request's
+# deadline. These tests call `_delivery` on a clock they own: the worker's `monotonic` reads it and its `sleep`
+# advances it.
+SETTLE_NO_ANSWER = ["REQUEST_UNCERTAIN", "SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE"]
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.start = self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _scripted_settle(
+    monkeypatch: pytest.MonkeyPatch, script: list[str | dict[str, Any]], *, cost: float = 0.0,
+) -> tuple[_Clock, list[SimpleNamespace]]:
+    """`instance_client.settle` replaced by a script: a string is the code of a ChatError, a dict is the answer.
+
+    The last entry repeats. Each try takes `cost` seconds. A try that would cross its deadline ends at it with
+    CLI_INTERRUPTED, as the client does.
+    """
+    clock = _Clock()
+    calls: list[SimpleNamespace] = []
+
+    def settle(
+        instance: Any, attempt: UUID, result: DeliveryResult, *, deadline: float | None = None
+    ) -> dict[str, Any]:
+        calls.append(SimpleNamespace(at=clock.now, attempt=attempt, result=result, deadline=deadline))
+        step = script[min(len(calls), len(script)) - 1]
+        if deadline is not None and clock.now + cost >= deadline:
+            clock.now = deadline
+            raise ChatError("CLI_INTERRUPTED")
+        clock.now += cost
+        if isinstance(step, str):
+            raise ChatError(step)
+        return step
+
+    monkeypatch.setattr(instance_worker.instance_client, "settle", settle)
+    monkeypatch.setattr(instance_worker, "monotonic", clock)
+    monkeypatch.setattr(instance_worker, "sleep", clock.sleep, raising=False)  # the worker imports it for the retry
+    return clock, calls
+
+
+def _deliver_settle(attempt: UUID) -> dict[str, Any]:
+    frame = {"id": 1, "op": "settle", "attempt": str(attempt), "result": {"outcome": "handed", "reason": None}}
+    return instance_worker._delivery(SimpleNamespace(), frame)
+
+
+@pytest.mark.parametrize("code", SETTLE_NO_ANSWER)
+def test_a_settle_with_no_answer_is_sent_again_with_the_same_attempt_and_result(
+    monkeypatch: pytest.MonkeyPatch, code: str,
+) -> None:
+    attempt = uuid4()
+    settled = {"attempt_id": str(attempt), "outcome": "handed", "reason": None}
+    clock, calls = _scripted_settle(monkeypatch, [code, code, settled], cost=3.0)
+    assert _deliver_settle(attempt) == settled
+    result = DeliveryResult(outcome="handed", reason=None)
+    assert [(call.attempt, call.result) for call in calls] == [(attempt, result)] * 3
+    # One deadline for every try, inside the request's alarm; one short fixed pause between the tries.
+    deadline = calls[0].deadline
+    assert deadline is not None and clock.start < deadline < clock.start + instance_worker.REQUEST_SECONDS
+    assert {call.deadline for call in calls} == {deadline}
+    assert len(clock.sleeps) == 2 and len(set(clock.sleeps)) == 1 and 0 < clock.sleeps[0] <= 1
+
+
+@pytest.mark.parametrize("code", SETTLE_NO_ANSWER)
+def test_the_tries_of_a_settle_stop_at_the_deadline_and_the_last_error_propagates(
+    monkeypatch: pytest.MonkeyPatch, code: str,
+) -> None:
+    clock, calls = _scripted_settle(monkeypatch, [code])  # every try fails at once, as a refused connection does
+    with pytest.raises(ChatError) as caught:
+        _deliver_settle(uuid4())
+    assert caught.value.code == code
+    assert len(calls) > 2
+    deadline = calls[0].deadline
+    assert deadline is not None and clock.start < deadline < clock.start + instance_worker.REQUEST_SECONDS
+    assert all(call.at < deadline for call in calls)  # no try began once the deadline was spent
+    assert clock.now <= deadline  # and the worker is done before its alarm
+
+
+def test_a_try_that_the_deadline_cut_short_leaves_as_request_uncertain(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The client ends such a try with CLI_INTERRUPTED. The parent knows no such code, so it would fail where it rejoins
+    # for REQUEST_UNCERTAIN, the code of a request that may have been sent.
+    clock, calls = _scripted_settle(monkeypatch, ["REQUEST_UNCERTAIN"], cost=100.0)
+    with pytest.raises(ChatError) as caught:
+        _deliver_settle(uuid4())
+    assert caught.value.code == "REQUEST_UNCERTAIN"
+    assert len(calls) == 1 and calls[0].deadline is not None and clock.now == calls[0].deadline
+
+
+@pytest.mark.parametrize("sent_before", [0, 1, 2])
+@pytest.mark.parametrize("code", ["DELIVERY_CLOSED", "NOT_FOUND"])
+def test_a_definite_refusal_ends_the_tries_of_a_settle_and_is_answered_as_refused(
+    monkeypatch: pytest.MonkeyPatch, code: str, sent_before: int,
+) -> None:
+    _clock, calls = _scripted_settle(monkeypatch, ["REQUEST_UNCERTAIN"] * sent_before + [code], cost=3.0)
+    assert _deliver_settle(uuid4()) == {"refused": code}
+    assert len(calls) == sent_before + 1
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["STALE_INSTANCE", "UNAUTHENTICATED", "INVALID_RESPONSE", "HTTP_REFUSED", "REDIRECT_REFUSED", "INVALID_REQUEST"],
+)
+def test_any_other_failure_of_a_settle_is_not_sent_again(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+    _clock, calls = _scripted_settle(monkeypatch, [code])
+    with pytest.raises(ChatError) as caught:
+        _deliver_settle(uuid4())
+    assert caught.value.code == code and len(calls) == 1
+
+
+def test_sigterm_during_a_settle_still_ends_the_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SIGTERM fails the request in flight as REQUEST_UNCERTAIN, a code that is sent again. A stop is not an outage.
+    handlers: dict[int, Any] = {}
+    settle = {"op": "settle", "attempt": str(uuid4()), "result": {"outcome": "handed", "reason": None}}
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, settle), (2, {"op": "status"})], [],
+        failures={"result": [_sigterm(handlers, "REQUEST_UNCERTAIN")]}, handlers=handlers,
+    )
+    assert code == 1 and frames[-1] == {"id": 1, "error": {"code": "REQUEST_UNCERTAIN"}}
+    assert len(frames) == 2  # no second try answered, and the second frame was never read
+    assert [path.rsplit("/", 1)[-1] for _at, path in calls] == ["result", "end"]
 
 
 # Receipts are advisory: a receipt fault of any code is a soft refusal and never ends the worker. The instance's
@@ -1040,6 +1171,71 @@ def test_live_worker_survives_a_server_restart_and_keeps_its_instance(
                 process.kill()
                 process.wait(timeout=3)
     assert db.execute("SELECT ended_at FROM agent_chat.instances").fetchone()["ended_at"] is not None
+
+
+#: How long the stalled read holds the clock: past the service's 3 s lock limit, well inside the worker's 20 s request.
+CLOCK_HELD_SECONDS = 4
+
+
+@pytest.mark.parametrize("delivery_enabled", [True])
+def test_a_settle_waits_out_a_stalled_read_that_holds_the_event_clock(
+    process_api, credentials, send, join_frame, db, database, lock_wait,
+) -> None:
+    """#176: a read that stalls holds the event clock shared. The settle of another instance waits for it past the
+    service's 3 s lock limit, so its first try ends without an answer or with a 503, and the client reports either as
+    REQUEST_UNCERTAIN. The worker used to end there, the reservation lapsed as uncertain and the message was never
+    offered again. Now the worker sends the same settlement again, and the retry lands once the read lets go.
+    """
+    with subprocess.Popen(
+        [sys.executable, "-m", "agent_chat.instance_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=ROOT, env={},
+    ) as process:
+        try:
+            assert process.stdin is not None and process.stdout is not None
+            joined = _frame(process, join_frame)["result"]
+            assert "result" in _frame(process, {"id": 1, "op": "heartbeat", "state": HEARTBEAT_STATE})
+            message = send(
+                process_api, credentials, "synthetic coordination", kind="question",
+                recipients=[joined["session_id"]],
+            )
+            pending = _frame(process, {"id": 2, "op": "pending"})["result"]
+            assert pending == {"messages": [message["id"]]}
+            grant = _frame(process, {"id": 3, "op": "claim", "key": str(uuid4()), "messages": pending["messages"]})[
+                "result"
+            ]
+            assert grant["dispatch"] is True
+            handed = {"outcome": "handed", "reason": None}
+            settle = {"id": 4, "op": "settle", "attempt": grant["attempt_id"], "result": handed}
+            with connect(database) as reader:
+                reader.execute("BEGIN")
+                reader.execute("SELECT 1 FROM agent_chat.event_clock WHERE singleton FOR SHARE")
+                try:
+                    process.stdin.write(json.dumps(settle) + "\n")
+                    process.stdin.flush()
+                    # Counted from the settle's own wait on the clock, so its first try outlasts the lock limit.
+                    lock_wait("agent_chat.event_clock")
+                    time.sleep(CLOCK_HELD_SECONDS)
+                finally:
+                    reader.execute("ROLLBACK")
+            # The answer is read after the release: the worker is still inside its request, with the alarm armed.
+            answer = process.stdout.readline()
+            assert json.loads(answer) == {"id": 4, "result": {"attempt_id": grant["attempt_id"]} | handed}
+            attempt = db.execute(
+                "SELECT outcome, reason FROM agent_chat.delivery_attempts WHERE id = %s", (grant["attempt_id"],)
+            ).fetchone()
+            assert attempt == handed
+            recipient = db.execute(
+                "SELECT handed_at FROM agent_chat.recipients WHERE message_id = %s AND session_id = %s",
+                (message["id"], joined["session_id"]),
+            ).fetchone()
+            assert recipient is not None and recipient["handed_at"] is not None
+            process.stdin.close()
+            process.wait(timeout=30)
+            assert process.returncode == 0 and process.stderr is not None and process.stderr.read() == ""
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
 
 
 def test_pending_with_bodies_keeps_the_empty_backoff_and_passes_the_sizing_through(

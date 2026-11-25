@@ -1108,6 +1108,22 @@ def test_a_refused_claim_keeps_a_full_expiry_pass_when_its_refusal_sweep_cannot_
     assert db.execute("SELECT count(*) AS n FROM agent_chat.delivery_attempts").fetchone()["n"] == 0
 
 
+def test_a_refused_claim_expires_the_whole_backlog_when_its_refusal_sweep_can_lock(
+    process_api, credentials, target, send, db
+):
+    """#186, unlocked counterpart of the test above: the same 101 due items, no held row. The claim's sweep settles
+    100 before the admission refuses it, and the refusal-path sweep then settles the 101st.
+    """
+    token, binding = target
+    due_backlog(process_api, credentials, send, db, binding)
+    fresh = question(process_api, credentials, send, binding)["id"]
+    ready(process_api, token, plan_mode=True)
+    response = claim(process_api, token, [fresh])
+    refusal(response, 409, "DELIVERY_BLOCKED")
+    assert expired_count(db) == 101
+    assert db.execute("SELECT count(*) AS n FROM agent_chat.delivery_attempts").fetchone()["n"] == 0
+
+
 def test_a_result_refused_before_its_sweep_keeps_its_refusal_when_the_refusal_sweep_cannot_lock(
     process_api, credentials, target, send, db, database
 ):

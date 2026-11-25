@@ -1,4 +1,4 @@
-"""One private stdin/stdout lifecycle worker; no launcher, native send or retry.
+"""One private stdin/stdout lifecycle worker; no launcher or native send, and no retry but a settlement's.
 
 The parent supplies one explicit join, then serial heartbeat, pending, claim, settle,
 status, receipts, receipts_delivered and end requests. EOF, idle expiry and failure end only this
@@ -19,7 +19,7 @@ import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 from uuid import UUID
 
@@ -32,13 +32,19 @@ REQUEST_SECONDS = 20
 IDLE_SECONDS = 90
 # A server restart fails a poll or a heartbeat without ending the session. Each op tolerates its own
 # unbroken failure streak for less than the server lease; one success of that op ends the streak.
-# A repeated heartbeat is safe, a claim or settle is not. Receipts are advisory and have no streak: a receipt
+# A repeated heartbeat is safe and a claim is not. A settle is safe only as the same attempt with the same result,
+# which `_settle` sends again itself, so it has no streak either. Receipts are advisory and have no streak: a receipt
 # read or mark that fails, whatever the code or the length of the failure, answers `refused` and never ends the
 # worker, because the parent offers the receipt again at its next poll. Liveness stays with heartbeat, pending
 # and claim, which fail closed. The receipts read includes the session's mute flag (`_receipts_with_mute`), so a
 # failed mute read is the same refusal, not the fatal `status` request.
 PENDING_OUTAGE = frozenset({"TRANSPORT_UNAVAILABLE", "SERVICE_UNAVAILABLE"})
 HEARTBEAT_OUTAGE = PENDING_OUTAGE | {"REQUEST_UNCERTAIN"}
+# A settlement with no answer is sent again after this pause. One try can take 3 s (the client's step), so the
+# pause only keeps a refused connection from spinning; it is not a back-off.
+SETTLE_PAUSE_SECONDS = 0.5
+# The tries end this long before the request's alarm, so the worker answers its parent before the alarm fires.
+SETTLE_MARGIN_SECONDS = 1.0
 
 
 def _interrupt(_signum: int, _frame: Any) -> None:
@@ -141,7 +147,39 @@ def _is_pending(request: dict[str, Any]) -> bool:
     return request.get("op") == "pending" and {"id", "op"} <= set(request) <= {"id", "op", "bodies"}
 
 
-def _delivery(instance: instance_client.JoinedInstance, request: dict[str, Any]) -> dict[str, Any]:
+def _settle(
+    instance: instance_client.JoinedInstance, attempt: UUID, result: DeliveryResult, stopping: Callable[[], bool]
+) -> dict[str, Any]:
+    """Settle, and send the same attempt and result again while the request has no answer and has time left.
+
+    No answer is an uncertain or unavailable transport, the codes of `HEARTBEAT_OUTAGE`. A settlement with no answer
+    may have committed, and a server that waits too long for a lock answers it with a 5xx that did not. The client
+    reports both as `REQUEST_UNCERTAIN`. Ending the worker there would leave the reservation to lapse as `uncertain`,
+    and the message would never be offered again (#176). The server answers a repeat of the same outcome with the
+    recorded one, and another outcome or a lapsed reservation with `DELIVERY_CLOSED`, so a repeat can neither settle
+    twice nor change the record. A definite refusal, any other code and a stop (`stopping`, the worker's SIGTERM)
+    end the tries at once.
+
+    All tries share one deadline, `SETTLE_MARGIN_SECONDS` before the request's alarm. When it is spent the last
+    error propagates and ends the worker. The client ends a try that crosses the deadline with `CLI_INTERRUPTED`,
+    which the parent does not know, so it leaves as `REQUEST_UNCERTAIN`, the code of a request that may have been
+    sent (`Adapter._failed_operation` maps it the same way).
+    """
+    deadline = monotonic() + REQUEST_SECONDS - SETTLE_MARGIN_SECONDS
+    while True:
+        try:
+            return instance_client.settle(instance, attempt, result, deadline=deadline)
+        except ChatError as error:
+            if error.code == "CLI_INTERRUPTED":
+                raise ChatError("REQUEST_UNCERTAIN") from None
+            if stopping() or error.code not in HEARTBEAT_OUTAGE or monotonic() + SETTLE_PAUSE_SECONDS >= deadline:
+                raise
+        sleep(SETTLE_PAUSE_SECONDS)
+
+
+def _delivery(
+    instance: instance_client.JoinedInstance, request: dict[str, Any], stopping: Callable[[], bool] = lambda: False
+) -> dict[str, Any]:
     operation = request.get("op")
     try:
         if _is_pending(request):
@@ -157,14 +195,15 @@ def _delivery(instance: instance_client.JoinedInstance, request: dict[str, Any])
                 instance, UUID(request["key"]), DeliveryClaim(messages=request["messages"]), _asks_bodies(request)
             )
         if operation == "settle" and set(request) == {"id", "op", "attempt", "result"}:
-            return instance_client.settle(
-                instance, UUID(request["attempt"]), DeliveryResult.model_validate(request["result"])
+            return _settle(
+                instance, UUID(request["attempt"]), DeliveryResult.model_validate(request["result"]), stopping
             )
     except ChatError as error:
         # A definite refusal is the ledger's answer, not a failed transport, and that holds for settlement
         # too: a reservation that lapsed while the native send ran answers DELIVERY_CLOSED, and the server has
         # already settled the attempt as uncertain. Ending the worker there would disable chat for the whole
-        # session over an ordinary race. Only an uncertain or unavailable transport ends the worker.
+        # session over an ordinary race. Only an uncertain or unavailable transport ends the worker, and a
+        # settlement's only after `_settle` has sent it again until its deadline.
         if error.code in {
             "DELIVERY_DISABLED",
             "DELIVERY_BLOCKED",
@@ -317,7 +356,7 @@ def main() -> int:
                 result = _end(instance, directory)
                 ended = True
             else:
-                result = _delivery(instance, request)
+                result = _delivery(instance, request, lambda: terminated)
             _write({"id": sequence, "result": result}, credentials)
             if ended:
                 break

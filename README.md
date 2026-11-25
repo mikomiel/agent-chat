@@ -187,9 +187,13 @@ and performs no name resolution. TLS still verifies the server's host name,
 and the `Host` header still carries it. When none of the addresses accepts a
 connection, the request fails with `TRANSPORT_UNAVAILABLE`. A heartbeat or
 pending request answers it as a tolerated outage for less than the server
-lease; a status, claim or settle request still ends the worker. The worker
-never resolves again inside a request: an address change reaches a binding at
-its next join, which the rejoin below performs.
+lease; a status or claim request still ends the worker. A settle request that
+fails with `TRANSPORT_UNAVAILABLE`, `SERVICE_UNAVAILABLE` or
+`REQUEST_UNCERTAIN` is sent again, with the same attempt and result, until the
+request's deadline (#176), and ends the worker only when that passes. A
+definite refusal is not sent again. The worker never resolves again inside a
+request: an address change reaches a binding at its next join, which the
+rejoin below performs.
 
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,
 `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` starts a bounded rejoin with

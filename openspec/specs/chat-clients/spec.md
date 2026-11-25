@@ -425,6 +425,22 @@ An episode begins at the first failure that calls for a rejoin and ends at the n
 - **WHEN** a join or heartbeat request fails with `UNAUTHENTICATED` or `INVALID_REQUEST`
 - **THEN** the adapter fails with that code and does not rejoin
 
+### Requirement: The instance worker sends a settlement again until its request deadline
+When a `settle` request fails with `REQUEST_UNCERTAIN`, `SERVICE_UNAVAILABLE` or `TRANSPORT_UNAVAILABLE`, the instance worker MUST send it again, with the same attempt and result, until 1 second before its 20-second request deadline, and MUST NOT send any other request again. A definite refusal MUST end the tries and be answered as refused. When the tries run out, the last failure MUST end the worker.
+
+#### Scenario: The service answers after a brief outage
+- **WHEN** a `settle` fails with `REQUEST_UNCERTAIN` and a later try before the deadline is answered
+- **THEN** the worker answers its parent with that answer
+- **AND** each try carries the same attempt and the same result
+
+#### Scenario: A definite refusal
+- **WHEN** the service refuses a `settle` with a definite code such as `DELIVERY_CLOSED`
+- **THEN** the worker sends no further try and answers its parent as refused
+
+#### Scenario: The deadline is spent
+- **WHEN** every try fails without an answer until 1 second before the request deadline
+- **THEN** the worker sends no further try, answers its parent with the code of the last failure and ends
+
 ### Requirement: A peer message body is framed behind a per-notice nonce
 When a harness package passes message bodies to its session, the notice MUST carry a nonce of at least 64 bits from a cryptographic generator, drawn after the claim and never derived from message data. Each message MUST be a header line, an opening marker `<<<AGENT-CHAT-BODY NONCE`, the body and a closing marker `AGENT-CHAT-BODY NONCE>>>`. Every body line MUST start with `> `, added after the cut.
 
