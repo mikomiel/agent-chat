@@ -209,7 +209,9 @@ or a stop. Only the idle-wake waiter exits 2.
   other, and it never replaces a claim. It gives way: a claim, a heartbeat or a
   state report that queues behind it ends it with the worker's cancel signal, so,
   client-side, none of them waits for it beyond the worker's answer to the
-  signal, and no hook skips its claim for it. The server is another wait: a
+  signal, and no hook skips its claim for it. A cancel that reaches the worker
+  before it has read the request is dropped, and that request then ends within
+  2 seconds (#183). The server is another wait: a
   receipts read that stalls inside it keeps the row of the instance, so the
   request that goes first after the cancel, the `pending` that opens a claim or
   a heartbeat, waits for it, up to 3 seconds, and is refused if the row is still

@@ -69,6 +69,10 @@ const brief = result => BRIEF_OUTAGE.has(refused(result))
 const isDone = (frame, outcome) => frame?.op === "done" && frame.outcome === outcome
 // What a receipts request that was never sent answers: the worker's own answer to a cancelled one, and a held one for the pass.
 const CANCELLED = Object.freeze({ refused: "CLI_INTERRUPTED" })
+// The answer `receipts.muteSeen` is given for a `status` answer. The worker forwards a status answer that has no `muted` flag, and
+// `muteSeen` keeps the older flag for an answer with no `muted` key, so that flag would stand for this one and could still authorize
+// a notice. A flag that is not a boolean is an unknown flag: nothing is shown until a later answer carries one.
+const statusMute = answer => ({ muted: typeof answer?.muted === "boolean" ? answer.muted : null })
 
 export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
@@ -595,7 +599,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         else {
           const state = await ask("status")
           if (live !== record) return false
-          receiptState = receipts.muteSeen(receiptState, state) // the latest mute flag known; it reads and never throws
+          receiptState = receipts.muteSeen(receiptState, statusMute(state)) // the latest mute flag known, or unknown; it never throws
           if (check(state, "status")) result = { outcome: "deferred", reason: "unknown" }
           else if (unreachable()) result = NOT_WRITTEN
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
@@ -616,7 +620,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
                 try {
                   again = await ask("status")
                   if (live !== record || closed || failure) return "offline"
-                  receiptState = receipts.muteSeen(receiptState, again)
+                  receiptState = receipts.muteSeen(receiptState, statusMute(again))
                   if (check(again, "status")) return "unknown"
                 } catch (error) { readyFailure = error; return "offline" }
                 return again.muted === false ? null : again.muted === true ? "muted" : "unknown"
@@ -733,7 +737,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // A pass that is cancelled, or finds a sequence queued, is a refused answer: held, and asked again by a later pass. A
   // transport failure goes where any request's failure goes; a refused or malformed answer, and any fault of this code, is
   // held: it never ends chat and never reaches a delivery. `force` is a mark right after a confirmation: a mark is not a
-  // poll, so the cadence does not apply.
+  // poll, so the cadence does not apply. The cadence counts from the write, so the pass records it when it runs, not when it
+  // queues: a heartbeat that holds the worker must not use up the wait. Until then `receiptsBusy` is what keeps a second pass
+  // from queuing behind the first.
   function receiptsPass({ force = false } = {}) {
     if (receiptsBusy || !live || !joined || closed || failure || !cancelsReceipts(joined)) return
     if (!force && !receipts.due(receiptState, now())) return
@@ -741,9 +747,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const poll = !force && !staged && !handing && chatState() === "busy"
     if (!marks && !poll) return
     receiptsBusy = true
-    if (!force) receiptState = receipts.polled(receiptState, now())
     lane(async () => {
       if (!live || !joined) return
+      if (!force) receiptState = receipts.polled(receiptState, now())
       if (await markReceipts()) return
       if (poll && live && joined && chatState() === "busy") await pollReceipts()
     }).catch(error => {

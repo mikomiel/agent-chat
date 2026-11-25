@@ -403,7 +403,8 @@ export function createLifecycle(bus, delivery, config, {
     } else {
       const status = await request("status")
       if (!live) return
-      receiptState = receipts.muteSeen(receiptState, status) // the latest mute flag known; it reads and never throws
+      // The latest mute flag known. A status answer without a boolean flag makes it unknown, so a staged notice is dropped.
+      receiptState = receipts.muteSeen(receiptState, { muted: typeof status?.muted === "boolean" ? status.muted : null })
       const statusRefusal = refused(status)
       if (statusRefusal) {
         if (REJOIN_AFTER.has(statusRefusal)) throw Object.assign(new Error(statusRefusal), { code: statusRefusal, operation: "status" })

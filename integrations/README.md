@@ -273,7 +273,8 @@ The rules below bind every package that shows receipts.
   It shares the worker's single request slot, like every request, so it gives way: see the next rule. A pass sends one
   receipts request, never a mark and a poll in a row.
 - **A receipts request gives way (#175), client-side.** In a package and its worker, nothing waits behind a receipts
-  request except for the cancel latency, a signal and the worker's answer to it. Two rules make that so, and a package
+  request except for the cancel latency, a signal and the worker's answer to it, and except when the worker drops a
+  cancel for a request it has not read yet (#183, *Known race* below). Two rules make that so, and a package
   keeps no other receipts path. The server is a separate wait, and these rules do not remove it. A receipts read that
   stalls inside the server keeps the row of its instance after the cancel, so the first request after the cancel waits
   for that row, up to the server's `lock_timeout` of 3 seconds, and is refused if the row is still held. That request is
@@ -290,10 +291,15 @@ The rules below bind every package that shows receipts.
   one that arrives just before a receipts request is kept by one latch, so that request answers `refused` at once. One
   that arrives after a receipts request has its answer, and before the worker reads the next request, was sent for the
   request that has just been answered, and the worker drops it: it never refuses the request after it, such as a retry of
-  the same mark. A signal for a receipts request sent right after another one's answer is dropped the same way if it
-  lands before the worker has read that request; the 2-second deadline below then ends it. During a receipts request, `SIGTERM` and the 20-second alarm end the worker, also when the HTTP client reports
+  the same mark. During a receipts request, `SIGTERM` and the 20-second alarm end the worker, also when the HTTP client reports
   their interrupt as a failed transport. Other requests keep their existing outage handling. The package holds the answer like any refusal: no state changes, a
   feed read is asked again at a later pass, and a mark that was ended keeps its ids.
+  *Known race (#183).* A package can send a receipts request right after the answer to another one, a retried mark for
+  example, and cancel it. A signal for that request that lands after the package wrote it and before the worker has read
+  it is dropped the same way, because the worker cannot tell it from a signal for the request just answered. Nothing ends
+  the request then but its answer or the 2-second deadline below, so what queued behind it waits up to 2 seconds, not the
+  cancel latency. That is latency only, and no message is lost: a deadline answers `refused`, which the package holds like
+  any refusal, and a hook that runs short of time delivers nothing and leaves its message on the server.
   `claude-code` and `codex` cancel when a counted request queues behind a receipts request: a hook's or a wake's claim
   sequence, a heartbeat or a state report. A receipts task that reaches the head of the queue while a counted request
   is in flight sends nothing, and a later pass asks again. The hook's check for a slow request does not count a
@@ -328,7 +334,7 @@ The rules below bind every package that shows receipts.
 - **A staged notice is checked again when it is output.** `deepseek`, `claude-code` and `codex` stage a notice and output it
   at a later boundary, and the session may be muted by then. At the boundary the package asks the server nothing and
   uses the latest `muted` flag that a worker answer carried: a `receipts` answer that has rows, and the `status` answer
-  of a claim. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the answer that
+  of a claim. A `status` answer without a boolean `muted` makes the flag unknown. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the answer that
   staged the notice came at most 5 seconds before. The three packages count those seconds on the wall clock, so a
   suspend ages a notice, and an age that is negative or not a number drops it. `deepseek` also drops it unless its
   native state, read again without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and

@@ -644,6 +644,27 @@ test("a status answer that says muted between the poll and the output drops the 
   assert.deepEqual(s.marks(), [{ receipts: ids(feed) }])
 })
 
+// A status answer that carries no boolean flag is newer evidence than the unmuted feed answer, and it proves nothing:
+// the staged notice must not be shown on the older flag.
+test("a status answer with no muted flag between the poll and the output drops the notice: it is not marked and comes back", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed })
+  await s.tick(0) // staged from an unmuted answer
+  s.native.state = null
+  s.server.delivery = peerMessage
+  s.server.status = () => ({})
+  await s.tick(1)
+  assert.equal(s.delivered.length, 0, "the delivery is deferred")
+  assert.equal(s.log.find(entry => entry.op === "settle").fields.result.reason, "unknown")
+  s.native.state = "busy"
+  assert.equal(s.take(), null, "the flag is unknown: the staged notice is dropped")
+  assert.equal(s.count("receipts_delivered"), 0)
+  s.server.status = null
+  await s.tick()
+  const again = s.take()
+  assert.ok(again && again.text.includes(feed[0].message_id), "the row comes back")
+})
+
 test("a staged notice is dropped at output unless the turn still runs outside Plan Mode, and its row comes back", async () => {
   const feed = [row(1)]
   const states = [

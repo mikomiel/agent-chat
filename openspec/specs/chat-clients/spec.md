@@ -566,7 +566,7 @@ A package that shows sender receipts MUST offer them only while the session is j
 - **AND** the receipts stay pending on the server
 
 ### Requirement: A staged sender receipts notice is checked again when it is output
-A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest `muted` flag that any worker answer carried is `false` and the answer that staged it came at most 5 seconds before. `deepseek` MUST also drop it unless its native state, read without side effect, is a running turn outside Plan Mode. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
+A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest `muted` flag that any worker answer carried is `false` and the answer that staged it came at most 5 seconds before. A `status` answer without a boolean `muted` makes that flag unknown. `deepseek` MUST also drop it unless its native state, read without side effect, is a running turn outside Plan Mode. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
 
 #### Scenario: A mute after the notice was staged
 - **WHEN** a `status` answer says the session is muted, or more than 5 seconds pass, after the answer that staged a notice and before its output
@@ -598,7 +598,16 @@ A package's receipts pass MUST send at most one receipts request: the mark that 
 - **AND** the delivery still counts the agent as busy and starts no turn
 
 ### Requirement: A receipts request gives way to every other request
-A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`. It MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused. A worker that lists `receipts-cancel` MUST let a cancel end only the receipts request it was sent for, and MUST still end on its alarm or on `SIGTERM` during a receipts request.
+A package MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused. A cancel that the worker drops leaves a receipts request to its 2 s deadline: latency only, no message is lost.
+
+#### Scenario: A request falls due while a receipts request is in flight
+- **WHEN** a heartbeat, a state report, a delivery poll or a claim falls due while a receipts request is in flight and nothing releases that request
+- **THEN** the package cancels the receipts request, and sends the due request when the worker has answered the cancel
+- **AND** the package holds the `refused` answer like any refusal, changes no state for it, and keeps the ids of a mark that was ended
+- **AND** chat stays on, and those ids are marked at a later pass
+
+### Requirement: `receipts-cancel` gates receipts requests and ends only a receipts request
+A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`. A worker that lists `receipts-cancel` MUST let a cancel end only the receipts request it was sent for, and MUST still end on its alarm or on `SIGTERM` during a receipts request.
 
 #### Scenario: A worker without the capability
 - **WHEN** a worker's join reply has no `capabilities` list, or the list does not contain `receipts-cancel`
@@ -609,16 +618,16 @@ A package MUST send a receipts request only to a worker whose join reply lists `
 - **WHEN** a rejoin starts a worker whose join reply differs in `capabilities` from the worker before it
 - **THEN** the package follows the join reply of the worker that serves, and of no other
 
-#### Scenario: A request falls due while a receipts request is in flight
-- **WHEN** a heartbeat, a state report, a delivery poll or a claim falls due while a receipts request is in flight and nothing releases that request
-- **THEN** the package cancels the receipts request, and sends the due request when the worker has answered the cancel
-- **AND** the package holds the `refused` answer like any refusal, changes no state for it, and keeps the ids of a mark that was ended
-- **AND** chat stays on, and those ids are marked at a later pass
-
 #### Scenario: A cancel arrives after the receipts request has its answer
 - **WHEN** the worker receives the cancel signal after a receipts request has its answer and before it reads the next request
 - **THEN** the worker drops the signal
 - **AND** the next request, a retry of the same mark included, is sent to the server and answered
+
+#### Scenario: A cancel arrives before the worker reads the receipts request it was sent for
+- **WHEN** a package writes a receipts request right after the answer to another one and cancels it, and the signal lands before the worker has read that request
+- **THEN** the worker drops the signal, as it does for any cancel in that window
+- **AND** the request ends at its answer or at the worker's 2-second receipt deadline, and a deadline answers `refused`, which the package holds like any refusal
+- **AND** the wait costs latency only, and no message is lost
 
 #### Scenario: The alarm fires during a receipts request
 - **WHEN** the worker's alarm fires while a receipts request runs, also while the HTTP client waits for the answer

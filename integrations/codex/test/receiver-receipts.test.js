@@ -845,6 +845,29 @@ test("a notice is dropped at output when a later answer says muted: nothing is s
   assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
 })
 
+// Review 6057156266: the worker forwards any `status` answer whose instance and session ids match. One without a `muted` flag says
+// nothing about the mute, so the flag of an older answer must not stand for it: the notice that flag authorized is dropped.
+test("a notice is dropped at output when a later status answer carries no muted flag: nothing is shown or marked, and the row comes back", async () => {
+  const feed = [rcpt(1)]
+  const r = await staged({ rows: feed })
+  r.server.pending = ["m1"]
+  assert.ok(isDeliveryText((await r.op(turn())).sent[0].context), "a delivery whose status says muted:false is handed, and the notice waits")
+  // No clock has moved, so the notice is as young as it was: only the missing flag can drop it.
+  r.server.status = () => ({ session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222" })
+  r.server.pending = ["m2"]
+  const hook = await r.op(turn())
+  assert.deepEqual(hook.sent, [{ context: null }], "the hook is answered with no notice, and the delivery that could not read the flag sends none")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }, { outcome: "deferred", reason: "unknown" }])
+  assert.equal(r.count("receipts_delivered"), 0, "nothing was shown, so nothing is marked")
+  // The next feed answer carries the flag again: the id was never marked, so the same row is shown and marked then.
+  r.server.status = null
+  await r.clock.advance(POLL_MS)
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "this event's pass polls again")
+  const shown = (await r.op(turn())).sent[0]
+  assert.ok(isNoticeText(shown.context) && shown.context.includes(feed[0].message_id), "and the next event shows the row")
+  assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
+})
+
 test("a notice is shown only by an event at most one cadence after the poll that staged it; an older one is dropped and offered again", async () => {
   const feed = [rcpt(1)]
   const inside = await staged({ rows: feed })
@@ -910,6 +933,38 @@ test("a pass with a mark waiting sends no feed request: the mark takes it, and t
   await r.op(turn()) // the next cadence reads the feed
   assert.equal(r.count("receipts"), 2)
   assert.equal(r.count("receipts_delivered"), 5)
+})
+
+// Review 6057156266: the cadence counts from the write of a request, not from the queuing of its pass. A heartbeat that holds the
+// worker delays the pass queued behind it, and the next feed request is due a whole cadence after the write of that one. The
+// worker double times each feed request on the scheduler's clock as it answers it. `ready` has published the native state, so the
+// state report that the event queues ahead of the pass sends nothing. There is one event during the hold: a second one would
+// queue a counted state report behind the pass, as the state is not published until the heartbeat is confirmed, and the pass
+// would give way to it and send nothing, which is another test's business.
+test("a feed request is due one cadence after the write of the last one, not after the queuing of its pass: a heartbeat holds the queue", async () => {
+  const r = await ready({ rows: [] })
+  const sent = []
+  Object.defineProperty(r.server, "receipts", { configurable: true, get: () => { sent.push(r.clock.now()); return { receipts: [], muted: false } } })
+  const first = r.clock.now()
+  await r.op(turn()) // the first poll
+  assert.deepEqual(sent, [first])
+  let release
+  r.server.gates.heartbeat = new Promise(resolve => { release = resolve })
+  await r.clock.advance(HEARTBEAT_MS - r.elapsed()) // the heartbeat falls due and holds the worker
+  const queuedAt = r.clock.now()
+  await r.op(turn()) // a poll is due, and its pass queues behind the heartbeat
+  await r.clock.advance(1000)
+  assert.deepEqual(sent, [first], "nothing is asked while the heartbeat holds the worker")
+  delete r.server.gates.heartbeat
+  release()
+  await settle()
+  assert.deepEqual(sent, [first, queuedAt + 1000], "the request goes out as the heartbeat ends")
+  await r.clock.advance(POLL_MS - 1000)
+  await r.op(turn()) // one cadence after the pass was queued, and four seconds after its write
+  assert.deepEqual(sent, [first, queuedAt + 1000], "not due yet: the cadence counts from the write")
+  await r.clock.advance(1000)
+  await r.op(turn())
+  assert.deepEqual(sent, [first, queuedAt + 1000, queuedAt + 1000 + POLL_MS], "due one cadence after the write")
 })
 
 // Review 6032554837: the age of a staged notice is counted on the wall clock, as `claude-code` counts it, so that a suspend ages
