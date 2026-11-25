@@ -273,6 +273,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // hook wrote and flushed the output; it does not mean the model has read it.
   async function hand(link, text, until, wake, announce) {
     if (!eligible(wake)) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
+    // A consumer that left before the write has seen nothing, so the claimed batch stays offerable. Once a write
+    // was attempted, a missing receipt is ambiguous and stays uncertain.
+    if (link.closed) return { result: { outcome: "deferred", reason: "offline" }, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null

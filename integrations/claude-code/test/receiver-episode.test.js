@@ -375,3 +375,47 @@ test("a waiter whose connection closes mid-hold exits 0 at once, with no output 
   assert.ok(elapsed >= 90, `it was held until the connection closed (${elapsed} ms)`)
   assert.ok(elapsed < 5000, `the close, not the 30-second hold, ended the wait (${elapsed} ms)`)
 })
+
+// A waiter that leaves between the claim and the notice has been shown nothing. The claimed batch must settle
+// `deferred`, not `uncertain`: an uncertain batch is excluded from later delivery. A write that was attempted and
+// never confirmed stays uncertain; `receiver.test.js` pins that ("a write that failed or went unconfirmed settles
+// uncertain, never handed", and "a wake whose write failed settles uncertain and leaves no waiter").
+for (const [later, again] of [
+  ["a later turn", async r => {
+    const next = await r.op(turn())
+    assert.match(next.sent[0].context, /"id":"m1"/, "the turn is offered the same message")
+    return next
+  }],
+  ["a later waiter", async r => {
+    const wake = hookDouble()
+    const waiting = r.receiver.handle({ op: "wait" }, wake)
+    await r.clock.advance(2000)
+    assert.equal(wake.sent.length, 1, "the waiter is offered the same message")
+    assert.match(wake.sent[0].context, /"id":"m1"/)
+    wake.close()
+    await waiting
+    return wake
+  }],
+]) {
+  test(`a waiter that leaves after the claim but before the notice is written defers the batch, and ${later} is offered it again`, async () => {
+    const control = { onStatus: () => {} }
+    const r = await rig({
+      handlers: { pending: () => ({ messages: ["m1"] }), status: () => { control.onStatus(); return { muted: false } } },
+    })
+    await idle(r)
+    const wake = hookDouble()
+    control.onStatus = () => wake.close() // the hold ends while the status call is in flight, after the claim
+    const waiting = r.receiver.handle({ op: "wait" }, wake)
+    await r.clock.advance(2000)
+    await waiting
+    assert.equal(r.worker.ops("claim").length, 1, "the message was claimed while the waiter was open")
+    assert.deepEqual(wake.sent, [], "no notice was written")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "offline" }])
+    control.onStatus = () => {}
+    await again(r)
+    assert.equal(r.worker.ops("claim").length, 2, "the same message was claimed again")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [
+      { outcome: "deferred", reason: "offline" }, { outcome: "handed", reason: null },
+    ])
+  })
+}

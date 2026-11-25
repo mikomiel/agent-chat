@@ -233,6 +233,10 @@ or a stop. Only the idle-wake waiter exits 2.
   A session idle for longer than the hold is delivered at its next turn, not by
   a wake. A new waiter starts at each `Stop`. A shorter hold frees the idle Node
   process and its socket sooner.
+  A waiter that leaves after it claimed a message but before it wrote the
+  notice has shown nothing, so the batch settles `deferred` and is offered again
+  at the next turn or waiter. A write that was attempted and never confirmed
+  still settles `uncertain`.
 - **A rejoin episode that outlasts the hold leaves no waiter.** The receiver
   keeps a registered waiter through a rejoin. After the join, the waiter wakes
   the idle session for a pending message, and its notice names the new boot id.
