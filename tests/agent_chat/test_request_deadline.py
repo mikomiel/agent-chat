@@ -72,10 +72,14 @@ def post(origin, path, payload, token, headers, sent):
         )
         try:
             response = connection.getresponse()
-            response.read()
+            body = response.read()
         except TimeoutError:
             return None, time.monotonic() - sent[0]
-        return response.status, time.monotonic() - sent[0]
+        elapsed = time.monotonic() - sent[0]
+        if response.status == 503:
+            # Every refusal these tests expect is the deadline's, never another 503.
+            assert json.loads(body)["error"]["code"] == "DATABASE_UNAVAILABLE", body
+        return response.status, elapsed
 
 
 def claim_request(service, token, message, sent):
@@ -405,17 +409,35 @@ def test_an_arming_reply_after_the_deadline_refuses_the_statement(database, monk
 
 
 @pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
-def test_steady_arming_latency_above_the_drift_still_runs_the_statement(database, monkeypatch, explicit):
-    """Every arming reply 60 ms late: one re-arm per statement, then the statement runs. Arming until replies are
-    fast would spend the whole deadline arming and refuse a request that fits."""
+def test_steady_arming_latency_within_the_drift_arms_once_and_runs_the_statement(database, monkeypatch, explicit):
+    """Every arming reply 60 ms late: one arm, and the statement runs under a limit at most that much past the
+    deadline. Arming until replies are fast would spend the whole deadline arming and refuse a request that fits."""
     with connect(database) as bounded:
-        clock, delayed, _ = slow_first_arm(monkeypatch, bounded, (ARM_DRIFT_MS + 10) / 1000, every=True)
+        clock, delayed, _ = slow_first_arm(monkeypatch, bounded, 0.06, every=True)
         accepted = clock()
         with bounded.request_deadline(accepted), bounded.transaction() if explicit else nullcontext():
             limit = bounded.execute(LOCK_LIMIT).fetchone()["ms"]
             left = int((accepted + SERVER_BUDGET - clock()) * 1000)
+        assert len(delayed) == 1, delayed
+        assert limit <= left + 60 + 1, (limit, left)  # 1 ms for the truncation of `left`
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
+def test_two_slow_arming_replies_refuse_the_statement_while_time_is_left(database, monkeypatch, explicit):
+    """Each reply is slower than the drift but leaves time: the second still left a limit that would end after the
+    deadline by more than the drift, so the statement is not sent."""
+    with connect(database) as bounded:
+        clock, delayed, others = slow_first_arm(monkeypatch, bounded, (ARM_DRIFT_MS + 50) / 1000, every=True)
+        accepted = clock()
+        with (
+            bounded.request_deadline(accepted),
+            pytest.raises(RequestDeadlineSpent),
+            bounded.transaction() if explicit else nullcontext(),
+        ):
+            bounded.execute(LOCK_LIMIT)
         assert len(delayed) == 2, delayed
-        assert limit <= left + ARM_DRIFT_MS + 10, (limit, left)
+        assert accepted + SERVER_BUDGET - clock() > 1, "time was still left"
+        assert LOCK_LIMIT not in others
 
 
 def test_entering_the_deadline_sends_no_query(database, monkeypatch):

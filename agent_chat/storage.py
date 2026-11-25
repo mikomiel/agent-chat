@@ -40,11 +40,11 @@ LEGACY_DIGESTS: dict[int, frozenset[str]] = {
 #: client step and reopens #177. tests/agent_chat/test_request_deadline.py pins the production budget.
 REQUEST_MARGIN_SECONDS = 1.0
 
-#: Milliseconds the round trip that arms a statement's limits may take before they are armed once more. The limits
-#: are measured before that round trip, so a slow reply would leave the statement a limit that ends after the
-#: deadline by the delay. One re-arm with the time then left bounds that overrun to the second round trip; it and
-#: the statement's own transit to the server fall inside `REQUEST_MARGIN_SECONDS`.
-ARM_DRIFT_MS = 50
+#: Milliseconds by which a statement's limit may outlast the deadline. A limit is measured before the round trip that
+#: sets it, so it ends after the deadline by that round trip. A reply slower than this arms once more with the time
+#: then left, and a second reply slower than this refuses the statement. The overrun therefore stays within this value,
+#: which with the statement's own transit to the server falls inside `REQUEST_MARGIN_SECONDS`.
+ARM_DRIFT_MS = 250
 
 #: The session limits `connect` sets. A request deadline is measured from the lock limit.
 LOCK_TIMEOUT_MS = 3000
@@ -116,19 +116,19 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
         self._limits = (lock_ms, statement_ms)
 
     def _arm(self) -> None:
-        """Lower this transaction's limits to the time left, measured again after the round trip that set them.
+        """Lower this transaction's limits to the time left, so that they end no more than `ARM_DRIFT_MS` after the
+        deadline.
 
-        A reply slower than `ARM_DRIFT_MS` arms once more with the time then left, so the statement never runs under
-        a limit taken before a long delay. Only once: under steady latency every reply is slow, and a loop would spend
-        the whole deadline arming. A deadline that passed during either reply raises `RequestDeadlineSpent`, so the
-        statement is not sent.
+        A reply slower than `ARM_DRIFT_MS` left a limit measured before it: the limits are armed once more with the
+        time then left. Only once: a second slow reply raises `RequestDeadlineSpent`, as a deadline that passed does,
+        so the statement is not sent.
         """
-        left = self._left()
-        self._set_local(left)
-        now = self._left()
-        if left - now > ARM_DRIFT_MS:
-            self._set_local(now)
-            self._left()  # a second reply after the deadline refuses the statement too
+        for _ in range(2):
+            left = self._left()
+            self._set_local(left)
+            if left - self._left() <= ARM_DRIFT_MS:
+                return
+        raise RequestDeadlineSpent("request deadline: arming replies too slow to bound the statement")
 
     def _set_local(self, left: int) -> None:
         lock_ms, statement_ms = self._limits
