@@ -120,13 +120,15 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
 
         A reply slower than `ARM_DRIFT_MS` arms once more with the time then left, so the statement never runs under
         a limit taken before a long delay. Only once: under steady latency every reply is slow, and a loop would spend
-        the whole deadline arming. A deadline that passed meanwhile raises `RequestDeadlineSpent`.
+        the whole deadline arming. A deadline that passed during either reply raises `RequestDeadlineSpent`, so the
+        statement is not sent.
         """
         left = self._left()
         self._set_local(left)
         now = self._left()
         if left - now > ARM_DRIFT_MS:
             self._set_local(now)
+            self._left()  # a second reply after the deadline refuses the statement too
 
     def _set_local(self, left: int) -> None:
         lock_ms, statement_ms = self._limits

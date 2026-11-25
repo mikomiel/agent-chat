@@ -432,3 +432,19 @@ def test_entering_the_deadline_sends_no_query(database, monkeypatch):
         monkeypatch.setattr(psycopg.Connection, "execute", execute)
         with bounded.request_deadline(time.monotonic()):
             assert sent == []
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
+def test_a_second_arming_reply_after_the_deadline_refuses_the_statement(database, monkeypatch, explicit):
+    """Each reply takes a little over half the budget: the first leaves time and triggers the re-arm, the second
+    crosses the deadline, so the statement is never sent."""
+    with connect(database) as bounded:
+        clock, delayed, others = slow_first_arm(monkeypatch, bounded, SERVER_BUDGET * 0.55, every=True)
+        with (
+            bounded.request_deadline(clock()),
+            pytest.raises(RequestDeadlineSpent),
+            bounded.transaction() if explicit else nullcontext(),
+        ):
+            bounded.execute(LOCK_LIMIT)
+        assert len(delayed) == 2, delayed
+        assert LOCK_LIMIT not in others
