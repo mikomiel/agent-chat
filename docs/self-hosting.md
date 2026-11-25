@@ -15,11 +15,13 @@ Read [AGENTS.md](../AGENTS.md) and [SECURITY.md](../SECURITY.md) first.
 - Linux and Python 3.11 or newer.
 - [uv](https://docs.astral.sh/uv/) for the Python environment.
 - PostgreSQL server binaries and a database. The product does not create the
-  database or its role. A round trip from the service to the database of at
-  most 15 ms: a delivery claim must send its COMMIT within 2.25 s of arriving.
-  A full batch of 16 messages makes about 50 round trips when they come from
-  one room, and about 140 when they come from 16 rooms. On a slower database
-  such a claim is refused, and the agent reads it as uncertain.
+  database or its role. Keep the database close to the service: a delivery
+  claim must finish its admission within 2.25 s of arriving, or it is refused
+  and the agent reads it as uncertain; nothing is lost, and the messages are
+  offered again. Measured with no contention, a full batch of 16 messages makes
+  48 round trips to the database when they come from one room and 138 when
+  they come from 16 rooms, plus expiry work when a backlog of old messages is
+  due.
 - Chromium through Playwright only for the optional browser inspection and the
   browser tests.
 

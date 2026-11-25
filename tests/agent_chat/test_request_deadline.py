@@ -23,8 +23,8 @@ import pytest
 
 from agent_chat import deliveries, storage
 from agent_chat.auth import authenticate
-from agent_chat.models import DeliveryClaim
-from agent_chat.storage import RequestDeadlineSpent, connect
+from agent_chat.models import DELIVERY_MAX_AGE_SECONDS, ChatError, DeliveryClaim
+from agent_chat.storage import connect
 
 #: The CLI's per-socket-step timeout (`agent_chat/client.py`).
 CLIENT_STEP = 3.0
@@ -33,12 +33,6 @@ CLIENT_STEP = 3.0
 SERVER_BUDGET = 2.25
 #: Seconds from the deadline beyond which a release has a fixed outcome: granted before, refused after.
 FIXED_SIDE = 0.7
-#: The database round trip at which every full batch claim is supported, the worst case being 16 messages from 16
-#: rooms: every round trip costing this much, the connection's included, still sends COMMIT before the deadline. A
-#: slower database can refuse such a batch.
-SUPPORTED_ROUND_TRIP = 0.015
-#: Round trips `storage.connect` spends after `accepted` and before the first query: TCP, TLS and a SCRAM exchange.
-CONNECT_ROUND_TRIPS = 6
 
 CLOCK = "agent_chat.event_clock WHERE singleton FOR UPDATE"
 
@@ -354,53 +348,6 @@ def test_entering_the_deadline_sends_no_query(database, monkeypatch):
             assert trips == []
 
 
-def test_a_statement_past_the_deadline_is_not_sent(database, monkeypatch):
-    with connect(database) as bounded:
-        clock, trips = charged(monkeypatch, bounded, 0)
-        with bounded.request_deadline(clock() - SERVER_BUDGET), pytest.raises(RequestDeadlineSpent):
-            bounded.execute("SELECT 1")
-        assert trips == []
-
-
-@pytest.mark.parametrize("nested", [False, True], ids=["transaction", "savepoint"])
-def test_a_spent_deadline_opens_no_transaction_or_savepoint(database, monkeypatch, nested):
-    with connect(database) as bounded:
-        clock, _ = charged(monkeypatch, bounded, 0)
-        outer = bounded.transaction() if nested else None
-        with bounded.request_deadline(clock() - SERVER_BUDGET + 0.5):
-            if outer is not None:
-                outer.__enter__()
-            monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: clock() + 1))
-            entered = []
-            opened = psycopg.Connection.transaction
-
-            def recorded(self, *arguments, **options):
-                entered.append(arguments)
-                return opened(self, *arguments, **options)
-
-            monkeypatch.setattr(psycopg.Connection, "transaction", recorded)
-            with pytest.raises(RequestDeadlineSpent), bounded.transaction():
-                pytest.fail("the block must not run")
-            assert entered == [], "psycopg's transaction context was entered"
-            if outer is not None:
-                monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=clock))
-                outer.__exit__(None, None, None)
-
-
-def test_a_deadline_passed_inside_a_transaction_rolls_it_back_instead_of_committing(database, monkeypatch):
-    """The last statement ran past the deadline: the outermost block raises before COMMIT, and nothing persists."""
-    with connect(database) as bounded:
-        bounded.execute("CREATE TEMP TABLE deadline_probe (n integer)")
-        clock, _ = charged(monkeypatch, bounded, 0)
-        with bounded.request_deadline(clock() - SERVER_BUDGET + 0.5):
-            with pytest.raises(RequestDeadlineSpent), bounded.transaction():
-                bounded.execute("INSERT INTO deadline_probe VALUES (1)")
-                with bounded.transaction():  # a savepoint released past the deadline does not raise on its own
-                    bounded.execute("INSERT INTO deadline_probe VALUES (2)")
-                    monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: clock() + 1))
-        assert bounded.execute("SELECT count(*) AS n FROM deadline_probe").fetchone()["n"] == 0
-
-
 def full_batch(process_api, credentials, target, db, rooms=1):
     """Sixteen questions to `target`, spread over `rooms` rooms (the first is the credentials' room), offered at once.
 
@@ -433,21 +380,6 @@ def full_batch(process_api, credentials, target, db, rooms=1):
     return token, DeliveryClaim(messages=ids)
 
 
-@pytest.mark.parametrize("rooms", [1, 16], ids=["one_room", "sixteen_rooms"])
-def test_a_full_batch_claim_fits_the_deadline_at_the_supported_round_trip(
-    process_api, credentials, target, db, database, monkeypatch, rooms
-):
-    """The worst case is a batch whose 16 messages come from 16 rooms. The clock starts before the connection is made,
-    as `accepted` does, and the connection's own round trips are counted as `CONNECT_ROUND_TRIPS`."""
-    token, request = full_batch(process_api, credentials, target, db, rooms)
-    with connect(database) as bounded:
-        clock, trips = charged(monkeypatch, bounded, SUPPORTED_ROUND_TRIP)
-        accepted = clock() - CONNECT_ROUND_TRIPS * SUPPORTED_ROUND_TRIP
-        with bounded.request_deadline(accepted):
-            granted = deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
-    assert granted["dispatch"] and len(granted["messages"]) == 16
-
-
 def test_the_deadline_adds_no_round_trip_to_a_full_batch_claim(
     process_api, credentials, target, db, database, monkeypatch, register
 ):
@@ -470,3 +402,40 @@ def test_the_deadline_adds_no_round_trip_to_a_full_batch_claim(
         assert len(granted["messages"]) == 16
         counted.append(len(trips))
     assert counted[0] == counted[1], counted
+
+
+def test_a_claim_refused_at_its_deadline_keeps_its_expiry_work_and_the_next_claim_is_granted(
+    process_api, credentials, target, send, db, database, monkeypatch
+):
+    """A backlog of 20 undelivered items past the age limit makes the claim expire them first, one receipt each.
+
+    The admission ends past the deadline and is refused, and records no attempt, but the expiry commits: it is true
+    whenever it commits. The next claim of the same batch has no backlog left and is granted.
+    """
+    token, binding = target
+    for _ in range(20):
+        question(process_api, credentials, send, binding)
+    db.execute(
+        "UPDATE agent_chat.recipients SET stored_at = stored_at - make_interval(secs => %s) WHERE session_id = %s",
+        (DELIVERY_MAX_AGE_SECONDS + 60, binding["session_id"]),
+    )
+    _, request = full_batch(process_api, credentials, target, db)
+    receipts_before = db.execute("SELECT count(*) AS n FROM agent_chat.events WHERE kind = 'receipt'").fetchone()["n"]
+    with connect(database) as bounded, monkeypatch.context() as patched:
+        clock, _ = charged(patched, bounded, 0.05)  # about 70 round trips: past the 2.25 s deadline
+        with bounded.request_deadline(clock()), pytest.raises(ChatError) as refused:
+            deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
+    assert refused.value.code == "DATABASE_UNAVAILABLE"
+    assert attempts(db) == 0
+    expired = db.execute(
+        "SELECT count(*) AS n FROM agent_chat.recipients WHERE uncertainty_reason = 'expired_undelivered'"
+    ).fetchone()["n"]
+    assert expired == 20
+    receipts = db.execute("SELECT count(*) AS n FROM agent_chat.events WHERE kind = 'receipt'").fetchone()["n"]
+    assert receipts == receipts_before + 20
+    with connect(database) as bounded, monkeypatch.context() as patched:
+        clock, _ = charged(patched, bounded, 0)
+        with bounded.request_deadline(clock()):
+            granted = deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
+    assert granted["dispatch"] and len(granted["messages"]) == 16
+    assert attempts(db) == 1

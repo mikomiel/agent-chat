@@ -26,6 +26,7 @@ from .models import (
     DeliveryClaim,
     DeliveryResult,
 )
+from .storage import deadline_spent
 
 # The one judgement of a thread's consultation limit, for publication, pending and claim. `direct` is the thread's
 # class (008_direct_threads.sql), counting the sessions `joining` would add; a thread that existed before the
@@ -498,7 +499,13 @@ def claim(db: Connection[dict[str, Any]], actor: Actor, key: UUID, request: Deli
             rows = _recipient_state(db, actor, rows)
             # A refusal rolls back only this admission, not expiry reconciliation.
             with db.transaction():
-                return _claim(db, actor, key, request, rows)
+                granted = _claim(db, actor, key, request, rows)
+                # Issue #177: an admission that ends past the request deadline is refused like any other, after its
+                # last statement, so its attempt never commits after the client gave the claim up. The reconciliation
+                # and expiry above are true whenever they commit, and they stay.
+                if deadline_spent(db):
+                    raise ChatError("DATABASE_UNAVAILABLE")
+                return granted
         except ChatError as caught:
             reconcile(db, session=actor.session_id)
             expire_undelivered(db, session=actor.session_id)

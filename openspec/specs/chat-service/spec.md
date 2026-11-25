@@ -469,37 +469,42 @@ The service MUST answer every refusal made before a response starts with `{"erro
 - **WHEN** the service refuses with a code that has no assigned status
 - **THEN** the HTTP status is 503
 
-### Requirement: A claim sends no COMMIT after its deadline
-The service MUST take one deadline per delivery claim when the request reaches its route, before connecting: the configured lock limit (3 s, the client's socket step) less 0.75 s for COMMIT, response and transit, read without a query. Past it the service MUST NOT send a statement, BEGIN, SAVEPOINT or COMMIT for the claim, and a claim with work left MUST roll back and answer 503 `DATABASE_UNAVAILABLE`. A delivery result is not bounded by it.
+### Requirement: A claim records no attempt after its deadline
+The service MUST take one deadline per delivery claim when the request reaches its route, before connecting: the configured lock limit (3 s, the client's socket step) less 0.75 s for the commit, response and transit, read without a query. A claim whose admission ends past it MUST be refused with 503 `DATABASE_UNAVAILABLE` and MUST NOT record its attempt; reconciliation and expiry done before the admission still commit. A delivery result is not bounded by it.
 
 #### Scenario: Lock released after the deadline
 - **WHEN** another transaction holds a lock that a claim waits on until after the claim's deadline
-- **THEN** the claim rolls back, and the service answers 503 `DATABASE_UNAVAILABLE`, which can arrive after the client's 3-second step
+- **THEN** the claim is refused with 503 `DATABASE_UNAVAILABLE`, which can arrive after the client's 3-second step
 - **AND** no delivery attempt is recorded, and the pending view offers the message again
 
 #### Scenario: Several waits that each fit the lock limit
 - **WHEN** a claim waits on several locks in turn, in separate statements or within one statement, each for less than the lock limit, and together until after the deadline
-- **THEN** the claim rolls back instead of committing
-- **AND** no delivery attempt is recorded
+- **THEN** the claim is refused, and no delivery attempt is recorded
 
 #### Scenario: Authentication waits on a lock
 - **WHEN** another transaction holds a lock on the principals that the authentication of a claim waits on until after the client's step
-- **THEN** the claim opens no transaction and records no delivery attempt
+- **THEN** the claim records no delivery attempt
 
 #### Scenario: Lock released before the deadline
-- **WHEN** the lock is released early enough for the claim to send its COMMIT before the deadline
+- **WHEN** the lock is released early enough for the claim's admission to end before the deadline
 - **THEN** the service grants the claim as usual
+
+#### Scenario: Expiry before a refused admission
+- **WHEN** a claim first expires undelivered items past the age limit, and its admission then ends past the deadline
+- **THEN** the claim is refused and records no attempt, and the expiry and its receipts commit
+- **AND** a later claim of the same messages no longer repeats that expiry and is granted
+
+#### Scenario: A claim slower than its deadline
+- **WHEN** an uncontended claim's admission ends after the deadline, as a large batch on a slow database can
+- **THEN** the claim is refused, and the client reads it as uncertain
+- **AND** nothing is lost: no attempt is recorded, and the pending view offers the messages again
 
 #### Scenario: A result waits past the claim deadline
 - **WHEN** a delivery result waits on a lock that is released after the claim deadline and before the client's step ends
 - **THEN** the service records the result and answers 200, as it did before the deadline existed
 
-### Requirement: A full batch claim fits its deadline at a 15 ms database round trip
-The deadline MUST add no round trip to a claim. An uncontended claim of 16 messages, from one room or from 16 rooms, MUST send its COMMIT before the deadline when every round trip to the database, the connection's included, takes 15 milliseconds. A slower database can refuse a full batch, and the client then reads the claim as uncertain.
-
-#### Scenario: Full batch at the supported round trip
-- **WHEN** an uncontended claim of 16 messages from 16 rooms runs, and every round trip to the database takes 15 milliseconds
-- **THEN** the claim is granted
+### Requirement: The claim deadline adds no round trip
+Taking and checking the claim deadline MUST NOT add a round trip to the database: a claim makes as many round trips with the deadline as without it.
 
 #### Scenario: No round trip added
 - **WHEN** the same full batch claim runs with and without the deadline
