@@ -4,11 +4,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from psycopg.errors import QueryCanceled
+from psycopg.pq import TransactionStatus
 
-from agent_chat import events
+from agent_chat import deliveries, events
 from agent_chat.deliveries import expire_undelivered
 from agent_chat.models import DELIVERY_MAX_AGE_SECONDS
 from agent_chat.retention import prune
@@ -1118,3 +1121,34 @@ def test_a_result_refused_before_its_sweep_keeps_its_refusal_when_the_refusal_sw
         response = result(process_api, token, {"id": str(uuid4())})
     refusal(response, 404, "NOT_FOUND")
     assert expired_count(db) == 0
+
+
+class _SweepConnection:
+    """A stand-in for the refusal sweep's connection: its savepoint fails, leaving the given transaction status."""
+
+    def __init__(self, status):
+        self.info = SimpleNamespace(transaction_status=status)
+
+    @contextmanager
+    def transaction(self):
+        yield
+        raise QueryCanceled("canceling statement due to statement timeout")
+
+
+@pytest.mark.parametrize(
+    "status,absorbed",
+    [(TransactionStatus.INTRANS, True), (TransactionStatus.INERROR, False)],
+    ids=["rolled_back", "release_failed"],
+)
+def test_a_refusal_sweep_error_is_absorbed_only_while_the_transaction_can_commit(monkeypatch, status, absorbed):
+    """#187 review: a cancel can hit the savepoint's RELEASE and leave the transaction failed. Its COMMIT would then
+    roll back the call's earlier sweep without an error, so the sweep error must propagate.
+    """
+    monkeypatch.setattr(deliveries, "reconcile", lambda db, session: None)
+    monkeypatch.setattr(deliveries, "expire_undelivered", lambda db, session: None)
+    actor = SimpleNamespace(session_id=uuid4())
+    if absorbed:
+        deliveries._refusal_sweep(_SweepConnection(status), actor)
+    else:
+        with pytest.raises(QueryCanceled):
+            deliveries._refusal_sweep(_SweepConnection(status), actor)
