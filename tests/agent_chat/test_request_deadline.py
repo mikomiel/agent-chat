@@ -11,7 +11,7 @@ storage module.
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from hashlib import sha256
 from http.client import HTTPConnection
 from types import SimpleNamespace
@@ -358,6 +358,20 @@ def test_entering_and_checking_the_deadline_sends_no_query(database, monkeypatch
             assert trips == []
 
 
+@pytest.mark.parametrize(
+    "elapsed,spent", [(SERVER_BUDGET - 0.001, False), (SERVER_BUDGET, True)], ids=["just_before", "at_budget"]
+)
+def test_the_deadline_falls_at_the_pinned_budget(database, monkeypatch, elapsed, spent):
+    """The deadline is the pinned 2.25 s after acceptance, on a clock the test sets: just before it the admission
+    may still commit, and from it on the admission is refused.
+    """
+    now = [1000.0]
+    monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    with connect(database) as bounded, bounded.request_deadline(now[0]):
+        now[0] += elapsed
+        assert storage.deadline_spent(bounded) is spent
+
+
 def full_batch(process_api, credentials, target, db, rooms=1):
     """Sixteen questions to `target`, spread over `rooms` rooms (the first is the credentials' room), offered at once.
 
@@ -453,12 +467,14 @@ def test_a_claim_refused_at_its_deadline_keeps_its_expiry_work_and_the_next_clai
     assert attempts(db) == 1
 
 
-def test_a_late_claim_keeps_a_full_expiry_pass_while_the_next_backlog_row_is_held(
-    process_api, credentials, target, send, db, database, monkeypatch
+@pytest.mark.parametrize("held_row", [True, False], ids=["next_row_held", "next_row_free"])
+def test_a_late_claim_runs_one_expiry_pass_and_keeps_it(
+    process_api, credentials, target, send, db, database, monkeypatch, held_row
 ):
     """An expiry pass settles at most 100 items. With 101 due, the claim's pass settles the oldest 100 and never
-    reaches the last, which another transaction holds. A refusal at the deadline asks nothing more of the database,
-    so it cannot wait on that row and roll the 100 back.
+    reaches the last. A refusal at the deadline asks nothing more of the database: when another transaction holds
+    the last item, the refusal cannot wait on it and roll the 100 back; when nothing holds it, it stays unexpired,
+    because no second pass runs.
     """
     token, binding = target
     backlog = [question(process_api, credentials, send, binding)["id"] for _ in range(101)]
@@ -473,12 +489,17 @@ def test_a_late_claim_keeps_a_full_expiry_pass_while_the_next_backlog_row_is_hel
         (DELIVERY_MAX_AGE_SECONDS + 60, backlog[-1], binding["session_id"]),
     )
     _, request = full_batch(process_api, credentials, target, db)
-    with (
+    hold = (
         held(
             database,
             "SELECT 1 FROM agent_chat.recipients WHERE message_id = %s AND session_id = %s FOR UPDATE",
             (backlog[-1], binding["session_id"]),
-        ),
+        )
+        if held_row
+        else nullcontext()
+    )
+    with (
+        hold,
         connect(database) as bounded,
         monkeypatch.context() as patched,
     ):

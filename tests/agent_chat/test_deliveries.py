@@ -4,13 +4,18 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from psycopg.errors import QueryCanceled
+from psycopg.pq import TransactionStatus
 
-from agent_chat import events
+from agent_chat import deliveries, events
 from agent_chat.deliveries import expire_undelivered
+from agent_chat.models import DELIVERY_MAX_AGE_SECONDS
 from agent_chat.retention import prune
+from agent_chat.storage import connect
 
 
 @pytest.fixture
@@ -1048,3 +1053,102 @@ def test_an_empty_pending_carries_no_sizes(process_api, target):
     status, body = process_api.request("GET", "/v1/instance/deliveries/pending", token=token)
     assert status == 200
     assert body == {"session_id": binding["session_id"], "instance_id": binding["instance_id"], "messages": []}
+
+
+@contextmanager
+def recipient_row_held(database, message_id, session_id):
+    """Another transaction holds one recipient row until the block ends."""
+    with connect(database) as holder:
+        holder.execute("BEGIN")
+        holder.execute(
+            "SELECT 1 FROM agent_chat.recipients WHERE message_id = %s AND session_id = %s FOR UPDATE",
+            (message_id, session_id),
+        )
+        try:
+            yield
+        finally:
+            holder.execute("ROLLBACK")
+
+
+def due_backlog(process_api, credentials, send, db, binding, count=101):
+    """`count` questions past the age limit; the last is the youngest, so a sweep of 100 reaches it last."""
+    ids = [question(process_api, credentials, send, binding)["id"] for _ in range(count)]
+    db.execute(
+        "UPDATE agent_chat.recipients SET stored_at = stored_at - make_interval(secs => %s) WHERE session_id = %s",
+        (DELIVERY_MAX_AGE_SECONDS + 120, binding["session_id"]),
+    )
+    db.execute(
+        "UPDATE agent_chat.recipients SET stored_at = clock_timestamp() - make_interval(secs => %s) "
+        "WHERE message_id = %s AND session_id = %s",
+        (DELIVERY_MAX_AGE_SECONDS + 60, ids[-1], binding["session_id"]),
+    )
+    return ids
+
+
+def expired_count(db):
+    return db.execute(
+        "SELECT count(*) AS n FROM agent_chat.recipients WHERE uncertainty_reason = 'expired_undelivered'"
+    ).fetchone()["n"]
+
+
+def test_a_refused_claim_keeps_a_full_expiry_pass_when_its_refusal_sweep_cannot_lock(
+    process_api, credentials, target, send, db, database
+):
+    """#186: the claim's sweep settles its limit of 100 items before the admission refuses it. The refusal-path
+    sweep then waits on the next due item, which another transaction holds; only that sweep rolls back.
+    """
+    token, binding = target
+    backlog = due_backlog(process_api, credentials, send, db, binding)
+    fresh = question(process_api, credentials, send, binding)["id"]
+    ready(process_api, token, plan_mode=True)
+    with recipient_row_held(database, backlog[-1], binding["session_id"]):
+        response = claim(process_api, token, [fresh])
+    refusal(response, 409, "DELIVERY_BLOCKED")
+    assert expired_count(db) == 100
+    assert db.execute("SELECT count(*) AS n FROM agent_chat.delivery_attempts").fetchone()["n"] == 0
+
+
+def test_a_result_refused_before_its_sweep_keeps_its_refusal_when_the_refusal_sweep_cannot_lock(
+    process_api, credentials, target, send, db, database
+):
+    """#186: a result for an unknown attempt is refused before the normal sweep. When its refusal-path sweep waits
+    on a held item, here the oldest due one, the sweep rolls back alone and the caller still learns the refusal, not
+    a database failure.
+    """
+    token, binding = target
+    backlog = due_backlog(process_api, credentials, send, db, binding)
+    with recipient_row_held(database, backlog[0], binding["session_id"]):
+        response = result(process_api, token, {"id": str(uuid4())})
+    refusal(response, 404, "NOT_FOUND")
+    assert expired_count(db) == 0
+
+
+class _SweepConnection:
+    """A stand-in for the refusal sweep's connection: its savepoint fails, leaving the given transaction status."""
+
+    def __init__(self, status):
+        self.info = SimpleNamespace(transaction_status=status)
+
+    @contextmanager
+    def transaction(self):
+        yield
+        raise QueryCanceled("canceling statement due to statement timeout")
+
+
+@pytest.mark.parametrize(
+    "status,absorbed",
+    [(TransactionStatus.INTRANS, True), (TransactionStatus.INERROR, False)],
+    ids=["rolled_back", "release_failed"],
+)
+def test_a_refusal_sweep_error_is_absorbed_only_while_the_transaction_can_commit(monkeypatch, status, absorbed):
+    """#187 review: a cancel can hit the savepoint's RELEASE and leave the transaction failed. Its COMMIT would then
+    roll back the call's earlier sweep without an error, so the sweep error must propagate.
+    """
+    monkeypatch.setattr(deliveries, "reconcile", lambda db, session: None)
+    monkeypatch.setattr(deliveries, "expire_undelivered", lambda db, session: None)
+    actor = SimpleNamespace(session_id=uuid4())
+    if absorbed:
+        deliveries._refusal_sweep(_SweepConnection(status), actor)
+    else:
+        with pytest.raises(QueryCanceled):
+            deliveries._refusal_sweep(_SweepConnection(status), actor)
