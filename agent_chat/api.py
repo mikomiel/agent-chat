@@ -58,7 +58,7 @@ from .models import (
 )
 from .protocol import cursor, validate_origin
 from .publication import publish
-from .storage import MIGRATIONS, connect
+from .storage import MIGRATIONS, BoundedConnection, connect
 
 # A free-text roster filter: bounded, and free of control characters, so a NUL never reaches the database.
 RosterText = Annotated[str | None, Query(max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")]
@@ -156,9 +156,13 @@ def create_app(
         # The body names nothing; the server still logs the traceback.
         return error_response("INTERNAL_ERROR", 500)
 
-    def connection() -> Iterator[Connection[dict[str, Any]]]:
+    def connection() -> Iterator[BoundedConnection]:
         with connect(dsn) as db:
             yield db
+
+    async def accepted() -> float:
+        """When the request reached its route: on the event loop, before a threadpool queue, connect or auth."""
+        return time.monotonic()
 
     def bearer(request: Request) -> str:
         authorization = request.headers.get("authorization", "")
@@ -326,17 +330,23 @@ def create_app(
             raise ChatError("DELIVERY_DISABLED")
         return deliveries.pending(db, actor)
 
+    # A claim the client gives up as uncertain must not record its attempt (issue #177): the claim carries one deadline
+    # from `accepted`, declared first so it is read before the connection is made, and `deliveries.claim` refuses an
+    # admission that ends past it. A result is not bounded so: a late settle commits the outcome the worker reported,
+    # and `/end` then finds it settled.
     @app.post("/v1/instance/deliveries/claim")
     def claim_delivery(
+        started: Annotated[float, Depends(accepted)],
         payload: DeliveryClaim,
         token: Annotated[str, Depends(bearer)],
         key: Annotated[UUID, Header(alias="Idempotency-Key")],
-        db: Annotated[Connection[dict[str, Any]], Depends(connection)],
+        db: Annotated[BoundedConnection, Depends(connection)],
     ):
-        actor = authenticate(db, token)
-        if not delivery_enabled:
-            raise ChatError("DELIVERY_DISABLED")
-        return deliveries.claim(db, actor, key, payload)
+        with db.request_deadline(started):
+            actor = authenticate(db, token)
+            if not delivery_enabled:
+                raise ChatError("DELIVERY_DISABLED")
+            return deliveries.claim(db, actor, key, payload)
 
     @app.post("/v1/instance/deliveries/{attempt}/result")
     def delivery_result(

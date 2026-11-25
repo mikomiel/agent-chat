@@ -1,5 +1,8 @@
 """Explicit migrations and bounded PostgreSQL connections, never implicit startup DDL."""
 
+import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -28,17 +31,72 @@ LEGACY_DIGESTS: dict[int, frozenset[str]] = {
 }
 
 
-def connect(dsn: str) -> psycopg.Connection[dict[str, Any]]:
-    return psycopg.Connection[dict[str, Any]].connect(
+#: Seconds a claim deadline keeps free below the session's lock limit, for what follows its last check: RELEASE and
+#: COMMIT, two round trips that wait on no lock, the response and its transport, and the request's own transit before
+#: it was accepted. Production's 3 s lock limit equals the CLI's 3 s socket step (`agent_chat/client.py`), so an
+#: admission that passes the check at most 2.25 s after the claim was accepted leaves 0.75 s for those, and only a
+#: commit, response and transit slower than that together still land after the client gave the claim up (issue
+#: #177). The two values are coupled only by this comment: raising the lock limit in `connect`, or lowering the
+#: client step, moves the deadline to or past the client step and reopens #177.
+#: tests/agent_chat/test_request_deadline.py pins the production budget.
+REQUEST_MARGIN_SECONDS = 0.75
+
+#: The session limits `connect` sets. A request deadline is measured from the lock limit.
+LOCK_TIMEOUT_MS = 3000
+STATEMENT_TIMEOUT_MS = 5000
+
+
+class BoundedConnection(psycopg.Connection[dict[str, Any]]):
+    """A connection that can carry one request deadline, which the code it serves checks with `deadline_spent`.
+
+    PostgreSQL 16 has no transaction-wide timeout, and `lock_timeout` bounds each wait on its own, so a request that
+    waits on several locks, in one statement or in several, can finish after its client gave it up. The deadline
+    costs no query: it is taken from the lock limit this connection was given, and checked on the client.
+    """
+
+    _deadline: float | None = None
+    _lock_ms: int = 0
+
+    @contextmanager
+    def request_deadline(self, accepted: float) -> Generator[None, None, None]:
+        """Carry a deadline in this block: `accepted` plus the session's lock limit, less `REQUEST_MARGIN_SECONDS`.
+        `accepted` is a `time.monotonic()` reading taken when the request arrived. A lock limit of 0 (none) sets none.
+        """
+        lock_ms = self._lock_ms
+        self._deadline = accepted + lock_ms / 1000 - REQUEST_MARGIN_SECONDS if lock_ms else None
+        try:
+            yield
+        finally:
+            self._deadline = None
+
+    def set_limits(self, lock_ms: int, statement_ms: int) -> None:
+        """Set this session's lock and statement limits, and the request budget measured from them."""
+        self.execute(
+            "SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
+            (f"{lock_ms}ms", f"{statement_ms}ms"),
+        )
+        self._lock_ms = lock_ms
+
+
+def deadline_spent(db: psycopg.Connection[Any]) -> bool:
+    """Whether `db` carries a request deadline that has passed. A connection without one never has."""
+    deadline = db._deadline if isinstance(db, BoundedConnection) else None
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def connect(dsn: str) -> BoundedConnection:
+    db = BoundedConnection.connect(
         dsn,
         autocommit=True,
         row_factory=dict_row,
         connect_timeout=3,
         options=(
-            "-c timezone=UTC -c statement_timeout=5000 -c lock_timeout=3000 "
+            f"-c timezone=UTC -c statement_timeout={STATEMENT_TIMEOUT_MS} -c lock_timeout={LOCK_TIMEOUT_MS} "
             "-c idle_in_transaction_session_timeout=15000"
         ),
     )
+    db._lock_ms = LOCK_TIMEOUT_MS
+    return db
 
 
 _APPLIED = "SELECT version, digest FROM agent_chat.schema_migrations ORDER BY version"
