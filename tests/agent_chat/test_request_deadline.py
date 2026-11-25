@@ -300,8 +300,12 @@ def test_a_settle_is_not_held_to_the_claim_deadline(process_api, credentials, ta
     assert db.execute("SELECT handed_at FROM agent_chat.recipients").fetchone()["handed_at"] is not None
 
 
-def test_authentication_waits_inside_the_deadline(process_api, credentials, target, send, db, database):
-    """A lock on the principals holds the claim in authentication, before any transaction of the operation."""
+def test_authentication_waits_inside_the_deadline(process_api, credentials, target, send, db, database, lock_wait):
+    """A lock on the principals holds the claim in authentication, before any transaction of the operation.
+
+    It is released after the deadline but before the per-lock limit and the client step, so only the deadline, which
+    authentication time counts toward, can refuse the claim.
+    """
     token, binding = target
     message = question(process_api, credentials, send, binding)["id"]
     sent: list[float] = []
@@ -310,11 +314,10 @@ def test_authentication_waits_inside_the_deadline(process_api, credentials, targ
         held(database, "LOCK TABLE agent_chat.principals IN ACCESS EXCLUSIVE MODE") as release,
     ):
         future = pool.submit(claim_request, process_api, token, message, sent)
-        # Held until the client gives up, so the claim's transaction starts after the deadline.
-        wait([future], timeout=CLIENT_STEP + 0.5)
-        release()
+        lock_wait("agent_chat.principals")
+        release_at(future, sent, SERVER_BUDGET + 0.4, release)
         status, elapsed = future.result()
-    assert status != 200, (status, elapsed)
+    assert status == 503, (status, elapsed)
     assert_claim_property(db, process_api, token, message, status, elapsed)
 
 
