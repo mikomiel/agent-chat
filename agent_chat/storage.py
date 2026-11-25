@@ -145,6 +145,7 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
         for _ in range(2):
             measured = time.monotonic()
             self._set_local(self._left())
+            self._left()  # a reply that used up the time left refuses the statement, however fast it was
             if (time.monotonic() - measured) * 1000 <= ARM_DRIFT_MS:
                 self._measured = measured
                 return

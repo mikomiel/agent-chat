@@ -481,14 +481,17 @@ def test_a_long_uncontended_transaction_at_steady_latency_arms_rarely_and_fits(d
         base = time.monotonic()
         skew = [0.0]
         arms: list[float] = []
+        stale: list[float] = []
         real = psycopg.Connection.execute
 
         def execute(self, query, *args, **kwargs):
             cursor = real(self, query, *args, **kwargs)
             if self is bounded:
-                skew[0] += rtt
                 if isinstance(query, str) and query.startswith(ARM):
-                    arms.append(skew[0])
+                    arms.append(skew[0] - rtt)  # measured when the arming statement was sent
+                elif arms:
+                    stale.append(skew[0] - rtt - arms[-1])  # age of the measurement when this statement was sent
+                skew[0] += rtt
             return cursor
 
         monkeypatch.setattr(psycopg.Connection, "execute", execute)
@@ -499,3 +502,20 @@ def test_a_long_uncontended_transaction_at_steady_latency_arms_rarely_and_fits(d
         elapsed = skew[0]
         assert elapsed < SERVER_BUDGET, elapsed
         assert len(arms) <= int(elapsed * 1000 / ARM_DRIFT_MS) + 1, (len(arms), elapsed)
+        assert len(arms) > 1, "the measurement was refreshed as it aged"
+        assert max(stale) <= ARM_DRIFT_MS / 1000 + 1e-9, max(stale)
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
+def test_a_fast_arming_reply_that_uses_up_the_time_left_refuses_the_statement(database, monkeypatch, explicit):
+    """60 ms left, and the reply takes 100 ms: within the drift but past the deadline, so the statement is not sent."""
+    with connect(database) as bounded:
+        clock, delayed, others = slow_first_arm(monkeypatch, bounded, 0.1)
+        with (
+            bounded.request_deadline(clock() - SERVER_BUDGET + 0.06),
+            pytest.raises(RequestDeadlineSpent),
+            bounded.transaction() if explicit else nullcontext(),
+        ):
+            bounded.execute(LOCK_LIMIT)
+        assert delayed
+        assert LOCK_LIMIT not in others
