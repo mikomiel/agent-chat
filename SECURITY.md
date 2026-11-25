@@ -49,6 +49,7 @@ made.
   instance worker's bounded resend of an identical settlement that got no
   status or a 5xx is not such a retry: the service answers a repeat with the
   recorded outcome. A definite refusal stops the resends and is answered as
-  refused; any other reply below 500 ends the worker.
+  refused; any other reply below 500 that the client cannot accept ends the
+  worker.
 - Public CI runs read-only and must never receive deployment credentials or
   production data.

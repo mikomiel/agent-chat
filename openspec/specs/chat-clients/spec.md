@@ -426,7 +426,7 @@ An episode begins at the first failure that calls for a rejoin and ends at the n
 - **THEN** the adapter fails with that code and does not rejoin
 
 ### Requirement: The instance worker sends a settlement again until its request deadline
-Only a `settle` try that gets no status, because the connection fails or ends before the status line is complete, or that gets a 5xx reply, MUST be sent again by the instance worker, with the same attempt and result, until 1 second before its 20-second request deadline, when the last failure MUST end the worker. A try the deadline cuts MUST report `REQUEST_UNCERTAIN`. A definite delivery refusal MUST be answered as refused. Any other failure MUST end the worker at once.
+Only a `settle` try that gets no status, because the connection fails before the status line and headers are read or ends before a three-digit status code, or that gets a 5xx reply, MUST be sent again by the instance worker, with the same attempt and result, until 1 second before its 20-second request deadline, when the last failure MUST end the worker. A try the deadline cuts MUST report `REQUEST_UNCERTAIN`. A definite delivery refusal MUST be answered as refused. Any other failure MUST end the worker at once.
 
 #### Scenario: The service answers after a brief outage
 - **WHEN** a `settle` gets no status or a 5xx reply, and a later try before the deadline is answered
@@ -437,12 +437,12 @@ Only a `settle` try that gets no status, because the connection fails or ends be
 - **WHEN** the service refuses a `settle` with a definite code such as `DELIVERY_CLOSED`
 - **THEN** the worker sends no further try and answers its parent as refused
 
-#### Scenario: A reply that ends in its status line
-- **WHEN** a `settle` reply stops inside its status line
+#### Scenario: A reply that ends in its status code
+- **WHEN** a `settle` reply stops before a three-digit status code, or the connection is reset before its headers are read
 - **THEN** the try counts as one that got no status
 
 #### Scenario: A reply below 500 that cannot be accepted
-- **WHEN** a `settle` gets a reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know, a 200 that names another attempt, or a reply cut or rejected by the parser after its status line
+- **WHEN** a `settle` gets a reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's or is cut, a code the client does not know or a 200 that names another attempt, or a reply the parser rejects, such as one with too many headers
 - **THEN** the worker sends no further try and ends at once
 - **AND** this holds because the service sends a status below 500 only once a settlement is committed or definitely refused
 

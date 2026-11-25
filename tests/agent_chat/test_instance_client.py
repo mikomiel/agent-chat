@@ -130,6 +130,25 @@ def peer(process_api, credentials, tmp_path):
                 self.connection.shutdown(socket.SHUT_WR)
                 self.close_connection = True
                 return
+            if mode == "status_600":
+                # A complete reply whose three-digit status is above every 5xx: an answer, not a server failure.
+                data = json.dumps(envelope("DATABASE_UNAVAILABLE")).encode()
+                self.send_response(600)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if mode == "reset_in_headers":
+                # A 403 status line, then a reset inside the headers: http.client gives no status before the headers
+                # are read, so the try got no status.
+                self.wfile.write(b"HTTP/1.1 403 Forbidden\r\nX-Synthetic: 1\r\n")
+                self.wfile.flush()
+                time.sleep(0.3)
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                self.connection.close()
+                self.close_connection = True
+                return
             if mode == "reset_after_status":
                 # A 200 whose connection is reset after its headers: a socket error once the status is in. The pause
                 # lets the client read the headers first; closing with a zero linger sends a reset, not an end.
@@ -509,13 +528,15 @@ def test_a_connection_that_is_refused_is_unanswered(shape):
 
 
 @pytest.mark.parametrize("delivery_enabled", [True])
-@pytest.mark.parametrize("mode", ["unavailable", "drop", "bad_gateway", "partial_status"])
+@pytest.mark.parametrize(
+    "mode", ["unavailable", "drop", "bad_gateway", "partial_status", "reset_in_headers"]
+)
 def test_the_worker_sends_a_settle_again_when_it_got_no_status_or_a_5xx(
     peer, process_api, credentials, send, db, mode
 ):
-    # A 503 with the service's envelope, a connection lost before any reply, a proxy's 502 and a status line cut
-    # short. The server has already settled the attempt, as it has when a reply is lost, so the second POST gets the
-    # recorded result.
+    # A 503 with the service's envelope, a connection lost before any reply, a proxy's 502, a status line cut short
+    # and a reset inside the headers. The server has already settled the attempt, as it has when a reply is lost, so
+    # the second POST gets the recorded result.
     joined, attempt = _open_attempt(peer, process_api, credentials, send)
     peer.state.mode = mode
     assert instance_worker._delivery(joined, _settle_frame(attempt)) == {"attempt_id": attempt, **SETTLEMENT}
@@ -534,6 +555,7 @@ def test_the_worker_sends_a_settle_again_when_it_got_no_status_or_a_5xx(
         "other_attempt",
         "many_headers",
         "bad_status",
+        "status_600",
         "truncated",
         "reset_after_status",
         "unframed_cut",
@@ -543,15 +565,15 @@ def test_the_worker_sends_a_settle_again_when_it_got_no_status_or_a_5xx(
         "redirect_header_cut",
     ],
 )
-def test_the_worker_does_not_send_a_settle_again_after_a_status_below_500(
+def test_the_worker_does_not_send_a_settle_again_after_a_status_that_is_not_5xx(
     peer, process_api, credentials, send, mode
 ):
     # A redirect, a proxy's HTML 403, a 4xx with a code this client does not know, a 200 that names another attempt,
-    # replies the HTTP parser rejects (too many headers, a status line that is not HTTP), and replies cut after their
-    # status line: in the body, by a reset, in the headers, in chunked framing, and redirects cut in their body or
-    # headers. The
-    # client gives each the code of a request that may have been sent, but each has a status below 500, which the
-    # service sends only once the request is committed or refused, so the error ends the worker after one POST.
+    # a complete reply with status 600, replies the HTTP parser rejects (too many headers, a status line that is not
+    # HTTP), and replies cut after their status was read: in the body, by a reset, in chunked framing, and by an end
+    # inside the headers, which http.client reads as their end (also for redirects). The client gives each the code
+    # of a request that may have been sent, but the service sends a status below 500 only once the request is
+    # committed or refused, so the error ends the worker after one POST.
     joined, attempt = _open_attempt(peer, process_api, credentials, send)
     peer.state.mode = mode
     with pytest.raises(ChatError) as caught:
