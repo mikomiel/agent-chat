@@ -347,11 +347,14 @@ def charged(monkeypatch, bounded, cost):
     return clock, trips
 
 
-def test_entering_the_deadline_sends_no_query(database, monkeypatch):
-    """The budget comes from the limits the connection was given, so no query runs before it applies."""
+def test_entering_and_checking_the_deadline_sends_no_query(database, monkeypatch):
+    """The budget comes from the limits the connection was given, and the check reads only the clock, so neither
+    entering the deadline nor checking it sends a query.
+    """
     with connect(database) as bounded:
         clock, trips = charged(monkeypatch, bounded, 0)
         with bounded.request_deadline(clock()):
+            assert not storage.deadline_spent(bounded)
             assert trips == []
 
 

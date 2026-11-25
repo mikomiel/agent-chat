@@ -393,7 +393,7 @@ The service MUST settle an eligible recipient entry of a retained `question`, `c
 #### Scenario: Settlement is not clock-driven
 - **WHEN** a claim made while delivery is enabled, or a result call, runs for the session
 - **THEN** the oldest retained `question`, `consultation` and `reply` entries of that session with a body, past 24 hours, that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep
-- **AND** a call runs up to two sweeps. A refusal handled before the normal sweep runs only the refusal-path sweep. A refusal handled after the normal sweep runs both
+- **AND** a call runs up to two sweeps. A refusal handled before the normal sweep runs only the refusal-path sweep. A refusal handled after the normal sweep runs both, except a claim refused at its deadline, which runs only the normal sweep
 - **AND** later sweeps continue with the oldest remaining eligible entries
 - **AND** an entry covered by an open attempt is not settled
 
@@ -482,8 +482,8 @@ The service MUST take one deadline per delivery claim when the request reaches i
 - **THEN** the claim is refused, and no delivery attempt is recorded
 
 #### Scenario: Authentication waits on a lock
-- **WHEN** another transaction holds a lock on the principals that the authentication of a claim waits on until after the client's step
-- **THEN** the claim records no delivery attempt
+- **WHEN** another transaction holds a lock on the principals that the authentication of a claim waits on, and releases it after the claim's deadline but before the lock limit and the client's step
+- **THEN** the claim is refused with 503 `DATABASE_UNAVAILABLE` and records no delivery attempt
 
 #### Scenario: Lock released before the deadline
 - **WHEN** the lock is released early enough for the claim's admission to end before the deadline
