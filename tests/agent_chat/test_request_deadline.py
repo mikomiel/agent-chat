@@ -2,35 +2,39 @@
 
 These tests run under the production limits: none requests `expiry_margin`, so the service child keeps the lock
 and statement limits of `agent_chat.storage.connect`. A test transaction holds a lock that the request waits on
-and releases it at a chosen offset after the request was sent. A settle is outside the deadline, and one test pins
-that. The client side is modelled as the CLI's: one
-3-second socket step, and a timed-out or 5xx POST counts as uncertain. The arming tests at the end drive
-`agent_chat.storage.BoundedConnection` directly, with a fake clock on the storage module that a slow arming reply
-advances.
+and releases it at a chosen offset after the request was sent. The client side is modelled as the CLI's: one
+3-second socket step, and a timed-out or 5xx POST counts as uncertain. A settle is outside the deadline, and one
+test pins that. The tests at the end drive `agent_chat.storage.BoundedConnection` directly, with a fake clock on the
+storage module.
 """
 
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import closing, contextmanager, nullcontext
+from contextlib import closing, contextmanager
 from http.client import HTTPConnection
 from types import SimpleNamespace
 from urllib.parse import urlsplit
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 
-from agent_chat import storage
-from agent_chat.storage import ARM_DRIFT_MS, RequestDeadlineSpent, connect
+from agent_chat import deliveries, storage
+from agent_chat.auth import authenticate
+from agent_chat.models import DeliveryClaim
+from agent_chat.storage import RequestDeadlineSpent, connect
 
 #: The CLI's per-socket-step timeout (`agent_chat/client.py`).
 CLIENT_STEP = 3.0
 #: The server's whole-request budget for a claim under the production limits: the 3 s lock limit of
 #: `storage.connect` less the request margin. Spelled out here so the tests state the number they pin.
-SERVER_BUDGET = 2.0
+SERVER_BUDGET = 2.25
 #: Seconds from the deadline beyond which a release has a fixed outcome: granted before, refused after.
 FIXED_SIDE = 0.7
+#: The database round trip at which a full batch claim is supported: every one of its round trips costing this
+#: much still sends COMMIT before the deadline. A slower database can refuse a full batch.
+SUPPORTED_ROUND_TRIP = 0.04
 
 CLOCK = "agent_chat.event_clock WHERE singleton FOR UPDATE"
 
@@ -168,35 +172,37 @@ def offered(service, token):
 
 
 def assert_claim_property(db, service, token, message, status, elapsed):
-    """#177: an attempt row exists if and only if the client got the grant, and the client always got an answer."""
+    """#177: an attempt row exists if and only if the client got the grant within its step.
+
+    A refusal may come after the client step: a statement already sent waits under the session limits. The client
+    then reads a timeout (`None`), and nothing may have committed.
+    """
     settled(db)
-    assert status is not None and elapsed < CLIENT_STEP, (status, elapsed)
     if status == 200:
+        assert elapsed < CLIENT_STEP, elapsed
         assert attempts(db) == 1
     else:
-        assert status == 503, status
+        assert status in (503, None), status
         assert attempts(db) == 0
         assert offered(service, token) == [message]
 
 
-def test_claim_held_past_the_deadline_fails_cleanly_before_the_client_step(
-    process_api, credentials, target, send, db, database, lock_wait
-):
+def test_claim_held_past_the_deadline_commits_nothing(process_api, credentials, target, send, db, database, lock_wait):
     token, binding = target
     message = question(process_api, credentials, send, binding)["id"]
     sent: list[float] = []
     with ThreadPoolExecutor(max_workers=1) as pool, hold_clock(database) as release:
         future = pool.submit(claim_request, process_api, token, message, sent)
         lock_wait(CLOCK)
-        release_at(future, sent, SERVER_BUDGET + 0.7, release)
+        release_at(future, sent, SERVER_BUDGET + 0.5, release)
         status, elapsed = future.result()
-    assert status == 503, (status, elapsed)
+    assert status != 200, (status, elapsed)
     assert_claim_property(db, process_api, token, message, status, elapsed)
 
 
 @pytest.mark.parametrize(
     "offset",
-    [SERVER_BUDGET - 1.0, SERVER_BUDGET - 0.05, SERVER_BUDGET + 0.05, SERVER_BUDGET + 0.7, 2.98, 3.2],
+    [SERVER_BUDGET - 1.0, SERVER_BUDGET - 0.05, SERVER_BUDGET + 0.05, 2.98, 3.2],
     ids=lambda offset: f"release_{offset:.2f}s",
 )
 def test_claim_lock_release_sweep_never_leaves_an_attempt_the_client_saw_as_uncertain(
@@ -216,17 +222,14 @@ def test_claim_lock_release_sweep_never_leaves_an_attempt_the_client_saw_as_unce
     if offset <= SERVER_BUDGET - FIXED_SIDE:
         assert status == 200, (status, elapsed)
     if offset >= SERVER_BUDGET + FIXED_SIDE:
-        assert status == 503, (status, elapsed)
+        assert status != 200, (status, elapsed)
 
 
 def test_one_deadline_bounds_sequential_lock_waits(process_api, credentials, target, send, db, database, lock_wait):
     """Each wait alone is shorter than the per-lock limit; together they outlast the client step.
 
-    The clock is released at 1.2 s and the grant at 3.5 s at the latest, or as soon as the request has ended
-    (`release_at`), so a per-lock limit alone would let the grant wait end in a commit after the client gave up. The
-    test does not try to observe the grant wait, which lasts only from the clock release to the deadline: a request
-    that ends refused, no earlier than the deadline, was held past the clock release by the only other lock, and
-    nothing else can refuse it.
+    The clock is released at 1.35 s and the grant at 3.5 s at the latest, or as soon as the request has ended
+    (`release_at`), so a per-lock limit alone would let the grant wait end in a commit after the client gave up.
     """
     token, binding = target
     message = question(process_api, credentials, send, binding)["id"]
@@ -241,11 +244,33 @@ def test_one_deadline_bounds_sequential_lock_waits(process_api, credentials, tar
         release_at(future, sent, 0.6 * SERVER_BUDGET, release_clock)
         release_at(future, sent, CLIENT_STEP + 0.5, release_grant)
         status, elapsed = future.result()
-    settled(db)
-    # The #177 property first, then the answer: refused, and inside the client step.
-    assert attempts(db) == 0, (status, elapsed)
-    assert offered(process_api, token) == [message]
-    assert status == 503 and SERVER_BUDGET - 0.05 <= elapsed < CLIENT_STEP, (status, elapsed)
+    assert status != 200, (status, elapsed)
+    assert_claim_property(db, process_api, token, message, status, elapsed)
+
+
+def test_two_lock_waits_inside_one_statement_commit_nothing_after_the_deadline(
+    process_api, credentials, target, send, db, database, lock_wait
+):
+    """The claim's last statement appends the receipt event. It waits for a SHARE lock on `events` to clear, and then,
+    in its foreign-key check, for the message row. Each wait restarts `lock_timeout`, so no per-statement limit
+    bounds the two together; the check before COMMIT does.
+    """
+    token, binding = target
+    message = question(process_api, credentials, send, binding)["id"]
+    sent: list[float] = []
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        held(database, "LOCK TABLE agent_chat.events IN SHARE MODE") as release_events,
+        held(database, "SELECT 1 FROM agent_chat.messages WHERE id = %s FOR UPDATE", (message,)) as release_message,
+    ):
+        future = pool.submit(claim_request, process_api, token, message, sent)
+        lock_wait("INSERT INTO agent_chat.events")
+        release_at(future, sent, SERVER_BUDGET - 0.55, release_events)
+        lock_wait("INSERT INTO agent_chat.events")  # the same statement, now in its foreign-key check
+        release_at(future, sent, CLIENT_STEP + 0.5, release_message)
+        status, elapsed = future.result()
+    assert status != 200, (status, elapsed)
+    assert_claim_property(db, process_api, token, message, status, elapsed)
 
 
 def test_a_settle_is_not_held_to_the_claim_deadline(process_api, credentials, target, send, db, database, lock_wait):
@@ -283,201 +308,64 @@ def test_authentication_waits_inside_the_deadline(process_api, credentials, targ
         held(database, "LOCK TABLE agent_chat.principals IN ACCESS EXCLUSIVE MODE") as release,
     ):
         future = pool.submit(claim_request, process_api, token, message, sent)
-        # Held past the client step, so only the request's own deadline can end the wait.
+        # Held until the client gives up, so the claim's transaction starts after the deadline.
         wait([future], timeout=CLIENT_STEP + 0.5)
         release()
         status, elapsed = future.result()
-    settled(db)
-    assert attempts(db) == 0, (status, elapsed)
-    assert offered(process_api, token) == [message]
-    # Without a lock the request succeeds, so a refusal no earlier than the deadline is the wait it bounded.
-    assert status == 503 and SERVER_BUDGET - 0.05 <= elapsed < CLIENT_STEP, (status, elapsed)
+    assert status != 200, (status, elapsed)
+    assert_claim_property(db, process_api, token, message, status, elapsed)
 
 
-#: The arming statement of `BoundedConnection`, and a statement that reports the lock limit it runs under in ms.
-ARM = "SELECT set_config('lock_timeout', %s, true)"
-LOCK_LIMIT = "SELECT setting::integer AS ms FROM pg_settings WHERE name = 'lock_timeout'"
+def charged(monkeypatch, bounded, cost):
+    """Charge `cost` seconds of the storage module's clock for every round trip `bounded` makes from here on.
 
-
-def slow_first_arm(monkeypatch, bounded, delay, every=False):
-    """Make the first arming round trip on `bounded` (or, with `every`, each one) take `delay` seconds on the storage
-    module's clock.
-
-    The clock stands still otherwise, so real round trips spend none of the budget and the outcome is fixed. Return
-    that clock, a list that holds True for each delay spent, and the other queries `bounded` sent.
+    psycopg runs each query and each BEGIN, SAVEPOINT, RELEASE and COMMIT through one `wait`, so a `wait` is one
+    round trip. The clock stands still otherwise. Return that clock and a list that grows by one per round trip.
     """
     base = time.monotonic()
     skew = [0.0]
-    delayed: list[bool] = []
-    others: list[str] = []
-    real = psycopg.Connection.execute
+    trips: list[bool] = []
+    real = psycopg.Connection.wait
 
-    def execute(self, query, *args, **kwargs):
-        cursor = real(self, query, *args, **kwargs)
+    def wait(self, gen, *args, **kwargs):
+        result = real(self, gen, *args, **kwargs)
         if self is bounded:
-            if not isinstance(query, str) or not query.startswith(ARM):
-                others.append(query)
-            elif every or not delayed:
-                skew[0] += delay
-                delayed.append(True)
-        return cursor
+            skew[0] += cost
+            trips.append(True)
+        return result
 
     def clock():
         return base + skew[0]
 
-    monkeypatch.setattr(psycopg.Connection, "execute", execute)
+    monkeypatch.setattr(psycopg.Connection, "wait", wait)
     monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=clock))
-    return clock, delayed, others
-
-
-@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
-def test_a_slow_arming_reply_arms_again_with_the_time_left(database, monkeypatch, explicit):
-    """An arming reply 1.2 s late must not leave the statement the 2 s limit measured before it."""
-    with connect(database) as bounded:
-        clock, delayed, _ = slow_first_arm(monkeypatch, bounded, 1.2)
-        accepted = clock()
-        with bounded.request_deadline(accepted), bounded.transaction() if explicit else nullcontext():
-            limit = bounded.execute(LOCK_LIMIT).fetchone()["ms"]
-            left = int((accepted + SERVER_BUDGET - clock()) * 1000)
-        assert limit <= left + ARM_DRIFT_MS, (limit, left)
-        assert delayed
-        # The lowered limit ended with its transaction.
-        assert bounded.execute(LOCK_LIMIT).fetchone()["ms"] == 3000
-
-
-@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
-def test_an_arming_reply_after_the_deadline_refuses_the_statement(database, monkeypatch, explicit):
-    with connect(database) as bounded:
-        clock, delayed, others = slow_first_arm(monkeypatch, bounded, SERVER_BUDGET + 0.1)
-        with (
-            bounded.request_deadline(clock()),
-            pytest.raises(RequestDeadlineSpent),
-            bounded.transaction() if explicit else nullcontext(),
-        ):
-            bounded.execute(LOCK_LIMIT)
-        assert delayed
-        assert LOCK_LIMIT not in others
-
-
-@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
-def test_steady_arming_latency_within_the_drift_arms_once_and_runs_the_statement(database, monkeypatch, explicit):
-    """Every arming reply 60 ms late: one arm, and the statement runs under a limit at most that much past the
-    deadline. Arming until replies are fast would spend the whole deadline arming and refuse a request that fits."""
-    with connect(database) as bounded:
-        clock, delayed, _ = slow_first_arm(monkeypatch, bounded, 0.06, every=True)
-        accepted = clock()
-        with bounded.request_deadline(accepted), bounded.transaction() if explicit else nullcontext():
-            limit = bounded.execute(LOCK_LIMIT).fetchone()["ms"]
-            left = int((accepted + SERVER_BUDGET - clock()) * 1000)
-        assert len(delayed) == 1, delayed
-        assert limit <= left + 60 + 1, (limit, left)  # 1 ms for the truncation of `left`
-
-
-@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
-def test_two_slow_arming_replies_refuse_the_statement_while_time_is_left(database, monkeypatch, explicit):
-    """Each reply is slower than the drift but leaves time: the second still left a limit that would end after the
-    deadline by more than the drift, so the statement is not sent."""
-    with connect(database) as bounded:
-        clock, delayed, others = slow_first_arm(monkeypatch, bounded, (ARM_DRIFT_MS + 50) / 1000, every=True)
-        accepted = clock()
-        with (
-            bounded.request_deadline(accepted),
-            pytest.raises(RequestDeadlineSpent),
-            bounded.transaction() if explicit else nullcontext(),
-        ):
-            bounded.execute(LOCK_LIMIT)
-        assert len(delayed) == 2, delayed
-        assert accepted + SERVER_BUDGET - clock() > 1, "time was still left"
-        assert LOCK_LIMIT not in others
+    return clock, trips
 
 
 def test_entering_the_deadline_sends_no_query(database, monkeypatch):
-    """The budget comes from the limits the connection was given, so no unbounded query runs before it applies."""
+    """The budget comes from the limits the connection was given, so no query runs before it applies."""
     with connect(database) as bounded:
-        sent: list[object] = []
-        real = psycopg.Connection.execute
-
-        def execute(self, query, *args, **kwargs):
-            if self is bounded:
-                sent.append(query)
-            return real(self, query, *args, **kwargs)
-
-        monkeypatch.setattr(psycopg.Connection, "execute", execute)
-        with bounded.request_deadline(time.monotonic()):
-            assert sent == []
+        clock, trips = charged(monkeypatch, bounded, 0)
+        with bounded.request_deadline(clock()):
+            assert trips == []
 
 
-@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
-def test_a_second_arming_reply_after_the_deadline_refuses_the_statement(database, monkeypatch, explicit):
-    """Each reply takes a little over half the budget: the first leaves time and triggers the re-arm, the second
-    crosses the deadline, so the statement is never sent."""
+def test_a_statement_past_the_deadline_is_not_sent(database, monkeypatch):
     with connect(database) as bounded:
-        clock, delayed, others = slow_first_arm(monkeypatch, bounded, SERVER_BUDGET * 0.55, every=True)
-        with (
-            bounded.request_deadline(clock()),
-            pytest.raises(RequestDeadlineSpent),
-            bounded.transaction() if explicit else nullcontext(),
-        ):
-            bounded.execute(LOCK_LIMIT)
-        assert len(delayed) == 2, delayed
-        assert LOCK_LIMIT not in others
-
-
-def test_a_long_uncontended_transaction_at_steady_latency_arms_rarely_and_fits(database, monkeypatch):
-    """Every round trip takes 15 ms, as to a remote database. A claim of a full batch runs about a hundred statements:
-    arming before each one would double the round trips and spend the deadline with no lock held. The limits are set
-    again only once the last measurement is older than the drift, so the statements fit and arming stays rare."""
-    rtt = 0.015
-    with connect(database) as bounded:
-        base = time.monotonic()
-        skew = [0.0]
-        arms: list[float] = []
-        stale: list[float] = []
-        real = psycopg.Connection.execute
-
-        def execute(self, query, *args, **kwargs):
-            cursor = real(self, query, *args, **kwargs)
-            if self is bounded:
-                if isinstance(query, str) and query.startswith(ARM):
-                    arms.append(skew[0] - rtt)  # measured when the arming statement was sent
-                elif arms:
-                    stale.append(skew[0] - rtt - arms[-1])  # age of the measurement when this statement was sent
-                skew[0] += rtt
-            return cursor
-
-        monkeypatch.setattr(psycopg.Connection, "execute", execute)
-        monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: base + skew[0]))
-        with bounded.request_deadline(base), bounded.transaction():
-            for _ in range(100):
-                bounded.execute("SELECT 1")
-        elapsed = skew[0]
-        assert elapsed < SERVER_BUDGET, elapsed
-        assert len(arms) <= int(elapsed * 1000 / ARM_DRIFT_MS) + 1, (len(arms), elapsed)
-        assert len(arms) > 1, "the measurement was refreshed as it aged"
-        assert max(stale) <= ARM_DRIFT_MS / 1000 + 1e-9, max(stale)
-
-
-@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
-def test_a_fast_arming_reply_that_uses_up_the_time_left_refuses_the_statement(database, monkeypatch, explicit):
-    """60 ms left, and the reply takes 100 ms: within the drift but past the deadline, so the statement is not sent."""
-    with connect(database) as bounded:
-        clock, delayed, others = slow_first_arm(monkeypatch, bounded, 0.1)
-        with (
-            bounded.request_deadline(clock() - SERVER_BUDGET + 0.06),
-            pytest.raises(RequestDeadlineSpent),
-            bounded.transaction() if explicit else nullcontext(),
-        ):
-            bounded.execute(LOCK_LIMIT)
-        assert delayed
-        assert LOCK_LIMIT not in others
+        clock, trips = charged(monkeypatch, bounded, 0)
+        with bounded.request_deadline(clock() - SERVER_BUDGET), pytest.raises(RequestDeadlineSpent):
+            bounded.execute("SELECT 1")
+        assert trips == []
 
 
 @pytest.mark.parametrize("nested", [False, True], ids=["transaction", "savepoint"])
 def test_a_spent_deadline_opens_no_transaction_or_savepoint(database, monkeypatch, nested):
     with connect(database) as bounded:
-        clock, _, _ = slow_first_arm(monkeypatch, bounded, 0)
-        outer = bounded.transaction() if nested else nullcontext()
-        with bounded.request_deadline(clock() - SERVER_BUDGET + 0.5), outer:
+        clock, _ = charged(monkeypatch, bounded, 0)
+        outer = bounded.transaction() if nested else None
+        with bounded.request_deadline(clock() - SERVER_BUDGET + 0.5):
+            if outer is not None:
+                outer.__enter__()
             monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: clock() + 1))
             entered = []
             opened = psycopg.Connection.transaction
@@ -490,3 +378,65 @@ def test_a_spent_deadline_opens_no_transaction_or_savepoint(database, monkeypatc
             with pytest.raises(RequestDeadlineSpent), bounded.transaction():
                 pytest.fail("the block must not run")
             assert entered == [], "psycopg's transaction context was entered"
+            if outer is not None:
+                monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=clock))
+                outer.__exit__(None, None, None)
+
+
+def test_a_deadline_passed_inside_a_transaction_rolls_it_back_instead_of_committing(database, monkeypatch):
+    """The last statement ran past the deadline: the outermost block raises before COMMIT, and nothing persists."""
+    with connect(database) as bounded:
+        bounded.execute("CREATE TEMP TABLE deadline_probe (n integer)")
+        clock, _ = charged(monkeypatch, bounded, 0)
+        with bounded.request_deadline(clock() - SERVER_BUDGET + 0.5):
+            with pytest.raises(RequestDeadlineSpent), bounded.transaction():
+                bounded.execute("INSERT INTO deadline_probe VALUES (1)")
+                with bounded.transaction():  # a savepoint released past the deadline does not raise on its own
+                    bounded.execute("INSERT INTO deadline_probe VALUES (2)")
+                    monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: clock() + 1))
+        assert bounded.execute("SELECT count(*) AS n FROM deadline_probe").fetchone()["n"] == 0
+
+
+def full_batch(process_api, credentials, send, target):
+    token, binding = target
+    for _ in range(16):
+        question(process_api, credentials, send, binding)
+    ids = tuple(UUID(message) for message in offered(process_api, token))
+    assert len(ids) == 16
+    return token, DeliveryClaim(messages=ids)
+
+
+def test_a_full_batch_claim_fits_the_deadline_at_the_supported_round_trip(
+    process_api, credentials, target, send, database, monkeypatch
+):
+    token, request = full_batch(process_api, credentials, send, target)
+    with connect(database) as bounded:
+        clock, trips = charged(monkeypatch, bounded, SUPPORTED_ROUND_TRIP)
+        with bounded.request_deadline(clock()):
+            granted = deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
+    assert granted["dispatch"] and len(granted["messages"]) == 16
+    assert len(trips) * SUPPORTED_ROUND_TRIP < SERVER_BUDGET, len(trips)
+
+
+def test_the_deadline_adds_no_round_trip_to_a_full_batch_claim(
+    process_api, credentials, target, send, database, monkeypatch, register
+):
+    """The deadline is read without a query and checked on the client, so a claim costs what it costs without it.
+
+    Each claim goes to its own recipient, so both claim a full batch from the same starting state.
+    """
+    other = register(process_api, credentials, "second recipient")
+    ready(process_api, other[0])
+    counted = []
+    for bounded_claim, recipient in ((True, target), (False, other)):
+        token, request = full_batch(process_api, credentials, send, recipient)
+        with connect(database) as bounded, monkeypatch.context() as patched:
+            clock, trips = charged(patched, bounded, 0)
+            if bounded_claim:
+                with bounded.request_deadline(clock()):
+                    granted = deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
+            else:
+                granted = deliveries.claim(bounded, authenticate(bounded, token), uuid4(), request)
+        assert len(granted["messages"]) == 16
+        counted.append(len(trips))
+    assert counted[0] == counted[1], counted

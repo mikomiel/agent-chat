@@ -15,7 +15,10 @@ Read [AGENTS.md](../AGENTS.md) and [SECURITY.md](../SECURITY.md) first.
 - Linux and Python 3.11 or newer.
 - [uv](https://docs.astral.sh/uv/) for the Python environment.
 - PostgreSQL server binaries and a database. The product does not create the
-  database or its role.
+  database or its role. A round trip from the service to the database of at
+  most 40 ms: a delivery claim must send its COMMIT within 2.25 s of arriving,
+  and a claim of a full batch of 16 messages makes about fifty round trips. On a
+  slower database such a claim is refused, and the agent reads it as uncertain.
 - Chromium through Playwright only for the optional browser inspection and the
   browser tests.
 

@@ -330,8 +330,9 @@ def create_app(
             raise ChatError("DELIVERY_DISABLED")
         return deliveries.pending(db, actor)
 
-    # A claim the client gives up as uncertain must not commit (issue #177): its lock waits, authentication included,
-    # end under one deadline from `accepted`, declared first so it is read before the connection is made. A result is
+    # A claim the client gives up as uncertain must not commit (issue #177): its work, authentication included, runs
+    # under one deadline from `accepted`, declared first so it is read before the connection is made, and checked again
+    # just before COMMIT. A result is
     # not bounded so: a late settle commits the outcome the worker reported, and `/end` then finds it settled.
     @app.post("/v1/instance/deliveries/claim")
     def claim_delivery(

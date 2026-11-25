@@ -469,51 +469,41 @@ The service MUST answer every refusal made before a response starts with `{"erro
 - **WHEN** the service refuses with a code that has no assigned status
 - **THEN** the HTTP status is 503
 
-### Requirement: Lock waits end a claim before the client step
-The service MUST take one deadline per delivery claim when the request reaches its route, before connecting: the configured lock limit (3 s, the client's socket step) less a 1 s margin, read without a query. Past the deadline it MUST NOT send an application statement or open a transaction or savepoint; with work left it MUST roll back and answer 503 `DATABASE_UNAVAILABLE`. A delivery result is not bounded by this deadline.
+### Requirement: A claim commits nothing after its deadline
+The service MUST take one deadline per delivery claim when the request reaches its route, before connecting: the configured lock limit (3 s, the client's socket step) less 0.75 s for COMMIT, response and transit, read without a query. Past it the service MUST NOT send a statement, BEGIN, SAVEPOINT or COMMIT for the claim, and a claim with work left MUST roll back and answer 503 `DATABASE_UNAVAILABLE`. A delivery result is not bounded by it.
 
 #### Scenario: Lock released after the deadline
-- **WHEN** another transaction holds a lock that a claim waits on until more than 250 milliseconds, plus the statement's transit to the database, after the claim's deadline
-- **THEN** the service answers 503 `DATABASE_UNAVAILABLE` before the client's 3-second step ends
+- **WHEN** another transaction holds a lock that a claim waits on until after the claim's deadline
+- **THEN** the claim rolls back, and the service answers 503 `DATABASE_UNAVAILABLE`, which can arrive after the client's 3-second step
 - **AND** no delivery attempt is recorded, and the pending view offers the message again
 
 #### Scenario: Several waits that each fit the lock limit
-- **WHEN** a claim waits on two locks in turn, each for less than the lock limit, and the second wait lasts until more than 250 milliseconds, plus the statement's transit to the database, after the deadline
-- **THEN** the service answers 503 `DATABASE_UNAVAILABLE` before the client's step ends
+- **WHEN** a claim waits on several locks in turn, in separate statements or within one statement, each for less than the lock limit, and together until after the deadline
+- **THEN** the claim rolls back instead of committing
 - **AND** no delivery attempt is recorded
 
 #### Scenario: Authentication waits on a lock
 - **WHEN** another transaction holds a lock on the principals that the authentication of a claim waits on until after the client's step
-- **THEN** the service answers 503 `DATABASE_UNAVAILABLE` before the client's step ends
-- **AND** no delivery attempt is recorded
+- **THEN** the claim opens no transaction and records no delivery attempt
 
 #### Scenario: Lock released before the deadline
-- **WHEN** the lock is released early enough for the claim to finish before the deadline
+- **WHEN** the lock is released early enough for the claim to send its COMMIT before the deadline
 - **THEN** the service grants the claim as usual
 
 #### Scenario: A result waits past the claim deadline
 - **WHEN** a delivery result waits on a lock that is released after the claim deadline and before the client's step ends
 - **THEN** the service records the result and answers 200, as it did before the deadline existed
 
-### Requirement: Each lock wait of a bounded claim is limited to the time left
-In a bounded claim, authentication included, each application statement MUST run under a `lock_timeout` its transaction lowered to the time left, measured at most 250 ms before it is sent, never above the session's. If two replies in a row that set it take longer, the service MUST NOT send the statement and MUST answer 503 `DATABASE_UNAVAILABLE`. Not bounded: BEGIN, COMMIT, SAVEPOINT, ROLLBACK, the query that sets the limit, and work that waits on no lock.
+### Requirement: A full batch claim fits its deadline at a 40 ms database round trip
+The deadline MUST add no round trip to a claim. An uncontended claim of 16 messages MUST send its COMMIT before the deadline when every round trip to the database takes 40 milliseconds. A slower database can refuse a full batch, and the client then reads the claim as uncertain.
 
-#### Scenario: Slow reply to setting the limit
-- **WHEN** the reply that sets a statement's lock limit arrives more than 250 milliseconds late, and the next one does not
-- **THEN** the statement runs under a lock limit measured at most 250 milliseconds before it was sent
+#### Scenario: Full batch at the supported round trip
+- **WHEN** an uncontended claim of 16 messages runs, and every round trip to the database takes 40 milliseconds
+- **THEN** the claim is granted
 
-#### Scenario: Two slow replies
-- **WHEN** both replies that set a statement's lock limit arrive more than 250 milliseconds late, while time is still left
-- **THEN** the statement is not sent, and the service answers 503 `DATABASE_UNAVAILABLE`
-
-#### Scenario: Stalled reply to setting the limit
-- **WHEN** the query that sets a statement's lock limit, which takes no lock and runs under the limits before it, replies after the deadline
-- **THEN** the statement is not sent, the transaction rolls back, and the service answers 503 `DATABASE_UNAVAILABLE`, which can arrive after the client's step
-- **AND** nothing is committed, and no delivery attempt is recorded
-
-#### Scenario: Many statements at steady latency
-- **WHEN** an uncontended claim runs many statements, each round trip taking a few milliseconds
-- **THEN** the lock limit is set again only when its measurement is older than 250 milliseconds, so the statements fit the deadline
+#### Scenario: No round trip added
+- **WHEN** the same full batch claim runs with and without the deadline
+- **THEN** both make the same number of round trips to the database
 
 ### Requirement: Handled refusals are logged with fixed fields only
 The service MUST log a handled refusal with only its code, route, status and exception class. A refusal that follows the start of an event stream MUST also carry a `phase=stream` marker, and its status is the 200 already sent.
