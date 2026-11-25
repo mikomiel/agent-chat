@@ -134,7 +134,8 @@ idle wake name. The [integrations README](../README.md#tool-route) gives the
 exact text and the room each route takes.
 
 - Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
-  the binding ends them with the one receipts sentence.
+  the binding ends them with the one receipts sentence (except in the one case
+  under the known limit below).
 - `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
   has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
 - `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
@@ -159,9 +160,13 @@ sentence at the end of the binding that tells the model how to ask for receipts:
 54 bytes on `cli` and 57 on each `mcp` route. In `noticeBodies` mode a hook
 that carries the binding, the first one after a rejoin for example, shares its
 6,000 bytes between the binding and the notice, and the interpreter path is in
-both. A retry batch is claimed whole, so it can be too large to follow the
-binding: the hook then sends the binding alone and settles the batch `deferred`
-with reason `offline`. Each such hook spends one of the batch's three attempts,
+both. A retry batch is claimed whole. When the notice fits only beside the
+binding without the receipts sentence, the hook sends that binding, so the
+sentence never makes a batch wait that fit before it; that binding counts as
+shown, and the sentence returns with the next announcement, at a session start
+or a rejoin. A batch that does not fit
+even so is too large to follow the binding: the hook then sends the binding
+alone and settles the batch `deferred` with reason `offline`. Each such hook spends one of the batch's three attempts,
 and a batch with none left is not offered again; the first offer after the
 binding is confirmed, which the ledger makes after its backoff, is delivered
 whole. #172 tracks a fit check before the claim.
@@ -418,7 +423,9 @@ sends its request: it does not wait for the worker to end its instance.
   5 seconds and only while the turn is busy (the hook state and, with
   `appServer`, the thread's own status), the receiver asks the worker for the
   `handed` and `acked` receipts of messages this session sent. The first poll
-  comes one cadence after the receiver starts. When the worker's answer says the
+  comes one cadence after the receiver starts. The cadence counts from the write
+  of a request: a pass that sends nothing, because it gave way or the turn
+  ended, does not delay the next one. When the worker's answer says the
   session is not muted, up to 10 of the oldest rows are staged as one notice,
   and the next prompt or tool hook of a running turn carries it as
   `additionalContext`. Only a reply that would otherwise carry nothing does, so a
@@ -435,7 +442,10 @@ sends its request: it does not wait for the worker to end its instance.
   receipt says it wrote the text, the receiver marks exactly those ids
   delivered at once; a refused or failed mark is sent again at the next pass. A
   pass sends one request, the mark that waits or else the poll. A
-  staged notice that was not shown is released at `Stop` and at `Interrupt`. The
+  staged notice that was not shown is released at `Stop`, at `Interrupt` and
+  when its worker is retired (a rejoin, or chat ending), so a worker that
+  rejoins without `receipts-cancel` shows none; its rows come back with a later
+  feed. Confirmed ids wait for a worker that can mark them. The
   request runs after the hook's reply, queued like any other, and it never
   replaces a claim or a wake. It gives way: a hook's or a wake's claim, a
   heartbeat or a state report that queues behind it ends it with the worker's

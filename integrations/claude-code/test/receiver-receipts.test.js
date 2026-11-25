@@ -456,10 +456,11 @@ test("a staged notice is not handed while chat is down, and is shown and marked 
   assert.equal(binding.length, 1)
   assert.match(binding[0].context, /^Agent Chat is available to this session/)
   assert.ok(!binding[0].context.includes(NOTICE_HEAD), "the binding goes alone")
-  // The notice staged before the outage is older than one cadence by now: this event drops it, and its pass asks the new instance.
-  await r.op(turn())
+  // The notice staged before the outage was released with the retired worker (review 6057736618), so the pass of the event
+  // that carried the binding asks the new instance, and the next event shows what it answered.
   const shown = (await r.op(turn())).sent[0]
   assert.ok(isNoticeText(shown.context), "and the notice follows")
+  assert.deepEqual(r.worker.ops("receipts").map(entry => entry.boot), [1, 2], "read again through the new instance")
   assert.deepEqual(r.worker.ops("receipts_delivered").map(entry => [entry.boot, entry.receipts]), [[2, [rcpt(1).id]]])
 })
 
@@ -867,6 +868,27 @@ test("a feed request is due one cadence after the write of the last one, not aft
   assert.deepEqual(sent, [first, queuedAt + 1000, queuedAt + 1000 + POLL_MS], "due one cadence after the write")
 })
 
+// Review 6057736618: a pass that reaches the head of the queue and then sends nothing does not use up the cadence. Here a Stop
+// arrives while the pass waits behind a heartbeat: the turn is over, and its state report queues, counted, behind the pass, so
+// the pass gives way and sends nothing. The next prompt polls at once, with no clock moved.
+test("a pass that sends nothing uses up no cadence: it gave way to a Stop queued behind it, and the next prompt polls at once", async () => {
+  const r = await ready({ rows: [] })
+  await r.op(turn()) // the first poll, and the event that sets the native state
+  assert.equal(r.count("receipts"), 1)
+  let release
+  r.server.gates.heartbeat = new Promise(resolve => { release = resolve })
+  await r.clock.advance(HEARTBEAT_MS - r.elapsed()) // the heartbeat falls due and holds the worker
+  await r.op(turn()) // a poll is due, and its pass queues behind the heartbeat
+  const stopping = r.op({ op: "stop", permission_mode: "default" }) // its state report queues behind the pass
+  await settle()
+  delete r.server.gates.heartbeat
+  release()
+  await stopping
+  assert.equal(r.count("receipts"), 1, "the pass sent nothing")
+  await r.op(turn())
+  assert.equal(r.count("receipts"), 2, "the next prompt polls without waiting a cadence")
+})
+
 // A receipts request gives way (#175). The pass starts after a hook's reply, so the next hook, a heartbeat or a Stop's state
 // report can arrive while it is in flight. Each of them ends the request: the worker answers `refused` on the cancel signal,
 // and what waited goes next. The tests below give the worker a read that nothing releases, so only the cancel can end it, and
@@ -1131,6 +1153,37 @@ test("the capability is the join reply's of the worker that serves: a worker tha
   assert.deepEqual(r.worker.log.filter(entry => entry.boot === 2 && RECEIPTS_OPERATIONS.has(entry.op)), [], "no read and no mark through the new worker")
   assert.ok(r.worker.log.some(entry => entry.boot === 2 && entry.op === "pending"), "it serves deliveries")
 })
+
+// Review 6057736618: a notice staged just before the lease is lost is under one cadence old after a fast rejoin. It is the retired
+// worker's: it is released with it, and its rows go back to the feed. A worker that rejoined without the capability shows and
+// marks nothing; one that has it offers the rows again from its own feed.
+for (const capable of [false, true]) {
+  test(`a notice staged before a rejoin is released with the retired worker: ${capable ? "a capable worker offers its rows again" : "a worker without the capability shows and marks nothing"}`, async () => {
+    const feed = [rcpt(1)]
+    const r = await ready({ rows: feed, tweak: server => { server.capabilities = boot => (boot === 1 || capable ? ["receipts-cancel"] : null) } })
+    await r.clock.advance(HEARTBEAT_MS - r.elapsed() - 500)
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the event that polls carries nothing")
+    assert.equal(r.count("receipts"), 1, "a notice is staged 500 ms before the heartbeat")
+    r.server.heartbeat = staleOnce()
+    await r.clock.advance(500) // the heartbeat finds the lease lost: the worker is stopped and a rejoin waits
+    await r.clock.advance(3750)
+    assert.equal(r.worker.bootIds.length, 2, "rejoined")
+    assert.match((await r.op(turn())).sent[0].context, /^Agent Chat is available to this session/, "the binding goes first")
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "4.25 s after its answer, the retired worker's notice is not shown")
+    assert.equal(r.count("receipts_delivered"), 0, "and nothing is marked")
+    await r.clock.advance(POLL_MS)
+    await r.op(turn())
+    const shown = (await r.op(turn())).sent[0]
+    if (!capable) {
+      assert.deepEqual(shown, { context: null })
+      assert.deepEqual(r.worker.log.filter(entry => entry.boot === 2 && RECEIPTS_OPERATIONS.has(entry.op)), [], "no read and no mark through the new worker")
+    } else {
+      assert.ok(isNoticeText(shown.context) && shown.context.includes(feed[0].message_id), "the row came back with the new worker's feed")
+      assert.deepEqual(r.worker.ops("receipts").map(entry => entry.boot), [1, 2])
+      assert.deepEqual(r.worker.ops("receipts_delivered").map(entry => [entry.boot, entry.receipts]), [[2, ids(feed)]])
+    }
+  })
+}
 
 // Wire order after a cancel (#175). A cancel ends the package's wait for a receipts request. It does not end the server's work
 // on it: the server can still hold the instance row, and the first request after the cancel then waits for it, up to 3 seconds,

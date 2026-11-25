@@ -173,7 +173,7 @@ stays closed, so an unknown key next to `toolRoute` is still refused.
 
 | Value | What the text tells the model |
 |---|---|
-| absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The route lines are byte-identical to the text before `toolRoute` existed. In `pi`, `deepseek`, `claude-code` and `codex` the binding then ends with the [receipts sentence](#sender-receipts). |
+| absent, `"cli"` | The Agent Chat CLI: `AGENT_CHAT_INSTANCE_FILE` set to the binding's `instance_file` and the declared python with `-I -m agent_chat.cli`. The route lines are byte-identical to the text before `toolRoute` existed. In `pi`, `deepseek`, `claude-code` and `codex` the binding then ends with the [receipts sentence](#sender-receipts), save the one case that section names. |
 | `"mcp"` | The tools of the MCP server named `agent-chat`: `bind` (when the server has it), `who`, `history`, `send`, `ack` and `reply`. The text says not to run the CLI, and it carries no CLI argument. |
 | `"mcp-with-cli-fallback"` | The `mcp` bind line, then one line with the tools and the CLI: "Use who (room, online=true), history (room) and send (room, recipients, UUID key, body). Only if MCP is unavailable, set AGENT_CHAT_INSTANCE_FILE to exactly instance_file below and run the declared python with -I -m agent_chat.cli." Then the retry rule: "Reconcile an uncertain send or reply before retrying: keep the same key, recipients and body, and never replay it automatically on the other transport." The CLI's own `--help` names its arguments. The notice names its own CLI from the binding line below it, after the `mcp` use line: "Only if MCP is unavailable: AGENT_CHAT_INSTANCE_FILE=instance_file python -I -m agent_chat.cli (both below); never auto-replay an uncertain send or reply across transports." The Codex wake points at the binding's CLI line and keeps the no-replay clause: "Only if MCP is unavailable, use the binding's CLI; never replay an uncertain send or reply automatically on the other transport." |
 
@@ -234,10 +234,12 @@ The binding caps the interpreter path and the state directory together. With a 6
 and plain ASCII paths, `codex` leaves 940 bytes on `cli`, 798 on `mcp` and 594 on the fallback route; one byte more
 refuses at start with `CHAT_BINDING_TOO_LONG`. `claude-code` leaves 2,987, 2,845 and 2,641; one byte more and the
 binding is not announced. A test in each of the two packages pins its numbers. They include the
-[receipts sentence](#sender-receipts) that every binding of these two packages carries: without it `codex` left 994, 855
-and 651 bytes, and `claude-code` 3,041, 2,902 and 2,698. In `noticeBodies` mode a `codex` retry batch is claimed whole,
-so a hook that carries the binding can find it too large to follow, since the interpreter path is in both: the hook sends
-the binding alone and settles the batch `deferred` with reason `offline`. Each such hook spends one of the batch's three
+[receipts sentence](#sender-receipts) that the binding of these two packages carries: without it `codex` left 994, 855
+and 651 bytes, and `claude-code` 3,041, 2,902 and 2,698. In `noticeBodies` mode a retry batch is claimed whole. When its
+notice fits only beside the binding without the receipts sentence, `claude-code` and `codex` send that binding, so the
+sentence never makes a batch wait that fit before it. A `codex` hook that carries the binding can still find the batch too
+large to follow, since the interpreter path is in both: the hook sends the binding alone and settles the batch `deferred`
+with reason `offline`. Each such hook spends one of the batch's three
 attempts, and a batch with none left is not offered again; the first offer after the binding is confirmed, which the
 ledger makes after its backoff, is delivered whole. #172 tracks a fit check before the claim.
 
@@ -329,7 +331,8 @@ The rules below bind every package that shows receipts.
   `receipts` answer that has rows; an absent or non-boolean flag counts as muted, as an older worker's answer does, and
   the rows then wait on the server. A package polls at most every 5 seconds and only while a turn runs. `claude-code` and
   `codex` make the first poll one cadence after the receiver starts, and show an answer at the next event, never in the
-  reply of the event that polled. A notice holds at most 10 rows, oldest first, shown whole or not at all. A package
+  reply of the event that polled. Every package counts the cadence from the write of a request, so a pass that sends
+  nothing does not delay the next one. A notice holds at most 10 rows, oldest first, shown whole or not at all. A package
   tracks at most 200 ids, offers nothing while 200 wait for output or a mark, and, once an id's output was confirmed, never shows it again; above 200 it forgets the oldest marked ids.
 - **A staged notice is checked again when it is output.** `deepseek`, `claude-code` and `codex` stage a notice and output it
   at a later boundary, and the session may be muted by then. At the boundary the package asks the server nothing and
@@ -371,7 +374,10 @@ sends one request, the mark that waits or, when none waits, the poll. It is sent
 poll is due, and it stays due until then. `claude-code` and `codex` do the same in the pass that follows a hook's reply.
 A mark that keeps failing therefore holds the poll, and once it lands the poll waits for the next cadence. A notice
 that is staged or out, and not confirmed when the turn ends, is released and its rows are offered again. `pi` and
-`deepseek` release it at `agent_settled`, `claude-code` at `Stop`, and `codex` at `Stop` and at `Interrupt`.
+`deepseek` release it at `agent_settled`, `claude-code` at `Stop`, and `codex` at `Stop` and at `Interrupt`. `deepseek`,
+`claude-code` and `codex` also release a staged notice that is not yet output when its worker is retired, at a rejoin or
+when chat ends, so a worker that rejoins without `receipts-cancel` shows none. Confirmed ids stay, and a later worker
+with the capability marks them.
 
 Making senders ask. A question and a consultation carry receipts without a request. A `message` and a `reply` carry them
 only on request: `--receipts` on the CLI, `receipts: true` on the MCP `send` and `reply` tools. So each binding of the four
@@ -379,6 +385,9 @@ packages ends its route lines with one sentence from `receiptsHint(route)`: `sen
 handed/acked receipts.` on `cli`, and `send/reply receipts=true asks for handed/acked receipts.` on both `mcp` routes. It
 adds 54 bytes to the binding on `cli` and 57 on each `mcp` route. A notice and a wake do not carry it, and the Python
 reference mirrors no binding, so only the packages' byte pins and the room numbers in [Tool route](#tool-route) moved.
+One case leaves it out: when a `claude-code` or `codex` notice fits only beside a binding without the sentence, that
+binding goes with it and counts as shown. The sentence then returns with the next announcement, at a session start or a
+rejoin.
 
 Limits that remain:
 

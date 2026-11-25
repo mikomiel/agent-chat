@@ -1317,6 +1317,35 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
   })
 }
 
+// Review 6057736618: the receipts sentence (#130) adds 54 to 57 bytes to the binding. A retry batch is claimed whole, so a batch
+// that fit beside the binding before #130 must not be claimed and then deferred because of that sentence: on its last attempt
+// the ledger does not offer it again. The double offers the batch once, as the ledger does after a third attempt. Bodies of one
+// byte keep the notice one size at every body cap above zero, so the batch either fits whole or not at all. When the notice fits
+// only without the sentence, the binding goes without it.
+for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
+  test(`route: on ${toolRoute} a retry batch on its last attempt that fit beside the binding before #130 is handed with that binding, not deferred`, async () => {
+    const hint = `${RECEIPTS_LINE[toolRoute]}\n`
+    const rows = Array.from({ length: 16 }, (_, index) => bodyRow(index, "q"))
+    const firstHook = async length => {
+      const r = await retryAfterRejoin(toolRoute, { python: baseConfig.python + "x".repeat(length), directory: baseConfig.directory, rows })
+      return { r, reply: (await r.op(turn({ event: "PostToolUse" }))).sent[0] }
+    }
+    // The longest extra path for which one hook carried the binding before #130 and the batch: each byte of it costs two.
+    const before = Math.floor((MAX_OUTPUT_BYTES - (bytes((await firstHook(0)).reply.context) - bytes(hint))) / 2)
+    assert.ok(baseConfig.python.length + before + baseConfig.directory.length <= BINDING_PATH_ROOM[toolRoute], "the path is inside the binding's room")
+    const { r, reply } = await firstHook(before)
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [rows.map(row => row.id)], "the batch was claimed whole")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }], "and handed, not deferred")
+    assert.match(reply.context, /^Agent Chat is available to this session/)
+    assert.ok(reply.context.includes(`${r.worker.bootIds[1]}.json`), "the hook carries the new binding")
+    assert.ok(!reply.context.includes(hint), "without the receipts sentence")
+    for (const row of rows) assert.ok(reply.context.includes(`message ${row.id} kind question`), row.id)
+    assert.ok(bytes(reply.context) <= MAX_OUTPUT_BYTES, `${bytes(reply.context)} bytes`)
+    assert.ok(bytes(reply.context) + bytes(hint) > MAX_OUTPUT_BYTES, "with the sentence the two would not fit")
+    assert.deepEqual((await r.op(turn({ event: "PostToolUse" }))).sent, [{ context: null }], "the binding was shown, and the batch is not offered again")
+  })
+}
+
 for (const toolRoute of ["mcp", "mcp-with-cli-fallback"]) {
   test(`route: a rejoin on ${toolRoute} announces the new instance_file, the supersede sentence and bind again, never the old file`, async () => {
     let refuse = true

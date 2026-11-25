@@ -123,10 +123,14 @@ export function createLifecycle(bus, delivery, config, {
     return state
   }
 
+  // A notice staged and not yet taken is the retired worker's: it is released, and its rows come back with the next worker's
+  // feed. One the native half took waits for its confirmation, and a confirmed one for a mark, which a later worker with the
+  // capability sends.
   function stopLive() {
     const record = live
     live = null
     joined = null
+    if (pendingReceipts?.id === null) dropReceipts()
     clearIntervalImpl(heartbeatTimer)
     clearIntervalImpl(pollTimer)
     heartbeatTimer = null

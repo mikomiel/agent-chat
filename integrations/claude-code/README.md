@@ -115,7 +115,8 @@ The service and its host-token provisioning are documented in the product
 each route takes.
 
 - Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
-  the binding ends them with the one receipts sentence.
+  the binding ends them with the one receipts sentence (except in the one case
+  under "Large retry batches" below).
 - `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
   has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
 - `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
@@ -191,7 +192,9 @@ or a stop. Only the idle-wake waiter exits 2.
 - **Sender receipts.** After the reply of a `UserPromptSubmit` or `PostToolUse`
   hook, at most every 5 seconds and only while the session is busy, the receiver
   asks the worker for the `handed` and `acked` receipts of messages this session
-  sent. The first poll comes one cadence after the receiver starts. When the
+  sent. The first poll comes one cadence after the receiver starts. The cadence
+  counts from the write of a request: a pass that sends nothing, because it gave
+  way or the turn ended, does not delay the next one. When the
   worker's answer says the session is not muted, up to 10 of the oldest rows are
   staged as one notice, and the next prompt or tool event carries it as
   `additionalContext`. Only a reply that would otherwise carry nothing does, so
@@ -205,7 +208,10 @@ or a stop. Only the idle-wake waiter exits 2.
   receiver marks exactly those ids delivered at once; a refused or failed mark
   is sent again at the next pass. A pass sends one request, the mark that waits
   or else the poll. A staged notice that was not shown is
-  released at `Stop`. The request runs after the hook's reply, queued like any
+  released at `Stop` and when its worker is retired (a rejoin, or chat ending),
+  so a worker that rejoins without `receipts-cancel` shows none; its rows come
+  back with a later feed. Confirmed ids wait for a worker that can mark them.
+  The request runs after the hook's reply, queued like any
   other, and it never replaces a claim. It gives way: a claim, a heartbeat or a
   state report that queues behind it ends it with the worker's cancel signal, so,
   client-side, none of them waits for it beyond the worker's answer to the
@@ -291,7 +297,11 @@ or a stop. Only the idle-wake waiter exits 2.
   announcement in the first case and 2,224 bytes in the second. The
   announcement is 1,070 bytes in the receiver tests and never more than 4,096.
   An announcement larger than that room leaves less than the batch needs, so
-  the renderer returns nothing and the batch is deferred.
+  the renderer returns nothing and the batch is deferred. When the notice fits
+  only beside the announcement without its receipts sentence (54 bytes on `cli`,
+  57 on each `mcp` route), that announcement goes instead, so the sentence never
+  makes a batch wait that fit before it. That announcement counts as shown, and
+  the sentence returns with the next one, at a session start or a rejoin.
 - **Fallback route room beside an announcement.** On `mcp-with-cli-fallback`
   an announcement and the notice after it take 344 bytes more than on `cli` in
   metadata mode and 282 bytes more in bodies mode, so a batch beside an

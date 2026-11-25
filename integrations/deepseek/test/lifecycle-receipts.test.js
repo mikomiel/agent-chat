@@ -961,6 +961,57 @@ test("the capability is the join reply's of the worker that serves: a worker tha
   assert.ok(s.workers[1].requests.some(entry => entry.op === "pending"), "it serves deliveries")
 })
 
+// Review 6057736618: a notice staged just before the lease is lost is under one cadence old after a fast rejoin. It is the retired
+// worker's: it is released with it, and its rows go back to the feed. A worker that rejoined without the capability shows and
+// marks nothing; one that has it offers the rows again from its own feed. A notice the native half already took is not released:
+// its confirmation is still awaited.
+for (const capable of [false, true]) {
+  test(`a notice staged before a rejoin is released with the retired worker: ${capable ? "a capable worker offers its rows again" : "a worker without the capability shows and marks nothing"}`, async () => {
+    const feed = [row(1)]
+    const s = await session({ rows: feed, rejoinedCapabilities: capable ? ["receipts-cancel"] : null })
+    await s.tick(0)
+    assert.equal(s.count("receipts"), 1, "a notice is staged")
+    s.server.heartbeatRefusal = "STALE_INSTANCE"
+    await s.lifecycle.heartbeat()
+    s.server.heartbeatRefusal = null
+    s.clock.t += 2500 // the rejoin, within one cadence of the answer
+    s.rejoins()[0].fn()
+    await flush()
+    assert.equal(s.workers.length, 2, "rejoined")
+    assert.equal(s.take(), null, "the retired worker's notice is not handed over")
+    await s.tick()
+    const taken = s.take()
+    if (!capable) {
+      assert.equal(taken, null)
+      assert.deepEqual(s.workers[1].requests.filter(entry => entry.op.startsWith("receipts")), [], "no read and no mark through the new worker")
+    } else {
+      assert.ok(taken && taken.text.includes(feed[0].message_id), "the row came back with the new worker's feed")
+      s.lifecycle.receiptsConfirmed(taken.id)
+      await s.tick()
+      assert.deepEqual(s.workers[1].requests.filter(entry => entry.op.startsWith("receipts")).map(entry => entry.op), ["receipts", "receipts_delivered"])
+    }
+    assert.equal(s.workers[0].requests.filter(entry => entry.op === "receipts_delivered").length, 0, "nothing is marked through the retired worker")
+  })
+}
+
+test("a notice the native half took before a rejoin stays confirmable, and is marked through the new instance", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed })
+  await s.tick(0)
+  const taken = s.take()
+  assert.ok(taken)
+  s.server.heartbeatRefusal = "STALE_INSTANCE"
+  await s.lifecycle.heartbeat()
+  s.server.heartbeatRefusal = null
+  s.clock.t += POLL_MS
+  s.rejoins()[0].fn()
+  await flush()
+  assert.equal(s.workers.length, 2, "rejoined")
+  s.lifecycle.receiptsConfirmed(taken.id) // the native session logged it after the rejoin
+  await s.tick()
+  assert.deepEqual(s.workers[1].requests.filter(entry => entry.op === "receipts_delivered").map(entry => entry.fields), [{ receipts: ids(feed) }])
+})
+
 test("a session whose requests never overlap a receipts request cancels nothing", async () => {
   const run = await deliveryRun({ rows: [row(1), row(2), row(3)] })
   assert.ok(run.s.count("receipts") >= 1 && run.s.count("receipts_delivered") >= 1, "the receipts path ran")

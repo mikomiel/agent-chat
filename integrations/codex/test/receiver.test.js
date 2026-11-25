@@ -3994,10 +3994,12 @@ for (const toolRoute of ROUTES) {
 }
 
 // The first hook after a rejoin shares one 6,000-byte output between the new binding and the notice, and the interpreter path
-// is in both, so each byte of it costs two. A retry batch is claimed whole, so once the hook cannot hold both, the binding goes
-// alone and the batch waits: the hook settles it `deferred` with reason `offline`, which spends one of its three attempts. The
-// ledger offers it again after its backoff, and that offer, with no binding in front of it, is delivered whole. The double
-// offers it again at once; the backoff is the ledger's. The path stays inside the binding's room on every route.
+// is in both, so each byte of it costs two. A retry batch is claimed whole. Up to the edge of the binding before #130 the hook
+// holds both: past the edge of the binding with the receipts sentence, the binding goes without that sentence (review
+// 6057736618). Once the hook cannot hold both even so, the binding goes alone and the batch waits: the hook settles it
+// `deferred` with reason `offline`, which spends one of its three attempts. The ledger offers it again after its backoff, and
+// that offer, with no binding in front of it, is delivered whole. The double offers it again at once; the backoff is the
+// ledger's. The path stays inside the binding's room on every route.
 for (const toolRoute of ROUTES) {
   test(`route: on ${toolRoute} a retry batch that no longer fits beside the new binding waits: the binding goes alone, and the next offer is delivered whole`, async () => {
     const firstHook = async length => {
@@ -4005,14 +4007,17 @@ for (const toolRoute of ROUTES) {
       return { r, ids, reply: (await r.op(turn({ event: "tool" }))).sent[0] }
     }
     const holdsBatch = ({ ids, reply }) => ids.every(id => reply.context.includes(`message ${id} kind question`))
-    // The longest extra path for which one hook still carries both: the binding and the notice take 2 bytes for each byte of it.
-    const edge = Math.floor((MAX_OUTPUT_BYTES - bytes((await firstHook(0)).reply.context)) / 2)
+    const hint = `${RECEIPTS_LINE[toolRoute]}\n`
+    // The longest extra path for which one hook still carries both, with the binding before #130: the binding and the notice
+    // take 2 bytes for each byte of it.
+    const edge = Math.floor((MAX_OUTPUT_BYTES - (bytes((await firstHook(0)).reply.context) - bytes(hint))) / 2)
     assert.ok(baseConfig.python.length + edge + 1 + baseConfig.directory.length <= BINDING_PATH_ROOM[toolRoute], "the path is inside the binding's room")
 
     const fits = await firstHook(edge)
     assert.ok(holdsBatch(fits), "at the edge one hook carries the binding and the batch")
     assert.match(fits.reply.context, /^Agent Chat is available to this session/)
     assert.ok(bytes(fits.reply.context) <= MAX_OUTPUT_BYTES && bytes(fits.reply.context) + 2 > MAX_OUTPUT_BYTES, "and one byte more of path would not fit")
+    assert.ok(!fits.reply.context.includes(hint), "the binding goes without the receipts sentence")
     assert.deepEqual(fits.r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
 
     const waits = async length => {
@@ -4032,7 +4037,39 @@ for (const toolRoute of ROUTES) {
       assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], `${length}: and nothing is offered after it`)
     }
     await waits(edge + 1)
-    if (toolRoute === "cli") await waits(510) // the reviewer's case: an interpreter path 510 bytes longer
+    if (toolRoute === "cli") {
+      // The reviewer's case: an interpreter path 510 bytes longer. It fit beside the binding before #130, and is handed.
+      const reviewed = await firstHook(510)
+      assert.ok(holdsBatch(reviewed), "510: one hook carries the binding and the batch")
+      assert.deepEqual(reviewed.r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }], "510: handed, no attempt spent")
+    }
+  })
+}
+
+// Review 6057736618: the receipts sentence (#130) adds 54 to 57 bytes to the binding. A retry batch is claimed whole, so a batch
+// that fit beside the binding before #130 must not be claimed and then deferred because of that sentence: on its last attempt
+// the ledger does not offer it again. The double offers the batch once, as the ledger does after a third attempt. When the
+// notice fits only without the sentence, the binding goes without it.
+for (const toolRoute of ROUTES) {
+  test(`route: on ${toolRoute} a retry batch on its last attempt that fit beside the binding before #130 is handed with that binding, not deferred`, async () => {
+    const hint = `${RECEIPTS_LINE[toolRoute]}\n`
+    const firstHook = async length => {
+      const { r, ids } = await retryAfterRejoin(toolRoute, { python: baseConfig.python + "x".repeat(length), count: 10 })
+      return { r, ids, reply: (await r.op(turn({ event: "tool" }))).sent[0] }
+    }
+    // The longest extra path for which one hook carried the binding before #130 and the batch: each byte of it costs two.
+    const before = Math.floor((MAX_OUTPUT_BYTES - (bytes((await firstHook(0)).reply.context) - bytes(hint))) / 2)
+    assert.ok(baseConfig.python.length + before + baseConfig.directory.length <= BINDING_PATH_ROOM[toolRoute], "the path is inside the binding's room")
+    const { r, ids, reply } = await firstHook(before)
+    assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [ids], "the batch was claimed whole")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }], "and handed, not deferred")
+    assert.match(reply.context, /^Agent Chat is available to this session/)
+    assert.ok(reply.context.includes(`${r.worker.bootIds[1]}.json`), "the hook carries the new binding")
+    assert.ok(!reply.context.includes(hint), "without the receipts sentence")
+    for (const id of ids) assert.ok(reply.context.includes(`message ${id} kind question`), id)
+    assert.ok(bytes(reply.context) <= MAX_OUTPUT_BYTES, `${bytes(reply.context)} bytes`)
+    assert.ok(bytes(reply.context) + bytes(hint) > MAX_OUTPUT_BYTES, "with the sentence the two would not fit")
+    assert.deepEqual((await r.op(turn({ event: "tool" }))).sent, [{ context: null }], "the binding was shown, and the batch is not offered again")
   })
 }
 

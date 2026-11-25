@@ -13,7 +13,7 @@ After a successful join the adapter MUST expose `python`, `instance_file`, `room
 - **THEN** the context carries the eight binding fields and the route lines of the configured tool route
 - **AND** on the `cli` route, and in the fallback lines of the `mcp-with-cli-fallback` route, it names the interpreter form and the environment variable the CLI needs
 - **AND** on the `mcp` and `mcp-with-cli-fallback` routes it tells the model to call the agent-chat MCP `bind` tool, when the server exposes one, with exactly the `instance_file` shown, and again whenever a later binding shows a different one
-- **AND** a package that shows sender receipts ends its route lines with one sentence that tells the model how to ask for them: `send/reply --receipts asks for handed/acked receipts.` on the `cli` route, and `send/reply receipts=true asks for handed/acked receipts.` on the `mcp` and `mcp-with-cli-fallback` routes
+- **AND** a package that shows sender receipts ends its route lines with one sentence that tells the model how to ask for them: `send/reply --receipts asks for handed/acked receipts.` on the `cli` route, and `send/reply receipts=true asks for handed/acked receipts.` on the `mcp` and `mcp-with-cli-fallback` routes, except in a binding that goes with a notice that fits only without that sentence
 - **AND** it carries no token and no other session's binding
 
 #### Scenario: Tool route
@@ -513,12 +513,16 @@ The caller MUST pass `bound`, the UTF-8 bytes it may send, with its own prefix a
 - **THEN** the renderer returns nothing
 
 ### Requirement: A batch with no notice is deferred, never partly delivered
-A package MUST settle a batch for which the renderer returns nothing as `deferred` with reason `offline`, and MUST NOT send a partial or metadata notice in its place.
+A package MUST settle a batch for which the renderer returns nothing as `deferred` with reason `offline`, and MUST NOT send a partial or metadata notice in its place. When a notice fits only beside a binding without its receipts sentence, the package MUST send that binding with it and MUST NOT defer the batch.
 
 #### Scenario: The renderer returns nothing
 - **WHEN** a claimed batch has a message that fails its pattern, or a batch that does not fit at cap 0
 - **THEN** the package settles the batch as `deferred` with reason `offline`
 - **AND** it sends no text to the session
+
+#### Scenario: A batch that fits only beside the binding without the receipts sentence
+- **WHEN** `claude-code` or `codex` claims a retry batch whose notice does not fit beside the binding still to be shown, and fits beside that binding without the receipts sentence
+- **THEN** the hook carries that binding and the notice, and the batch settles `handed`
 
 ### Requirement: A package claims the longest prefix that one notice is estimated to carry
 Before the claim, the package MUST take the longest prefix of the pending candidates, and at least one, whose estimated rendering fits `bound`. The estimate MUST budget the widest header, markers and pointer for each message and 3 rendered bytes for each stored body byte, up to the body cap. It MUST claim a retry batch, or a batch for which the server reported no sizes, whole. A missing or invalid size MUST count as a full body.
@@ -566,23 +570,30 @@ A package that shows sender receipts MUST offer them only while the session is j
 - **AND** the receipts stay pending on the server
 
 ### Requirement: A staged sender receipts notice is checked again when it is output
-A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest `muted` flag that any worker answer carried is `false` and the answer that staged it came at most 5 seconds before. A `status` answer without a boolean `muted` makes that flag unknown. `deepseek` MUST also drop it unless its native state, read without side effect, is a running turn outside Plan Mode. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
+A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest worker answer's `muted` flag is `false` (a `status` answer without a boolean one makes it unknown) and the answer that staged it came at most 5 seconds before. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
 
 #### Scenario: A mute after the notice was staged
 - **WHEN** a `status` answer says the session is muted, or more than 5 seconds pass, after the answer that staged a notice and before its output
 - **THEN** no notice is output, and `claude-code` and `codex` answer the hook as for a reply with nothing to carry
 - **AND** the ids are not marked, and a later poll offers the rows again
 
+### Requirement: `deepseek` outputs a staged receipts notice only into a running turn
+`deepseek` MUST also drop a staged receipts notice at output unless its native state, read without side effect, is a running turn outside Plan Mode. A notice it drops MUST NOT be marked, and its rows MUST be offered again.
+
 #### Scenario: Plan Mode after the notice was staged
 - **WHEN** `deepseek` finds its native state idle, stopped, unknown or in Plan Mode at the step that would carry a staged notice
 - **THEN** no message is appended and the ids are not marked
 
 ### Requirement: A receipts pass sends one request and reads the native state without side effect
-A package's receipts pass MUST send at most one receipts request: the mark that waits or, when none waits, the feed poll. A mark that is not accepted MUST hold the feed poll until it lands. `deepseek` MUST read its native state for receipts with a read that does not stop chat, log a warning or fence a delivery, and a state that read cannot classify MUST hold receipts for that pass and change nothing else.
+A package's receipts pass MUST send at most one receipts request: the mark that waits or, when none waits, the feed poll. A mark that is not accepted MUST hold the feed poll until it lands. A pass that sends nothing MUST NOT delay the next one. `deepseek` MUST read its native state for receipts with a read that does not stop chat, log a warning or fence a delivery, and a state that read cannot classify MUST hold receipts for that pass and change nothing else.
 
 #### Scenario: A mark waits
 - **WHEN** a mark is waiting at a pass and the feed poll is due too
 - **THEN** the pass sends only the mark, and the feed poll waits for the next cadence after the mark landed
+
+#### Scenario: A pass that sends nothing
+- **WHEN** a pass gives way to a request queued behind it, or finds the turn over, and sends no receipts request
+- **THEN** the next pass of a running turn may poll at once
 
 #### Scenario: An unreadable native state in a receipts pass
 - **WHEN** `deepseek` cannot read its native state during a receipts pass
@@ -607,7 +618,7 @@ A package MUST end a receipts request in flight with the worker's cancel when a 
 - **AND** chat stays on, and those ids are marked at a later pass
 
 ### Requirement: `receipts-cancel` gates receipts requests and ends only a receipts request
-A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`. A worker that lists `receipts-cancel` MUST let a cancel end only the receipts request it was sent for, and MUST still end on its alarm or on `SIGTERM` during a receipts request.
+A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`, and MUST release a notice staged and not yet output when its worker is retired. A worker that lists `receipts-cancel` MUST let a cancel end only the receipts request it was sent for, and MUST still end on its alarm or on `SIGTERM` during a receipts request.
 
 #### Scenario: A worker without the capability
 - **WHEN** a worker's join reply has no `capabilities` list, or the list does not contain `receipts-cancel`
@@ -617,6 +628,7 @@ A package MUST send a receipts request only to a worker whose join reply lists `
 #### Scenario: A rejoin onto another worker
 - **WHEN** a rejoin starts a worker whose join reply differs in `capabilities` from the worker before it
 - **THEN** the package follows the join reply of the worker that serves, and of no other
+- **AND** a notice staged for the worker before it, and not yet output, is not shown, and its rows are offered again by a later feed
 
 #### Scenario: A cancel arrives after the receipts request has its answer
 - **WHEN** the worker receives the cancel signal after a receipts request has its answer and before it reads the next request

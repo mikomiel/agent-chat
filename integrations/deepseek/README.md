@@ -214,8 +214,10 @@ fits on `cli` fits on every route.
   shows none. The `session/event`
   `user/message` that carries the appended message's id confirms the notice, and
   the next pass marks exactly those ids delivered. A notice that is not
-  confirmed is released at `agent_settled`, and a refused or failed mark is sent
-  again at the next pass. A fault in the receipts step itself, a refused answer
+  confirmed is released at `agent_settled`, and one not yet taken by a step is
+  released when its worker is retired (a rejoin, or chat ending), so a worker
+  that rejoins without `receipts-cancel` shows none. A refused or failed mark is
+  sent again at the next pass. A fault in the receipts step itself, a refused answer
   and a malformed answer never isolate the agent; a thrown error that carries a
   code takes the path it takes on any request. Receipts never change the bytes
   of a delivery, a heartbeat or the binding. The binding ends its route lines
