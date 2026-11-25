@@ -1556,6 +1556,40 @@ def test_a_cancel_that_comes_before_another_kind_of_request_is_forgotten(monkeyp
     assert _paths(calls) == ["heartbeat", "status", "receipts", "end"]
 
 
+@pytest.mark.parametrize("first", ["refused", "answered"])
+@pytest.mark.parametrize("when", ["before its frame is written", "after its frame is written"])
+def test_a_late_cancel_for_an_answered_receipts_request_never_reaches_the_next_one(
+    monkeypatch: pytest.MonkeyPatch, when: str, first: str
+) -> None:
+    """The signal lands once the mark has its answer, and the next request is a retry of the same mark.
+
+    The parent signalled for the mark that has just been answered. That signal must not refuse the retry that follows,
+    which the server has never seen: the retry is sent, and answered.
+    """
+    handlers: dict[int, Any] = {}
+    frame, key = RECEIPT_OPERATIONS["receipts_delivered"]
+    real_write = instance_worker._write
+
+    def write(reply: dict[str, Any], credentials: tuple[str, ...]) -> None:
+        if when == "before its frame is written" and reply.get("id") == 1:
+            handlers[CANCEL](CANCEL, None)
+        real_write(reply, credentials)
+        if when == "after its frame is written" and reply.get("id") == 1:
+            handlers[CANCEL](CANCEL, None)  # the worker is idle, waiting for its next request
+
+    monkeypatch.setattr(instance_worker, "_write", write)
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, frame), (2, frame)], [],
+        failures={key: [ChatError("SERVICE_UNAVAILABLE") if first == "refused" else None]}, handlers=handlers,
+    )
+    assert code == 0
+    _assert_one_frame_each(frames, 2)
+    answered = {"delivered": frame["receipts"]}
+    assert frames[1]["result"] == ({"refused": "SERVICE_UNAVAILABLE"} if first == "refused" else answered)
+    assert frames[2]["result"] == answered  # the retry was asked, not refused by the signal
+    assert _paths(calls) == [key, key, "end"]
+
+
 def test_a_second_cancel_after_the_first_interrupted_the_request_is_remembered_not_raised(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1743,3 +1777,82 @@ def test_a_real_cancel_signal_ends_a_held_receipts_request_at_once_and_the_worke
     assert replies[1]["result"] == CANCELLED
     assert wrote_at[1] - read_at[1] < 4.0  # the signal ended it; the server held it for 8 s and the deadline was 30 s
     assert replies[2]["result"] == _HeldServer.identity  # the same worker answers the next request
+
+
+@pytest.mark.parametrize("operation", sorted(RECEIPT_OPERATIONS))
+def test_a_real_alarm_during_a_held_receipts_request_still_ends_the_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, operation: str
+) -> None:
+    """A real socket, the real client and a real SIGALRM: the client turns the alarm's interrupt into a ChatError.
+
+    The receipts deadline is long and the server holds the answer for 8 s, so only the alarm can end the request. A
+    receipts request that took the converted alarm for an ordinary failure would answer `refused` and serve on.
+    """
+    frame, _key = RECEIPT_OPERATIONS[operation]
+    path = "/v1/instance/receipts" if operation == "receipts" else "/v1/instance/receipts/delivered"
+    instance = instance_client.JoinedInstance(
+        InstanceSecret("alarmed-native", uuid4(), "1" * 64, "http://127.0.0.1:1"), uuid4(), uuid4(), uuid4(),
+        "synthetic-host", "pi",
+    )
+    _HeldServer.identity = {"instance_id": str(instance.instance_id), "session_id": str(instance.session_id)}
+    _HeldServer.stalled = frozenset({path})  # its answer drips for 8 s
+    _HeldServer.reached = threading.Event()
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _HeldServer)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    previous = signal.getsignal(signal.SIGALRM)
+    try:
+        port = server.server_address[1]
+        pinned = ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", port)),)
+        bound = instance_client.JoinedInstance(
+            InstanceSecret("alarmed-native", instance.binding.boot_id, "1" * 64, f"http://127.0.0.1:{port}"),
+            instance.session_id, instance.instance_id, instance.room_id, "synthetic-host", "pi", pinned,
+        )
+        frames = iter(
+            [{"id": 0, "op": "join", "directory": str(tmp_path), "host_token": "synthetic-host-secret"}]
+            + [{"id": 1, **frame}, {"id": 2, "op": "status"}]
+        )
+        read_at: list[float] = []
+        wrote_at: list[float] = []
+        output = io.BytesIO()
+
+        def readline(_size: int) -> bytes:
+            read_at.append(time.monotonic())
+            item = next(frames, None)
+            return b"" if item is None else (json.dumps(item) + "\n").encode()
+
+        class Stdout:
+            def write(self, view: memoryview) -> int:
+                wrote_at.append(time.monotonic())
+                return output.write(view)
+
+        def install(number: int, handler: Any) -> None:
+            if number == signal.SIGALRM:  # the real alarm handler on the real timer; SIGTERM and the cancel stay off
+                signal.signal(number, handler)
+
+        monkeypatch.setattr(instance_worker, "RECEIPT_SECONDS", 30.0)  # the receipts deadline cannot end the request
+        monkeypatch.setattr(instance_worker, "REQUEST_SECONDS", 0.5)
+        monkeypatch.setattr(instance_worker, "_join", lambda _request: bound)
+        monkeypatch.setattr(
+            instance_worker, "sys",
+            SimpleNamespace(stdin=SimpleNamespace(buffer=SimpleNamespace(readline=readline)),
+                            stdout=SimpleNamespace(buffer=Stdout())),
+        )
+        monkeypatch.setattr(
+            instance_worker, "signal",
+            SimpleNamespace(SIGALRM=signal.SIGALRM, SIGTERM=signal.SIGTERM, ITIMER_REAL=signal.ITIMER_REAL,
+                            signal=install, setitimer=signal.setitimer),
+        )
+        code = instance_worker.main()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+        server.shutdown()
+        server.server_close()
+    replies = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert _HeldServer.reached.is_set()  # the request was in the server's hands when the alarm fired
+    assert code == 1
+    assert len(replies) == 2
+    assert replies[1]["id"] == 1 and replies[1]["error"]["code"] in {"TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"}
+    assert len(read_at) == 2  # the join and the receipts request: the status after it was never read
+    assert wrote_at[1] - read_at[1] < 4.0  # the alarm ended it, not the end of the 8 s answer

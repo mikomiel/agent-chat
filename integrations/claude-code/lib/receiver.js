@@ -131,13 +131,16 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return run
   }
   // A counted sequence that queues behind a receipts read ends that read: the worker answers it `refused` within
-  // milliseconds, and the sequence waits for that and no longer. Such a sequence is counted from its turn, not from its
-  // queuing: it is no slow request yet, and a hook that arrives in that moment must not skip its claim for a receipts read.
-  function exclusive(task) {
+  // milliseconds, and the sequence waits for that and no longer. A heartbeat or a state report that queues there is counted
+  // from its turn, not from its queuing: it is one request and no slow one yet, so a hook that arrives in that moment queues
+  // its claim behind it. A claim sequence (`claim`) is counted at once, as it is with no read ahead of it: a hook that
+  // queued behind it would wait for that whole delivery, so it takes the slow-request path instead.
+  function exclusive(task, { claim = false } = {}) {
     const behind = receiptsReading
     if (behind) live?.worker.cancel()
-    else inflight += 1
-    return lane(() => { if (behind) inflight += 1; return task() }).finally(() => { inflight -= 1 })
+    const counted = claim || !behind
+    if (counted) inflight += 1
+    return lane(() => { if (!counted) inflight += 1; return task() }).finally(() => { inflight -= 1 })
   }
   const guard = promise => promise.catch(error => handleFailure(error))
   const within = (promise, ms) => new Promise(resolve => {
@@ -371,7 +374,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         delivering = false
         if (holder) holder.delivering = false
       }
-    })
+    }, { claim: true })
   }
 
   async function wakePoll() {

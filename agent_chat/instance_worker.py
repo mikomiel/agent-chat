@@ -14,8 +14,10 @@ with TRANSPORT_UNAVAILABLE. Only the next join, the parent's rejoin, resolves ag
 
 The join reply names what this worker can do beyond the base requests (`capabilities`). `receipts-cancel` means
 that SIGUSR1 ends a receipts request that is running, which then answers `refused`, so that a delivery never waits
-in this worker behind advisory work; the server finishes the request. Nothing else ends on it: outside a receipts
-request the signal is remembered once, for the request that follows, and never ends the worker.
+in this worker behind advisory work; the server finishes the request. Nothing else ends on it, and it never ends the
+worker. A signal that lands after a receipts request has its answer and before the next frame is read was meant for
+that request, and is dropped. Anywhere else outside a receipts request it is remembered once: a receipts request
+read next answers `refused` without asking, and any other request read next forgets it.
 """
 
 import json
@@ -233,13 +235,25 @@ def main() -> int:
     published_state: Heartbeat | None = None
     failing_since: dict[str, float] = {}
     terminated = False
-    receipts_open = False  # a receipts request runs: the only time CANCEL_SIGNAL interrupts anything
-    cancel_latched = False  # a cancel arrived that no request has answered yet; a request that follows one answers it
+    alarmed = False  # the alarm fired in the receipts request that runs; the client reports it as a failed transport
+    # What CANCEL_SIGNAL does now. "open": a receipts request runs, and the signal ends it. "answered": a receipts
+    # request has its answer and the next frame is not read yet, so the signal was meant for that request and is
+    # dropped. "latch": anywhere else, the signal is remembered for a receipts request that comes next. One store moves
+    # between them, so no signal can land between two of them.
+    cancel_window = "latch"
+    cancel_latched = False  # a cancel arrived that no request has answered; a receipts request that follows answers it
 
     def _terminate(signum: int, frame: Any) -> None:
         # SIGTERM makes the blocked request fail like a transport error. Record it so it is never tolerated.
         nonlocal terminated
         terminated = True
+        _interrupt(signum, frame)
+
+    def _alarm(signum: int, frame: Any) -> None:
+        # The alarm also reaches a receipts request as a failed transport. Record it, so that `_receipt` ends the
+        # worker on it instead of answering `refused`.
+        nonlocal alarmed
+        alarmed = True
         _interrupt(signum, frame)
 
     def _outage(op: str, error: ChatError, codes: frozenset[str]) -> bool:
@@ -248,38 +262,45 @@ def main() -> int:
         return monotonic() - failing_since.setdefault(op, monotonic()) < LEASE_SECONDS
 
     def _cancel(_signum: int, _frame: Any) -> None:
-        nonlocal receipts_open, cancel_latched
+        nonlocal cancel_window, cancel_latched
+        if cancel_window == "answered":
+            return
         cancel_latched = True
-        if receipts_open:
-            receipts_open = False  # one interrupt per request: a second signal latches, it never raises again
+        if cancel_window == "open":
+            cancel_window = "latch"  # one interrupt per request: a second signal latches, it never raises again
             raise _ReceiptsCancelled("receipts request cancelled")
 
     def _receipt(call: Callable[..., Any], *arguments: Any) -> Any:
-        nonlocal receipts_open, cancel_latched
+        nonlocal alarmed, cancel_window, cancel_latched
+        alarmed = False  # only an alarm inside this receipts request counts; other requests keep their outage rules
         try:
             try:
-                # From this store until the `finally`, everything is inside the outer `try`, so a cancel that lands
-                # anywhere in the request, or in its clean-up, is answered below. Before it, the handler only latches.
-                receipts_open = True
-                if cancel_latched:
-                    raise _ReceiptsCancelled("receipts request cancelled before it began")
-                return call(*arguments, deadline=monotonic() + RECEIPT_SECONDS)
-            finally:
-                receipts_open = False
-        except _ReceiptsCancelled:
-            if terminated:  # SIGTERM came with it: a stop still ends the worker
-                raise
-            cancel_latched = False
-            return {"refused": "CLI_INTERRUPTED"}
-        except ChatError as error:
-            if terminated:  # SIGTERM interrupted the call: a stop still ends the worker
-                raise
-            if cancel_latched:  # the cancel interrupted the client, which reported it as a failed transport
-                cancel_latched = False
+                try:
+                    # From this store until the `finally`, everything is inside the outer `try`, so a cancel that
+                    # lands anywhere in the request, or in its clean-up, is answered below. Before it, the handler only
+                    # latches.
+                    cancel_window = "open"
+                    if cancel_latched:
+                        raise _ReceiptsCancelled("receipts request cancelled before it began")
+                    return call(*arguments, deadline=monotonic() + RECEIPT_SECONDS)
+                finally:
+                    # The request has its answer. A signal from here until the next frame is read was sent for it, and
+                    # must not reach the next request, which can be a retry the server has never seen.
+                    cancel_window = "answered"
+            except _ReceiptsCancelled:
+                if terminated or alarmed:  # SIGTERM or the alarm came with it: either still ends the worker
+                    raise
                 return {"refused": "CLI_INTERRUPTED"}
-            return {"refused": error.code}
+            except ChatError as error:
+                if terminated or alarmed:  # SIGTERM or the alarm interrupted the call: either still ends the worker
+                    raise
+                if cancel_latched:  # the cancel interrupted the client, which reported it as a failed transport
+                    return {"refused": "CLI_INTERRUPTED"}
+                return {"refused": error.code}
+        finally:
+            cancel_latched = False  # whatever this request's signal was, it is answered
 
-    signal.signal(signal.SIGALRM, _interrupt)
+    signal.signal(signal.SIGALRM, _alarm)
     signal.signal(signal.SIGTERM, _terminate)
     signal.signal(CANCEL_SIGNAL, _cancel)
     signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
@@ -315,6 +336,7 @@ def main() -> int:
             signal.setitimer(signal.ITIMER_REAL, IDLE_SECONDS)
             request = _read(sequence)
             signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
+            cancel_window = "latch"  # a new request: a signal from now on is for a receipts request this one may be
             if request is None:
                 break
             operation = request.get("op")

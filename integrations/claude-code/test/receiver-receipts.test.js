@@ -890,6 +890,34 @@ test("a heartbeat queued behind a poll does not make a hook skip its claim: the 
   assert.equal(r.worker.ops("settle")[0].result.outcome, "handed")
 })
 
+// Two hooks in that window. Without receipts the first hook's claim sequence is counted as it queues, and a hook that arrives
+// while it is queued takes the slow-request path: it reports and returns, and waits for no delivery. A claim sequence that
+// queues behind a receipts read is counted the same way, so the second hook does not wait behind the first one's delivery.
+test("a claim sequence queued behind a poll counts at once: a second hook returns without waiting behind that delivery", async () => {
+  const r = await ready({ rows: [] })
+  holdReads(r)
+  r.server.cancelEnds = false
+  await r.op(turn()) // its reply starts a pass, and the read is held
+  assert.equal(r.count("receipts"), 1, "the poll is in flight")
+  const before = r.worker.log.length
+  r.server.pending = ["m1"]
+  const first = hookDouble({ events: r.events })
+  const second = hookDouble({ events: r.events })
+  const firstHandled = r.receiver.handle(turn(), first)
+  const secondHandled = r.receiver.handle(turn(), second)
+  await settle()
+  assert.deepEqual(second.sent, [{ context: null }], "the second hook answered while the worker still holds the read")
+  assert.deepEqual(first.sent, [], "the first hook waits for the worker's answer to the cancel")
+  assert.deepEqual(r.worker.cancels, [{ boot: 1, held: "receipts" }], "one cancel, by the first hook's claim sequence")
+  assert.equal(r.worker.log.length, before, "nothing was sent meanwhile: the worker holds one request")
+  r.worker.endHeld() // the worker answers the cancel
+  await Promise.all([firstHandled, secondHandled])
+  await settle()
+  assert.ok(isDeliveryText(first.sent[0].context), "the first hook delivered")
+  const sent = r.worker.log.slice(before).filter(entry => !RECEIPTS_OPERATIONS.has(entry.op)).map(entry => entry.op)
+  assert.deepEqual(sent, ["pending", "claim", "status", "settle"], "one claim sequence, and nothing queued behind it")
+})
+
 test("a read that the worker answers for real after the turn ended is not staged, although the Stop asked it to end; the Stop does not wait for it", async () => {
   const r = await ready({ rows: [rcpt(1)] })
   let open

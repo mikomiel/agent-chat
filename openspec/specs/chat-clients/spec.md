@@ -590,7 +590,7 @@ A package's receipts pass MUST send at most one receipts request: the mark that 
 - **AND** a later delivery is handed with no new Web prompt
 
 ### Requirement: A receipts request gives way to every other request
-A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`. It MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
+A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`. It MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused. A worker that lists `receipts-cancel` MUST let a cancel end only the receipts request it was sent for, and MUST still end on its alarm or on `SIGTERM` during a receipts request.
 
 #### Scenario: A worker without the capability
 - **WHEN** a worker's join reply has no `capabilities` list, or the list does not contain `receipts-cancel`
@@ -606,6 +606,15 @@ A package MUST send a receipts request only to a worker whose join reply lists `
 - **THEN** the package cancels the receipts request, and sends the due request when the worker has answered the cancel
 - **AND** the package holds the `refused` answer like any refusal, changes no state for it, and keeps the ids of a mark that was ended
 - **AND** chat stays on, and those ids are marked at a later pass
+
+#### Scenario: A cancel arrives after the receipts request has its answer
+- **WHEN** the worker receives the cancel signal after a receipts request has its answer and before it reads the next request
+- **THEN** the worker drops the signal
+- **AND** the next request, a retry of the same mark included, is sent to the server and answered
+
+#### Scenario: The alarm fires during a receipts request
+- **WHEN** the worker's alarm fires while a receipts request runs, also while the HTTP client waits for the answer
+- **THEN** the worker ends with an error frame and does not answer `refused` for that receipts request
 
 ### Requirement: Sender receipts never wake and never change delivery
 A package MUST output a receipts notice only at a native boundary of a turn that already runs, and MUST NOT start a turn, claim, settle, steer or wake for it. A pending receipt MUST NOT change the bytes of a claim, a handoff, a settle, a heartbeat, a binding announcement or a wake, and a receipts request MUST NOT sit between a claim and its settle.

@@ -287,19 +287,27 @@ The rules below bind every package that shows receipts.
   *Cancel.* `worker.cancel()` sends `SIGUSR1` to a worker that listed the capability, once for the receipts request that
   is pending, and never for any other request. Inside a receipts request the worker raises an interrupt that only this
   signal raises, answers `refused: CLI_INTERRUPTED`, and serves on. Outside a receipts request the signal does nothing;
-  one that arrives just before a receipts request is kept by one latch, so that request answers `refused` at once. `SIGTERM`
-  and the 20-second alarm end the worker as before. The package holds the answer like any refusal: no state changes, a
+  one that arrives just before a receipts request is kept by one latch, so that request answers `refused` at once. One
+  that arrives after a receipts request has its answer, and before the worker reads the next request, was sent for the
+  request that has just been answered, and the worker drops it: it never refuses the request after it, such as a retry of
+  the same mark. A signal for a receipts request sent right after another one's answer is dropped the same way if it
+  lands before the worker has read that request; the 2-second deadline below then ends it. During a receipts request, `SIGTERM` and the 20-second alarm end the worker, also when the HTTP client reports
+  their interrupt as a failed transport. Other requests keep their existing outage handling. The package holds the answer like any refusal: no state changes, a
   feed read is asked again at a later pass, and a mark that was ended keeps its ids.
   `claude-code` and `codex` cancel when a counted request queues behind a receipts request: a hook's or a wake's claim
   sequence, a heartbeat or a state report. A receipts task that reaches the head of the queue while a counted request
-  is in flight sends nothing, and a later pass asks again. The hook's check for a slow request does not count requests
-  that queued behind a receipts request. `pi` and `deepseek` cancel when a heartbeat or a delivery poll falls due while
+  is in flight sends nothing, and a later pass asks again. The hook's check for a slow request does not count a heartbeat
+  or a state report that queued behind a receipts request until its turn comes. A claim sequence counts from the moment it
+  queues, as it does with no receipts request ahead of it, so a second hook never waits behind another hook's delivery.
+  `pi` and `deepseek` cancel when a heartbeat or a delivery poll falls due while
   their receipts request is in flight, and send none while either is due. The worker's own deadline for a receipts request, 2 seconds
   (`RECEIPT_SECONDS` in `agent_chat/instance_worker.py`), stays as the backstop for a request that nothing ends. The
   tests hold a receipts request on a gate that nothing releases, so only the cancel can end it, and a hook delivers
   while it is held: client-side, no hook skips its claim for a receipts request. The first request after a cancel is
   always a `pending` or a `heartbeat`, because a delivery opens with `pending` and a state report is a `heartbeat`. It
-  is never a `claim`, a `settle` or a `status`, and the tests of all four packages pin that order. A `claim` or a
+  is never a `claim`, a `settle` or a `status`, and the tests of all four packages pin that order. In `codex` a state
+  report that ended a receipts request sends its heartbeat even when the state it reports is published again by its
+  turn. A `claim` or a
   `settle` that went first would meet the server wait above and be answered `REQUEST_UNCERTAIN`, where a refused
   `pending` or `heartbeat` is only a brief outage.
 - **Receipts never wake.** `pi` sends the message with `triggerTurn: false`. `deepseek` appends it at `agent/pre-step`

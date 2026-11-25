@@ -127,6 +127,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let handing = false // a notice is out on a hook's connection, not yet confirmed
   let receiptsBusy = false // a pass is queued or running
   let receiptsReading = false // a receipts request is out on the worker: a counted sequence that queues ends it
+  let receiptsEnded = false // a counted sequence has queued behind that request: it goes first after it, and one that queues later does not
   let firstAttempt
   const attempted = new Promise(resolve => { firstAttempt = resolve })
 
@@ -138,13 +139,21 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return run
   }
   // A counted sequence that queues behind a receipts read ends that read: the worker answers it `refused` within
-  // milliseconds, and the sequence waits for that and no longer. Such a sequence is counted from its turn, not from its
-  // queuing: it is no slow request yet, and a hook that arrives in that moment must not skip its claim for a receipts read.
-  function exclusive(task) {
+  // milliseconds, and the sequence waits for that and no longer. A heartbeat or a state report that queues there is counted
+  // from its turn, not from its queuing: it is one request and no slow one yet, so a hook that arrives in that moment queues
+  // its claim behind it. A claim sequence (`claim`) is counted at once, as it is with no read ahead of it: a hook that
+  // queued behind it would wait for that whole delivery, so it takes the slow-request path instead. The task is told whether
+  // it is the first sequence to queue behind the read (`first`): it runs first after the read, and must send a request then.
+  function exclusive(task, { claim = false } = {}) {
     const behind = receiptsReading
-    if (behind) live?.worker.cancel()
-    else inflight += 1
-    return lane(() => { if (behind) inflight += 1; return task() }).finally(() => { inflight -= 1 })
+    const first = behind && !receiptsEnded
+    if (behind) {
+      receiptsEnded = true
+      live?.worker.cancel()
+    }
+    const counted = claim || !behind
+    if (counted) inflight += 1
+    return lane(() => { if (!counted) inflight += 1; return task(first) }).finally(() => { inflight -= 1 })
   }
   const guard = promise => promise.catch(error => handleFailure(error))
   const within = (promise, ms) => new Promise(resolve => {
@@ -276,11 +285,13 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // Publish the state unless the server already holds it. Resolves true when the server holds the current state once the
   // report is done, false otherwise (the heartbeat was not confirmed, the worker was retired or chat is off). The check is
   // made again in the worker queue, so a report that waited behind a heartbeat that confirmed the same state sends nothing.
+  // A report that ended a receipts request sends its heartbeat all the same: it is the first request after the cancel, and
+  // that one is a heartbeat or a pending (integrations/README.md, "A receipts request gives way").
   function report() {
     if (!live || !joined || failure) return Promise.resolve(false)
     if (published()) return Promise.resolve(true)
     const record = live
-    return guard(exclusive(() => (published() ? undefined : beat(record)))).then(() => live === record && !failure && published())
+    return guard(exclusive(first => (published() && !first ? undefined : beat(record)))).then(() => live === record && !failure && published())
   }
 
   function stopLive() {
@@ -635,7 +646,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         check(await ask("settle", { attempt: grant.attempt_id, result }), "settle")
         return replied
       } finally { delivering = false }
-    })
+    }, { claim: true })
   }
 
   // The idle wake, every WAKE_POLL_MS while the route is positive and the thread bound. It is not hook contact: it moves no
@@ -683,6 +694,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   async function receiptsAsk(operation, fields) {
     if (inflight) return CANCELLED
     receiptsReading = true
+    receiptsEnded = false
     try { return await ask(operation, fields) } catch (error) {
       throw Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation, receipts: true })
     } finally { receiptsReading = false }
