@@ -278,6 +278,9 @@ class Client:
         watchdog: _DeadlineWatchdog | None = None
         submitted = False
         status: int | None = None
+        # Whether the reply declares its length (Content-Length or chunked). One that does not ends only when the peer
+        # closes, so a cut one cannot be told from a complete one.
+        framed: bool | None = None
 
         def check() -> float | None:
             """The time left in the whole-operation budget, or None when unbounded."""
@@ -331,6 +334,7 @@ class Client:
                 connection.sock.settimeout(max(0.001, min(3.0, left)))
             response = connection.getresponse()
             status = response.status
+            framed = response.length is not None or response.chunked
             # Never inspect a redirect destination or relay a credential to it.
             if 300 <= response.status < 400:
                 raise ChatError("REQUEST_UNCERTAIN" if submitted else "REDIRECT_REFUSED")
@@ -409,11 +413,16 @@ class Client:
                 and isinstance(error, (ValueError, RecursionError))
             ):
                 raise ChatError(refused) from None
-            # A connection that failed or ended early, and a 5xx whose body is not the service's, got no complete
-            # answer. A complete reply below 500 that breaks the protocol is an answer, which no caller may send again,
-            # and so is one the HTTP parser rejects (a bad status line, too many headers): only a socket error (an
-            # OSError, which includes a peer that closed before the status line) and a body cut short are lost.
-            transport_lost = isinstance(error, (OSError, http.client.IncompleteRead))
+            # A try got no complete answer when the reply cannot be shown to be complete, or is a 5xx: a socket error
+            # (an OSError, which includes a peer that closed before the status line), a status line cut short, a body
+            # shorter than its declared length or whose chunked framing breaks off (http.client raises IncompleteRead
+            # for both, so a broken chunk size counts as cut), and a reply that declares no length and whose body
+            # cannot be accepted. A complete reply below 500 is an answer, which no caller may send again, even when
+            # it breaks the protocol or the parser rejects its complete status line or headers.
+            # BadStatusLine carries the line it read (typeshed omits its `line` attribute); a cut one has no newline.
+            cut_status = isinstance(error, http.client.BadStatusLine) and not str(error.args[0]).endswith("\n")
+            unframed = framed is False and isinstance(error, (ValueError, RecursionError))
+            transport_lost = isinstance(error, (OSError, http.client.IncompleteRead)) or cut_status or unframed
             unanswered = transport_lost or (status is not None and status >= 500)
             raise ChatError(
                 "REQUEST_UNCERTAIN" if submitted else "TRANSPORT_UNAVAILABLE", unanswered=unanswered

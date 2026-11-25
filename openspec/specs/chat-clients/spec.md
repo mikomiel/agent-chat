@@ -437,8 +437,13 @@ Only a `settle` try that gets no complete answer, because the connection fails o
 - **WHEN** the service refuses a `settle` with a definite code such as `DELIVERY_CLOSED`
 - **THEN** the worker sends no further try and answers its parent as refused
 
+#### Scenario: A reply that ends early
+- **WHEN** a `settle` reply stops inside its status line, short of its declared length, inside chunked framing, or before a reply that declares no length can be accepted
+- **THEN** the try counts as one that got no complete answer
+- **AND** a chunk size that is not hex counts the same, because the client cannot tell it from framing that stops
+
 #### Scenario: A complete reply that cannot be accepted
-- **WHEN** a `settle` gets a complete reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know or a 200 that names another attempt, or a reply the HTTP parser rejects, such as one with too many headers
+- **WHEN** a `settle` gets a complete reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know, a 200 that names another attempt, or a complete status line or headers that the HTTP parser rejects
 - **THEN** the worker sends no further try and ends at once
 
 #### Scenario: The deadline is spent
@@ -448,6 +453,7 @@ Only a `settle` try that gets no complete answer, because the connection fails o
 #### Scenario: The deadline cuts a try
 - **WHEN** the request deadline cuts a try short
 - **THEN** the worker answers its parent with `REQUEST_UNCERTAIN` and ends
+- **AND** a pause between tries that ends after the deadline starts no try, and the worker answers with the code of the last failure
 
 ### Requirement: A peer message body is framed behind a per-notice nonce
 When a harness package passes message bodies to its session, the notice MUST carry a nonce of at least 64 bits from a cryptographic generator, drawn after the claim and never derived from message data. Each message MUST be a header line, an opening marker `<<<AGENT-CHAT-BODY NONCE`, the body and a closing marker `AGENT-CHAT-BODY NONCE>>>`. Every body line MUST start with `> `, added after the cut.

@@ -98,6 +98,23 @@ def peer(process_api, credentials, tmp_path):
                 self.wfile.write(b"SYNTHETIC GARBAGE\r\n\r\n")
                 self.close_connection = True
                 return
+            if mode in ("partial_status", "unframed_cut", "chunked_cut", "chunked_bad_size"):
+                # Replies that end before they can be shown complete: in the status line, in the headers of a reply
+                # that has not declared its length, and in chunked framing that stops or that http.client cannot
+                # tell from one that stops (a chunk size that is not hex). The request was read in full first.
+                chunked = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+                self.wfile.write(
+                    {
+                        "partial_status": b"HTTP/1.1 20",
+                        "unframed_cut": b"HTTP/1.1 200 OK\r\nContent-Type: appl",
+                        "chunked_cut": chunked + b"5\r\nab",
+                        "chunked_bad_size": chunked + b"zz\r\nab\r\n0\r\n\r\n",
+                    }[mode]
+                )
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_WR)
+                self.close_connection = True
+                return
             if mode == "truncated":
                 # A 200 whose body stops before its declared length: a read failure, not a malformed body.
                 data = json.dumps(result).encode()
@@ -464,12 +481,26 @@ def test_a_connection_that_is_refused_is_unanswered(shape):
 
 
 @pytest.mark.parametrize("delivery_enabled", [True])
-@pytest.mark.parametrize("mode", ["unavailable", "drop", "truncated", "bad_gateway"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "unavailable",
+        "drop",
+        "truncated",
+        "bad_gateway",
+        "partial_status",
+        "unframed_cut",
+        "chunked_cut",
+        "chunked_bad_size",
+    ],
+)
 def test_the_worker_sends_a_settle_again_when_the_server_gave_no_complete_answer(
     peer, process_api, credentials, send, db, mode
 ):
-    # A 503 with the service's envelope, a lost connection, a body cut short and a proxy's 502. The server has already
-    # settled the attempt, as it has when a reply is lost, so the second POST gets the recorded result.
+    # A 503 with the service's envelope, a lost connection, a body cut short, a proxy's 502, a status line cut short,
+    # a reply cut in its headers before it declared a length, and chunked framing that stops or has a chunk size that
+    # is not hex, which http.client cannot tell apart. The server has already settled the attempt, as it has when a
+    # reply is lost, so the second POST gets the recorded result.
     joined, attempt = _open_attempt(peer, process_api, credentials, send)
     peer.state.mode = mode
     assert instance_worker._delivery(joined, _settle_frame(attempt)) == {"attempt_id": attempt, **SETTLEMENT}

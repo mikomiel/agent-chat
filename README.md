@@ -191,11 +191,13 @@ lease; a status or claim request still ends the worker. A settle request that
 gets no complete answer, because the connection fails or ends early, or that
 gets a 5xx reply, is sent again, with the same attempt and result, until 1
 second before the request's deadline (#176); the last failure then ends the
-worker, and a try the deadline cuts reports `REQUEST_UNCERTAIN`. A definite
-delivery refusal is answered as refused. Any other failure, such as a redirect,
-a reply below 500 that is not the service's or a reply the HTTP parser rejects,
-ends the worker at once. The
-worker never resolves again inside a request: an address change reaches a
+worker, and a try the deadline cuts reports `REQUEST_UNCERTAIN`. A reply ends
+early when it stops inside its status line, short of its declared length, inside
+chunked framing (a chunk size that is not hex looks the same to the client), or
+before a reply that declares no length can be accepted. A definite delivery
+refusal is answered as refused. Any other failure, such as a redirect, a reply
+below 500 that is not the service's, or a complete status line or headers that
+the HTTP parser rejects, ends the worker at once. The worker never resolves again inside a request: an address change reaches a
 binding at its next join, which the rejoin below performs.
 
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,

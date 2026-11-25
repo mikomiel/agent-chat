@@ -900,6 +900,32 @@ def test_the_tries_of_a_settle_stop_at_the_deadline_and_the_last_error_propagate
     assert clock.now <= deadline  # and the worker is done before its alarm
 
 
+def test_a_settle_pause_that_oversleeps_the_deadline_starts_no_try_and_keeps_the_last_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The client would refuse a try begun after the deadline before sending it, with CLI_INTERRUPTED, which leaves as
+    # REQUEST_UNCERTAIN; the worker instead reports the failure it saw last, here a connection that was refused.
+    clock, calls = _scripted_settle(monkeypatch, [_no_answer("TRANSPORT_UNAVAILABLE")])
+
+    def oversleep(seconds: float) -> None:
+        clock.now += 100.0
+
+    monkeypatch.setattr(instance_worker, "sleep", oversleep)
+    with pytest.raises(ChatError) as caught:
+        _deliver_settle(uuid4())
+    assert caught.value.code == "TRANSPORT_UNAVAILABLE" and len(calls) == 1
+
+
+def test_a_stop_during_a_settle_pause_starts_no_try(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clock, calls = _scripted_settle(monkeypatch, [_no_answer("REQUEST_UNCERTAIN")])
+    paused: list[float] = []
+    monkeypatch.setattr(instance_worker, "sleep", paused.append)  # SIGTERM arrives during the pause
+    frame = {"id": 1, "op": "settle", "attempt": str(uuid4()), "result": {"outcome": "handed", "reason": None}}
+    with pytest.raises(ChatError) as caught:
+        instance_worker._delivery(SimpleNamespace(), frame, stopping=lambda: bool(paused))
+    assert caught.value.code == "REQUEST_UNCERTAIN" and len(calls) == 1 and len(paused) == 1
+
+
 @pytest.mark.parametrize("armed", [0.0, 7.0, 12.5])
 def test_the_deadline_of_a_settle_follows_the_alarm_that_is_armed(
     monkeypatch: pytest.MonkeyPatch, armed: float,
