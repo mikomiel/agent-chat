@@ -9,9 +9,10 @@
 //   delivery.state()          null when a batch may be handed over now, or one
 //                             of busy/plan/stopped/offline/unknown/stale_binding.
 //                             It latches stop on a state it cannot classify.
-//   delivery.peek()           the same answer with no side effect. Only the receipts
-//                             pass and a notice's output read it; without it,
-//                             receipts are held.
+//   delivery.peek({ running }) the same answer with no side effect. Only the receipts
+//                             pass and a notice's output read it, with `running`:
+//                             busy only while a turn runs, never for an idle agent
+//                             with a parked inbox item. Without it, receipts are held.
 //   delivery.heartbeatState() the Heartbeat object published every 30 seconds.
 //   delivery.deliver(batch, deadline)
 //                             hands one rendered notice to the model and
@@ -100,10 +101,10 @@ export function createLifecycle(bus, delivery, config, {
 
   // One native read, normalized: a string, or null for an agent that may receive a delivery now. A missing method, a throw
   // and any other value are `unknown`.
-  function nativeState(read) {
+  function nativeState(read, options) {
     if (typeof delivery[read] !== "function") return "unknown"
     try {
-      const reason = delivery[read]()
+      const reason = delivery[read](options)
       return typeof reason === "string" || reason === null ? reason : "unknown"
     } catch { return "unknown" }
   }
@@ -111,8 +112,9 @@ export function createLifecycle(bus, delivery, config, {
   // The delivery's question. `state` latches stop on a state it cannot classify, so only a delivery path asks it.
   const deliveryState = () => nativeState("state")
   // The receipts' question: `peek` is the same classification with no side effect, so a read that fails here holds receipts
-  // and changes nothing else.
-  const receiptsState = () => nativeState("peek")
+  // and changes nothing else. It asks whether a turn runs (`running`): an idle agent whose inbox holds a parked prompt is busy
+  // for a delivery, which must not start a second turn, but runs no turn, so receipts are neither asked for nor shown.
+  const receiptsState = () => nativeState("peek", { running: true })
 
   function heartbeatState() {
     let state

@@ -139,19 +139,20 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return run
   }
   // A counted sequence that queues behind a receipts read ends that read: the worker answers it `refused` within
-  // milliseconds, and the sequence waits for that and no longer. A heartbeat or a state report that queues there is counted
-  // from its turn, not from its queuing: it is one request and no slow one yet, so a hook that arrives in that moment queues
-  // its claim behind it. A claim sequence (`claim`) is counted at once, as it is with no read ahead of it: a hook that
-  // queued behind it would wait for that whole delivery, so it takes the slow-request path instead. The task is told whether
+  // milliseconds, and the sequence waits for that and no longer. The heartbeat timer's beat and any other state report that
+  // queue there are counted from their turn, not from their queuing: each is one request and no slow one yet, so a hook that
+  // arrives in that moment queues its claim behind it. What a turn hook queues for its own claim (`atOnce`: its state report
+  // and its claim sequence) is counted at once, as it is with no read ahead of it: a second hook that arrives meanwhile takes
+  // the slow-request path, as on a worker with no receipts request, and the first hook claims. The task is told whether
   // it is the first sequence to queue behind the read (`first`): it runs first after the read, and must send a request then.
-  function exclusive(task, { claim = false } = {}) {
+  function exclusive(task, { atOnce = false } = {}) {
     const behind = receiptsReading
     const first = behind && !receiptsEnded
     if (behind) {
       receiptsEnded = true
       live?.worker.cancel()
     }
-    const counted = claim || !behind
+    const counted = atOnce || !behind
     if (counted) inflight += 1
     return lane(() => { if (!counted) inflight += 1; return task(first) }).finally(() => { inflight -= 1 })
   }
@@ -287,11 +288,12 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // made again in the worker queue, so a report that waited behind a heartbeat that confirmed the same state sends nothing.
   // A report that ended a receipts request sends its heartbeat all the same: it is the first request after the cancel, and
   // that one is a heartbeat or a pending (integrations/README.md, "A receipts request gives way").
-  function report() {
+  function report({ atOnce = false } = {}) {
     if (!live || !joined || failure) return Promise.resolve(false)
     if (published()) return Promise.resolve(true)
     const record = live
-    return guard(exclusive(first => (published() && !first ? undefined : beat(record)))).then(() => live === record && !failure && published())
+    return guard(exclusive(first => (published() && !first ? undefined : beat(record)), { atOnce }))
+      .then(() => live === record && !failure && published())
   }
 
   function stopLive() {
@@ -646,7 +648,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         check(await ask("settle", { attempt: grant.attempt_id, result }), "settle")
         return replied
       } finally { delivering = false }
-    }, { claim: true })
+    }, { atOnce: true })
   }
 
   // The idle wake, every WAKE_POLL_MS while the route is positive and the thread bound. It is not hook contact: it moves no
@@ -840,7 +842,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     let replied = false
     if (inflight || (wake && waking === wake)) void report() // a slow request never stacks up behind every tool call
     else {
-      await report()
+      await report({ atOnce: true }) // the head of this hook's claim sequence
       replied = (await guard(deliver({ link, announce: announcement({ from }), deadline }))) === true
     }
     if (replied) return undefined

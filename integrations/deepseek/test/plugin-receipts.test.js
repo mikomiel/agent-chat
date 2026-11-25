@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createAgentChat } from "../extensions/agent-chat.js"
 import { createLifecycle } from "../lib/lifecycle.js"
+import { createDelivery } from "../lib/delivery.js"
 import { MAX_CONTEXT_BYTES } from "../lib/channel.js"
 import { renderReceiptNotice } from "../lib/notice.js"
 import { POLL_MS } from "../lib/receipts.js"
@@ -440,4 +441,68 @@ test("end to end: a notice that went stale or met Plan Mode before its step is n
       assert.ok(again.content[0].text.includes(feed[0].message_id))
     } finally { s.cleanup() }
   }
+})
+
+// Part three: the real native half too. The delivery counts an idle agent with a parked inbox item as busy, so that it starts
+// no second turn; the receipts ask whether a turn runs, and such an agent runs none. DSH parks a Web prompt that arrives
+// while a maintenance task runs: the agent stays idle and the prompt waits in the inbox until maintenance ends.
+test("end to end: an idle agent with a parked Web prompt is asked for no receipts and shown none; a running turn is", async () => {
+  const joined = {
+    session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+    room_id: "33333333-3333-4333-8333-333333333333", host: "synthetic-host", harness: "deepseek", instance_file: "/tmp/agent-chat-state/boot-1.json",
+    capabilities: ["receipts-cancel"],
+  }
+  const clock = { t: 5_000_000 }
+  const requests = []
+  let lifecycle = null
+  let delivery = null
+  let close
+  const closed = new Promise(resolve => { close = resolve })
+  const worker = {
+    ready: Promise.resolve(joined),
+    closed,
+    request(op, fields) {
+      requests.push({ op, fields })
+      if (op === "receipts") return Promise.resolve({ receipts: [row(1)], muted: false })
+      if (op === "pending") return Promise.resolve({ messages: [] })
+      return Promise.resolve({})
+    },
+    stop() { close({ code: 0, signal: null }); return closed },
+  }
+  const plan = { snapshot: () => ({ values: { plan: { active: false, pending: false } } }) }
+  const loadParts = async () => ({
+    createDelivery(ctx, agent) {
+      delivery = createDelivery({ ...ctx, get: name => (name === "sessionProjections" ? plan : ctx.get(name)) }, agent)
+      return delivery
+    },
+    createLifecycle(bus, native, received, options) {
+      lifecycle = createLifecycle(bus, native, received, {
+        ...options, startProcess: () => worker, now: () => clock.t, random: () => 0,
+        setTimeoutImpl: () => 0, clearTimeoutImpl: () => {}, setIntervalImpl: () => 0, clearIntervalImpl: () => {},
+      })
+      return lifecycle
+    },
+    startProcess: () => worker,
+  })
+  const s = await adopt({ loadParts })
+  const count = op => requests.filter(entry => entry.op === op).length
+  const tick = async (seconds = POLL_MS / 1000) => { clock.t += seconds * 1000; await lifecycle.poll(); await flush() }
+  try {
+    s.agent.status = "idle" // a maintenance task runs: the agent is idle, and the Web prompt below is parked
+    const prompt = { source: { kind: "user", rpcId: "rpc-1" } }
+    s.agent.inbox.nextTurn.push(prompt)
+    s.fire("agent/inbox/inserted", { agent: s.agent, message: prompt })
+    await flush()
+    assert.equal(delivery.state(), "busy", "the delivery still counts the parked prompt as busy, and starts no turn")
+    await tick(0)
+    await tick()
+    assert.equal(count("receipts"), 0, "no turn runs: no receipts request")
+    assert.equal(receiptOf(await s.preStep(2)), undefined, "and nothing is appended")
+    assert.deepEqual(s.agent.steers, [], "nothing was steered")
+    s.agent.inbox.nextTurn.length = 0 // maintenance ended, and the parked prompt started its turn
+    s.agent.status = "running"
+    await tick()
+    assert.equal(count("receipts"), 1, "a running turn is asked")
+    assert.ok(receiptOf(await s.preStep(3)), "and its step carries the notice")
+  } finally { s.cleanup() }
 })

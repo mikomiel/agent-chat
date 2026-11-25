@@ -158,7 +158,14 @@ export function createDelivery(ctx, agent, {
   // The same classification for a reader that only observes, such as the sender receipts: it never latches, never
   // warns and never fences. A state it cannot read is `unknown`, and nothing else changes: whether the agent may
   // receive a delivery stays the delivery's own decision, made by `state` at its own question.
-  function peek() { return classify(capture()).reason }
+  // `running` asks whether a turn runs now, which is narrower than `busy`. The delivery counts an idle agent with a parked
+  // inbox item or a steer in flight as busy, so that it starts no second turn; such an agent runs no turn. With `running`,
+  // `busy` is answered only while `agent.status` is `running`, and an idle agent is answered null, whatever is parked.
+  function peek({ running = false } = {}) {
+    const reason = classify(capture()).reason
+    if (!running || reason !== "busy") return reason
+    try { return agent.status === "running" ? "busy" : null } catch { return "unknown" }
+  }
 
   function heartbeatState() {
     // A blocked or unknown observation is conservative, never permission to

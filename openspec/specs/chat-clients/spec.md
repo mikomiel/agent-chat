@@ -589,6 +589,14 @@ A package's receipts pass MUST send at most one receipts request: the mark that 
 - **THEN** it sends no receipts request and chat stays on
 - **AND** a later delivery is handed with no new Web prompt
 
+### Requirement: `deepseek` counts only a running turn as busy for receipts
+`deepseek`'s native-state read for receipts MUST count the agent as busy only while its status is `running`. An idle agent whose inbox holds a parked item is busy for a delivery, which MUST still start no turn, but runs no turn and MUST NOT be asked for receipts.
+
+#### Scenario: A Web prompt parked while the agent is idle
+- **WHEN** a `deepseek` agent is idle and a Web prompt waits in its inbox, as it does while a maintenance task runs
+- **THEN** the receipts pass sends no `receipts` request and no notice is appended
+- **AND** the delivery still counts the agent as busy and starts no turn
+
 ### Requirement: A receipts request gives way to every other request
 A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`. It MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused. A worker that lists `receipts-cancel` MUST let a cancel end only the receipts request it was sent for, and MUST still end on its alarm or on `SIGTERM` during a receipts request.
 

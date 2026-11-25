@@ -335,6 +335,34 @@ test("peek classifies exactly as state does, in every state the delivery has", (
   }
 })
 
+// The receipts ask `peek({ running: true })`: whether a turn runs now. An idle agent with a parked inbox item or a steer in
+// flight is busy for the delivery, which must not start a second turn, and runs no turn.
+test("peek with running answers busy only while a turn runs; the delivery's own classification is unchanged", () => {
+  const prompt = { source: { kind: "user", rpcId: "rpc-1" } }
+  const cases = [
+    ["a running turn", { status: "running" }, () => {}, "busy", "busy"],
+    ["a running turn with a parked item", { status: "running" }, fake => { fake.agent.inbox.nextTurn.push({}) }, "busy", "busy"],
+    ["an idle agent with a parked prompt", {}, fake => { fake.agent.inbox.nextTurn.push({}) }, "busy", null],
+    ["an idle agent with a parked step", {}, fake => { fake.agent.inbox.nextStep.push({}) }, "busy", null],
+    ["an idle agent", {}, () => {}, null, null],
+  ]
+  for (const [name, agentOptions, prepare, delivery, receipts] of cases) {
+    const fake = setup(agentOptions)
+    fake.delivery.onInserted(prompt)
+    prepare(fake)
+    assert.equal(fake.delivery.peek({ running: true }), receipts, `${name}: peek with running`)
+    assert.equal(fake.delivery.peek(), delivery, `${name}: peek`)
+    assert.equal(fake.delivery.state(), delivery, `${name}: state`)
+  }
+  for (const [name, ctxOptions, expected] of [["Plan Mode", { plan: { active: true, pending: false } }, "plan"], ["an unreadable plan projection", { planUnreadable: true }, "unknown"]]) {
+    const fake = setup({ status: "running" }, ctxOptions)
+    fake.delivery.onInserted(prompt)
+    assert.equal(fake.delivery.peek({ running: true }), expected, `${name}: not busy, as before`)
+  }
+  const stopped = setup({ status: "running" })
+  assert.equal(stopped.delivery.peek({ running: true }), "stopped", "a running turn before any Web prompt is still stopped")
+})
+
 test("peek never latches, warns or fences: a state it cannot read is unknown and nothing else changes", () => {
   const fake = fakeAgent()
   const warnings = []

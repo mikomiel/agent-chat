@@ -918,6 +918,48 @@ test("a claim sequence queued behind a poll counts at once: a second hook return
   assert.deepEqual(sent, ["pending", "claim", "status", "settle"], "one claim sequence, and nothing queued behind it")
 })
 
+// Two hooks that change the state, in that window. Without receipts the first hook's state report is sent at once: it records
+// the new state and is counted, so a hook that arrives meanwhile sends no second report and takes the slow-request path, and
+// the first hook claims. A state report that queues behind a receipts read is recorded and counted the same way: the second
+// hook returns, the first one claims, and a second hook that goes away loses nothing.
+test("a hook's state report queued behind a mark is counted at once: the first hook claims, and a second one that goes away loses nothing", async () => {
+  const r = await staged({ rows: [rcpt(1)] })
+  r.server.mark = () => ({ refused: "SERVICE_UNAVAILABLE" })
+  assert.ok(isNoticeText((await r.op(turn())).sent[0].context), "the notice is shown")
+  assert.equal(r.count("receipts_delivered"), 1, "its mark did not land, so it waits for a retry")
+  delete r.server.mark
+  r.server.gates.receipts_delivered = new Promise(() => {})
+  r.server.cancelEnds = false
+  await r.clock.advance(POLL_MS)
+  await r.op(turn({ permission_mode: "plan" })) // Plan Mode is published, and its reply starts the mark retry
+  const heldAt = r.worker.log.length - 1
+  assert.equal(r.worker.log[heldAt].op, "receipts_delivered", "the mark retry is in flight")
+  r.server.pending = ["m1"]
+  const first = hookDouble({ events: r.events })
+  const second = hookDouble({ events: r.events })
+  const firstHandled = r.receiver.handle(turn(), first)
+  await settle()
+  const secondHandled = r.receiver.handle(turn(), second)
+  await settle()
+  assert.deepEqual(second.sent, [{ context: null }], "the second hook answered while the worker still holds the mark")
+  assert.deepEqual(first.sent, [], "the first hook waits for the worker's answer to the cancel")
+  second.close() // the second hook goes away
+  // A real worker takes time to answer a heartbeat: each one is held until it is released, one at a time.
+  const releases = []
+  Object.defineProperty(r.server.gates, "heartbeat", { configurable: true, get: () => new Promise(resolve => releases.push(resolve)) })
+  r.worker.endHeld() // the worker answers the cancel
+  await settle()
+  while (releases.length) { releases.shift()(); await settle() }
+  delete r.server.gates.heartbeat
+  await Promise.all([firstHandled, secondHandled])
+  await settle()
+  assert.ok(isDeliveryText(first.sent[0]?.context), "the first hook delivered")
+  assert.deepEqual(r.worker.ops("claim").map(entry => entry.messages), [["m1"]])
+  const sent = r.worker.log.slice(heldAt + 1).filter(entry => !RECEIPTS_OPERATIONS.has(entry.op))
+  assert.deepEqual(sent.map(entry => entry.op), ["heartbeat", "pending", "claim", "status", "settle"], "one state report, then one claim sequence")
+  assert.equal(sent[0].state.native_state, "busy")
+})
+
 test("a read that the worker answers for real after the turn ended is not staged, although the Stop asked it to end; the Stop does not wait for it", async () => {
   const r = await ready({ rows: [rcpt(1)] })
   let open

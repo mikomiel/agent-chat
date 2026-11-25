@@ -191,8 +191,10 @@ fits on `cli` fits on every route.
   source `plugin:agent-chat-receipts`. On the first step of a turn it does so
   only when that step already has a message of its own, because a notice is
   never the reason for a step, and the plugin never calls `agent.steer` for a
-  receipt. It asks only while the agent is busy and stages rows only when the
-  worker's answer says the session is not muted. At that step the notice is
+  receipt. It asks only while a turn runs, that is while the agent's status is
+  `running`: an idle agent whose Web prompt is parked behind a maintenance task
+  is busy for a delivery, which starts no turn, but is asked for no receipts.
+  It stages rows only when the worker's answer says the session is not muted. At that step the notice is
   checked again, with no request: the latest mute flag any worker answer
   carried must be `false`, the notice must be at most 5 seconds old, and the
   agent must still run a turn outside Plan Mode, read without side effect;

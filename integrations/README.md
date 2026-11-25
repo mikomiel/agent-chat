@@ -296,9 +296,12 @@ The rules below bind every package that shows receipts.
   feed read is asked again at a later pass, and a mark that was ended keeps its ids.
   `claude-code` and `codex` cancel when a counted request queues behind a receipts request: a hook's or a wake's claim
   sequence, a heartbeat or a state report. A receipts task that reaches the head of the queue while a counted request
-  is in flight sends nothing, and a later pass asks again. The hook's check for a slow request does not count a heartbeat
-  or a state report that queued behind a receipts request until its turn comes. A claim sequence counts from the moment it
-  queues, as it does with no receipts request ahead of it, so a second hook never waits behind another hook's delivery.
+  is in flight sends nothing, and a later pass asks again. The hook's check for a slow request does not count a
+  heartbeat, or any state report other than the one a prompt or tool hook sends before its own claim, that queued behind
+  a receipts request until its turn comes. That hook's state report and its claim sequence count from the moment they
+  queue, as they do with no receipts request ahead of them: a second hook that arrives meanwhile takes the slow-request
+  path, the first hook claims, and no hook waits behind another hook's delivery. `claude-code` also records the state of
+  a report that queues behind a receipts request as it queues, so that second hook sends no second report.
   `pi` and `deepseek` cancel when a heartbeat or a delivery poll falls due while
   their receipts request is in flight, and send none while either is due. The worker's own deadline for a receipts request, 2 seconds
   (`RECEIPT_SECONDS` in `agent_chat/instance_worker.py`), stays as the backstop for a request that nothing ends. The
@@ -315,7 +318,8 @@ The rules below bind every package that shows receipts.
   `Stop`, never the idle-wake waiter, never exit code 2. `codex` uses only the reply of a prompt or tool hook of a running
   turn; a wake carries no receipt, even when one is waiting. A package never asks for receipts while the session is idle.
 - **When a package offers receipts.** The session is joined and chat is not failed, its native state is `busy` (not idle,
-  Plan Mode, stopped, unknown or offline), and the worker's answer says `muted === false`. The worker adds the flag to a
+  Plan Mode, stopped, unknown or offline; for `deepseek`, a running turn, since an idle agent with a parked inbox item is
+  busy only for a delivery), and the worker's answer says `muted === false`. The worker adds the flag to a
   `receipts` answer that has rows; an absent or non-boolean flag counts as muted, as an older worker's answer does, and
   the rows then wait on the server. A package polls at most every 5 seconds and only while a turn runs. `claude-code` and
   `codex` make the first poll one cadence after the receiver starts, and show an answer at the next event, never in the

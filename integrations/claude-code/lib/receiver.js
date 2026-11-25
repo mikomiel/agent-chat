@@ -131,14 +131,15 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     return run
   }
   // A counted sequence that queues behind a receipts read ends that read: the worker answers it `refused` within
-  // milliseconds, and the sequence waits for that and no longer. A heartbeat or a state report that queues there is counted
-  // from its turn, not from its queuing: it is one request and no slow one yet, so a hook that arrives in that moment queues
-  // its claim behind it. A claim sequence (`claim`) is counted at once, as it is with no read ahead of it: a hook that
-  // queued behind it would wait for that whole delivery, so it takes the slow-request path instead.
-  function exclusive(task, { claim = false } = {}) {
+  // milliseconds, and the sequence waits for that and no longer. The heartbeat timer's beat and a Stop's state report that
+  // queue there are counted from their turn, not from their queuing: each is one request and no slow one yet, so a hook that
+  // arrives in that moment queues its claim behind it. What a turn hook queues for its own claim (`atOnce`: its state report
+  // and its claim sequence) is counted at once, as it is with no read ahead of it: a second hook that arrives meanwhile takes
+  // the slow-request path, as on a worker with no receipts request, and the first hook claims.
+  function exclusive(task, { atOnce = false } = {}) {
     const behind = receiptsReading
     if (behind) live?.worker.cancel()
-    const counted = claim || !behind
+    const counted = atOnce || !behind
     if (counted) inflight += 1
     return lane(() => { if (!counted) inflight += 1; return task() }).finally(() => { inflight -= 1 })
   }
@@ -219,9 +220,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (!brief(result)) check(result, "heartbeat")
   }
 
-  function report() {
-    if (!live || !joined || failure || JSON.stringify(heartbeatState()) === reported) return Promise.resolve()
-    return guard(exclusive(beat))
+  // A report records its state when its beat starts. One that queues behind a receipts read records it as it queues too,
+  // so a hook that arrives before the worker answers the cancel sends no second report: with no receipts read ahead, the
+  // beat would have started, and recorded it, before that hook arrived. The beat sends the state current when it runs.
+  function report({ atOnce = false } = {}) {
+    const snapshot = JSON.stringify(heartbeatState())
+    if (!live || !joined || failure || snapshot === reported) return Promise.resolve()
+    if (receiptsReading) reported = snapshot
+    return guard(exclusive(beat, { atOnce }))
   }
 
   function stopLive() {
@@ -374,7 +380,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         delivering = false
         if (holder) holder.delivering = false
       }
-    }, { claim: true })
+    }, { atOnce: true })
   }
 
   async function wakePoll() {
@@ -511,7 +517,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     let replied = false
     if (inflight) void report() // a slow request never stacks up behind every tool call
     else {
-      await report()
+      await report({ atOnce: true }) // the head of this hook's claim sequence
       replied = (await guard(deliver({
         link, wake: false, announce: announcement(), deadline: now() + clamp(request.patience_ms, 30_000),
       }))) === true
