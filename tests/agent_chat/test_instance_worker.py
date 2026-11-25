@@ -916,16 +916,6 @@ def test_a_settle_pause_that_oversleeps_the_deadline_starts_no_try_and_keeps_the
     assert caught.value.code == "TRANSPORT_UNAVAILABLE" and len(calls) == 1
 
 
-def test_a_stop_during_a_settle_pause_starts_no_try(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clock, calls = _scripted_settle(monkeypatch, [_no_answer("REQUEST_UNCERTAIN")])
-    paused: list[float] = []
-    monkeypatch.setattr(instance_worker, "sleep", paused.append)  # SIGTERM arrives during the pause
-    frame = {"id": 1, "op": "settle", "attempt": str(uuid4()), "result": {"outcome": "handed", "reason": None}}
-    with pytest.raises(ChatError) as caught:
-        instance_worker._delivery(SimpleNamespace(), frame, stopping=lambda: bool(paused))
-    assert caught.value.code == "REQUEST_UNCERTAIN" and len(calls) == 1 and len(paused) == 1
-
-
 @pytest.mark.parametrize("armed", [0.0, 7.0, 12.5])
 def test_the_deadline_of_a_settle_follows_the_alarm_that_is_armed(
     monkeypatch: pytest.MonkeyPatch, armed: float,
@@ -998,6 +988,26 @@ def test_sigterm_during_a_settle_still_ends_the_worker(monkeypatch: pytest.Monke
     )
     assert code == 1 and frames[-1] == {"id": 1, "error": {"code": "REQUEST_UNCERTAIN"}}
     assert len(frames) == 2  # no second try answered, and the second frame was never read
+    assert [path.rsplit("/", 1)[-1] for _at, path in calls] == ["result", "end"]
+
+
+def test_sigterm_during_a_settle_pause_ends_the_worker_without_another_try(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The handler raises, so the pause ends at once. The worker reports REQUEST_UNCERTAIN, as for any request a stop
+    # interrupts, even though the last try failed with TRANSPORT_UNAVAILABLE.
+    handlers: dict[int, Any] = {}
+    paused: list[float] = []
+
+    def pause(seconds: float) -> None:
+        paused.append(seconds)
+        handlers[15](15, None)
+
+    monkeypatch.setattr(instance_worker, "sleep", pause)
+    settle = {"op": "settle", "attempt": str(uuid4()), "result": {"outcome": "handed", "reason": None}}
+    code, frames, calls = _timed_worker(
+        monkeypatch, [(1, settle), (2, {"op": "status"})], [],
+        failures={"result": [ChatError("TRANSPORT_UNAVAILABLE", unanswered=True)]}, handlers=handlers,
+    )
+    assert code == 1 and frames[-1] == {"id": 1, "error": {"code": "REQUEST_UNCERTAIN"}} and len(paused) == 1
     assert [path.rsplit("/", 1)[-1] for _at, path in calls] == ["result", "end"]
 
 

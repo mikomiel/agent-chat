@@ -418,7 +418,8 @@ class Client:
             # shorter than its declared length or whose chunked framing breaks off (http.client raises IncompleteRead
             # for both, so a broken chunk size counts as cut), and a reply that declares no length and whose body
             # cannot be accepted. A complete reply below 500 is an answer, which no caller may send again, even when
-            # it breaks the protocol or the parser rejects its complete status line or headers.
+            # it breaks the protocol or the parser rejects its complete status line or headers. A redirect is refused
+            # above once its headers arrive, before its body is read: it is an answer, and the service never sends one.
             # BadStatusLine carries the line it read (typeshed omits its `line` attribute); a cut one has no newline.
             cut_status = isinstance(error, http.client.BadStatusLine) and not str(error.args[0]).endswith("\n")
             unframed = framed is False and isinstance(error, (ValueError, RecursionError))

@@ -161,7 +161,8 @@ def _settle(
     below 500 that cannot be accepted (a redirect, a body that is not the service's, a 200 that names another
     attempt, a complete status line or headers the parser rejects) is an answer even where its code is
     `REQUEST_UNCERTAIN`. It is never sent again, and neither are a definite refusal, any other code and a stop
-    (`stopping`, the worker's SIGTERM). A pause that ends after a stop or after the deadline starts no try.
+    (`stopping`, the worker's SIGTERM). A stop during a pause ends the worker with `REQUEST_UNCERTAIN`, as it ends
+    any request it interrupts; a pause that ends after the deadline starts no try, and the last failure propagates.
 
     All tries share one deadline, `SETTLE_MARGIN_SECONDS` before the alarm armed for the request (`REQUEST_SECONDS`
     when none is, as in `_join`). When it is spent the last error propagates and ends the worker. The client ends a
@@ -180,10 +181,11 @@ def _settle(
             if stopping() or not no_answer or monotonic() + SETTLE_PAUSE_SECONDS >= deadline:
                 raise
             last = error
+        # SIGTERM's handler raises, so a stop ends the pause at once and leaves as `REQUEST_UNCERTAIN` (`main`).
         sleep(SETTLE_PAUSE_SECONDS)
         # A pause that overslept the deadline starts no try: the client would refuse it before sending, and its
         # CLI_INTERRUPTED would replace the last failure.
-        if stopping() or monotonic() >= deadline:
+        if monotonic() >= deadline:
             raise last
 
 

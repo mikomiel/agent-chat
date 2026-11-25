@@ -85,6 +85,16 @@ def peer(process_api, credentials, tmp_path):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+            if mode == "redirect_cut":
+                # A redirect that closes before its declared body: an answer once its headers arrive.
+                self.send_response(302)
+                self.send_header("Location", "/elsewhere")
+                self.send_header("Content-Length", "64")
+                self.end_headers()
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_WR)
+                self.close_connection = True
+                return
             if mode == "many_headers":
                 # A complete proxy refusal with more header lines than http.client accepts: the parser rejects it.
                 self.send_response(403)
@@ -511,15 +521,15 @@ def test_the_worker_sends_a_settle_again_when_the_server_gave_no_complete_answer
 
 @pytest.mark.parametrize("delivery_enabled", [True])
 @pytest.mark.parametrize(
-    "mode", ["redirect", "html_403", "unknown_code", "other_attempt", "many_headers", "bad_status"]
+    "mode", ["redirect", "redirect_cut", "html_403", "unknown_code", "other_attempt", "many_headers", "bad_status"]
 )
 def test_the_worker_does_not_send_a_settle_again_after_a_complete_reply_it_cannot_accept(
     peer, process_api, credentials, send, mode
 ):
-    # A redirect, a proxy's HTML 403, a 4xx with a code this client does not know, a 200 that names another
-    # attempt, and replies the HTTP parser rejects (too many headers, a status line that is not HTTP). The client
-    # gives each the code of a request that may have been sent, but each is an answer, so the error ends the worker
-    # after one POST.
+    # A redirect, also one cut before its body, a proxy's HTML 403, a 4xx with a code this client does not know, a
+    # 200 that names another attempt, and replies the HTTP parser rejects (too many headers, a status line that is
+    # not HTTP). The client gives each the code of a request that may have been sent, but each is an answer, so the
+    # error ends the worker after one POST.
     joined, attempt = _open_attempt(peer, process_api, credentials, send)
     peer.state.mode = mode
     with pytest.raises(ChatError) as caught:

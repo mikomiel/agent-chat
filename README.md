@@ -197,7 +197,9 @@ chunked framing (a chunk size that is not hex looks the same to the client), or
 before a reply that declares no length can be accepted. A definite delivery
 refusal is answered as refused. Any other failure, such as a redirect, a reply
 below 500 that is not the service's, or a complete status line or headers that
-the HTTP parser rejects, ends the worker at once. The worker never resolves again inside a request: an address change reaches a
+the HTTP parser rejects, ends the worker at once; a redirect is refused once its
+headers arrive, without reading its body. SIGTERM during a pause between tries
+ends the worker with `REQUEST_UNCERTAIN`. The worker never resolves again inside a request: an address change reaches a
 binding at its next join, which the rejoin below performs.
 
 A worker failure with `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`,

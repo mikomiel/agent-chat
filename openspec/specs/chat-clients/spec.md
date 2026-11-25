@@ -441,6 +441,7 @@ Only a `settle` try that gets no complete answer, because the connection fails o
 - **WHEN** a `settle` reply stops inside its status line, short of its declared length, inside chunked framing, or before a reply that declares no length can be accepted
 - **THEN** the try counts as one that got no complete answer
 - **AND** a chunk size that is not hex counts the same, because the client cannot tell it from framing that stops
+- **AND** a redirect is an answer once its status line and headers arrive, because the client refuses it without reading its body
 
 #### Scenario: A complete reply that cannot be accepted
 - **WHEN** a `settle` gets a complete reply below 500 that the client cannot accept, such as a redirect, a body that is not the service's, a code the client does not know, a 200 that names another attempt, or a complete status line or headers that the HTTP parser rejects
