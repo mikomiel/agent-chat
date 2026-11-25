@@ -618,6 +618,36 @@ test("a notice taken at most one cadence after the poll that staged it is output
   }
 })
 
+// Review 6065344121 (P2): the age of a staged notice is counted from the request that asked for it, not from the read of its answer.
+// A worker that wrote `muted: false` just before the host suspended, read after the resume, would otherwise give the notice an age
+// counted from the resume, and a mute set during the suspend would go unseen. Here the worker answers, the clock jumps, and the
+// lifecycle reads the answer at its next await: after the jump.
+test("a notice is as old as the request that asked for it: an answer read after a suspend is not fresher than its request", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed })
+  let answerLate
+  s.server.receiptsReply = new Promise(resolve => { answerLate = resolve })
+  const tick = s.tick(0)
+  await flush()
+  assert.equal(s.count("receipts"), 1, "the poll is waiting for its answer")
+  answerLate({ receipts: feed, muted: false }) // the worker wrote its answer ...
+  s.clock.t += 60_000 // ... and the host suspended before the lifecycle read it
+  await tick
+  const requests = s.log.length
+  assert.equal(s.take(), null, "the notice is older than one cadence, counted from its request: dropped")
+  assert.equal(s.log.length, requests, "and the output asked the server nothing")
+  assert.equal(s.count("receipts_delivered"), 0, "a dropped notice is not marked")
+  // Its id was released, so the next poll offers the same row; it is then output, confirmed and marked.
+  s.server.receiptsReply = null
+  await s.tick(0)
+  assert.equal(s.count("receipts"), 2, "the id was never marked: the feed is asked again")
+  const again = s.take()
+  assert.ok(again && again.text.includes(feed[0].message_id), "and the same row is output")
+  s.lifecycle.receiptsConfirmed(again.id)
+  await s.tick()
+  assert.deepEqual(s.marks(), [{ receipts: ids(feed) }])
+})
+
 test("a status answer that says muted between the poll and the output drops the notice: it is not marked and comes back once unmuted", async () => {
   const feed = [row(1)]
   const s = await session({ rows: feed })

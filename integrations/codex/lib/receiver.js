@@ -127,7 +127,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let tail = Promise.resolve()
   // Sender receipts. The first poll waits one cadence: a session that has just joined has sent nothing to receive receipts for.
   let receiptState = receipts.polled(receipts.createReceipts(), now())
-  let staged = null // { ids, text, at }: a notice waiting for a prompt or tool event that has nothing else to carry; `at` is when its answer came, on the wall clock
+  let staged = null // { ids, text, at }: a notice waiting for a prompt or tool event that has nothing else to carry; `at` is when its request was sent, on the wall clock
   let handing = false // a notice is out on a hook's connection, not yet confirmed
   let receiptsBusy = false // a pass is queued or running
   let receiptsReading = false // a receipts request is out on the worker: a counted sequence that queues ends it
@@ -732,16 +732,18 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   // Stage a notice for the next event, from the feed, while a turn runs. An answer for a turn that is over is dropped.
   async function pollReceipts() {
+    // The notice is as old as the request that asked for it: its age is counted from here, before the request is written, and
+    // on the wall clock, because a suspend stops the monotonic clock, not the time that passes. An answer read late, after a
+    // suspend, is then never fresher than that request, and its mute flag cannot look new.
+    const askedAt = wall()
     const answer = await receiptsAsk("receipts", undefined, true)
-    // The flag of this answer is the latest known, whether or not the turn it was asked for is still running. Its age is
-    // counted on the wall clock: a suspend stops the monotonic clock, not the time that has passed since the answer.
-    const answeredAt = wall()
+    // The flag of this answer is the latest known, whether or not the turn it was asked for is still running.
     receiptState = receipts.muteSeen(receiptState, answer)
     if (chatState() !== "busy") return
     const rows = receipts.offer(receiptState, answer)
     const notice = rows.length ? renderReceiptNotice(rows, MAX_OUTPUT_BYTES) : null
     if (notice === null) return // nothing to show, or not whole within the budget: held, and still pending server-side
-    staged = { ids: notice.ids, text: notice.text, at: answeredAt }
+    staged = { ids: notice.ids, text: notice.text, at: askedAt }
     receiptState = receipts.issued(receiptState, notice.ids)
   }
 
@@ -777,9 +779,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // is confirmed by the same write receipt a delivery waits for. Anything else leaves the ids unmarked, so the feed offers
   // them again: a duplicate notice is data; a lost one is not. A hook that is gone, or past its `deadline`, is sent no notice,
   // as a delivery is: it stays staged for the next event. The notice is checked again here and asks the server nothing: the
-  // latest mute flag any answer carried must be false and the answer that staged it at most one cadence old, by the wall
-  // clock; an age that is negative or not a number counts as too old. Otherwise the notice is dropped, and the hook is
-  // answered as for any other reply with nothing to carry.
+  // latest mute flag any answer carried must be false and the notice at most one cadence old, counted from the request that
+  // asked for it, by the wall clock; an age that is negative or not a number counts as too old. Otherwise the notice is
+  // dropped, and the hook is answered as for any other reply with nothing to carry.
   async function receiptsReply(link, deadline) {
     const notice = staged
     if (!notice || !live || !joined || closed || failure || chatState() !== "busy" || link.closed || deadline <= now()) return link.send({ context: null })

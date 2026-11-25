@@ -791,6 +791,31 @@ test("a notice is shown only by an event at most one cadence after the poll that
   assert.deepEqual(late.marks(), [{ receipts: [feed[0].id] }])
 })
 
+// Review 6065344121 (P2): the age of a staged notice is counted from the request that asked for it, not from the read of its answer.
+// A worker that wrote `muted: false` just before the host suspended, read after the resume, would otherwise give the notice an age
+// counted from the resume, and a mute set during the suspend would go unseen. The worker holds its answer here until the clock has
+// moved: the receiver sees the same request, then the same jump, then the answer, as it does for a reply that waited in the pipe.
+// The jump stays under the heartbeat cadence, which would end the read in flight.
+test("a notice is as old as the request that asked for it: an answer read after a suspend is not fresher than its request", async () => {
+  const feed = [rcpt(1)]
+  const r = await ready({ rows: feed })
+  let open
+  r.server.gates.receipts = new Promise(resolve => { open = resolve })
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the event that polls carries nothing")
+  assert.equal(r.count("receipts"), 1, "the poll is in flight: the worker holds its answer")
+  await r.clock.advance(POLL_MS + 1) // the host suspends, and the receiver wakes more than one cadence after it wrote the request
+  delete r.server.gates.receipts
+  open() // the answer, `muted: false` and a row, is read only now
+  await settle()
+  const hook = await r.op(turn())
+  assert.deepEqual(hook.sent, [{ context: null }], "the notice is dropped at output, and the hook is still answered")
+  assert.equal(r.count("receipts_delivered"), 0, "nothing was shown, so nothing is marked")
+  // The id was never marked: the pass after that event asks again, and the next event shows the row.
+  const again = (await r.op(turn())).sent[0]
+  assert.ok(isNoticeText(again.context) && again.context.includes(feed[0].message_id), "and the same row is shown by the next event")
+  assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
+})
+
 test("events more than one cadence apart show no notice, and an event inside one cadence of the poll does", async () => {
   const slow = await ready({ rows: [rcpt(1)] })
   const hooks = []

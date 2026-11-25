@@ -132,7 +132,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let tail = Promise.resolve()
   // Sender receipts. The first poll waits one cadence: a session that has just joined has sent nothing to receive receipts for.
   let receiptState = receipts.polled(receipts.createReceipts(), now())
-  let staged = null // { ids, text, at }: a notice waiting for a prompt or tool event that has nothing else to carry; `at` is when its answer came
+  let staged = null // { ids, text, at }: a notice waiting for a prompt or tool event that has nothing else to carry; `at` is when its request was sent
   let handing = false // a notice is out on a hook's connection, not yet confirmed
   let receiptsBusy = false // a pass is queued or running
   let receiptsReading = false // a receipts request is out on the worker: a counted sequence that queues ends it
@@ -463,15 +463,17 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   // Stage a notice for the next event, from the feed, while a turn runs. An answer for a turn that is over is dropped.
   async function pollReceipts() {
+    // The notice is as old as the request that asked for it: its age is counted from here, before the request is written. An
+    // answer read late, after a suspend, is then never fresher than that request, and its mute flag cannot look new.
+    const askedAt = now()
     const answer = await receiptsAsk("receipts", undefined, true)
     // The flag of this answer is the latest known, whether or not the turn it was asked for is still running.
-    const answeredAt = now()
     receiptState = receipts.muteSeen(receiptState, answer)
     if (chatState() !== "busy") return
     const rows = receipts.offer(receiptState, answer)
     const notice = rows.length ? renderReceiptNotice(rows, MAX_OUTPUT_BYTES) : null
     if (notice === null) return // nothing to show, or not whole within the budget: held, and still pending server-side
-    staged = { ids: notice.ids, text: notice.text, at: answeredAt }
+    staged = { ids: notice.ids, text: notice.text, at: askedAt }
     receiptState = receipts.issued(receiptState, notice.ids)
   }
 
@@ -506,8 +508,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // The one place a notice reaches the model: the reply of a prompt or tool event that would otherwise carry nothing. It
   // is confirmed by the same write receipt a delivery waits for. Anything else leaves the ids unmarked, so the feed offers
   // them again: a duplicate notice is data; a lost one is not. It is checked again here and asks the server nothing: the
-  // latest mute flag any answer carried must be false and the answer that staged it at most one cadence old. Otherwise the
-  // notice is dropped, and the hook is answered as for any other reply with nothing to carry.
+  // latest mute flag any answer carried must be false and the notice at most one cadence old, counted from the request that
+  // asked for it. Otherwise the notice is dropped, and the hook is answered as for any other reply with nothing to carry.
   async function receiptsReply(link) {
     const notice = staged
     if (!notice || !live || !joined || closed || failure || chatState() !== "busy") return link.send({ context: null })

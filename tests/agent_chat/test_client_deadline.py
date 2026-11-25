@@ -10,8 +10,11 @@ only interrupting the socket bounds them.
 from __future__ import annotations
 
 import json
+import os
+import signal
 import socket
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -20,6 +23,7 @@ from typing import Any, cast
 
 import pytest
 
+from agent_chat import client as client_module
 from agent_chat.client import Client
 from agent_chat.models import ChatError
 
@@ -420,3 +424,41 @@ def test_a_dripping_header_or_framing_cannot_outlast_the_deadline(opening: bytes
         assert peer.hits == 1
     finally:
         peer.close()
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="no POSIX signal masks")
+def test_a_raising_signal_handler_never_runs_inside_the_watchdog_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review 6065344121 (P2): the worker's receipts cancel raises from its handler. A raise in `Thread.start`, in its
+    # wait on an internal condition, is not safe, so the watchdog blocks every signal while its timer starts. The
+    # signal sent from inside the start runs its handler after the start returned, and the timer is cancelled again.
+    phase: dict[str, bool | None] = {"in_start": False, "ran_in_start": None}
+    started: list[threading.Timer] = []
+
+    class Cancelled(Exception):
+        pass
+
+    def handler(_signum: int, _frame: Any) -> None:
+        phase["ran_in_start"] = phase["in_start"]
+        raise Cancelled
+
+    class SignallingTimer(threading.Timer):
+        def start(self) -> None:
+            started.append(self)
+            phase["in_start"] = True
+            try:
+                os.kill(os.getpid(), signal.SIGUSR1)
+                super().start()
+            finally:
+                phase["in_start"] = False
+
+    previous = signal.signal(signal.SIGUSR1, handler)
+    try:
+        monkeypatch.setattr(client_module.threading, "Timer", SignallingTimer)
+        with socket.socket() as transport, pytest.raises(Cancelled):
+            client_module._DeadlineWatchdog(time.monotonic() + 30, transport)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+    assert phase["ran_in_start"] is False
+    assert len(started) == 1
+    started[0].join(timeout=5)
+    assert not started[0].is_alive()  # cancelled: it ended long before its 30 s interval

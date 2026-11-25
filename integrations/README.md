@@ -337,8 +337,9 @@ The rules below bind every package that shows receipts.
 - **A staged notice is checked again when it is output.** `deepseek`, `claude-code` and `codex` stage a notice and output it
   at a later boundary, and the session may be muted by then. At the boundary the package asks the server nothing and
   uses the latest `muted` flag that a worker answer carried: a `receipts` answer that has rows, and the `status` answer
-  of a claim. A `status` answer without a boolean `muted` makes the flag unknown. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the answer that
-  staged the notice came at most 5 seconds before. The three packages count those seconds on the wall clock, so a
+  of a claim. A `status` answer without a boolean `muted` makes the flag unknown. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the request that
+  staged the notice was sent at most 5 seconds before, so an answer read late, after a suspend, is never fresher than
+  its request. The three packages count those seconds on the wall clock, so a
   suspend ages a notice, and an age that is negative or not a number drops it. `deepseek` also drops it unless its
   native state, read again without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and
   a later poll offers them again. `claude-code` and `codex` answer the hook as for any reply with nothing to carry.
@@ -446,7 +447,7 @@ Limits that remain:
   active and appends it at the end of the running turn, after the assistant message and every tool result, or when the
   run ends if that comes first (the Pi 1.5.0 and 1.5.2 source). The mute window on `pi` therefore extends to the end of
   that turn, tool calls that have not started included, and the package cannot withdraw the message.
-- A notice is output only at a boundary within 5 seconds of the answer that staged it: a second prompt or tool event in
+- A notice is output only at a boundary within 5 seconds of the request that staged it: a second prompt or tool event in
   `claude-code` and `codex`, a pre-step in `deepseek`. A staged notice holds the next poll until a boundary shows it or
   drops it, so a session whose boundaries are always more than 5 seconds apart drops each notice, and its receipts
   arrive late or not at all. The rows stay on the server, so nothing is lost.

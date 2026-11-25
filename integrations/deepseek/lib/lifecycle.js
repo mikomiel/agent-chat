@@ -89,7 +89,7 @@ export function createLifecycle(bus, delivery, config, {
   let receiptsDue = false
   let reading = false // a receipts request is out on the worker: a heartbeat or a delivery poll that falls due ends it
   let receiptState = receipts.createReceipts()
-  let pendingReceipts = null // { ids, text, id, at }: a notice staged for the next step (id null) or taken by it (id set); `at` is when its answer came
+  let pendingReceipts = null // { ids, text, id, at }: a notice staged for the next step (id null) or taken by it (id set); `at` is when its request was sent
   let stopped = true
   let closed = false
   let disabled = false
@@ -318,25 +318,27 @@ export function createLifecycle(bus, delivery, config, {
 
   async function offerReceipts() {
     const record = live
+    // The notice is as old as the request that asked for it: its age is counted from here, before the request is written. An
+    // answer read late, after a suspend, is then never fresher than that request, and its mute flag cannot look new.
+    const askedAt = now()
     const answer = await receiptsRequest("receipts")
     if (live !== record) return
     // The flag of this answer is the latest known, whether or not the turn it was asked for is still running.
-    const answeredAt = now()
     receiptState = receipts.muteSeen(receiptState, answer)
     if (!offerable()) return
     const rows = receipts.offer(receiptState, answer)
     const notice = rows.length ? renderReceiptNotice(rows, MAX_CONTEXT_BYTES) : null
     if (notice === null) return
-    pendingReceipts = { ids: notice.ids, text: notice.text, id: null, at: answeredAt }
+    pendingReceipts = { ids: notice.ids, text: notice.text, id: null, at: askedAt }
     receiptState = receipts.issued(receiptState, notice.ids)
   }
 
   // The native half asks at the pre-step of a running turn. The notice is handed over once, with the id the native
   // message must carry, so only that message's log event confirms it. This is the moment it reaches the model, so it is
-  // checked again, and asks the server nothing: the latest mute flag any answer carried must be false and the answer that
-  // staged it at most one cadence old, and the native state, read again without side effect, must be a running turn that is
-  // not in Plan Mode. Otherwise the notice is dropped: its ids stay unmarked, so the server keeps them and a later poll offers
-  // them again.
+  // checked again, and asks the server nothing: the latest mute flag any answer carried must be false and the notice at most
+  // one cadence old, counted from the request that asked for it, and the native state, read again without side effect, must
+  // be a running turn that is not in Plan Mode. Otherwise the notice is dropped: its ids stay unmarked, so the server keeps
+  // them and a later poll offers them again.
   function receiptsNotice() {
     const pending = pendingReceipts
     if (!pending || pending.id !== null || !live || !joined || stopped || closed || disabled) return null

@@ -1027,6 +1027,31 @@ test("a staged notice is aged on the wall clock alone: 6 s of monotonic time wit
   assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
 })
 
+// Review 6065344121 (P2): the age of a staged notice is counted from the request that asked for it, on the same wall clock, not from
+// the read of its answer. A worker that wrote `muted: false` just before the host suspended, read after the resume, would otherwise
+// give the notice an age counted from the resume, and a mute set during the suspend would go unseen. The worker holds its answer
+// here until the wall clock has jumped: the receiver sees the same request, then the same jump, then the answer, as it does for a
+// reply that waited in the pipe.
+test("a staged notice is as old as the request that asked for it: an answer read after a suspend is not fresher than its request", async () => {
+  const feed = [rcpt(1)]
+  const r = await ready({ rows: feed })
+  let open
+  r.server.gates.receipts = new Promise(resolve => { open = resolve })
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the event that polls carries nothing")
+  assert.equal(r.count("receipts"), 1, "the poll is in flight: the worker holds its answer")
+  r.wallJump(60_000) // the host suspends: the wall clock moves, and the monotonic clock does not
+  delete r.server.gates.receipts
+  open() // the answer, `muted: false` and a row, is read only after the resume
+  await settle()
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the notice is dropped at output, and the hook is still answered")
+  assert.equal(r.count("receipts_delivered"), 0, "nothing was shown, so nothing is marked")
+  await r.clock.advance(POLL_MS)
+  assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "the next cadence asks for the row again")
+  const shown = (await r.op(turn())).sent[0]
+  assert.ok(isNoticeText(shown.context) && shown.context.includes(feed[0].message_id), "and the row is shown by the next event")
+  assert.deepEqual(r.marks(), [{ receipts: [feed[0].id] }])
+})
+
 // A receipts request gives way (#175). The pass starts after a hook's reply, so the next hook, a heartbeat or a Stop's state
 // report can arrive while it is in flight. Each of them ends the request: the worker answers `refused` on the cancel signal,
 // and what waited goes next. The tests below give the worker a read that nothing releases, so only the cancel can end it, and

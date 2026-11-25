@@ -6,6 +6,7 @@ import http.client
 import ipaddress
 import json
 import os
+import signal
 import socket
 import ssl
 import subprocess
@@ -223,7 +224,22 @@ class _DeadlineWatchdog:
         self._expired = threading.Event()
         self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._interrupt)
         self._timer.daemon = True
-        self._timer.start()
+        # A signal handler that raises (the worker's receipts cancel, its alarm, SIGTERM) must not raise inside
+        # `Thread.start`, whose wait on an internal condition is not safe against an asynchronous exception. With
+        # every signal blocked, a handler runs only inside a `pthread_sigmask` call, which checks pending signals:
+        # before the start, or after it, when the timer is cancelled again before the exception leaves.
+        if not hasattr(signal, "pthread_sigmask"):
+            self._timer.start()
+            return
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        try:
+            self._timer.start()
+        finally:
+            try:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            except BaseException:
+                self._timer.cancel()
+                raise
 
     def _interrupt(self) -> None:
         self._expired.set()
