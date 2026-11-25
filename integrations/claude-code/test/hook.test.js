@@ -375,6 +375,23 @@ test("the hold starts before the wait frame is sent: a send that completes late 
   assert.deepEqual(result.holds, [3_510_000])
 })
 
+// The hold bounds how long the hook waits for a frame, not whether it shows one it already has. A context frame that
+// the receiver wrote while the hold ran is still shown when the hook resumes after a stall: dropping it would leave the
+// write unconfirmed (`uncertain`) and show nothing. Claude Code's own timeout stays the hard limit. With nothing
+// queued, a hook whose hold is spent leaves at once.
+test("a hook that resumes after its hold is spent shows a context frame already queued, and otherwise leaves quietly", async () => {
+  const shown = await run("wait", base, { holdMs: 10_000, sendElapsedMs: 12_000, frames: [{ context: "queued notice" }] })
+  assert.deepEqual(shown.holds, [0])
+  assert.equal(shown.code, 2)
+  assert.deepEqual(shown.stderr, ["queued notice"])
+  assert.deepEqual(shown.sent.at(-1), { op: "done", outcome: "written" })
+  const quiet = await run("wait", base, { holdMs: 10_000, sendElapsedMs: 12_000 })
+  assert.deepEqual(quiet.holds, [0])
+  assert.equal(quiet.code, 0)
+  assert.deepEqual(quiet.stderr, [])
+  assert.equal(quiet.sent.length, 1, "no receipt")
+})
+
 // The test seam `holdMs` wins over the config, so a case that must see the hold run out does not wait for the
 // 10-second floor. The e2e suite runs the real 10-second hold.
 test("when the hold runs out the waiter leaves quietly and sends no receipt, and the seam wins over the config", async () => {

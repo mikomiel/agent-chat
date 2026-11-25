@@ -238,7 +238,9 @@ or a stop. Only the idle-wake waiter exits 2.
   its hold in the `wait` frame (`hold_ms`), and the receiver counts the hold as
   ended 1 second early, from when it handles that frame. The hook starts its own
   timer before it sends the frame, so the receiver never stops waking it more
-  than 1 second before it leaves. That margin covers the
+  than 1 second before it leaves. The hold bounds how long the hook waits for
+  a notice; a notice the receiver wrote while the hold ran is still shown if
+  the hook resumes after a stall. That margin covers the
   usual local socket lag, so a close the receiver has not yet seen does not lead
   to a write to a hook that left. If the receiver handles the frame more than
   1 second after the hook started its timer, the receiver's view of the hold

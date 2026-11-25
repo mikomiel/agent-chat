@@ -318,7 +318,7 @@ test("an episode that spends the rejoin budget sends disabled to a registered wa
 test("an episode that outlives its window sends disabled to a registered waiter and claims nothing afterwards", async () => {
   // The first join works. Every rejoin is refused with an outage code until the two-hour episode window is spent.
   const outage = Array.from({ length: 200 }, () => joinRefusal("SERVICE_UNAVAILABLE"))
-  const a = await armed({ joinErrors: [undefined, ...outage] })
+  const a = await armed({ joinErrors: [undefined, ...outage], holdMs: 8_385_000 }) // a waiter that outlasts the window
   const { r, control, wake, waiting } = a
   await leaseGone(a)
   control.stale = false
