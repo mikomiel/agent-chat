@@ -86,6 +86,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `python` | Absolute interpreter that can import `agent_chat`. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
+| `idleWakeHoldSeconds` | Optional. A positive integer: how many seconds the idle-wake waiter holds before it leaves. The default is `3540` (59 minutes). A value above `8385` holds for `8385` seconds and is never refused. Any other value keeps chat off: zero, a negative or fractional number, a string, or any other type. See [Limitations](#limitations). |
 
 Name the file in the environment of the Claude Code process:
 
@@ -103,7 +104,10 @@ The loader refuses a relative path, a symlink, a file that is not owned by the
 current user, a file with any group or world permission bit, a file larger than
 16 KiB, an unknown field and a delegated child. A hook also refuses a state
 directory that is not private. Chat stays off silently on every refusal; the
-host token is never logged.
+host token is never logged. A field that only a newer package version knows is
+an unknown field to an older one: a package that predates `idleWakeHoldSeconds`
+refuses a record that sets it. Install the version that lists the field before
+you add it.
 
 The service and its host-token provisioning are documented in the product
 [README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
@@ -219,10 +223,27 @@ or a stop. Only the idle-wake waiter exits 2.
   only `UserPromptSubmit`, `PostToolUse` and `Stop` carry `permission_mode`. A
   session put into Plan Mode while idle is seen at its next hook event, so an
   idle wake can land in it.
-- **The idle-wake window ends with the hook timeout.** The waiter holds for 59
-  minutes of its 60-minute `timeout`, because Claude Code kills an
-  `asyncRewake` hook at its timeout. A session idle for longer is delivered at
-  its next turn, not by a wake. A new waiter starts at each `Stop`.
+- **The idle-wake window is the hold, and the hold ends before the hook
+  timeout.** Claude Code enforces the `timeout` of an `asyncRewake` hook (see
+  [Run hooks in the
+  background](https://code.claude.com/docs/en/hooks.md#run-hooks-in-the-background)),
+  and `hooks/hooks.json` sets it to 9,000 seconds. The waiter leaves before
+  that: it holds for `idleWakeHoldSeconds`, 59 minutes by default and at most
+  8,385 seconds, which leaves more than 10 minutes to flush a notice and exit.
+  A session idle for longer than the hold is delivered at its next turn, not by
+  a wake. A new waiter starts at each `Stop`. A shorter hold frees the idle Node
+  process and its socket sooner.
+- **A rejoin episode that outlasts the hold leaves no waiter.** The receiver
+  keeps a registered waiter through a rejoin. After the join, the waiter wakes
+  the idle session for a pending message, and its notice names the new boot id.
+  An episode can last up to two hours, so one that is still running when the
+  hold ends finds no waiter: the hook has already left, quietly, with exit code
+  0. The session then has no wake until its next `Stop` starts a new waiter, and
+  the next delivery rides its next turn. A waiter that is cancelled or closed
+  during an episode causes no claim after the join. An episode that spends its
+  budget or its window latches chat off, answers a registered waiter with
+  `disabled` (the hook then exits 0 without output) and claims nothing after
+  that.
 - **The first release with `asyncRewake` is not documented.** A release that
   ignores the field would run the waiter as an ordinary `Stop` hook and hold
   every stop until the hold ends. Remove the `wait` entry from
@@ -307,8 +328,9 @@ node --test
 The suite covers config refusal, the worker join frame and frame validation,
 the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors
 and the byte bound with the announcement counted, the socket and its start handshake, the receiver's state, delivery,
-settlement, rejoin and shutdown with a manual clock, the hook commands with
-payload doubles (output cap, write receipts, delegated refusal, idle wake exit
-code), the plugin shape that Claude Code reads, and one run of the real hook and
-receiver processes against a fake worker. It needs no Claude Code install, no
-PostgreSQL, no service and no credential.
+settlement, rejoin and shutdown with a manual clock, the idle-wake waiter through
+a rejoin episode, the hook commands with payload doubles (output cap, write
+receipts, delegated refusal, idle wake exit code and hold), the plugin shape that
+Claude Code reads, and runs of the real hook and receiver processes against a
+fake worker. It needs no Claude Code install, no PostgreSQL, no service and no
+credential.

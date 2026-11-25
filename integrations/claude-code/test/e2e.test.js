@@ -179,7 +179,8 @@ test("a session joins, receives in a turn and by wake, ignores a delegate and en
   }
 })
 
-function fixture() {
+// `extra` adds optional keys to the config file.
+function fixture(extra = {}) {
   const root = mkdtempSync(join(tmpdir(), "acc-"))
   const state = join(root, "s")
   mkdirSync(state, { mode: 0o700 })
@@ -189,7 +190,7 @@ function fixture() {
   chmodSync(python, 0o755)
   const file = join(root, "chat.json")
   writeFileSync(file, JSON.stringify({
-    chatEnabled: true, directory: state, serverOrigin: "https://chat.example", hostToken: "synthetic-host-token", python,
+    chatEnabled: true, directory: state, serverOrigin: "https://chat.example", hostToken: "synthetic-host-token", python, ...extra,
   }))
   chmodSync(file, 0o600)
   const logFile = join(state, "worker.log")
@@ -252,6 +253,46 @@ test("a hook whose output pipe was closed exits 0, and the delivery it could not
     assert.deepEqual(f.ops("settle")[1].result, { outcome: "uncertain", reason: "transport_ambiguous" })
     assert.equal(f.ops("settle").some(entry => entry.result.outcome === "handed"), false, "nothing unwritten is ever handed")
   } finally {
+    await hook(f.env, "session-end", { ...common, hook_event_name: "SessionEnd", reason: "other" })
+    // A failed test must not leave processes behind: stop exactly the two this test started.
+    const [first] = f.ops("join")
+    for (const pid of [first?.pid, first?.ppid]) {
+      if (Number.isInteger(pid) && pid > 1 && alive(pid)) reap(pid)
+    }
+    rmSync(f.root, { recursive: true, force: true })
+  }
+})
+
+// Issue #133: with `idleWakeHoldSeconds: 1` the real waiter holds for one second, then leaves with exit 0 and no
+// output. A config that was refused would also exit 0 and print nothing, so the test also needs the join and the time
+// the wait took. The guard turns a hold that was not applied into a failure in seconds, not an hour.
+const within = (promise, ms) => new Promise(resolve => {
+  const timer = setTimeout(() => resolve(null), ms)
+  promise.then(value => { clearTimeout(timer); resolve(value) })
+})
+
+test("a waiter with a one-second hold leaves quietly at the hold, with no claim and no output", { timeout: 90_000 }, async t => {
+  if (/\s/.test(process.execPath)) return t.skip("the fake worker needs an interpreter path without whitespace")
+  const f = fixture({ idleWakeHoldSeconds: 1 })
+  const common = { session_id: "e2e-short-hold", permission_mode: "default" }
+  try {
+    const started = await hook(f.env, "session-start", { ...common, hook_event_name: "SessionStart", source: "startup" })
+    assert.equal(started.code, 0)
+    assert.equal(f.ops("join").length, 1, "the config was accepted: the receiver started and joined")
+    await hook(f.env, "stop", { ...common, hook_event_name: "Stop" })
+    await f.until(() => f.ops("heartbeat").some(entry => entry.state.native_state === "idle"), "an idle heartbeat")
+    const began = Date.now()
+    const waited = await within(hook(f.env, "wait", { ...common, hook_event_name: "Stop" }), 20_000)
+    const elapsed = Date.now() - began
+    assert.notEqual(waited, null, "the waiter did not leave within 20 seconds: the one-second hold was not applied")
+    assert.equal(waited.code, 0)
+    assert.equal(waited.stderr, "")
+    assert.equal(waited.stdout, "")
+    assert.ok(elapsed >= 900, `the hold ended the wait, not an early refusal (${elapsed} ms)`)
+    assert.equal(f.ops("claim").length, 0)
+    assert.equal(f.ops("settle").length, 0)
+  } finally {
+    // The receiver's end cancels a waiter that is still registered, so a failed run leaves no hook behind.
     await hook(f.env, "session-end", { ...common, hook_event_name: "SessionEnd", reason: "other" })
     // A failed test must not leave processes behind: stop exactly the two this test started.
     const [first] = f.ops("join")

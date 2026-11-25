@@ -1,0 +1,377 @@
+import test from "node:test"
+import assert from "node:assert/strict"
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { Readable } from "node:stream"
+import { createReceiver } from "../lib/receiver.js"
+import { runHook } from "../lib/hook.js"
+import { connect, paths, serve } from "../lib/ipc.js"
+import { CHAT_PREFIX } from "../lib/channel.js"
+
+// Issue #133: what an idle-wake waiter does while the receiver rejoins. These cases pin behaviour that was only
+// implied: the receiver owns the episode and the waiter's socket, so a registered waiter survives the back-off and a
+// claim needs a live worker and a registered consumer. `receiver.test.js` holds the waiter cases that need no episode
+// and the rejoin cases that need no waiter; the rig below is a copy of its rig without the event log.
+const ROOM = "33333333-3333-4333-8333-333333333333"
+const baseConfig = { python: "/usr/bin/python3", directory: "/tmp/agent-chat-state", serverOrigin: "https://chat.example", hostToken: "synthetic-host-token" }
+const row = id => ({
+  id, kind: "question", room_id: ROOM, history_after: `cursor-${id}`, body: `body of ${id}`,
+  sender_session_id: "peer-1", created_at: "2026-01-01T00:00:00Z",
+})
+const settle = async () => {
+  for (let index = 0; index < 20; index += 1) await Promise.resolve()
+  await new Promise(resolve => setImmediate(resolve))
+}
+const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+// A manual scheduler: nothing runs until the test advances the clock.
+function scheduler() {
+  let clock = 1_000_000
+  let next = 1
+  const timers = new Map()
+  const add = (fn, ms, repeat) => { const id = next++; timers.set(id, { fn, at: clock + ms, ms, repeat }); return id }
+  return {
+    now: () => clock,
+    setTimeoutImpl: (fn, ms) => add(fn, ms, false),
+    clearTimeoutImpl: id => { timers.delete(id) },
+    setIntervalImpl: (fn, ms) => add(fn, ms, true),
+    clearIntervalImpl: id => { timers.delete(id) },
+    async advance(ms) {
+      const end = clock + ms
+      for (;;) {
+        const due = [...timers.entries()].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at)[0]
+        if (!due) break
+        const [id, timer] = due
+        clock = timer.at
+        if (timer.repeat) timer.at += timer.ms
+        else timers.delete(id)
+        timer.fn()
+        await settle()
+      }
+      clock = end
+      await settle()
+    },
+  }
+}
+
+// The product's worker, as a double. `handlers` override one operation each; `joinErrors[n]` refuses the (n+1)th join.
+function workerDouble({ handlers = {}, joinErrors = [] } = {}) {
+  const log = []
+  const bootIds = []
+  const state = { stops: 0 }
+  const answers = {
+    heartbeat: () => ({}),
+    pending: () => ({ messages: [] }),
+    claim: fields => ({ dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(row) }),
+    status: () => ({ muted: false }),
+    settle: () => ({}),
+    ...handlers,
+  }
+  const startProcess = (_config, identity) => {
+    bootIds.push(identity.bootId)
+    let finish
+    const closed = new Promise(resolve => { finish = resolve })
+    const joined = {
+      session_id: "11111111-1111-4111-8111-111111111111", instance_id: "22222222-2222-4222-8222-222222222222",
+      room_id: ROOM, host: "synthetic-host", harness: "claude", instance_file: `/tmp/agent-chat-state/${identity.bootId}.json`,
+    }
+    const refusal = joinErrors[bootIds.length - 1]
+    return {
+      ready: refusal ? Promise.reject(refusal) : Promise.resolve(joined),
+      async request(op, fields = {}) {
+        log.push({ op, ...fields })
+        return answers[op](fields)
+      },
+      stop() { state.stops += 1; finish({ code: 0, signal: null }); return closed },
+      closed,
+    }
+  }
+  return { startProcess, log, bootIds, state, ops: name => log.filter(entry => entry.op === name) }
+}
+
+// The hook end of one connection, as a double. A context frame with `ack` is
+// answered with the configured write receipt, like a hook that wrote the output.
+function hookDouble({ receipt = "written", answer = true, sendOk = true } = {}) {
+  const sent = []
+  const queue = []
+  const listeners = []
+  let closed = false
+  return {
+    sent,
+    get closed() { return closed },
+    onClose: fn => listeners.push(fn),
+    close() { if (!closed) { closed = true; for (const fn of listeners) fn() } },
+    async send(value) {
+      if (closed) return false
+      sent.push(value)
+      if (!sendOk) return false
+      if (value.ack === true && answer) queue.push({ op: "done", outcome: receipt })
+      return true
+    },
+    async next() { return queue.shift() ?? null },
+  }
+}
+
+async function rig({ handlers, joinErrors } = {}) {
+  const clock = scheduler()
+  const worker = workerDouble({ handlers, joinErrors })
+  const receiver = createReceiver(baseConfig, { sessionId: "session-1", ownerPid: 4242 }, {
+    startProcess: worker.startProcess,
+    now: clock.now,
+    random: () => 0.5,
+    setTimeoutImpl: clock.setTimeoutImpl,
+    clearTimeoutImpl: clock.clearTimeoutImpl,
+    setIntervalImpl: clock.setIntervalImpl,
+    clearIntervalImpl: clock.clearIntervalImpl,
+    alive: () => true,
+    startTime: () => null,
+  })
+  void receiver.start()
+  await settle()
+  const rigged = {
+    receiver, clock, worker,
+    async op(request, hook = hookDouble()) {
+      await receiver.handle(request, hook)
+      return hook
+    },
+    // The hook that opens a session: announce the binding, as session-start does.
+    async begin() {
+      const hook = await rigged.op({ op: "start", wait_ms: 5000 })
+      worker.log.length = 0
+      return hook
+    },
+  }
+  return rigged
+}
+
+const turn = (extra = {}) => ({ op: "turn", permission_mode: "default", patience_ms: 6000, ...extra })
+const joinRefusal = workerCode => Object.assign(new Error("x"), { code: "CHAT_WORKER_REFUSED", workerCode, operation: "join" })
+
+async function idle(r) {
+  await r.begin()
+  await r.op(turn())
+  await r.op({ op: "stop", permission_mode: "default" })
+  r.worker.log.length = 0
+}
+
+// A stopped session with an idle-wake waiter registered. `control.stale` makes the next heartbeat answer
+// STALE_INSTANCE, which starts a rejoin episode while the waiter is registered; `control.queued` is what the service
+// holds for the session, and the waiter would claim it on its next poll if a worker were live.
+async function armed({ joinErrors } = {}) {
+  const control = { stale: false, queued: [] }
+  const r = await rig({
+    joinErrors,
+    handlers: {
+      heartbeat: () => (control.stale ? { refused: "STALE_INSTANCE" } : {}),
+      pending: () => ({ messages: control.queued }),
+    },
+  })
+  await idle(r)
+  const wake = hookDouble()
+  const waiting = r.receiver.handle({ op: "wait" }, wake)
+  await settle()
+  return { r, control, wake, waiting }
+}
+
+// The heartbeat tick that finds the lease gone. The episode begins: the old worker is stopped and the first retry
+// waits 3.75 s (5 s base, jitter 0.5 to 1.0, a random source fixed at 0.5). The waiter stays registered.
+async function leaseGone({ r, control, wake }) {
+  control.stale = true
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.state.stops, 1, "the episode began: the old worker is stopped")
+  assert.equal(r.worker.bootIds.length, 1, "and no new worker has joined yet")
+  assert.deepEqual(wake.sent, [], "the waiter is neither answered nor cancelled")
+  assert.equal(wake.closed, false)
+}
+
+test("a waiter armed before an episode stays registered through the back-off and wakes after the join, naming the new boot id", async () => {
+  const a = await armed()
+  const { r, control, wake, waiting } = a
+  await leaseGone(a)
+  control.stale = false // the lease that the rejoin gets is good
+  control.queued = ["m1"] // and a message is waiting
+  r.worker.log.length = 0
+  await r.clock.advance(3749)
+  assert.equal(r.worker.bootIds.length, 1, "still backing off")
+  assert.deepEqual(wake.sent, [], "unanswered through the back-off")
+  assert.equal(wake.closed, false)
+  assert.deepEqual(r.worker.log, [], "no worker request runs while no worker is live, so nothing is claimed")
+  await r.clock.advance(1)
+  assert.equal(r.worker.bootIds.length, 2, "the rejoin joined a new worker")
+  await r.clock.advance(2000) // the next poll on the core cadence
+  assert.equal(wake.sent.length, 1)
+  const [frame] = wake.sent
+  assert.equal(frame.ack, true)
+  assert.ok(frame.context.startsWith(CHAT_PREFIX), "the waiter hands the notice alone")
+  assert.match(frame.context, /"id":"m1"/)
+  assert.ok(frame.context.includes(`"instance_file":"/tmp/agent-chat-state/${r.worker.bootIds[1]}.json"`), "the notice names the new boot id")
+  assert.equal(frame.context.includes(r.worker.bootIds[0]), false, "and never the old one")
+  assert.equal(r.worker.ops("claim").length, 1)
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+  wake.close()
+  await waiting
+})
+
+test("a waiter armed during a lease-lost episode wakes after the join", async () => {
+  // The rig and idle session of armed(), but no waiter until the episode has begun.
+  const control = { stale: false, queued: [] }
+  const r = await rig({
+    handlers: {
+      heartbeat: () => (control.stale ? { refused: "STALE_INSTANCE" } : {}),
+      pending: () => ({ messages: control.queued }),
+    },
+  })
+  await idle(r)
+  const wake = hookDouble()
+  await leaseGone({ r, control, wake })
+  const waiting = r.receiver.handle({ op: "wait" }, wake)
+  await settle()
+  control.stale = false // the lease that the rejoin gets is good
+  control.queued = ["m1"] // and a message is waiting
+  r.worker.log.length = 0
+  await r.clock.advance(3749)
+  assert.equal(r.worker.bootIds.length, 1, "still backing off")
+  assert.deepEqual(wake.sent, [], "unanswered through the back-off")
+  assert.equal(wake.closed, false)
+  await r.clock.advance(1)
+  assert.equal(r.worker.bootIds.length, 2, "the rejoin joined a new worker")
+  await r.clock.advance(2000) // the next poll on the core cadence
+  assert.equal(wake.sent.length, 1)
+  const [frame] = wake.sent
+  assert.equal(frame.ack, true)
+  assert.ok(frame.context.startsWith(CHAT_PREFIX), "the waiter hands the notice alone")
+  assert.ok(frame.context.includes(`"instance_file":"/tmp/agent-chat-state/${r.worker.bootIds[1]}.json"`), "the notice names the new boot id")
+  assert.equal(r.worker.ops("claim").length, 1, "exactly one claim after the join")
+  wake.close()
+  await waiting
+})
+
+// The receiver claims only for a consumer. A waiter that is gone before the join leaves the idle session with a
+// message waiting and no consumer: nothing claims until the next turn event, which is the next consumer.
+for (const [how, leave] of [
+  ["its hook is killed", async (_r, wake) => { wake.close(); await settle() }],
+  ["a turn event cancels it and the turn ends", async (r, wake) => {
+    const during = await r.op(turn())
+    assert.deepEqual(during.sent, [{ context: null }], "no binding is live to announce mid-episode")
+    await settle()
+    assert.deepEqual(wake.sent, [{ cancelled: true }])
+    assert.equal(wake.closed, true)
+    await r.op({ op: "stop", permission_mode: "default" })
+  }],
+]) {
+  test(`a waiter that is gone mid-episode because ${how} causes no claim after the join`, async () => {
+    const a = await armed()
+    const { r, control, waiting } = a
+    await leaseGone(a)
+    control.stale = false
+    control.queued = ["m1"]
+    r.worker.log.length = 0
+    await leave(r, a.wake)
+    await r.clock.advance(3750)
+    assert.equal(r.worker.bootIds.length, 2, "the rejoin joined a new worker")
+    await r.clock.advance(120_000)
+    assert.ok(r.worker.ops("heartbeat").length > 0, "the new worker is live and serving, so silence is not a dead receiver")
+    assert.equal(r.receiver.state(), null, "the session is idle and chat is not offline")
+    for (const op of ["pending", "claim", "settle"]) assert.deepEqual(r.worker.ops(op), [], op)
+    const next = await r.op(turn())
+    assert.equal(r.worker.ops("claim").length, 1, "the next turn event is the next consumer")
+    assert.match(next.sent[0].context, /"id":"m1"/)
+    await waiting
+  })
+}
+
+// An exhausted episode latches chat off. A registered waiter gets `disabled` and is closed, and nothing claims after
+// that. The first hook after the latch names the bound that ended the episode, so the two cases differ in evidence.
+const stopped = reason => ({ disabled: true, message: `Agent Chat stopped (${reason}); the Claude Code session is unchanged.` })
+
+test("an episode that spends the rejoin budget sends disabled to a registered waiter and claims nothing afterwards", async () => {
+  const a = await armed()
+  const { r, control, wake, waiting } = a
+  await leaseGone(a) // every lease the service sees from here on is refused: three rejoins succeed and each is refused again
+  control.queued = ["m1"]
+  r.worker.log.length = 0
+  for (let rejoin = 1; rejoin <= 3; rejoin += 1) {
+    assert.deepEqual(wake.sent, [], `before rejoin ${rejoin} the waiter is still registered and unanswered`)
+    await r.clock.advance(3750)
+  }
+  assert.equal(r.worker.bootIds.length, 4, "the initial join and three rejoins")
+  assert.deepEqual(wake.sent, [{ disabled: true }])
+  assert.equal(wake.closed, true)
+  await waiting
+  assert.equal(r.receiver.state(), "offline")
+  assert.equal(r.worker.state.stops, 4, "no worker is left running")
+  await r.clock.advance(600_000)
+  assert.equal(r.worker.bootIds.length, 4, "no further join")
+  for (const op of ["pending", "claim", "settle"]) assert.deepEqual(r.worker.ops(op), [], op)
+  assert.deepEqual((await r.op(turn())).sent, [stopped("REJOIN_BUDGET")])
+})
+
+test("an episode that outlives its window sends disabled to a registered waiter and claims nothing afterwards", async () => {
+  // The first join works. Every rejoin is refused with an outage code until the two-hour episode window is spent.
+  const outage = Array.from({ length: 200 }, () => joinRefusal("SERVICE_UNAVAILABLE"))
+  const a = await armed({ joinErrors: [undefined, ...outage] })
+  const { r, control, wake, waiting } = a
+  await leaseGone(a)
+  control.stale = false
+  control.queued = ["m1"]
+  r.worker.log.length = 0
+  await r.clock.advance(3_600_000)
+  assert.ok(r.worker.bootIds.length > 2, "the rejoins keep failing")
+  assert.deepEqual(wake.sent, [], "an hour into the episode the waiter is still registered and unanswered")
+  assert.notEqual(r.receiver.state(), "offline")
+  await r.clock.advance(3_700_000) // past the 7,200,000 ms window
+  assert.deepEqual(wake.sent, [{ disabled: true }])
+  assert.equal(wake.closed, true)
+  await waiting
+  assert.equal(r.receiver.state(), "offline")
+  const boots = r.worker.bootIds.length
+  assert.equal(r.worker.state.stops, boots, "every worker that started was stopped")
+  await r.clock.advance(600_000)
+  assert.equal(r.worker.bootIds.length, boots, "no further join")
+  for (const op of ["pending", "claim", "settle"]) assert.deepEqual(r.worker.ops(op), [], op)
+  assert.deepEqual((await r.op(turn())).sent, [stopped("REJOIN_WINDOW")])
+})
+
+// The receiver owns both the episode and the waiter's socket, so a receiver that dies takes the socket with it. The
+// hook sees the connection close, not a frame: it must leave at once, print nothing and send no receipt. This runs
+// the real hook over the real socket layer, with the receiver's end closing 100 ms into a 30-second hold.
+test("a waiter whose connection closes mid-hold exits 0 at once, with no output and no receipt", { timeout: 20_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "acc-"))
+  const state = join(root, "s")
+  mkdirSync(state, { mode: 0o700 })
+  chmodSync(state, 0o700)
+  const file = join(root, "chat.json")
+  writeFileSync(file, JSON.stringify({ ...baseConfig, chatEnabled: true, directory: state }))
+  chmodSync(file, 0o600)
+  const received = []
+  const server = await serve(paths(state, "session-1").socket, async (first) => {
+    received.push(first)
+    await delay(100) // the handler returns, and serve closes the connection: the receiver is gone
+  })
+  const sent = []
+  const written = []
+  const io = {
+    stdin: Readable.from([Buffer.from(JSON.stringify({ session_id: "session-1", permission_mode: "default", hook_event_name: "Stop" }))]),
+    env: { AGENT_CHAT_CLAUDE_CONFIG: file },
+    connect: async path => {
+      const link = await connect(path)
+      return { ...link, send: frame => { sent.push(frame); return link.send(frame) } }
+    },
+    write: async (stream, text) => { written.push([stream, text]); return true },
+    ppid: () => 100, orphanMs: 60_000, holdMs: 30_000, sleep: () => new Promise(() => {}),
+  }
+  const began = Date.now()
+  let code
+  try { code = await runHook("wait", io) } finally {
+    server.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+  const elapsed = Date.now() - began
+  assert.equal(code, 0)
+  assert.deepEqual(written, [], "no output")
+  assert.deepEqual(received, [{ op: "wait" }], "the waiter registered with the receiver")
+  assert.deepEqual(sent, [{ op: "wait" }], "and sent nothing after it: no done frame")
+  assert.ok(elapsed >= 90, `it was held until the connection closed (${elapsed} ms)`)
+  assert.ok(elapsed < 5000, `the close, not the 30-second hold, ended the wait (${elapsed} ms)`)
+})

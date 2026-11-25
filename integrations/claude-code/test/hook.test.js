@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Readable } from "node:stream"
-import { runHook } from "../lib/hook.js"
+import { HOLD_MS, MAX_HOLD_MS, effectiveHoldMs, runHook } from "../lib/hook.js"
 import { MAX_OUTPUT_BYTES } from "../lib/channel.js"
 
 const absent = () => Object.assign(new Error("absent"), { code: "ENOENT" })
@@ -13,7 +13,7 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
 // A wait that never keeps the test process alive after the test is done.
 const idle = ms => new Promise(resolve => setTimeout(resolve, ms).unref())
 
-function world() {
+function world(extra = {}) {
   const root = mkdtempSync(join(tmpdir(), "acc-"))
   const state = join(root, "s")
   mkdirSync(state, { mode: 0o700 })
@@ -21,7 +21,7 @@ function world() {
   const file = join(root, "chat.json")
   writeFileSync(file, JSON.stringify({
     chatEnabled: true, directory: state, serverOrigin: "https://chat.example",
-    hostToken: "synthetic-host-token", python: "/usr/bin/python3",
+    hostToken: "synthetic-host-token", python: "/usr/bin/python3", ...extra,
   }))
   chmodSync(file, 0o600)
   return { root, state, file, env: { AGENT_CHAT_CLAUDE_CONFIG: file } }
@@ -29,13 +29,15 @@ function world() {
 
 // Runs one hook command against doubles. The receiver connection answers `reply`
 // to a request and serves `frames` to a waiter; the output records every write
-// in order, so a test can say what happened before what.
+// in order, so a test can say what happened before what. `config` adds keys to
+// the config file; `holdMs: null` leaves the hold to that config, and `holds`
+// records each wait the waiter asked the connection for.
 async function run(name, payload, {
-  env, reply = { context: null }, frames = [], up = true, writeOk = true, writeDelay = 0,
+  env, config = {}, reply = { context: null }, frames = [], up = true, writeOk = true, writeDelay = 0,
   hang = false, holdMs = 50, orphanMs = 10, ppid = () => 100, sleep = never,
 } = {}) {
-  const w = world()
-  const out = { stdout: [], stderr: [], started: [], calls: [], sent: [], log: [], connects: 0 }
+  const w = world(config)
+  const out = { stdout: [], stderr: [], started: [], calls: [], sent: [], log: [], connects: 0, holds: [] }
   const pending = [...frames]
   const link = {
     async call(request) {
@@ -45,7 +47,11 @@ async function run(name, payload, {
       return typeof reply === "function" ? reply(request) : reply
     },
     async send(frame) { out.sent.push(frame); out.log.push(`send:${frame.op}`); return true },
-    next: ms => (pending.length ? Promise.resolve(pending.shift()) : idle(ms).then(() => null)),
+    // A hold that the code under test got wrong must fail a test, not stall the run for the hour it asked for.
+    next: ms => {
+      out.holds.push(ms)
+      return pending.length ? Promise.resolve(pending.shift()) : idle(Math.min(ms, 10_000)).then(() => null)
+    },
     close() { out.log.push("close") },
   }
   const io = {
@@ -307,4 +313,59 @@ test("a waiter whose parent process vanished leaves without waiting out the hold
   assert.deepEqual(result.stderr, [])
   assert.deepEqual(result.sent, [{ op: "wait" }])
   assert.ok(Date.now() - started < 1500, "the orphan check, not the hold, ended the wait")
+})
+
+// Issue #133: the waiter holds for the configured `idleWakeHoldSeconds`, clamped to the longest hold. A refused config
+// also exits 0 and says nothing, the same as a waiter that held, so these cases check what a refusal cannot show: the
+// waiter connected and sent its `wait` frame (`sent`), and it asked the connection for the hold the config names
+// (`holds`). `holdMs: null` takes the test seam away, so the config alone decides.
+test("the effective hold is the configured seconds, never past the longest hold, and the default when none is usable", () => {
+  assert.equal(HOLD_MS, 3_540_000, "59 minutes by default")
+  assert.equal(MAX_HOLD_MS, 8_385_000, "8,385 seconds at most")
+  assert.equal(effectiveHoldMs(undefined), HOLD_MS)
+  assert.equal(effectiveHoldMs(1), 1000)
+  assert.equal(effectiveHoldMs(MAX_HOLD_MS / 1000), MAX_HOLD_MS)
+  for (const seconds of [MAX_HOLD_MS / 1000 + 1, 10_000, 86_400, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(effectiveHoldMs(seconds), MAX_HOLD_MS, String(seconds))
+  }
+  // The loader refuses these. The function still never returns a zero, negative or NaN hold.
+  for (const unusable of [0, -1, 0.5, 1.5, "60", "", null, true, [60], {}, Number.NaN, Infinity, -Infinity]) {
+    assert.equal(effectiveHoldMs(unusable), HOLD_MS, String(unusable))
+  }
+})
+
+test("the waiter holds for the configured seconds, clamps a longer hold and keeps the default when none is set", async () => {
+  const cap = MAX_HOLD_MS / 1000
+  for (const [seconds, expected] of [
+    [undefined, HOLD_MS], [1, 1000], [120, 120_000], [3540, HOLD_MS],
+    [cap, MAX_HOLD_MS], [cap + 1, MAX_HOLD_MS], [86_400, MAX_HOLD_MS], [Number.MAX_SAFE_INTEGER, MAX_HOLD_MS],
+  ]) {
+    // A cancel frame ends the wait at once, so the case does not wait out the hold it measures.
+    const result = await run("wait", base, {
+      config: seconds === undefined ? {} : { idleWakeHoldSeconds: seconds }, holdMs: null, frames: [{ cancelled: true }],
+    })
+    assert.equal(result.code, 0, String(seconds))
+    assert.deepEqual(result.sent, [{ op: "wait" }], `${seconds}: the waiter registered`)
+    assert.deepEqual(result.holds, [expected], String(seconds))
+  }
+})
+
+test("with a one-second hold the waiter leaves quietly at the hold and sends no receipt", { timeout: 15_000 }, async () => {
+  const began = Date.now()
+  const result = await run("wait", base, { config: { idleWakeHoldSeconds: 1 }, holdMs: null })
+  const elapsed = Date.now() - began
+  assert.equal(result.code, 0)
+  assert.deepEqual(result.stdout.concat(result.stderr), [])
+  assert.deepEqual(result.sent, [{ op: "wait" }], "it registered, waited and acknowledged nothing: no done frame")
+  assert.deepEqual(result.holds, [1000])
+  assert.ok(elapsed >= 900, `the hold ended the wait, not an early refusal (${elapsed} ms)`)
+  assert.ok(elapsed < 5000, `the one-second hold, not the default, ended the wait (${elapsed} ms)`)
+})
+
+test("a bad idleWakeHoldSeconds keeps the waiter silent: no connection, no wait, no output", async () => {
+  for (const idleWakeHoldSeconds of [0, -1, 1.5, "60", null]) {
+    silent(await run("wait", base, {
+      config: { idleWakeHoldSeconds }, holdMs: null, frames: [{ context: "notice", ack: true }],
+    }))
+  }
 })

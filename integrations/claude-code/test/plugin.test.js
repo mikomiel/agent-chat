@@ -2,7 +2,7 @@ import test from "node:test"
 import assert from "node:assert/strict"
 import { existsSync, readdirSync, readFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
-import { HOLD_MS, LIMITS_MS } from "../lib/hook.js"
+import { HOLD_MS, LIMITS_MS, MAX_HOLD_MS } from "../lib/hook.js"
 
 // The plugin surface is pinned here because Claude Code reads it, not this
 // package: a renamed event, a dropped `asyncRewake` or a hook timeout that the
@@ -67,6 +67,13 @@ test("the waiter holds for less than its timeout, because Claude Code kills it a
   const timeout = timeoutMs("Stop", "wait")
   assert.ok(HOLD_MS < timeout)
   assert.ok(timeout - HOLD_MS >= 30_000, "room to flush a notice and to exit before the kill")
+})
+
+// Issue #133: `idleWakeHoldSeconds` may raise the hold, never past MAX_HOLD_MS, and the cap keeps a wider margin.
+test("the longest hold that the config allows also ends well before the waiter's timeout", () => {
+  const timeout = timeoutMs("Stop", "wait")
+  assert.ok(HOLD_MS <= MAX_HOLD_MS, "the default hold is inside the cap")
+  assert.ok(MAX_HOLD_MS + 600_000 <= timeout, "10 minutes to flush a notice and to exit before Claude Code enforces the timeout")
 })
 
 test("every in-process time limit ends before the hook's own timeout", () => {
