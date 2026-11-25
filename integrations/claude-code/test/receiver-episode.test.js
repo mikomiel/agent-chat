@@ -421,8 +421,8 @@ test("a waiter whose connection closes mid-hold exits 0 at once, with no output 
   const elapsed = Date.now() - began
   assert.equal(code, 0)
   assert.deepEqual(written, [], "no output")
-  assert.deepEqual(received, [{ op: "wait" }], "the waiter registered with the receiver")
-  assert.deepEqual(sent, [{ op: "wait" }], "and sent nothing after it: no done frame")
+  assert.deepEqual(received, [{ op: "wait", hold_ms: 30_000 }], "the waiter registered with the receiver, naming its hold")
+  assert.deepEqual(sent, [{ op: "wait", hold_ms: 30_000 }], "and sent nothing after it: no done frame")
   assert.ok(elapsed >= 90, `it was held until the connection closed (${elapsed} ms)`)
   assert.ok(elapsed < 5000, `the close, not the 30-second hold, ended the wait (${elapsed} ms)`)
 })
@@ -545,4 +545,96 @@ for (const [branch, reservation, setup] of [
       assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [expected])
     })
   }
+}
+
+// The waiter's hold. The receiver learns it from the wait frame (`hold_ms`) and, before any write, treats a waiter whose
+// hold has ended like one whose socket closed: the hook has left, so nothing can have been shown and the batch settles
+// `deferred`. The close event can arrive after the receiver has already decided to write (a status reply and the
+// socket's close are separate events), so the receiver cannot rely on seeing it. The rig below keeps the link open
+// throughout: only the clock moves. A hold of 10,000 ms ends the receiver's view of the waiter at +9,000 ms (a 1,000 ms
+// safety for the hook's start-up and the IPC lag), and the first poll is at +2,000 ms.
+const holdRig = async ({ onClaim = () => {}, onStatus = () => {}, receipt = "written" } = {}) => {
+  const control = { onClaim, onStatus, clock: null }
+  const r = await rig({
+    handlers: {
+      pending: () => ({ messages: ["m1"] }),
+      claim: async fields => {
+        await control.onClaim(control)
+        return { dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(row) }
+      },
+      status: async () => { await control.onStatus(control); return { muted: false } },
+    },
+  })
+  control.clock = r.clock
+  await idle(r)
+  return { r, control, wake: hookDouble({ receipt }) }
+}
+// A handler that advances the clock runs timers of its own, so the delivery takes several turns of the event loop to finish.
+const drain = async () => { for (let turns = 0; turns < 10; turns += 1) await settle() }
+const settled = r => r.worker.ops("settle").map(entry => entry.result)
+
+for (const [where, hook] of [
+  ["the status call is in flight", { onStatus: control => control.clock.advance(8_000) }],
+  ["the claim is in flight", { onClaim: control => control.clock.advance(8_000) }],
+]) {
+  test(`a waiter whose hold ends while ${where} and whose close is not yet observed gets no write, and a later claim gets the batch`, async () => {
+    const { r, wake } = await holdRig(hook)
+    const waiting = r.receiver.handle({ op: "wait", hold_ms: 10_000 }, wake)
+    await r.clock.advance(2000)
+    await drain()
+    assert.equal(wake.closed, false, "the receiver has not seen the socket close")
+    assert.equal(r.worker.ops("claim").length, 1, "the message was claimed while the hold had time left")
+    assert.deepEqual(wake.sent, [], "no notice was written to a hook that has already left")
+    assert.deepEqual(settled(r), [{ outcome: "deferred", reason: "offline" }])
+    wake.close()
+    await waiting
+    r.worker.log.length = 0
+    const next = await r.op(turn())
+    assert.match(next.sent[0].context, /"id":"m1"/, "a later claim gets the same batch")
+    assert.deepEqual(settled(r), [{ outcome: "handed", reason: null }])
+  })
+}
+
+test("a write that was attempted to a waiter with hold left and never confirmed still settles uncertain", async () => {
+  const { r, wake } = await holdRig({ receipt: null })
+  const waiting = r.receiver.handle({ op: "wait", hold_ms: 10_000 }, wake)
+  await r.clock.advance(2000)
+  assert.equal(wake.sent.length, 1, "the notice was written")
+  assert.deepEqual(settled(r), [{ outcome: "uncertain", reason: "transport_ambiguous" }])
+  wake.close()
+  await waiting
+})
+
+// The floor is 4,000 ms: the poll at +2,000 ms claims only when the waiter has at least that long left.
+for (const [holdMs, claims] of [[6_999, false], [7_000, true]]) {
+  test(`a waiter with ${claims ? "exactly the floor" : "less than the floor"} left at the poll ${claims ? "claims" : "starts no claim"} (hold_ms ${holdMs})`, async () => {
+    const { r, wake } = await holdRig()
+    const waiting = r.receiver.handle({ op: "wait", hold_ms: holdMs }, wake)
+    await r.clock.advance(2000)
+    assert.equal(r.worker.ops("claim").length, claims ? 1 : 0)
+    assert.equal(r.worker.ops("pending").length, claims ? 1 : 0, "a short waiter does not even read the pending list")
+    assert.equal(wake.sent.length, claims ? 1 : 0)
+    wake.close()
+    await waiting
+    if (claims) return
+    r.worker.log.length = 0
+    const next = await r.op(turn())
+    assert.match(next.sent[0].context, /"id":"m1"/, "the message stays claimable by a later consumer")
+  })
+}
+
+// An older hook sends no hold; a malformed one is no better. Either way the receiver knows no deadline and behaves as
+// before: it writes even when the clock has run well past any hold.
+for (const holdMs of [undefined, 0, -1, 1.5, "10000", null, true, Number.NaN, Infinity, 2 ** 60]) {
+  test(`a wait with hold_ms ${String(holdMs)} is treated as no known deadline: the write happens as before`, async () => {
+    const { r, wake } = await holdRig({ onStatus: control => control.clock.advance(8_000) })
+    const request = holdMs === undefined ? { op: "wait" } : { op: "wait", hold_ms: holdMs }
+    const waiting = r.receiver.handle(request, wake)
+    await r.clock.advance(2000)
+    await drain()
+    assert.equal(wake.sent.length, 1, "the notice was written")
+    assert.deepEqual(settled(r), [{ outcome: "handed", reason: null }])
+    wake.close()
+    await waiting
+  })
 }

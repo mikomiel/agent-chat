@@ -275,13 +275,13 @@ test("the waiter acknowledges the write only after stderr is flushed, then exits
   assert.deepEqual(result.stderr, ["Agent Chat notice."])
   assert.deepEqual(result.stdout, [])
   assert.deepEqual(result.log, ["send:wait", "write:stderr:start", "write:stderr:end", "send:done", "close"])
-  assert.deepEqual(result.sent, [{ op: "wait" }, { op: "done", outcome: "written" }])
+  assert.deepEqual(result.sent, [{ op: "wait", hold_ms: 50 }, { op: "done", outcome: "written" }])
 })
 
 test("a waiter whose stderr write failed exits 0 and reports failed", async () => {
   const result = await run("wait", base, { frames: [{ context: "notice", ack: true }], writeOk: false })
   assert.equal(result.code, 0)
-  assert.deepEqual(result.sent, [{ op: "wait" }, { op: "done", outcome: "failed" }])
+  assert.deepEqual(result.sent, [{ op: "wait", hold_ms: 50 }, { op: "done", outcome: "failed" }])
 })
 
 test("a waiter never writes an oversized notice", async () => {
@@ -289,7 +289,7 @@ test("a waiter never writes an oversized notice", async () => {
     const result = await run("wait", base, { frames: [{ context, ack: true }] })
     assert.equal(result.code, 0)
     assert.deepEqual(result.stderr, [])
-    assert.deepEqual(result.sent, [{ op: "wait" }, { op: "done", outcome: "refused" }])
+    assert.deepEqual(result.sent, [{ op: "wait", hold_ms: 50 }, { op: "done", outcome: "refused" }])
   }
   const exact = await run("wait", base, { frames: [{ context: "y".repeat(MAX_OUTPUT_BYTES), ack: true }] })
   assert.equal(exact.code, 2)
@@ -301,7 +301,7 @@ test("a waiter that is cancelled, disabled, closed or out of hold leaves quietly
     const result = await run("wait", base, { frames, holdMs: 30 })
     assert.equal(result.code, 0, JSON.stringify(frames))
     assert.deepEqual(result.stderr.concat(result.stdout), [])
-    assert.deepEqual(result.sent, [{ op: "wait" }], "no acknowledgement for a notice it never wrote")
+    assert.deepEqual(result.sent, [{ op: "wait", hold_ms: 30 }], "no acknowledgement for a notice it never wrote")
   }
 })
 
@@ -311,7 +311,7 @@ test("a waiter whose parent process vanished leaves without waiting out the hold
   const result = await run("wait", base, { ppid: () => (reads++ === 0 ? 100 : 1), orphanMs: 10, holdMs: 3000 })
   assert.equal(result.code, 0)
   assert.deepEqual(result.stderr, [])
-  assert.deepEqual(result.sent, [{ op: "wait" }])
+  assert.deepEqual(result.sent, [{ op: "wait", hold_ms: 3000 }])
   assert.ok(Date.now() - started < 1500, "the orphan check, not the hold, ended the wait")
 })
 
@@ -349,8 +349,18 @@ test("the waiter holds for the configured seconds, raises a shorter hold, clamps
       config: seconds === undefined ? {} : { idleWakeHoldSeconds: seconds }, holdMs: null, frames: [{ cancelled: true }],
     })
     assert.equal(result.code, 0, String(seconds))
-    assert.deepEqual(result.sent, [{ op: "wait" }], `${seconds}: the waiter registered`)
+    assert.deepEqual(result.sent, [{ op: "wait", hold_ms: expected }], `${seconds}: the waiter registered and named its hold`)
     assert.deepEqual(result.holds, [expected], String(seconds))
+  }
+})
+
+// The receiver cannot see the hook's timer, so the wait frame names the hold the waiter asks the connection for: the
+// same value, whether it comes from the config or from the test seam.
+test("the wait frame carries hold_ms equal to the effective hold the waiter asks the connection for", async () => {
+  for (const [config, holdMs] of [[{}, null], [{ idleWakeHoldSeconds: 120 }, null], [{ idleWakeHoldSeconds: 1 }, null], [{}, 50]]) {
+    const result = await run("wait", base, { config, holdMs, frames: [{ cancelled: true }] })
+    assert.equal(result.holds.length, 1)
+    assert.deepEqual(result.sent, [{ op: "wait", hold_ms: result.holds[0] }], JSON.stringify([config, holdMs]))
   }
 })
 
@@ -360,7 +370,7 @@ test("when the hold runs out the waiter leaves quietly and sends no receipt, and
   const result = await run("wait", base, { config: { idleWakeHoldSeconds: 1 }, holdMs: 50 })
   assert.equal(result.code, 0)
   assert.deepEqual(result.stdout.concat(result.stderr), [])
-  assert.deepEqual(result.sent, [{ op: "wait" }], "it registered, waited and acknowledged nothing: no done frame")
+  assert.deepEqual(result.sent, [{ op: "wait", hold_ms: 50 }], "it registered, naming its hold, waited and acknowledged nothing: no done frame")
   assert.deepEqual(result.holds, [50])
 })
 

@@ -86,13 +86,15 @@ async function quiet(link, request, waitMs) {
 // test seam and wins when set.
 async function waitForWake(link, io, config) {
   const origin = io.ppid()
+  // The receiver cannot see this hook's timer, so the wait frame names the hold it is about to take.
+  const hold = io.holdMs ?? effectiveHoldMs(config.idleWakeHoldSeconds)
   let watch
   try {
-    if (!(await link.send({ op: "wait" }))) return 0
+    if (!(await link.send({ op: "wait", hold_ms: hold }))) return 0
     const orphan = new Promise(resolve => {
       watch = setInterval(() => { if (io.ppid() !== origin) resolve(null) }, io.orphanMs ?? ORPHAN_MS)
     })
-    const reply = await Promise.race([link.next(io.holdMs ?? effectiveHoldMs(config.idleWakeHoldSeconds)), orphan])
+    const reply = await Promise.race([link.next(hold), orphan])
     const context = reply?.context
     if (typeof context !== "string" || !context) return 0
     const ok = fits(context)
