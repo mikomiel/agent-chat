@@ -470,3 +470,32 @@ def test_a_second_arming_reply_after_the_deadline_refuses_the_statement(database
             bounded.execute(LOCK_LIMIT)
         assert len(delayed) == 2, delayed
         assert LOCK_LIMIT not in others
+
+
+def test_a_long_uncontended_transaction_at_steady_latency_arms_rarely_and_fits(database, monkeypatch):
+    """Every round trip takes 15 ms, as to a remote database. A claim of a full batch runs about a hundred statements:
+    arming before each one would double the round trips and spend the deadline with no lock held. The limits are set
+    again only once the last measurement is older than the drift, so the statements fit and arming stays rare."""
+    rtt = 0.015
+    with connect(database) as bounded:
+        base = time.monotonic()
+        skew = [0.0]
+        arms: list[float] = []
+        real = psycopg.Connection.execute
+
+        def execute(self, query, *args, **kwargs):
+            cursor = real(self, query, *args, **kwargs)
+            if self is bounded:
+                skew[0] += rtt
+                if isinstance(query, str) and query.startswith(ARM):
+                    arms.append(skew[0])
+            return cursor
+
+        monkeypatch.setattr(psycopg.Connection, "execute", execute)
+        monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: base + skew[0]))
+        with bounded.request_deadline(base), bounded.transaction():
+            for _ in range(100):
+                bounded.execute("SELECT 1")
+        elapsed = skew[0]
+        assert elapsed < SERVER_BUDGET, elapsed
+        assert len(arms) <= int(elapsed * 1000 / ARM_DRIFT_MS) + 1, (len(arms), elapsed)

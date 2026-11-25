@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg import Transaction
 from psycopg.pq import TransactionStatus
 from psycopg.rows import dict_row
 
@@ -40,10 +41,11 @@ LEGACY_DIGESTS: dict[int, frozenset[str]] = {
 #: client step and reopens #177. tests/agent_chat/test_request_deadline.py pins the production budget.
 REQUEST_MARGIN_SECONDS = 1.0
 
-#: Milliseconds by which a statement's limit may outlast the deadline. A limit is measured before the round trip that
-#: sets it, so it ends after the deadline by that round trip. A reply slower than this arms once more with the time
-#: then left, and a second reply slower than this refuses the statement. The overrun therefore stays within this value,
-#: which with the statement's own transit to the server falls inside `REQUEST_MARGIN_SECONDS`.
+#: Milliseconds by which a statement's limit may outlast the deadline. A transaction's limits are set to the time
+#: left as measured at one moment, so a statement that starts later runs under a limit that ends after the deadline by
+#: the time since that measurement. They are set again only when that time exceeds this value, which bounds the overrun
+#: and spares a round trip before most statements; the overrun and the statement's own transit to the server fall
+#: inside `REQUEST_MARGIN_SECONDS`.
 ARM_DRIFT_MS = 250
 
 #: The session limits `connect` sets. A request deadline is measured from the lock limit.
@@ -59,13 +61,29 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
     """A connection whose statements can share one request deadline.
 
     PostgreSQL 16 has no transaction-wide timeout, and `lock_timeout` bounds each wait on its own, so a request with
-    several sequential lock waits can outlast its client. While `request_deadline` is active, every statement first
-    lowers `lock_timeout` and `statement_timeout`, for its transaction only, to the time left. A statement outside a
-    transaction runs in a transaction of its own, so a lowered limit never outlives it.
+    several sequential lock waits can outlast its client. While `request_deadline` is active, every statement runs
+    under `lock_timeout` and `statement_timeout` lowered, for its transaction only, to the time left as measured at
+    most `ARM_DRIFT_MS` before it starts. A statement outside a transaction runs in a transaction of its own, so a
+    lowered limit never outlives it.
     """
 
     _deadline: float | None = None
     _limits: tuple[int, int] = (0, 0)
+    #: When the current transaction's limits were measured; None when this transaction has not lowered them yet.
+    _measured: float | None = None
+
+    @contextmanager
+    def transaction(
+        self, savepoint_name: str | None = None, force_rollback: bool = False
+    ) -> Generator[Transaction, None, None]:
+        # Limits set inside a transaction end with it, and a savepoint that rolls back undoes its own: the next
+        # statement measures again.
+        self._measured = None
+        try:
+            with super().transaction(savepoint_name, force_rollback) as transaction:
+                yield transaction
+        finally:
+            self._measured = None
 
     @contextmanager
     def request_deadline(self, accepted: float) -> Generator[None, None, None]:
@@ -88,7 +106,9 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
             return super().execute(*args, **kwargs)
         status = self.info.transaction_status
         if status == TransactionStatus.INTRANS:
-            self._arm()
+            self._left()
+            if self._measured is None or (time.monotonic() - self._measured) * 1000 > ARM_DRIFT_MS:
+                self._arm()
             return super().execute(*args, **kwargs)
         if status == TransactionStatus.IDLE:
             # An autocommit statement, such as authentication, has no transaction to scope a local limit, and a
@@ -116,17 +136,17 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
         self._limits = (lock_ms, statement_ms)
 
     def _arm(self) -> None:
-        """Lower this transaction's limits to the time left, so that they end no more than `ARM_DRIFT_MS` after the
-        deadline.
+        """Lower this transaction's limits to the time left, and record when it was measured.
 
-        A reply slower than `ARM_DRIFT_MS` left a limit measured before it: the limits are armed once more with the
-        time then left. Only once: a second slow reply raises `RequestDeadlineSpent`, as a deadline that passed does,
-        so the statement is not sent.
+        A reply slower than `ARM_DRIFT_MS` would leave a measurement too old for the statement that follows: the limits
+        are set once more. A second slow reply raises `RequestDeadlineSpent`, as a deadline that passed does, so the
+        statement is not sent.
         """
         for _ in range(2):
-            left = self._left()
-            self._set_local(left)
-            if left - self._left() <= ARM_DRIFT_MS:
+            measured = time.monotonic()
+            self._set_local(self._left())
+            if (time.monotonic() - measured) * 1000 <= ARM_DRIFT_MS:
+                self._measured = measured
                 return
         raise RequestDeadlineSpent("request deadline: arming replies too slow to bound the statement")
 
