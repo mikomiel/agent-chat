@@ -154,3 +154,37 @@ test("a valid toolRoute does not open the key set: an unknown sibling key still 
   assert.equal(withConfig({ ...base, toolRoute: "mcp", toolRouteFallback: "cli" }), null)
   assert.equal(withConfig({ ...base, toolRoute: "cli", mcpServer: "agent-chat" }), null)
 })
+
+// Issue #133: the idle-wake hold is one optional key, a count of whole seconds. The loader sets no upper bound:
+// the hook clamps a long hold where it uses it, so a value above the longest hold never keeps chat off.
+test("idleWakeHoldSeconds is optional and takes a positive integer", () => {
+  assert.equal(withConfig(base).idleWakeHoldSeconds, undefined)
+  for (const idleWakeHoldSeconds of [1, 60, 3540, 8385, 8386, 100_000]) {
+    assert.deepEqual(withConfig({ ...base, idleWakeHoldSeconds }), { ...base, idleWakeHoldSeconds })
+  }
+})
+
+test("any other idleWakeHoldSeconds keeps chat off", () => {
+  for (const idleWakeHoldSeconds of [0, -1, -3540, 0.5, 1.5, 3540.25, "60", "", " 60", null, true, false, [60], {}]) {
+    assert.equal(withConfig({ ...base, idleWakeHoldSeconds }), null, JSON.stringify(idleWakeHoldSeconds))
+  }
+  // JSON text that a typed value cannot show: numbers that overflow to infinity, and minus zero.
+  for (const number of ["1e400", "-1e400", "-0"]) {
+    const { dir, file } = fixture(undefined, 0o600, `${JSON.stringify(base).slice(0, -1)},"idleWakeHoldSeconds":${number}}`)
+    try { assert.equal(loadConfig({ [ENV]: file }), null, number) }
+    finally { rmSync(dir, { recursive: true, force: true }) }
+  }
+})
+
+// The loader validates the parsed number, not the JSON text. JSON.parse turns 1.0000000000000001 into 1 (it is
+// beyond double precision), so this literal is the whole number 1 by JSON number semantics. Accepted on purpose.
+test("a literal that JSON parses to a whole number is accepted as that number", () => {
+  const { dir, file } = fixture(undefined, 0o600, `${JSON.stringify(base).slice(0, -1)},"idleWakeHoldSeconds":1.0000000000000001}`)
+  try { assert.equal(loadConfig({ [ENV]: file }).idleWakeHoldSeconds, 1) }
+  finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("a valid idleWakeHoldSeconds does not open the key set: a misspelled sibling still keeps chat off", () => {
+  assert.equal(withConfig({ ...base, idleWakeHoldSeconds: 60, idleWakeHoldSecond: 60 }), null)
+  assert.equal(withConfig({ ...base, idleWakeHold: 60 }), null)
+})

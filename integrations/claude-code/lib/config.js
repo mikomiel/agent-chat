@@ -11,7 +11,7 @@ import { TOOL_ROUTES } from "./notice.js"
 export const CLAUDE_CHAT_CONFIG_ENV = "AGENT_CHAT_CLAUDE_CONFIG"
 const MAX_BYTES = 16 * 1024
 const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "python"]
-const OPTIONAL = ["noticeBodies", "toolRoute"]
+const OPTIONAL = ["noticeBodies", "toolRoute", "idleWakeHoldSeconds"]
 
 export function loadConfig(env = process.env, name = CLAUDE_CHAT_CONFIG_ENV) {
   const raw = env[name]
@@ -39,6 +39,8 @@ export function loadConfig(env = process.env, name = CLAUDE_CHAT_CONFIG_ENV) {
   if (data.chatEnabled !== true) return null
   if ("noticeBodies" in data && typeof data.noticeBodies !== "boolean") return null
   if ("toolRoute" in data && !TOOL_ROUTES.includes(data.toolRoute)) return null
+  // A count of whole seconds. A value above the longest hold is clamped where it is used, never refused here.
+  if ("idleWakeHoldSeconds" in data && !(Number.isInteger(data.idleWakeHoldSeconds) && data.idleWakeHoldSeconds > 0)) return null
   if (!REQUIRED.slice(1).every(key => typeof data[key] === "string" && data[key])) return null
   if (!["python", "directory"].every(key => isAbsolute(data[key]))) return null
   return data

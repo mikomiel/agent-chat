@@ -25,7 +25,7 @@
       {
         "hooks": [
           { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.js", "stop"], "timeout": 5 },
-          { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.js", "wait"], "asyncRewake": true, "timeout": 3600 }
+          { "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.js", "wait"], "asyncRewake": true, "timeout": 9000 }
         ]
       }
     ],

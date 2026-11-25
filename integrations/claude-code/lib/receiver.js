@@ -22,11 +22,22 @@ const POLL_MS = 2_000
 const HANDOFF_MS = 5_000
 const MIN_RESERVATION_MS = 500
 const CLAIM_MARGIN_MS = 2_500 // a hook consumer needs this long left to claim and answer
+// A waiter's hold, as the receiver sees it (the wait frame's `hold_ms`), ends WAIT_SAFETY_MS early: the hook began
+// its timer a little before the frame arrived (start-up, IPC lag), and a receiver that is early only defers a
+// batch to a later consumer, while one that is late writes to a hook that has left. No claim starts with less than
+// WAKE_FLOOR_MS of that left: CLAIM_MARGIN_MS to claim and answer, plus 1.5 s for the status call and the write
+// receipt. The shortest hold (MIN_HOLD_MS, 10 s in lib/hook.js) less the safety and the first poll still leaves 7 s.
+// The floor is checked at the poll and again after the pending read, immediately before the claim. The hook's timeout
+// measures elapsed time, so the hold's end and every comparison against it use the monotonic clock (`mono`), never a
+// wall clock that a step could move.
+const WAIT_SAFETY_MS = 1_000
+const WAKE_FLOOR_MS = CLAIM_MARGIN_MS + 1_500
 const MAX_BINDING_BYTES = 4_096
 const OWNER_CHECK_MS = 30_000
 const QUIET_MS = 180_000
 const STOP_GRACE_MS = 6_000
 const UNCERTAIN = { outcome: "uncertain", reason: "transport_ambiguous" }
+const GONE = { outcome: "deferred", reason: "offline" } // the consumer left before anything was written
 
 // A join conflict is the previous instance's lease; the rejoin policy owns the wait.
 const REJOIN_AFTER = new Set([
@@ -67,6 +78,7 @@ export function processStartTime(pid, read = path => readFileSync(path, "utf8"))
 export function createReceiver(config, { sessionId, ownerPid }, {
   startProcess = startWorker,
   now = Date.now,
+  mono = () => performance.now(),
   random = Math.random,
   setTimeoutImpl = setTimeout,
   clearTimeoutImpl = clearTimeout,
@@ -271,8 +283,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   // Send `text` to the consumer, then wait for its write receipt. Handed means the
   // hook wrote and flushed the output; it does not mean the model has read it.
-  async function hand(link, text, until, wake, announce) {
+  async function hand(link, text, until, wake, announce, gone) {
     if (!eligible(wake)) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
+    // A consumer that left before the write has seen nothing, so the claimed batch stays offerable. Once a write
+    // was attempted, a missing receipt is ambiguous and stays uncertain.
+    if (gone()) return { result: GONE, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
     const sent = await link.send({ context: text, ack: true })
     const done = sent ? await link.next(Math.max(0, Math.min(HANDOFF_MS, until - now()))) : null
@@ -287,6 +302,12 @@ export function createReceiver(config, { sessionId, ownerPid }, {
 
   // One claim sequence. Resolves true when it sent a context reply on `link`.
   function deliver({ link, wake, announce = null, deadline = Infinity, holder = null }) {
+    // The consumer has left: its socket closed, or the hold it announced has ended. The receiver can see the hold's
+    // end before the close event arrives, so it checks both.
+    const gone = () => link.closed || (holder?.ends != null && mono() >= holder.ends)
+    // Too little left to claim and answer. A waiter that knows its hold needs the whole wake floor; any other consumer
+    // needs the claim margin before its deadline.
+    const short = () => (holder?.ends != null ? holder.ends - mono() < WAKE_FLOOR_MS : deadline - now() < CLAIM_MARGIN_MS)
     if (!live || !joined || closed || failure || delivering || inflight || !eligible(wake)) return Promise.resolve(false)
     return exclusive(async () => {
       if (!live || closed) return false
@@ -300,12 +321,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const candidates = await ask("pending", bodies ? { bodies: true } : {})
         if (!live || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
-        if (!ids.length || link.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
+        if (!ids.length || link.closed || !eligible(wake)) return false
         // Bodies mode claims the longest prefix that one notice is estimated to carry. A retry batch, or a reply
         // without sizes, is claimed whole. The renderer still halves its body cap if a claimed body outgrows the estimate.
         const claimIds = bodies
           ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound, route: config.toolRoute })
           : ids
+        // The floor is checked after the candidate packing, with no await before the claim is sent.
+        if (short()) return false
         const started = now()
         const grant = await ask("claim", { key: randomUUID(), messages: claimIds, ...(bodies ? { bodies: true } : {}) })
         if (!live || check(grant, "claim")) return false
@@ -313,19 +336,22 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         const reservation = Number(grant.reservation_ms)
         let result
         let replied = false
-        if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = UNCERTAIN
+        // Before a write, a consumer that left means nothing was shown, so the batch stays offerable (see hand). A
+        // consumer that left during the claim needs no status call: a failed one would end the delivery with no settlement.
+        if (gone()) result = GONE
+        else if (!(reservation - (now() - started) > MIN_RESERVATION_MS)) result = UNCERTAIN
         else {
           const state = await ask("status")
           if (!live) return false
           if (check(state, "status")) result = { outcome: "deferred", reason: "unknown" }
           else if (state.muted !== false) result = { outcome: "deferred", reason: state.muted === true ? "muted" : "unknown" }
-          else if (started + reservation - now() <= MIN_RESERVATION_MS) result = UNCERTAIN // the status call used the reservation
+          else if (started + reservation - now() <= MIN_RESERVATION_MS) result = gone() ? GONE : UNCERTAIN // the status call used the reservation
           else {
             const notice = renderNotice(joined, config.python, grant.messages ?? [], {
               bodies, bound, admittedAt: grant.admitted_at, route: config.toolRoute,
             })
             if (notice === null) result = { outcome: "deferred", reason: "offline" }
-            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, wake, announce))
+            else ({ result, replied } = await hand(link, prefix + notice, started + reservation, wake, announce, gone))
           }
         }
         if (!live) return replied
@@ -341,6 +367,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   async function wakePoll() {
     const current = waiter
     if (!current || current.delivering || inflight || chatState() !== null) return
+    // Not worth a claim that the hook may leave before it settles; the batch waits for the next consumer.
+    if (current.ends !== null && current.ends - mono() < WAKE_FLOOR_MS) return
     const replied = await guard(deliver({ link: current.link, wake: true, holder: current }))
     if (replied === true && waiter === current) dropWaiter()
     await report()
@@ -400,12 +428,14 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   }
 
   // The connection stays open: a delivery, a cancel or the hook's own exit answers it.
-  function onWait(_request, link) {
+  function onWait(request, link) {
     if (failure) return link.send({ disabled: true })
     if (link.closed) return undefined
     cancelWaiter({ cancelled: true })
     if (waiter) return link.send({ cancelled: true })
-    const current = { link, delivering: false }
+    // An older hook sends no hold, and a malformed one is no better: the receiver then knows no deadline.
+    const hold = Number.isSafeInteger(request.hold_ms) && request.hold_ms > 0 ? request.hold_ms : null
+    const current = { link, delivering: false, ends: hold === null ? null : mono() + hold - WAIT_SAFETY_MS }
     waiter = current
     pollTimer = setIntervalImpl(() => { void wakePoll() }, POLL_MS)
     return new Promise(resolve => link.onClose(() => {
