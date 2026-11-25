@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from psycopg import Connection
+from psycopg.errors import DeadlockDetected, LockNotAvailable, QueryCanceled
 
 from . import events, receipts
 from .auth import authorize_message_room, lock_agent, require_live
@@ -515,10 +516,23 @@ def claim(db: Connection[dict[str, Any]], actor: Actor, key: UUID, request: Deli
             # lock the first pass did not reach and, refused there, roll back the work this transaction keeps.
             error = ChatError("DATABASE_UNAVAILABLE")
         except ChatError as caught:
-            reconcile(db, session=actor.session_id)
-            expire_undelivered(db, session=actor.session_id)
+            _refusal_sweep(db, actor)
             error = caught
     raise error
+
+
+def _refusal_sweep(db: Connection[dict[str, Any]], actor: Actor) -> None:
+    """Settle, after a refusal, what became due during the call, such as a reservation that expired while it waited.
+
+    The sweep runs in its own savepoint. When it cannot get a lock in time, only the sweep rolls back: the call keeps
+    the reconciliation and expiry it already did and answers with its refusal (issue #186).
+    """
+    try:
+        with db.transaction():
+            reconcile(db, session=actor.session_id)
+            expire_undelivered(db, session=actor.session_id)
+    except (LockNotAvailable, QueryCanceled, DeadlockDetected):
+        pass
 
 
 def result(db: Connection[dict[str, Any]], actor: Actor, attempt_id: UUID, request: DeliveryResult) -> dict[str, Any]:
@@ -564,7 +578,6 @@ def result(db: Connection[dict[str, Any]], actor: Actor, attempt_id: UUID, reque
                     raise ChatError("DELIVERY_CLOSED")
                 return _view(settled)
         except ChatError as caught:
-            reconcile(db, session=actor.session_id)
-            expire_undelivered(db, session=actor.session_id)
+            _refusal_sweep(db, actor)
             error = caught
     raise error

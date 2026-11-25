@@ -394,6 +394,7 @@ The service MUST settle an eligible recipient entry of a retained `question`, `c
 - **WHEN** a claim made while delivery is enabled, or a result call, runs for the session
 - **THEN** the oldest retained `question`, `consultation` and `reply` entries of that session with a body, past 24 hours, that have no evidence, no uncertainty reason and no open attempt are settled `expired_undelivered`, up to 100 entries per sweep
 - **AND** a call runs up to two sweeps. A refusal handled before the normal sweep runs only the refusal-path sweep. A refusal handled after the normal sweep runs both, except a claim refused at its deadline, which runs only the normal sweep
+- **AND** a refusal-path sweep that cannot get a lock in time rolls back alone: the call keeps the normal sweep's work and answers with its refusal
 - **AND** later sweeps continue with the oldest remaining eligible entries
 - **AND** an entry covered by an open attempt is not settled
 
