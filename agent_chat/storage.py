@@ -40,11 +40,15 @@ LEGACY_DIGESTS: dict[int, frozenset[str]] = {
 #: client step and reopens #177. tests/agent_chat/test_request_deadline.py pins the production budget.
 REQUEST_MARGIN_SECONDS = 1.0
 
-#: Milliseconds the round trip that arms a statement's limits may take before they are armed again. The limits are
-#: measured before that round trip, so a slow reply would leave the next statement a limit that ends after the
-#: deadline by the delay. Re-arming bounds that overrun to this value; it and the statement's own transit to the
-#: server fall inside `REQUEST_MARGIN_SECONDS`.
+#: Milliseconds the round trip that arms a statement's limits may take before they are armed once more. The limits
+#: are measured before that round trip, so a slow reply would leave the statement a limit that ends after the
+#: deadline by the delay. One re-arm with the time then left bounds that overrun to the second round trip; it and
+#: the statement's own transit to the server fall inside `REQUEST_MARGIN_SECONDS`.
 ARM_DRIFT_MS = 50
+
+#: The session limits `connect` sets. A request deadline is measured from the lock limit.
+LOCK_TIMEOUT_MS = 3000
+STATEMENT_TIMEOUT_MS = 5000
 
 
 class RequestDeadlineSpent(psycopg.OperationalError):
@@ -68,14 +72,9 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
         """Bound the statements run in this block to end before `accepted` plus the session's lock limit, less
         `REQUEST_MARGIN_SECONDS`. `accepted` is a `time.monotonic()` reading taken when the request arrived.
 
-        The budget comes from this session's own limits, so a connection whose limits were raised or lowered keeps
-        that change; a limit of 0 (none) stays unbounded.
+        The budget comes from the limits this connection was given (`connect`, `set_limits`), so it costs no query
+        before the deadline applies; a lock limit of 0 (none) stays unbounded.
         """
-        rows = super().execute(
-            "SELECT name, setting::integer AS ms FROM pg_settings WHERE name IN ('lock_timeout', 'statement_timeout')"
-        ).fetchall()
-        limits = {row["name"]: row["ms"] for row in rows}
-        self._limits = (limits["lock_timeout"], limits["statement_timeout"])
         lock_ms = self._limits[0]
         self._deadline = accepted + lock_ms / 1000 - REQUEST_MARGIN_SECONDS if lock_ms else None
         try:
@@ -108,37 +107,48 @@ class BoundedConnection(psycopg.Connection[dict[str, Any]]):
             raise RequestDeadlineSpent("request deadline spent")
         return left
 
+    def set_limits(self, lock_ms: int, statement_ms: int) -> None:
+        """Set this session's lock and statement limits, and the request budget measured from them."""
+        super().execute(
+            "SELECT set_config('lock_timeout', %s, false), set_config('statement_timeout', %s, false)",
+            (f"{lock_ms}ms", f"{statement_ms}ms"),
+        )
+        self._limits = (lock_ms, statement_ms)
+
     def _arm(self) -> None:
         """Lower this transaction's limits to the time left, measured again after the round trip that set them.
 
-        A reply slower than `ARM_DRIFT_MS` arms again with the time then left, so the statement never runs under a
-        limit taken before a long delay. Each retry spends more than `ARM_DRIFT_MS`, so the loop ends: armed, or
-        `RequestDeadlineSpent` once the deadline passes.
+        A reply slower than `ARM_DRIFT_MS` arms once more with the time then left, so the statement never runs under
+        a limit taken before a long delay. Only once: under steady latency every reply is slow, and a loop would spend
+        the whole deadline arming. A deadline that passed meanwhile raises `RequestDeadlineSpent`.
         """
-        lock_ms, statement_ms = self._limits
         left = self._left()
-        while True:
-            super().execute(
-                "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)",
-                (str(min(left, lock_ms)), str(min(left, statement_ms) if statement_ms else left)),
-            )
-            now = self._left()
-            if left - now <= ARM_DRIFT_MS:
-                return
-            left = now
+        self._set_local(left)
+        now = self._left()
+        if left - now > ARM_DRIFT_MS:
+            self._set_local(now)
+
+    def _set_local(self, left: int) -> None:
+        lock_ms, statement_ms = self._limits
+        super().execute(
+            "SELECT set_config('lock_timeout', %s, true), set_config('statement_timeout', %s, true)",
+            (str(min(left, lock_ms)), str(min(left, statement_ms) if statement_ms else left)),
+        )
 
 
 def connect(dsn: str) -> BoundedConnection:
-    return BoundedConnection.connect(
+    db = BoundedConnection.connect(
         dsn,
         autocommit=True,
         row_factory=dict_row,
         connect_timeout=3,
         options=(
-            "-c timezone=UTC -c statement_timeout=5000 -c lock_timeout=3000 "
+            f"-c timezone=UTC -c statement_timeout={STATEMENT_TIMEOUT_MS} -c lock_timeout={LOCK_TIMEOUT_MS} "
             "-c idle_in_transaction_session_timeout=15000"
         ),
     )
+    db._limits = (LOCK_TIMEOUT_MS, STATEMENT_TIMEOUT_MS)
+    return db
 
 
 _APPLIED = "SELECT version, digest FROM agent_chat.schema_migrations ORDER BY version"

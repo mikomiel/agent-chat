@@ -19,10 +19,7 @@ def connect_with_budget(seconds):
 
     def connect(dsn):
         db = storage.connect(dsn)
-        db.execute(
-            "SELECT set_config('lock_timeout', %(limit)s, false), set_config('statement_timeout', %(limit)s, false)",
-            {"limit": f"{seconds}s"},
-        )
+        db.set_limits(int(seconds * 1000), int(seconds * 1000))
         return db
 
     return connect

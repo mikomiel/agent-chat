@@ -344,11 +344,12 @@ ARM = "SELECT set_config('lock_timeout', %s, true)"
 LOCK_LIMIT = "SELECT setting::integer AS ms FROM pg_settings WHERE name = 'lock_timeout'"
 
 
-def slow_first_arm(monkeypatch, bounded, delay):
-    """Make the first arming round trip on `bounded` take `delay` seconds on the storage module's clock.
+def slow_first_arm(monkeypatch, bounded, delay, every=False):
+    """Make the first arming round trip on `bounded` (or, with `every`, each one) take `delay` seconds on the storage
+    module's clock.
 
     The clock stands still otherwise, so real round trips spend none of the budget and the outcome is fixed. Return
-    that clock, a list that holds True once the delay was spent, and the other queries `bounded` sent.
+    that clock, a list that holds True for each delay spent, and the other queries `bounded` sent.
     """
     base = time.monotonic()
     skew = [0.0]
@@ -361,7 +362,7 @@ def slow_first_arm(monkeypatch, bounded, delay):
         if self is bounded:
             if not isinstance(query, str) or not query.startswith(ARM):
                 others.append(query)
-            elif not delayed:
+            elif every or not delayed:
                 skew[0] += delay
                 delayed.append(True)
         return cursor
@@ -401,3 +402,33 @@ def test_an_arming_reply_after_the_deadline_refuses_the_statement(database, monk
             bounded.execute(LOCK_LIMIT)
         assert delayed
         assert LOCK_LIMIT not in others
+
+
+@pytest.mark.parametrize("explicit", [True, False], ids=["in_transaction", "autocommit"])
+def test_steady_arming_latency_above_the_drift_still_runs_the_statement(database, monkeypatch, explicit):
+    """Every arming reply 60 ms late: one re-arm per statement, then the statement runs. Arming until replies are
+    fast would spend the whole deadline arming and refuse a request that fits."""
+    with connect(database) as bounded:
+        clock, delayed, _ = slow_first_arm(monkeypatch, bounded, (ARM_DRIFT_MS + 10) / 1000, every=True)
+        accepted = clock()
+        with bounded.request_deadline(accepted), bounded.transaction() if explicit else nullcontext():
+            limit = bounded.execute(LOCK_LIMIT).fetchone()["ms"]
+            left = int((accepted + SERVER_BUDGET - clock()) * 1000)
+        assert len(delayed) == 2, delayed
+        assert limit <= left + ARM_DRIFT_MS + 10, (limit, left)
+
+
+def test_entering_the_deadline_sends_no_query(database, monkeypatch):
+    """The budget comes from the limits the connection was given, so no unbounded query runs before it applies."""
+    with connect(database) as bounded:
+        sent: list[object] = []
+        real = psycopg.Connection.execute
+
+        def execute(self, query, *args, **kwargs):
+            if self is bounded:
+                sent.append(query)
+            return real(self, query, *args, **kwargs)
+
+        monkeypatch.setattr(psycopg.Connection, "execute", execute)
+        with bounded.request_deadline(time.monotonic()):
+            assert sent == []
