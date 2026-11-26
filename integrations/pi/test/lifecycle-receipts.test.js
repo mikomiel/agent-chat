@@ -1062,8 +1062,8 @@ test("a refused heartbeat with a delivery poll and a receipts request both waiti
 
 // Review of #191, round 7, finding 1: the reviewer's run sent a delivery poll, the state A (refused), the state B (refused), a
 // delivery poll, A, and then the receipts request. That is the order of the scheduler: the receipts request is the last of the
-// three, so it goes only when no heartbeat and no delivery poll is due, whatever was refused before. It is late, and lost only if
-// its message expires first: the server feed stops offering the receipt of an expired message.
+// three, so it goes only when no heartbeat and no delivery poll is due, whatever was refused before. It is late, and the delay
+// deletes nothing: the feed offers a receipt while its message is retained and the session can still read its room.
 test("the receipts request goes last: a state that is due again and a delivery poll both go before it, and it goes once nothing is due", async () => {
   const s = await session({ rows: [row(1)] })
   const start = await primed(s)
@@ -1095,7 +1095,7 @@ test("the receipts request goes last: a state that is due again and a delivery p
   assert.deepEqual(opsSince(s, start).filter(op => op !== "tick"), ["pending", "heartbeat", "heartbeat", "pending", "heartbeat", "receipts"],
     "a delivery poll, A, B, a delivery poll, A, and the receipts request last")
   assert.deepEqual(s.cancels, [], "no receipts request was in flight to end")
-  assert.equal(s.receiptSends().length, 1, "the request was late, and a receipt is lost only if its message expires first: its row is shown")
+  assert.equal(s.receiptSends().length, 1, "the request was late, and the delay deleted nothing: its row is shown")
 })
 
 // A heartbeat and a delivery poll take turns, and a receipts request between them gives no turn back: the heartbeat of this run

@@ -320,8 +320,8 @@ fits on `cli` fits on every route.
   falling due, such as heartbeats that are refused or a title that changes at
   every tick, heartbeat and delivery poll take turns and a receipts notice
   waits until the streak ends. Presence and deliveries keep their place;
-  receipts are late, and lost only if their message expires first: the server
-  stops offering the receipt of an expired message.
+  receipts are late, and the delay deletes none: the server feed offers a
+  receipt while its message is retained and the session can still read its room.
 - Pi holds a `triggerTurn: false` message while a run is active and appends it
   at the end of the running turn, after the assistant message and every tool
   result, or when the run ends if that comes first (the Pi 1.5.0 and 1.5.2
