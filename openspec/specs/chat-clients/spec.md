@@ -535,12 +535,17 @@ At every 2-second poll the `pi` package MUST compare the state that it would hea
 - **THEN** it sends no second heartbeat
 
 ### Requirement: `pi` compares the state again when a slow request is done
-A state change that a poll or an event sees while a request other than a receipts request is in flight MUST NOT start a second request. When that request is done, the `pi` package MUST compare the current state with the last confirmed state once, and send one heartbeat if they differ, not at a later poll. A heartbeat that the worker answers `refused` MUST NOT be sent again in a loop: it is sent again at most once for each poll or event that found a request in flight.
+A state change that a poll or an event sees while a request other than a receipts request is in flight MUST NOT start a second request. When that request is done, the `pi` package MUST compare the current state with the last confirmed state once, and send one heartbeat if they differ, before a waiting request, not at a later poll. A heartbeat that the worker answers `refused` MUST NOT be sent again in a loop: it is sent again at most once for each poll or event that found a request in flight.
 
 #### Scenario: A change during a slow request
 - **WHEN** the session turns busy or enters Plan Mode while a pending read, a claim, a settlement or a heartbeat is in flight, and a poll finds that request in flight
 - **THEN** one heartbeat that carries the new state is sent when that request is done, not at a later poll
 - **AND** nothing is sent if the state has changed back by then
+
+#### Scenario: A poll that waits behind a heartbeat
+- **WHEN** a poll finds a heartbeat in flight and leaves a delivery poll due, and the state changes while that heartbeat is out
+- **THEN** the heartbeat of the new state is sent when the first one is done, before the delivery poll
+- **AND** the delivery poll follows it
 
 #### Scenario: A refusal is not repeated in a loop
 - **WHEN** the worker answers `refused` to a heartbeat that was sent when a slow request was done, or that was in flight when a poll found it
@@ -558,7 +563,7 @@ A state change that a poll or an event sees while a request other than a receipt
 #### Scenario: A reload during a rejoin
 - **WHEN** a failure that calls for a rejoin has stopped the worker, that worker has not closed yet, and Pi emits `session_shutdown` for a reload, and that worker closes within 6 seconds
 - **THEN** the promise that the handler returns settles only after that worker has closed
-- **AND** the replacing runtime joins after it, so the old instance cannot answer its join with `BINDING_CONFLICT`
+- **AND** the replacing runtime joins after it, which removes the usual cause of `BINDING_CONFLICT`: an old worker that is still ending its instance
 
 #### Scenario: A worker that does not close at shutdown
 - **WHEN** Pi emits `session_shutdown` and a worker that the package stopped has not closed 6 seconds later
@@ -573,7 +578,7 @@ A state change that a poll or an event sees while a request other than a receipt
 - **THEN** the new runtime starts no worker, and its footer reads `Agent Chat: no live instance`
 
 ### Requirement: A `pi` worker waits for every worker that the package stopped to close, for 6 seconds at most
-`connect` MUST start no worker while another joins or serves, and none until every worker that the package stopped has closed, a rejoin's included. A wait MUST end after 6 seconds at the latest, and the worker then starts. After that wait it MUST check again that its runtime was not shut down and that chat was not turned off. Two calls that wait together MUST start one worker, and a call that finds a worker joining or serving MUST stop none.
+`connect` MUST start no worker while another joins or serves, and none until every worker that the package stopped has closed, a rejoin's included. A wait MUST end after 6 seconds at the latest, and the worker then starts. After a wait it MUST check again that its runtime was not shut down and chat was not turned off. A call that comes while another waits MUST wait for that one, so waits that end at different times start one worker. A call that finds a worker joining or serving MUST stop none.
 
 #### Scenario: A rejoin waits for the old worker
 - **WHEN** the rejoin timer fires while the worker that the rejoin stopped has not closed yet, and it closes within 6 seconds
@@ -584,6 +589,16 @@ A state change that a poll or an event sees while a request other than a receipt
 - **WHEN** a rejoin waits and the worker that it stopped has not closed 6 seconds later
 - **THEN** the wait ends and the rejoin starts one worker
 - **AND** a join that still meets the old instance is refused with `BINDING_CONFLICT`, which the rejoin retries after a back-off
+
+#### Scenario: A worker that closed without ending its instance
+- **WHEN** the worker that a rejoin stopped closes within 6 seconds, but its `end` request failed, so its instance stays until its lease expires
+- **THEN** the rejoin starts one worker, because a close shows that the process exited and not that the server accepted `end`
+- **AND** a join that meets `BINDING_CONFLICT` is retried after a back-off like any other
+
+#### Scenario: Waits that end at different times
+- **WHEN** a second call comes while the first one waits for a worker that has not closed, and the join of the worker that starts after the wait meets `BINDING_CONFLICT`
+- **THEN** the second call starts no worker, and none starts before the back-off is over
+- **AND** the next worker starts after the back-off and once the worker that the failed join stopped has closed, or after 6 seconds
 
 #### Scenario: A second connect
 - **WHEN** `connect` is called while a worker joins or serves

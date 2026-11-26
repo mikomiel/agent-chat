@@ -1465,6 +1465,27 @@ test("a heartbeat that is refused while an entry skipped is retried once for tha
   assert.ok(beats().slice(base).every(row => row.fields.state.native_state === "busy"))
 })
 
+// The loop takes the compare before it chooses its next request, so a poll that was queued behind a request does not go first.
+test("a delivery poll that is queued behind a held heartbeat waits for the heartbeat of the change that was seen meanwhile", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker, entries } = session
+  const before = worker.requests.length
+  entries.push(PLAN_ON)
+  const release = session.hold("heartbeat")
+  const flight = lifecycle.heartbeat() // sends the state with Plan Mode on, and its answer is held
+  await flush()
+  entries.push(PLAN_OFF) // Plan Mode ends while that heartbeat is out
+  await lifecycle.poll() // finds the loop busy: the poll is queued, and one compare is asked for
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat"], "nothing else goes out while the heartbeat is held")
+  release({})
+  await flight
+  await flush()
+  const sent = worker.requests.slice(before)
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "pending"], "the changed state goes before the queued poll")
+  assert.equal(sent[0].fields.state.plan_mode, true)
+  assert.equal(sent[1].fields.state.plan_mode, false)
+})
+
 // One Pi extension runtime: the real factory on its own extension API, for the session `native`, with a worker that joins as
 // `instance`. Pi builds one for every session start. `log` records the order of the joins; `extra` replaces options, such as the timers.
 function runtime(native, instance = joined, log = [], extra = {}) {
@@ -1480,7 +1501,8 @@ function runtime(native, instance = joined, log = [], extra = {}) {
 }
 
 // Timers that run only when a test runs them. `log` lists every timer that was set, in order. `left(ms)` lists those of that
-// length that were neither run nor cleared, and `fire(ms)` runs them. A timer has `unrefs`, the count of its unref() calls.
+// length that were neither run nor cleared, `fire(ms)` runs them all, and `run(timer)` runs one that is still left. A timer has
+// `unrefs`, the count of its unref() calls.
 function manualTimeouts() {
   const log = []
   const left = new Set()
@@ -1495,6 +1517,7 @@ function manualTimeouts() {
     clearTimeoutImpl: timer => { left.delete(timer) },
     left: ms => [...left].filter(timer => timer.ms === ms),
     fire(ms) { for (const timer of [...left]) if (timer.ms === ms) { left.delete(timer); timer.fn() } },
+    run(timer) { if (left.delete(timer)) timer.fn() },
   }
 }
 const instanceTwo = {
@@ -1550,8 +1573,9 @@ for (const { reason, native } of REPLACEMENTS) {
 // time to exit). fail() answers the next heartbeat with a refusal that proves the lease gone: the worker is stopped at once, and the
 // rejoin timer is `retries[0].fn`. The worker that joins next is `instanceTwo`. `live` no longer names the stopped worker, so only the
 // lifecycle's own record of what is still closing can tell a shutdown or a rejoin to wait for it. `retries` lists every timer that
-// the lifecycle sets; `clock` runs and counts them.
-async function rejoinTeardown() {
+// the lifecycle sets; `clock` runs and counts them. `workerOptions(index)` may replace the fake worker's options for the worker
+// with that start index, as a join that fails.
+async function rejoinTeardown(workerOptions = () => ({})) {
   const { pi, emit, ctx, statuses, commands } = fakePi()
   const clock = manualTimeouts()
   const retries = clock.log
@@ -1566,6 +1590,7 @@ async function rejoinTeardown() {
         ready: Promise.resolve(first ? joined : instanceTwo),
         holdClose: first,
         answer: op => (refusal && op === "heartbeat" ? { refused: refusal } : op === "pending" ? { messages: [] } : {}),
+        ...workerOptions(workers.length),
       })
       workers.push(worker)
       return worker
@@ -1691,6 +1716,60 @@ test("the timer of a rejoin that waits is cleared when the closes settle first",
   assert.equal(workers.length, 2, "the rejoin started its worker once the close came")
   assert.equal(clock.left(CLOSE_WAIT_MS).length, 0, "no timer is left once the close came first")
   assert.equal(clock.log.filter(timer => timer.ms === CLOSE_WAIT_MS).length, 1)
+})
+
+// Calls whose waits reach their bound at different times start one worker between them. Its join meets BINDING_CONFLICT, as when
+// the old instance is still live, and from there the back-off is the only way to the next start, which waits for the close of the
+// worker that this one stopped.
+test("calls that wait for a closing worker until their bounds start one worker, and the back-off after its failed join holds", async () => {
+  const conflict = Object.assign(new Error("BINDING_CONFLICT"), { code: "BINDING_CONFLICT", operation: "join" })
+  const { lifecycle, workers, fail, retries, clock, statuses } = await rejoinTeardown(
+    index => (index === 1 ? { ready: Promise.reject(conflict), holdClose: true } : {}))
+  await fail()
+  retries[0].fn() // the rejoin timer fires, and the first call waits for the old close, which is held
+  await flush()
+  void lifecycle.connect() // a later call, whose wait would end after the first one's
+  await flush()
+  for (const timer of clock.left(CLOSE_WAIT_MS)) { // each wait reaches its bound, one after the other
+    clock.run(timer)
+    await flush()
+  }
+  assert.equal(workers.length, 2, "one worker started, however many calls waited, and its join met the conflict")
+  assert.equal(statuses.at(-1), "Agent Chat: reconnecting")
+  assert.equal(clock.left(5000).length, 1, "the failed join set a back-off")
+  workers[0].release() // the old worker closes, late
+  await flush()
+  assert.equal(workers.length, 2, "nothing starts before the back-off is over")
+  clock.fire(5000)
+  await flush()
+  assert.equal(workers.length, 2, "the next start waits for the close of the worker that the failed join stopped")
+  assert.equal(workers[1].stops, 1)
+  workers[1].release()
+  await flush()
+  assert.equal(workers.length, 3, "and starts once that worker has closed")
+  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
+})
+
+// A flight ends with its call. A call that comes after that, with a rejoin timer still pending, is made as it always was.
+test("a connect call that comes after its flight has ended is a call of its own, a pending rejoin timer included", async () => {
+  const conflict = Object.assign(new Error("BINDING_CONFLICT"), { code: "BINDING_CONFLICT", operation: "join" })
+  const { lifecycle, workers, fail, retries, clock } = await rejoinTeardown(
+    index => (index === 1 ? { ready: Promise.reject(conflict), holdClose: true } : {}))
+  await fail()
+  retries[0].fn() // the flight: it waits for the old close, which is held
+  await flush()
+  clock.fire(CLOSE_WAIT_MS) // the bound ends the wait, the worker starts, its join meets the conflict, and the flight ends
+  await flush()
+  assert.equal(workers.length, 2)
+  assert.equal(clock.left(5000).length, 1, "the back-off of the failed join is pending")
+  const later = lifecycle.connect()
+  await flush()
+  assert.equal(workers.length, 2, "the call waits for the workers that are closing")
+  assert.equal(clock.left(CLOSE_WAIT_MS).length, 1, "on a wait of its own")
+  clock.fire(CLOSE_WAIT_MS)
+  await flush()
+  await later
+  assert.equal(workers.length, 3, "and then starts its worker")
 })
 
 test("the extension ends its instance on session_shutdown only, never on session_before_switch or session_before_fork", () => {

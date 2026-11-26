@@ -128,9 +128,11 @@ fits on `cli` fits on every route.
   instance after a rejoin starts with nothing confirmed.
   A poll that finds another request in flight (a delivery poll, a claim, a settlement
   or a heartbeat) sends nothing, because a heartbeat of that state may be among them.
-  It asks for one more comparison, which is made when the request is done: a change
-  seen during a slow request goes out right after it, not at a later poll, and a change
-  that has reverted by then sends nothing, because presence reports the current state.
+  It asks for one more comparison, which is made when the request is done, before the
+  next request is chosen: a change seen during a slow request goes out right after it,
+  ahead of a delivery poll or a receipts request that waited behind it, not at a later
+  poll, and a change that has reverted by then sends nothing, because presence reports
+  the current state.
   A refused heartbeat is sent again at most once for each poll that asked, never in a loop.
   `session_tree`, `session_compact` and `session_compact_failed`
   ask for the same comparison at once, with the context they carry; the poll finds the
@@ -212,13 +214,19 @@ fits on `cli` fits on every route.
   outlasts the lease, the worker raises its own error, and that enters this path.
   A rejoin starts its worker only after the worker that it stopped has closed, because
   the new worker joins with the same native session id and would meet `BINDING_CONFLICT`
-  while the old instance is still live. The worker's own stop bounds that wait: it kills
-  a process that does not exit, 5 seconds after the stop. A child that still reports no
-  exit holds the rejoin no longer: the wait ends after 6 seconds at the latest, and a join
-  that still meets the old instance is retried after a back-off like any `BINDING_CONFLICT`.
+  while the old worker is still ending its instance. That removes the usual cause, and
+  only that one: an exit does not show that the server accepted the old worker's `end`.
+  If `end` failed, the worker exits and leaves its instance to the lease, which stays live
+  until it expires, and the next join can still meet `BINDING_CONFLICT`. The rejoin path
+  retries that after a back-off like any other. The worker's own stop bounds the wait: it
+  kills a process that does not exit, 5 seconds after the stop. A child that still reports
+  no exit holds the rejoin no longer: the wait ends after 6 seconds at the latest, and a
+  join that then meets the old instance is retried the same way.
   The wait has one timer, unreferenced and cleared when the close comes first. After the
   wait the rejoin checks again that the runtime was not shut down and that chat was not
-  turned off, and two calls start one worker.
+  turned off. The wait, the start and the join are one flight: a call that comes while one
+  is out waits for it and starts nothing, so calls whose waits would end at different times
+  start one worker, and a failed join is followed by its back-off, not by a second start.
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for the process. The native session,
   CI and any submitted work are unchanged. The footer then says `no live instance`.
@@ -232,9 +240,11 @@ fits on `cli` fits on every route.
   `session_shutdown` to the old runtime, awaits its handlers, loads a new runtime and
   emits `session_start` with the same reason. The extension ends its instance on
   `session_shutdown` only, and its handler returns once every worker that is still
-  closing has exited, one that a rejoin stopped earlier included, so the old instance
-  has ended before the new one joins, or after 6 seconds, so a child that never exits
-  cannot hold the replacement for ever. It subscribes to no
+  closing has exited, one that a rejoin stopped earlier included, so no old worker is
+  still ending its instance when the new one joins, or after 6 seconds, so a child that
+  never exits cannot hold the replacement for ever. An exit is not proof that the server
+  accepted `end`: a join that still meets the old instance, because its `end` failed, is
+  retried after a back-off. It subscribes to no
   `session_before_switch` or `session_before_fork`, because another handler can cancel
   those and the instance would end for a switch that never happened. The new runtime
   starts stopped. A chat session is keyed by the native session id: `/reload` and
@@ -293,9 +303,10 @@ The suite covers config refusal, the join frame and frame validation, rejoin
 budget/window/backoff, delivery and settlement, the system-prompt binding,
 fail-closed latching and the shared notice vectors, with the claim packing for
 bodies mode, the lease and the footer vocabulary (a lapse that holds until a confirmed
-heartbeat), presence on change (a change seen during a slow request included), the
-replacement of the runtime for each `session_start` reason (a reload during a rejoin
-and a close that never comes included), tree navigation and compaction, and sender
+heartbeat), presence on change (a change seen during a slow request included, sent
+ahead of a poll that waited behind it), the replacement of the runtime for each
+`session_start` reason (a reload during a rejoin, a close that never comes and calls
+whose waits end at different times included), tree navigation and compaction, and sender
 receipts: the offer rules, the confirmation and the mark,
 one request per pass, and that a delivery and the binding are byte-identical with
 receipts pending. It
