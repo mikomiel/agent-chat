@@ -431,6 +431,11 @@ The service MUST record a sender receipt, at most once per message, recipient an
 - **THEN** the read marks nothing delivered
 - **AND** ids that the instance later reports as delivered are marked once, and ids that are not its own are ignored without disclosure
 
+#### Scenario: A stalled receipts read does not delay an instance of another session
+- **WHEN** a sender's instance reads or marks its receipts, and its transaction waits on a row lock
+- **THEN** an event write by an instance of another session, such as the settlement of its delivery attempt, completes without waiting for that transaction
+- **AND** the write is recorded while the receipts transaction is still open
+
 ### Requirement: Receipt policy follows the message kind
 The service MUST create sender receipts by default for `question` and `consultation`. For `message` and `reply` it MUST create them only when the sender set `receipts` to true. It MUST NOT create them for `status`, the coordination kinds, room state or a message published without a session.
 

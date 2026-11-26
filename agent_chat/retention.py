@@ -62,12 +62,13 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             floor = event["position"]
         removed_events = db.execute("DELETE FROM agent_chat.events WHERE position <= %s", (floor,)).rowcount
         db.execute("UPDATE agent_chat.event_clock SET retained_floor = %s WHERE singleton", (floor,))
+        # NO KEY UPDATE: a clockless receipts mark may hold KEY SHARE on these rows; only the leaf delete conflicts.
         redacted = db.execute(
             """
             WITH expired AS (
                 SELECT id FROM agent_chat.messages
                 WHERE expires_at <= clock_timestamp() AND body IS NOT NULL
-                ORDER BY expires_at, id LIMIT %s FOR UPDATE
+                ORDER BY expires_at, id LIMIT %s FOR NO KEY UPDATE
             ) UPDATE agent_chat.messages SET body = NULL
               WHERE id IN (SELECT id FROM expired) RETURNING id
         """,
