@@ -4,12 +4,13 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from hashlib import sha256
+from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
 from psycopg.errors import LockNotAvailable
 
-from agent_chat import deliveries, receipts, sessions, state
+from agent_chat import auth, deliveries, receipts, sessions, state
 from agent_chat.auth import authenticate_producer
 from agent_chat.models import (
     COORDINATION_KINDS,
@@ -631,6 +632,64 @@ def test_prune_skips_a_message_a_stalled_mark_holds_and_never_waits_for_it(
     assert db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s", (leaf,)).fetchone() is None
     (kept,) = db.execute("SELECT id, delivered_at IS NOT NULL AS delivered FROM agent_chat.sender_receipts").fetchall()
     assert (kept["id"], kept["delivered"]) == (receipt_of[redacted], True)
+
+
+def test_prune_skips_a_lapsed_instance_a_receipts_call_holds_and_never_waits_for_it(
+    db, database, actors, actor_factory, lock_wait, monkeypatch
+):
+    """`lock_actor` locks the instance row `FOR UPDATE` and checks the lease in a second statement, so a receipts call
+    on a lapsed instance holds that row, without the event clock, between the two. Prune holds the clock for its whole
+    transaction and ends an instance that lapsed a day ago, so a wait for that row would delay every event writer. It
+    must skip the instance and leave it to a later pass. The feed here is held between its lock and its check. The
+    settle of another instance, started once prune has finished or waits, must complete. After the release the feed
+    fails with the lease error, and a second prune ends the instance.
+    """
+    room, sender, _target, operator = actors
+    other, attempt = other_instance_attempt(db, room, operator, actor_factory)
+    db.execute(
+        "UPDATE agent_chat.instances SET heartbeat_at = clock_timestamp() - interval '25 hours' WHERE id = %s",
+        (sender.instance_id,),
+    )
+    checking, release = Event(), Event()
+    lease_check = auth.require_live
+
+    def held_check(connection, actor):
+        if actor.instance_id == sender.instance_id:
+            checking.set()
+            assert release.wait(timeout=10), "the test never released the lease check"
+        return lease_check(connection, actor)
+
+    monkeypatch.setattr(auth, "require_live", held_check)
+
+    def read():
+        with connect(database) as reader:
+            return receipts.sender_feed(reader, sender)
+
+    def run_prune():
+        with connect(database) as pruner:
+            return prune(pruner)
+
+    def ended():
+        row = db.execute("SELECT ended_at FROM agent_chat.instances WHERE id = %s", (sender.instance_id,)).fetchone()
+        return row["ended_at"] is not None
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        try:
+            reading = pool.submit(read)
+            assert checking.wait(timeout=5), "the feed never reached its lease check"
+            pruning = pool.submit(run_prune)
+            wait_until_finished_or_waiting(lock_wait, pruning, "agent_chat.instances")
+            assert_settled_within_bound(db, settle_in_thread(pool, database, other, attempt), attempt)
+            assert pruning.done(), "prune waited for a lapsed instance that a receipts call holds"
+            assert not reading.done()
+            assert pruning.result()["ended_instances"] == 0
+            assert not ended()
+        finally:
+            release.set()
+        with pytest.raises(ChatError, match="^STALE_INSTANCE$"):
+            reading.result(timeout=5)
+    assert prune(db)["ended_instances"] == 1
+    assert ended()
 
 
 def test_a_delivered_mark_breaks_an_expiry_tie_by_message_id(db, database, actors, lock_wait):

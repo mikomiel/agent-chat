@@ -84,9 +84,10 @@ def sender_feed(db: Connection[dict[str, Any]], actor: Actor) -> dict[str, Any]:
 
     It takes no event clock, which a stalled read would hold against every event writer (#176): the row locks of
     `lock_agent` and `visible` carry the authorization, so a revocation still waits for this read and a read that
-    waited re-evaluates the rows. A write that targets this same session (its own send, a rejoin, a mute) takes the
-    clock first and then waits on the instance or session row held here, so it can still hold the clock while a read
-    of that session stalls.
+    waited re-evaluates the rows. A request that targets this same session takes the clock first and then waits on
+    the instance or session row held here, so it can still hold the clock while a read of that session stalls. Such a
+    request is a write (its own send, a rejoin, a mute) or a read (`status`, `pending`, `history`), whose shared clock
+    blocks every writer all the same.
     """
     with db.transaction():
         lock_agent(db, actor)
@@ -103,9 +104,9 @@ def mark_delivered(db: Connection[dict[str, Any]], actor: Actor, request: Receip
     It takes no event clock either (see `sender_feed`), and `lock_agent` carries the authorization. The clock also kept
     it apart from `retention.prune`, whose delete of a tombstoned message cascades to these rows. So the messages are
     locked first, in prune's order, and held to commit. Prune never waits for this call: its redaction takes
-    `FOR NO KEY UPDATE`, and its leaf delete skips a locked message and collects it in a later pass. This call may wait
-    for a leaf delete already in progress: one statement, in the same order, while it holds no receipt row. The
-    same-session limit of `sender_feed` applies.
+    `FOR NO KEY UPDATE`, and its leaf delete and its end of a lapsed instance skip a row held here and do that work
+    in a later pass. This call may wait for a leaf delete already in progress: one statement, in the same order,
+    while it holds no receipt row. The same-session limit of `sender_feed` applies.
     """
     owned = (list(request.receipts), actor.session_id)
     with db.transaction():

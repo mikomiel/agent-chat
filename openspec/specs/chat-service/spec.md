@@ -432,7 +432,7 @@ The service MUST record a sender receipt, at most once per message, recipient an
 - **AND** ids that the instance later reports as delivered are marked once, and ids that are not its own are ignored without disclosure
 
 #### Scenario: A stalled receipts read does not delay an instance of another session
-- **WHEN** a sender's instance reads or marks its receipts, and its transaction waits on a row lock
+- **WHEN** a sender's instance reads or marks its receipts, its transaction waits on a row lock, and no request that holds the event clock waits for that transaction, such as a request of the same session: its own send, a rejoin, a mute, or its status, pending or history read
 - **THEN** an event write by an instance of another session, such as the settlement of its delivery attempt, completes without waiting for that transaction
 - **AND** the write is recorded while the receipts transaction is still open
 
