@@ -134,6 +134,10 @@ fits on `cli` fits on every route.
   poll, and a change that has reverted by then sends nothing, because presence reports
   the current state.
   A refused heartbeat is sent again at most once for each poll that asked, never in a loop.
+  A delivery poll that waits goes before that retry, or a receipts request when no poll waits:
+  a heartbeat that is refused after every tick would otherwise be followed by another of the
+  same state each time, and the poll would never run. Heartbeat and poll take turns, and a
+  state that differs from the refused one goes first.
   `session_tree`, `session_compact` and `session_compact_failed`
   ask for the same comparison at once, with the context they carry; the poll finds the
   same change, so nothing depends on them.
@@ -227,6 +231,10 @@ fits on `cli` fits on every route.
   turned off. The wait, the start and the join are one flight: a call that comes while one
   is out waits for it and starts nothing, so calls whose waits would end at different times
   start one worker, and a failed join is followed by its back-off, not by a second start.
+  `disconnect()` ends the flight that is out: it starts no worker once its wait is over, and
+  the next `connect()` is a flight of its own, which the ended one never replaces or clears.
+  The extension calls it only at shutdown and when chat is turned off, and each of them also
+  stops every later start.
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for the process. The native session,
   CI and any submitted work are unchanged. The footer then says `no live instance`.
@@ -273,6 +281,11 @@ fits on `cli` fits on every route.
   a `triggerTurn: false` message; no live Pi run has shown it. If a release did
   not emit it, the receipts would be shown again in each later turn and never
   marked.
+- A receipts request is the last of the worker's requests: it goes only when
+  neither a heartbeat nor a delivery poll is due. While every heartbeat is
+  refused and outlasts a poll tick, heartbeat and delivery poll take turns, and
+  a receipts notice waits until that streak ends. Presence and deliveries keep
+  their place; receipts are late, not lost.
 - Pi holds a `triggerTurn: false` message while a run is active and appends it
   at the end of the running turn, after the assistant message and every tool
   result, or when the run ends if that comes first (the Pi 1.5.0 and 1.5.2
@@ -304,9 +317,10 @@ budget/window/backoff, delivery and settlement, the system-prompt binding,
 fail-closed latching and the shared notice vectors, with the claim packing for
 bodies mode, the lease and the footer vocabulary (a lapse that holds until a confirmed
 heartbeat), presence on change (a change seen during a slow request included, sent
-ahead of a poll that waited behind it), the replacement of the runtime for each
-`session_start` reason (a reload during a rejoin, a close that never comes and calls
-whose waits end at different times included), tree navigation and compaction, and sender
+ahead of a poll that waited behind it, and a refused heartbeat that takes turns with the
+poll), the replacement of the runtime for each `session_start` reason (a reload during a
+rejoin, a close that never comes, calls whose waits end at different times and a
+disconnect during a wait included), tree navigation and compaction, and sender
 receipts: the offer rules, the confirmation and the mark,
 one request per pass, and that a delivery and the binding are byte-identical with
 receipts pending. It

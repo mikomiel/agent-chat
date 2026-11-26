@@ -1486,6 +1486,119 @@ test("a delivery poll that is queued behind a held heartbeat waits for the heart
   assert.equal(sent[1].fields.state.plan_mode, false)
 })
 
+// A heartbeat that is refused after more than one tick, with a poll queued behind it, is not sent again ahead of that poll,
+// however often it happens: the retry follows the poll, and heartbeat and poll alternate.
+test("a refused heartbeat that outlasts every tick does not hold back the delivery poll: heartbeat, poll and retry alternate", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker } = session
+  const before = worker.requests.length
+  session.state.idle = false
+  session.refusal.code = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat that is not held is refused as well
+  let held = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds the change and sends it, and its answer is held
+  await flush()
+  for (let round = 0; round < 3; round += 1) {
+    await lifecycle.poll() // a tick while the heartbeat is out: it queues the poll and asks for a compare
+    const answer = held
+    answer({ refused: "TRANSPORT_UNAVAILABLE" })
+    held = session.hold("heartbeat") // the retry is held in its turn, so it outlasts a tick as well
+    await flush()
+  }
+  const ops = worker.requests.slice(before).map(row => row.op)
+  assert.deepEqual(ops, ["heartbeat", "pending", "heartbeat", "pending", "heartbeat", "pending", "heartbeat"],
+    "the poll goes between the retries, and never two heartbeats follow each other")
+  session.refusal.code = null
+  held({}) // the last retry is confirmed
+  await flight
+  assert.equal(worker.requests.slice(before).map(row => row.op).join(), ops.join(), "a confirmed state sends nothing more")
+  await lifecycle.poll()
+  assert.equal(worker.requests.slice(before).map(row => row.op).join(), [...ops, "pending"].join(), "and the next poll finds nothing to send")
+})
+
+// Only the snapshot that was refused waits for the poll. A state that differs from it is a change, and a change goes first.
+test("a refused heartbeat followed by a further change: the heartbeat of the new state still goes before the delivery poll", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker, entries } = session
+  const before = worker.requests.length
+  session.state.idle = false
+  session.refusal.code = "TRANSPORT_UNAVAILABLE"
+  const release = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds the change and sends it, and its answer is held
+  await flush()
+  await lifecycle.poll() // a tick while the heartbeat is out: it queues the poll and asks for a compare
+  entries.push(PLAN_ON) // and Plan Mode starts meanwhile
+  release({ refused: "TRANSPORT_UNAVAILABLE" })
+  await flight
+  const sent = worker.requests.slice(before)
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "pending"], "the changed state goes before the poll")
+  assert.equal(sent[0].fields.state.plan_mode, false)
+  assert.equal(sent[1].fields.state.plan_mode, true)
+})
+
+// The retry waits for one poll, and not for the polls that fall due while that one is held: a held poll leaves another one due,
+// and the retry still goes before it. Heartbeat and poll alternate, and slow polls hold back the heartbeat no more than slow
+// heartbeats hold back the poll.
+test("a refused heartbeat's retry waits for one delivery poll, not for the polls that fall due while that one is held", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker } = session
+  const before = worker.requests.length
+  session.state.idle = false
+  session.refusal.code = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat that is not held is refused as well
+  const releaseBeat = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds the change and sends it, and its answer is held; the poll is queued behind it
+  await flush()
+  await lifecycle.poll() // a tick while the heartbeat is out: it asks for a compare
+  releaseBeat({ refused: "TRANSPORT_UNAVAILABLE" })
+  const releasePoll = session.hold("pending") // the queued poll is held in its turn
+  await flush()
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending"], "the poll goes first")
+  await lifecycle.poll() // a tick while that poll is out: another poll falls due
+  releasePoll({ messages: [] })
+  await flight
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending", "heartbeat", "pending"],
+    "the retry goes before the second poll")
+})
+
+// What waits for the poll is the snapshot that was just refused, and no other. One that was refused earlier, and then left
+// behind by a state that went through, is a change again when the state returns to it.
+test("a snapshot that was refused, and then left behind by a state that went through, is a change again when the state returns to it", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker, entries, emit, ctx } = session
+  const before = worker.requests.length
+  session.state.idle = false // the snapshot S
+  const releaseS = session.hold("heartbeat")
+  const flight = lifecycle.heartbeat() // sends S, and its answer is held; no poll is queued
+  await flush()
+  emit("session_compact", { type: "session_compact" }, ctx) // finds the loop busy and asks for a compare
+  entries.push(PLAN_ON) // Plan Mode starts: the state is T
+  releaseS({ refused: "TRANSPORT_UNAVAILABLE" }) // S is refused, and the compare finds T, which differs from it
+  const releaseT = session.hold("heartbeat")
+  await flush()
+  entries.push(PLAN_OFF) // the state returns to S while T is out
+  await lifecycle.poll() // a tick: a poll falls due, and another compare is asked for
+  releaseT({}) // T goes through
+  await flight
+  const sent = worker.requests.slice(before)
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "heartbeat", "pending"], "S goes before the poll")
+  assert.deepEqual(sent.filter(row => row.op === "heartbeat").map(row => row.fields.state.plan_mode), [false, true, false])
+})
+
+// With no poll and no receipts pass waiting there is nothing to hold back, so the entry that skipped gets its one retry at once.
+test("an event that found a heartbeat in flight gets one retry at once when it is refused and no poll waits", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker, emit, ctx } = session
+  const before = worker.requests.length
+  session.state.idle = false
+  const release = session.hold("heartbeat")
+  const flight = lifecycle.heartbeat() // sends the change, and its answer is held; no poll is queued
+  await flush()
+  emit("session_compact", { type: "session_compact" }, ctx) // finds the loop busy and asks for a compare
+  session.refusal.code = "TRANSPORT_UNAVAILABLE"
+  release({ refused: "TRANSPORT_UNAVAILABLE" })
+  await flight
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "heartbeat"], "one retry for the event, and its refusal ends it")
+})
+
 // One Pi extension runtime: the real factory on its own extension API, for the session `native`, with a worker that joins as
 // `instance`. Pi builds one for every session start. `log` records the order of the joins; `extra` replaces options, such as the timers.
 function runtime(native, instance = joined, log = [], extra = {}) {
@@ -1770,6 +1883,152 @@ test("a connect call that comes after its flight has ended is a call of its own,
   await flush()
   await later
   assert.equal(workers.length, 3, "and then starts its worker")
+})
+
+// A call that comes while a flight is out gets that flight, as before.
+test("a connect call that comes while a flight is out gets that flight, and one worker starts", async () => {
+  const { lifecycle, workers, fail } = await rejoinTeardown()
+  await fail()
+  const first = lifecycle.connect() // waits for the old close, which is held
+  const second = lifecycle.connect()
+  assert.equal(second, first, "the same flight")
+  await flush()
+  assert.equal(workers.length, 1, "nothing starts while the old worker is closing")
+  workers[0].release()
+  await flush()
+  await first
+  assert.equal(workers.length, 2, "one worker, however many calls")
+})
+
+// disconnect() ends the authority of the flight that is out. The call that follows it is a flight of its own, and the old flight
+// starts nothing, whatever it was doing: waiting for a close, joining, or waiting for its first heartbeat.
+test("disconnect then connect while the first heartbeat is held: one new worker starts after the old close, and none from the old flight", async () => {
+  const { pi, emit, ctx } = fakePi()
+  const workers = []
+  let answerLate
+  const late = new Promise(resolve => { answerLate = resolve })
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000,
+    startProcess: () => {
+      const index = workers.length
+      const worker = fakeWorker({
+        ready: Promise.resolve(index === 0 ? joined : instanceTwo),
+        holdClose: index === 0,
+        answer: op => (op === "heartbeat" && index === 0 ? late : op === "pending" ? { messages: [] } : {}),
+      })
+      workers.push(worker)
+      return worker
+    },
+  })
+  emit("session_start", {}, ctx) // the first flight joins, and the answer to its first heartbeat is held
+  await flush()
+  assert.deepEqual(workers[0].requests.map(row => row.op), ["heartbeat"])
+  const ended = lifecycle.disconnect()
+  const again = lifecycle.connect()
+  await flush()
+  assert.equal(workers.length, 1, "the new flight waits for the old close")
+  workers[0].release()
+  await flush()
+  await ended
+  assert.equal(workers.length, 2, "one new worker starts after it")
+  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
+  answerLate({}) // the old flight's heartbeat is answered at last
+  await flush()
+  await again
+  assert.equal(workers.length, 2, "and the old flight starts none")
+  assert.equal(workers[0].requests.length, 1, "nothing more goes to the old worker")
+  assert.equal(workers[1].requests[0].op, "heartbeat", "the new instance publishes its state")
+})
+
+test("disconnect then connect while a worker joins: the new worker starts after the old close, and the interrupted join starts none", async () => {
+  const { pi, emit, ctx } = fakePi()
+  const workers = []
+  let admit
+  const admitted = new Promise(resolve => { admit = resolve })
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000,
+    startProcess: () => {
+      const index = workers.length
+      const worker = fakeWorker({ ready: index === 0 ? admitted.then(() => joined) : Promise.resolve(instanceTwo), holdClose: index === 0 })
+      workers.push(worker)
+      return worker
+    },
+  })
+  emit("session_start", {}, ctx) // the first worker is joining
+  const ended = lifecycle.disconnect()
+  const again = lifecycle.connect()
+  await flush()
+  assert.equal(workers.length, 1, "the new flight waits for the old close")
+  workers[0].release()
+  await flush()
+  await ended
+  assert.equal(workers.length, 2, "one new worker starts after it")
+  admit() // the interrupted join is answered at last
+  await flush()
+  await again
+  assert.equal(workers.length, 2, "and the interrupted join starts none")
+  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
+})
+
+test("a disconnect during the close wait of a flight: that flight starts no worker once the wait is over", async () => {
+  const { lifecycle, workers, fail, retries } = await rejoinTeardown()
+  await fail()
+  retries[0].fn() // the rejoin timer fires: the flight waits for the old close, which is held
+  await flush()
+  const ended = lifecycle.disconnect()
+  workers[0].release()
+  await flush()
+  await ended
+  assert.equal(workers.length, 1, "the flight that the disconnect ended starts nothing")
+})
+
+test("a disconnect during the close wait of a flight, then a connect: one worker starts, not two, and the back-off holds", async () => {
+  const conflict = Object.assign(new Error("BINDING_CONFLICT"), { code: "BINDING_CONFLICT", operation: "join" })
+  const { lifecycle, workers, fail, retries, clock } = await rejoinTeardown(
+    index => (index === 1 ? { ready: Promise.reject(conflict), holdClose: true } : {}))
+  await fail()
+  retries[0].fn() // the old flight waits for the old close, which is held
+  await flush()
+  void lifecycle.disconnect()
+  void lifecycle.connect() // a flight of its own, with a wait of its own
+  await flush()
+  for (const timer of clock.left(CLOSE_WAIT_MS)) { // the waits reach their bounds, one after the other
+    clock.run(timer)
+    await flush()
+  }
+  assert.equal(workers.length, 2, "one worker started, and its join met the conflict")
+  assert.equal(clock.left(5000).length, 1, "the failed join set a back-off")
+  await flush()
+  assert.equal(workers.length, 2, "and nothing starts before it is over")
+})
+
+// The flight that a disconnect ended may end after the flight that followed it began. It clears its own handle and no other, so a
+// call that comes in between gets the new flight, and not a third one with a wait of its own that would end past the back-off.
+test("the flight that a disconnect ended leaves the handle of the flight after it: a call in between gets that flight, and the back-off holds", async () => {
+  const conflict = Object.assign(new Error("BINDING_CONFLICT"), { code: "BINDING_CONFLICT", operation: "join" })
+  const { lifecycle, workers, fail, retries, clock } = await rejoinTeardown(
+    index => (index === 1 ? { ready: Promise.reject(conflict), holdClose: true } : {}))
+  await fail()
+  retries[0].fn() // the old flight waits for the old close, which is held
+  await flush()
+  const [oldWait] = clock.left(CLOSE_WAIT_MS)
+  void lifecycle.disconnect()
+  const next = lifecycle.connect() // a flight of its own, with a wait of its own
+  await flush()
+  const nextWait = clock.left(CLOSE_WAIT_MS).at(-1)
+  clock.run(oldWait) // the bound of the old flight comes first: it starts nothing, and it ends
+  await flush()
+  assert.equal(workers.length, 1)
+  assert.equal(lifecycle.connect(), next, "a call while the new flight waits gets that flight")
+  clock.run(nextWait)
+  await flush()
+  assert.equal(workers.length, 2, "the new flight starts one worker, and its join meets the conflict")
+  assert.equal(clock.left(5000).length, 1, "the failed join set a back-off")
+  for (const timer of clock.left(CLOSE_WAIT_MS)) { // every other wait reaches its bound
+    clock.run(timer)
+    await flush()
+  }
+  assert.equal(workers.length, 2, "and none of them starts a worker before the back-off is over")
 })
 
 test("the extension ends its instance on session_shutdown only, never on session_before_switch or session_before_fork", () => {

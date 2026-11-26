@@ -552,6 +552,34 @@ A state change that a poll or an event sees while a request other than a receipt
 - **THEN** that heartbeat is sent again at most once for each such poll or event, and never in a loop
 - **AND** a state that stays unconfirmed is sent again by the next poll that finds no request in flight
 
+### Requirement: `pi` sends a refused heartbeat again only after the delivery poll that waits
+When the worker answers a heartbeat `refused` and a delivery poll waits, the `pi` package MUST send the poll before it sends that state again, so a heartbeat that is refused after every tick cannot keep the poll from running. This is the one exception to sending a changed state before a waiting request. When no poll waits and a receipts request does, that request MUST go before the retry. A state that differs from the refused one is no exception: it MUST go before the poll.
+
+#### Scenario: A refusal that outlasts every tick
+- **WHEN** each heartbeat is answered `refused` after a poll tick has come, so a delivery poll is due each time
+- **THEN** the delivery poll is sent after each refusal, before the retry
+- **AND** heartbeat and delivery poll take turns, and two heartbeats never follow each other while a poll waits
+
+#### Scenario: A delivery poll that is held
+- **WHEN** a refused heartbeat waits for a delivery poll, and another poll falls due while that poll is held
+- **THEN** the retry is sent when that poll is done, before the second poll
+
+#### Scenario: Only a receipts request waits
+- **WHEN** a heartbeat is refused after an event asked for a compare, no delivery poll is due, and a receipts request is
+- **THEN** the receipts request is sent before the retry
+
+#### Scenario: A further change after a refusal
+- **WHEN** a heartbeat is refused, and the state then differs from the refused one while a delivery poll waits
+- **THEN** the heartbeat of the new state is sent before the delivery poll
+
+#### Scenario: A refused state that comes back
+- **WHEN** a heartbeat is refused, a different state is then confirmed, and the state returns to the refused one while a delivery poll waits
+- **THEN** the heartbeat of that state is sent before the delivery poll, as for any change
+
+#### Scenario: Nothing waits
+- **WHEN** a heartbeat that an event found in flight is refused and no delivery poll or receipts request is due
+- **THEN** that state is sent again once, at once
+
 ### Requirement: `pi` ends its instance at `session_shutdown` and starts a replacing runtime stopped
 `session_shutdown` MUST stop the `pi` worker, end the instance and return a promise that Pi awaits before a replacing runtime starts. The promise MUST settle when every worker that the package stopped has closed, a rejoin's included, or after 6 seconds. No other event, including `session_before_switch` and `session_before_fork`, MAY end an instance. A replacing runtime MUST start stopped and join with the native session id of its own `session_start`, and MUST start no worker once chat is off.
 
@@ -564,6 +592,11 @@ A state change that a poll or an event sees while a request other than a receipt
 - **WHEN** a failure that calls for a rejoin has stopped the worker, that worker has not closed yet, and Pi emits `session_shutdown` for a reload, and that worker closes within 6 seconds
 - **THEN** the promise that the handler returns settles only after that worker has closed
 - **AND** the replacing runtime joins after it, which removes the usual cause of `BINDING_CONFLICT`: an old worker that is still ending its instance
+
+#### Scenario: A worker that closed without ending its instance
+- **WHEN** Pi emits `session_shutdown`, and the worker closes within 6 seconds, but its `end` request failed, so its instance stays until its lease expires
+- **THEN** the promise that the handler returns settles, because a close shows that the process exited and not that the server accepted `end`
+- **AND** a join of the replacing runtime that meets `BINDING_CONFLICT` is retried after a back-off like any other
 
 #### Scenario: A worker that does not close at shutdown
 - **WHEN** Pi emits `session_shutdown` and a worker that the package stopped has not closed 6 seconds later
@@ -603,6 +636,23 @@ A state change that a poll or an event sees while a request other than a receipt
 #### Scenario: A second connect
 - **WHEN** `connect` is called while a worker joins or serves
 - **THEN** it starts no second worker and stops none
+
+### Requirement: A `pi` disconnect ends the connect call that waits
+`disconnect` MUST end the `connect` call that is out: that call MUST start no worker afterwards, whether it waits for a close, joins or waits for the answer to its first heartbeat. A `connect` that comes after a `disconnect` MUST NOT wait for the call that the `disconnect` ended, unlike other calls: it waits and starts on its own, so one worker starts once every worker that the package stopped has closed, or after 6 seconds. The ended call MUST NOT end or replace the call that follows it.
+
+#### Scenario: A disconnect during a wait
+- **WHEN** `connect` waits for a worker that has not closed, `disconnect` is called, and that worker then closes
+- **THEN** the call that waited starts no worker
+
+#### Scenario: A connect right after a disconnect
+- **WHEN** `disconnect` is called while a worker joins, or while the answer to its first heartbeat is out, and `connect` is called at once
+- **THEN** one worker starts after the old worker has closed, and none starts from the call that the `disconnect` ended
+- **AND** the answer that the old worker owes, when it comes, starts no worker
+
+#### Scenario: A call after the wait of an ended call
+- **WHEN** `disconnect` ends a call that waits, a `connect` follows and waits, the wait of the ended call reaches its bound first, and a third call comes
+- **THEN** the third call gets the call that follows the `disconnect` and starts no worker of its own
+- **AND** one worker starts, and a join that meets `BINDING_CONFLICT` is followed by its back-off
 
 ### Requirement: Compaction and tree navigation keep the `pi` binding
 Tree navigation and compaction MUST keep the `pi` binding and MUST NOT join again. While Pi is not idle, in a compaction or a tree summary, the package MUST report `busy` and claim nothing. `session_tree`, `session_compact` and `session_compact_failed` MUST make it read the state at once, with the context that the event carries.

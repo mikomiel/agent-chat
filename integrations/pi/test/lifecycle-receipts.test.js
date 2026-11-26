@@ -831,6 +831,30 @@ test("a heartbeat or a poll that falls due while a request that is not a receipt
   assert.deepEqual(s.cancels, [], "no receipts request was in flight: there was nothing to end")
 })
 
+// A heartbeat that is refused after a re-evaluation asked for a compare is sent again once the request that waits has had its
+// turn. With no delivery poll due, that is the receipts request that has waited behind the heartbeats and polls so far.
+test("a refused heartbeat that a re-evaluation asked for is sent again after the receipts request that waits, when no delivery poll does", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.ctx.sessionManager.getSessionName = () => "renamed" // a state report is due, and the turn still runs, so a receipts request is asked for
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat is refused and stays unconfirmed
+  let releaseFirst
+  s.server.gates.heartbeat = new Promise(resolve => { releaseFirst = resolve })
+  const flight = s.tick() // a poll tick that finds the change: its heartbeat is held, and a delivery poll and a receipts request wait
+  await flush()
+  await s.tick(0) // a tick while that heartbeat is out: it asks for a compare
+  let releaseSecond
+  releaseFirst()
+  s.server.gates.heartbeat = new Promise(resolve => { releaseSecond = resolve }) // the retry that follows the delivery poll is held in its turn
+  await flush()
+  s.emit("session_compact", {}, s.ctx) // an event while that retry is out asks for a compare, and sets no delivery poll
+  delete s.server.gates.heartbeat
+  releaseSecond()
+  await flight
+  assert.deepEqual(opsSince(s, start).filter(op => op !== "tick"), ["heartbeat", "pending", "heartbeat", "receipts", "heartbeat"],
+    "the delivery poll follows the first refusal, and the receipts request follows the second, each before the retry")
+})
+
 // A host suspend lapses the lease on the wall clock alone (#132), and the first poll tick after the resume renders it. The tick
 // renders the footer before it looks at the single flight, so a request in flight holds nothing back. A heartbeat that was sent
 // before the suspend and is answered after it renews nothing: it is older than the lease on the wall clock.

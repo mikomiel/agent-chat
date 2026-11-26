@@ -75,6 +75,7 @@ export function createAgentChat(pi, config, {
   let reading = false // a receipts request is out on the worker: a heartbeat or a delivery poll that falls due ends it
   let recheck = false // an entry found the loop busy and skipped the compare: the loop compares the state before its next request
   let connecting = null // the one flight of connect(): the wait for the closing workers, the start and the join
+  let flightEpoch = 0 // counted by disconnect(): a flight that began before it starts no worker
   let receiptState = receipts.createReceipts()
   let pendingReceipts = null // { marker, ids }: sent to Pi, not yet confirmed by message_start
   let prompts = 0
@@ -174,6 +175,10 @@ export function createAgentChat(pi, config, {
   // stopped here, and one that an earlier failure stopped, which `live` no longer names. It settles after CLOSE_WAIT_MS at
   // the latest.
   function disconnect() {
+    // The flight that is out loses its authority and its place: it starts nothing once its wait is over, and the next connect()
+    // is a flight of its own.
+    flightEpoch += 1
+    connecting = null
     clearTimers()
     stopLive()
     return allClosed()
@@ -300,7 +305,9 @@ export function createAgentChat(pi, config, {
     // it, ahead of a delivery poll or a receipts request that waits, and not at a later tick that finds the loop free. That
     // compare takes the current state and the last confirmed one of the current record, so a change that reverted meanwhile
     // sends nothing. One compare spends the flag, so a refused heartbeat is sent again at most once for each entry that
-    // skipped, never in a loop.
+    // skipped, never in a loop. That retry goes after a delivery poll or a receipts pass that waits, not before it: a refused
+    // heartbeat that outlasts a tick would otherwise be followed by another of the same state for every tick, and the poll
+    // would never run. Any other change goes first.
     if (!busy || reading) dirty ||= live.published !== JSON.stringify(heartbeatState(state))
     else recheck = true
     if (busy) {
@@ -311,16 +318,23 @@ export function createAgentChat(pi, config, {
       return
     }
     busy = true
+    let refusedText = null // the snapshot whose heartbeat was just refused, as JSON; any other request ends it
     try {
       // One request for each pass, chosen once `recheck` is spent: a heartbeat when one is due, else the delivery poll, else
       // the receipts pass. Whatever fell due during the last request is therefore seen before the next one is chosen: a
       // heartbeat goes before a queued poll, and the receipts request is sent only when neither is due, with nothing awaited
       // between that check and the write, and `receiptsDue` stays set until then. A pass that has only `recheck` to spend
-      // sends nothing and ends the loop.
+      // sends nothing and ends the loop. The compare finds the snapshot that was just refused again, while a poll or a
+      // receipts pass waits: the flag then stays set, so the poll goes first and the retry follows it. Heartbeat and poll
+      // alternate that way, and neither holds the other back. A snapshot that differs from the refused one goes at once.
       while ((dirty || pollDue || receiptsDue || recheck) && live && !disabled()) {
         if (recheck) {
           recheck = false
-          dirty ||= live.published !== JSON.stringify(heartbeatState())
+          const current = JSON.stringify(heartbeatState())
+          if (current !== live.published) {
+            if (current === refusedText && (pollDue || receiptsDue)) recheck = true
+            else dirty = true
+          }
         }
         if (dirty) {
           dirty = false
@@ -330,20 +344,25 @@ export function createAgentChat(pi, config, {
           const stamp = lease.stamp() // taken before the request is written: the lease runs from the send, not the reply
           const result = await request("heartbeat", { state: snapshot })
           if (refused(result)) {
+            refusedText = text
             if (REJOIN_AFTER.has(result.refused) && !BRIEF_OUTAGE.has(result.refused))
               throw Object.assign(new Error(result.refused), { code: result.refused, operation: "heartbeat" })
           } else {
             // Both stay with the instance that sent the request: the snapshot lives on its record, and the stamp of an ended
             // instance renews no lease, so a reply that arrives late changes nothing of the next instance.
             record.published = text
+            refusedText = null
             lease.confirm(stamp)
           }
-        } else if (pollDue) {
-          pollDue = false
-          await pollOnce()
-        } else if (receiptsDue) {
-          receiptsDue = false
-          await receiptsPass()
+        } else {
+          refusedText = null // a poll or a receipts pass is the turn that a refused snapshot waits for: its retry follows
+          if (pollDue) {
+            pollDue = false
+            await pollOnce()
+          } else if (receiptsDue) {
+            receiptsDue = false
+            await receiptsPass()
+          }
         }
       }
     } catch (error) {
@@ -528,27 +547,29 @@ export function createAgentChat(pi, config, {
   // The wait for the closing workers, the start after it and the join are one flight. A call that comes while one is out gets
   // that flight and starts nothing: calls whose waits ended at different times would each start a worker, and the second
   // would join at once, past the back-off that the failed join of the first asked for. The flight clears itself when it ends,
-  // so a call after that is made as before, with a rejoin timer that is still pending as well.
+  // and only itself, so a call after that is made as before, with a rejoin timer that is still pending as well. disconnect()
+  // drops the flight that is out, and a call after it is a flight of its own.
   function connect() {
-    if (!connecting) {
-      connecting = (async () => {
-        try { await connectOnce() } finally { connecting = null }
-      })()
-    }
-    return connecting
+    if (connecting) return connecting
+    const flight = (async () => {
+      try { await connectOnce() } finally { if (connecting === flight) connecting = null }
+    })()
+    connecting = flight
+    return flight
   }
 
   async function connectOnce() {
+    const epoch = flightEpoch
     // One live record at a time: a call, while one worker joins or serves, starts nothing and stops nothing.
     if (mayNotStart()) return
     // A worker that joins with the native session id of one that is still exiting meets BINDING_CONFLICT, as after a rejoin
     // that stopped the old worker moments before. Nothing is awaited while no worker is closing, so the usual start stays
     // synchronous. The wait ends after CLOSE_WAIT_MS at the latest, and a join that then still meets the old instance is
-    // retried like any other BINDING_CONFLICT. After the wait, everything is checked again, since a shutdown or the off
-    // latch may have come first.
+    // retried like any other BINDING_CONFLICT. After the wait, everything is checked again, since a shutdown, the off latch or
+    // a disconnect() may have come first. A disconnect() in the join is seen below, as `live` is no longer this record.
     if (closing.size) {
       await allClosed()
-      if (mayNotStart()) return
+      if (mayNotStart() || epoch !== flightEpoch) return
     }
     try { policy.check() } catch (error) { return failClosed(error) }
     rejoinTimer = null
