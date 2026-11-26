@@ -2483,6 +2483,57 @@ for (const [name, interrupt] of [
   })
 }
 
+// Review of #191, round 8, finding 1: the same hand-off, held in the first drive of a join. Local input came while the join was out,
+// so the first drive finds delivery eligible, claims the message and waits for Pi to report it: the loop is out with no request in
+// flight, and nothing but the exit of the worker can end it. The exit is seen from the join, and not after a first drive that does
+// not end. Nothing is waited for: no timer runs and Pi reports nothing before the asserts, so chat is off, the footer says so and
+// no binding is published for the instance that ended.
+test("a worker that exits while the first drive holds a delivery in its hand-off fails chat closed at once, and no binding is published", async t => {
+  resetLatchAfter(t)
+  const { pi, emit, ctx, sent, notices, statuses } = fakePi({ holdSend: true })
+  const clock = manualTimeouts()
+  let starts = 0
+  const worker = fakeWorker({
+    answer: op => {
+      if (op === "pending") return { messages: [message.id] }
+      if (op === "claim") return {
+        dispatch: true, attempt_id: attempt, reservation_ms: 20_000,
+        messages: [{ ...message, room_id: joined.room_id, history_after: "history-cursor-1", body: "synthetic body", sender_session_id: "peer-1", created_at: message.created_at }],
+      }
+      return op === "status" ? { muted: false } : {}
+    },
+  })
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000, random: () => 0,
+    setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl,
+    startProcess: () => { starts += 1; return worker },
+  })
+  emit("session_start", {}, ctx)
+  emit("input", { source: "interactive" }, ctx) // while the join is out: delivery is eligible when it ends
+  const flight = lifecycle.connect() // the flight that session_start began
+  await flush()
+  assert.deepEqual(worker.requests.map(row => row.op), ["heartbeat", "pending", "claim", "status"], "the first drive is out, in the hand-off")
+  assert.equal(sent.length, 1, "the message is with Pi, and its report is held")
+  assert.notEqual(lifecycle.binding(), null, "the instance is live")
+  worker.release() // the worker ends by itself: its exit is the fault
+  await flush()
+  assert.equal(lifecycle.state(), "offline")
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+  assert.equal(notices.filter(text => text.startsWith("Agent Chat stopped")).length, 1, "chat is stopped once")
+  assert.equal(worker.stops, 1, "and the worker is stopped once")
+  assert.equal(lifecycle.binding(), null)
+  const event = { systemPromptOptions: { sections: {} } }
+  emit("before_agent_start", event)
+  assert.equal("agent_chat" in event.systemPromptOptions.sections, false, "no binding is published for the instance that ended")
+  emit("message_start", { message: { ...sent[0].payload, role: "custom" } }) // Pi reports the message at last
+  await flight
+  assert.equal(worker.requests.some(row => row.op === "settle"), false, "nothing is settled")
+  for (const timer of [...clock.log]) clock.run(timer) // every timer that is left, a rejoin's included
+  await flush()
+  await lifecycle.connect()
+  assert.equal(starts, 1, "and no worker starts")
+})
+
 test("the extension ends its instance on session_shutdown only, never on session_before_switch or session_before_fork", () => {
   const { handlers } = runtime("native-1")
   assert.ok(handlers.has("session_shutdown"))

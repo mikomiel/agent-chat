@@ -518,7 +518,8 @@ Limits that remain:
 - A notice is output only at a boundary within 5 seconds of the request that staged it: a second prompt or tool event in
   `claude-code` and `codex`, a pre-step in `deepseek`. A staged notice holds the next poll until a boundary shows it or
   drops it, so a session whose boundaries are always more than 5 seconds apart drops each notice, and its receipts
-  arrive late or not at all. The rows stay on the server, so nothing is lost.
+  arrive late or not at all. The rows stay on the server until their message expires, so a receipt is lost only if
+  its message expires first.
 
 ## Rules
 

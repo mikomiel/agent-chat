@@ -218,7 +218,10 @@ fits on `cli` fits on every route.
   ends it with the worker's cancel signal, and the pass sends no request while
   either is due. A state change that the comparison finds then is a heartbeat
   that fell due; a re-evaluation that finds nothing due ends nothing, a state that has
-  returned to the confirmed one included. The signal
+  returned to the confirmed one included. A change of the stop state is such a change:
+  a stop, an abort of the turn or the user's input that ends a stop ends the request at
+  once when it leaves a state that the worker has not confirmed, and ends nothing when it
+  returns the state to the confirmed one. The signal
   is repeated every 5 milliseconds until the worker
   answers, so a cancel that reaches the worker before it has read the request,
   which the worker drops, is followed by one that ends it. That is client-side
@@ -317,7 +320,8 @@ fits on `cli` fits on every route.
   falling due, such as heartbeats that are refused or a title that changes at
   every tick, heartbeat and delivery poll take turns and a receipts notice
   waits until the streak ends. Presence and deliveries keep their place;
-  receipts are late, not lost.
+  receipts are late, and lost only if their message expires first: the server
+  stops offering the receipt of an expired message.
 - Pi holds a `triggerTurn: false` message while a run is active and appends it
   at the end of the running turn, after the assistant message and every tool
   result, or when the run ends if that comes first (the Pi 1.5.0 and 1.5.2
@@ -360,10 +364,10 @@ two turn rules, which are read off the request trace alone), the replacement of 
 for each `session_start` reason (a
 reload during a rejoin, a close that never comes, calls whose waits end at different times,
 a disconnect that no later connect undoes and a delivery whose hand-off is held when the
-instance ends included), tree navigation and compaction, and sender
+instance ends, in the first drive of a join too, included), tree navigation and compaction, and sender
 receipts: the offer rules, the confirmation and the mark,
 one request per pass, that a receipts request gives way (to a due heartbeat and to a poll,
-and not to an entry that finds the state confirmed), goes last and does not give back the
+a stop or an abort included, and not to an entry that finds the state confirmed), goes last and does not give back the
 heartbeat's turn, and
 that a delivery and the binding are byte-identical with receipts pending. It
 needs no PostgreSQL, no service and no credential.

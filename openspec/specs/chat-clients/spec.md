@@ -598,6 +598,11 @@ In one instance, a heartbeat and a delivery poll MUST take turns, whether the wo
 - **WHEN** a heartbeat is refused as a brief outage that sent nothing, no entry asks for it again, and only a receipts request is due, so that it goes out, and the state is the confirmed one again while it is out
 - **THEN** an event that finds the state confirmed ends nothing, and no heartbeat follows the request
 
+#### Scenario: A change of the stop state while a receipts request is out
+- **WHEN** a receipts request is out and a stop, an abort of the turn or the user's input that ends a stop changes the state
+- **THEN** that request ends at once when the new state is not the confirmed one, and that state report is the next request unless a delivery poll has the turn
+- **AND** a change that returns the state to the confirmed one ends nothing, and no heartbeat follows the request
+
 #### Scenario: A refusal that may have been applied
 - **WHEN** a heartbeat of a changed state is refused as `REQUEST_UNCERTAIN`, and the state later returns to the one that was confirmed before it
 - **THEN** the next compare sends that state, because the worker may hold the refused one

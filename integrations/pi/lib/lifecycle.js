@@ -250,12 +250,16 @@ export function createAgentChat(pi, config, {
     else status("Agent Chat: ready")
   }
 
+  // A stop, an abort or local input that ends a stop. It asks for a compare of the state, and starts no loop, so a receipts request
+  // that is in flight is asked here whether it ends (`endReceiptsUnlessNext`), as `drive` asks it for every other entry.
   function setStopped(value) {
     if (stopped === value) return
     stopped = value
     if (joined) {
-      showPresence(chatState())
+      const state = chatState()
+      showPresence(state)
       asked = true
+      endReceiptsUnlessNext(state)
     }
   }
 
@@ -309,12 +313,24 @@ export function createAgentChat(pi, config, {
   }
 
   // Whether a heartbeat is due. It is read when the loop chooses its next request and when an entry asks what a receipts request in
-  // flight should do, and both ask here, so the two cannot differ. One was asked for outright (`beat`), or an entry asked for a
-  // compare and the state is not the one that the worker last confirmed on this record. `published` is that state as JSON, and null
-  // while it is unknown: before the first confirm, and after a refusal of a changed state that may have been applied. Nothing keeps
-  // the answer between two choices, so a state that has reverted to the confirmed one is not due, whatever was refused or asked on
-  // the way.
+  // flight should do (`endReceiptsUnlessNext`), and both ask here, so the two cannot differ. One was asked for outright (`beat`), or
+  // an entry asked for a compare and the state is not the one that the worker last confirmed on this record. `published` is that
+  // state as JSON, and null while it is unknown: before the first confirm, and after a refusal of a changed state that may have been
+  // applied. Nothing keeps the answer between two choices, so a state that has reverted to the confirmed one is not due, whatever was
+  // refused or asked on the way.
   const due = (record, text) => beat || (asked && text !== record.published)
+
+  // What an entry does with a receipts request that is in flight. A receipts request holds no heartbeat, but it would hold the
+  // flight, so the entry asks `nextRequest` what goes next, with that request counted as waiting, and ends it unless the answer is
+  // "receipts": the worker answers `refused` within milliseconds, and the loop takes what is due. The question is the loop's own,
+  // about the state as it is now, so an entry that finds nothing due ends nothing, and with no receipts request in flight there is
+  // nothing to ask. Every entry that can make a heartbeat due while the loop is out asks here: `drive`, which finds the loop busy,
+  // and `setStopped`, which sets the ask without starting the loop.
+  function endReceiptsUnlessNext(state) {
+    if (!reading) return
+    const text = JSON.stringify(heartbeatState(state))
+    if (nextRequest({ dirty: due(reading, text), pollDue, receiptsDue: true, beatSincePoll }) !== "receipts") reading.worker.cancel()
+  }
 
   async function drive({ heartbeat = false, poll = false } = {}) {
     if (!live || !joined || disabled()) return
@@ -329,15 +345,8 @@ export function createAgentChat(pi, config, {
       // state may be among them and would go out twice: the loop compares at its next pass, so a change seen during a slow
       // request is published right after it, ahead of a receipts request that waits and, unless that request was a heartbeat sent
       // since the last delivery poll pass, ahead of a delivery poll, and a change that has reverted by then sends nothing. A
-      // receipts request holds no heartbeat, but it would hold the flight, so the entry asks `nextRequest` what goes next, with
-      // that request counted as waiting, and ends it unless the answer is "receipts": the worker answers `refused` within
-      // milliseconds, and the loop takes what is due. The question is the loop's own, about the state as it is now, so a
-      // re-evaluation that finds nothing due ends nothing.
-      if (reading) {
-        const text = JSON.stringify(heartbeatState(state))
-        if (nextRequest({ dirty: due(reading, text), pollDue, receiptsDue: true, beatSincePoll }) !== "receipts")
-          reading.worker.cancel()
-      }
+      // receipts request in flight is the one request that this entry asks about, since it would hold the flight.
+      endReceiptsUnlessNext(state)
       return
     }
     busy = true
@@ -422,7 +431,7 @@ export function createAgentChat(pi, config, {
   function offerable() { return !pendingReceipts && chatState() === "busy" }
 
   // `reading` names the record from the write until the answer, so a heartbeat or a poll that falls due meanwhile ends the
-  // request, as `drive` decides with `nextRequest`.
+  // request, as `endReceiptsUnlessNext` decides with `nextRequest`.
   async function receiptsRequest(record, operation, fields) {
     reading = record
     try { return await request(record, operation, fields) } catch (error) {
@@ -606,6 +615,15 @@ export function createAgentChat(pi, config, {
     try {
       const result = await worker.ready
       if (live !== record || closed || disabled()) { endWorker(worker); return }
+      // A worker that exits while its instance is live turns chat off at once, wherever the loop is out. A request in flight
+      // fails with the exit, and a native hand-off that waits for Pi has none, so only this sees it. It is registered with the
+      // join, before the first drive, so that the first drive is watched as every later one is. It ends nothing that another path
+      // has ended: a failure that stops the instance, a rejoin, a shutdown and the off latch each clear `live` or set `closed` or
+      // the latch before the worker that they stopped closes, so that exit finds nothing to do.
+      worker.closed.then(() => {
+        if (live === record && !closed && !disabled())
+          failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
+      })
       joined = result
       lease.confirm(stamp)
       policy.succeeded()
@@ -618,10 +636,6 @@ export function createAgentChat(pi, config, {
       joined = null
       handleFailure(error)
     }
-    worker.closed.then(() => {
-      if (live === record && !closed && !disabled())
-        failClosed(Object.assign(new Error("CHAT_WORKER_EXITED"), { code: "CHAT_WORKER_EXITED", operation: "end" }))
-    })
   }
 
   function bind(ctx) {

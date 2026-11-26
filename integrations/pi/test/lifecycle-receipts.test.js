@@ -956,6 +956,90 @@ test("a state that returns to the confirmed one while the receipts request is ou
   assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts"], "and the state that is confirmed is not sent again")
 })
 
+// Review of #191, round 8, finding 2: a stop, an abort and local input change the state without starting the loop, so the entry that
+// makes a heartbeat due is not a call of `drive`. It asks what a receipts request in flight does all the same: the state is not the
+// one that the worker confirmed, so the request gives way, and the heartbeat of the stopped state goes right after it. The read is
+// held on a gate that nothing releases, so only the cancel can end it, and the cancel is asserted before the flight is awaited:
+// with no cancel nothing ends the read, and the flight would not settle.
+for (const [name, stop] of [
+  ["the signal of the turn aborts", s => {
+    const controller = new AbortController()
+    s.ctx.signal = controller.signal
+    s.emit("agent_start", {}, s.ctx)
+    controller.abort()
+  }],
+  ["the turn settles as aborted", s => s.emit("agent_settled", { aborted: true })],
+  ["an input that is not the user's arrives", s => s.emit("input", { source: "extension" }, s.ctx)],
+]) {
+  test(`when ${name} while a receipts read is in flight, the read ends at once and the heartbeat of the stopped state goes right after it`, async () => {
+    const s = await session({ rows: [row(1)] })
+    const start = await primed(s)
+    s.server.gates.receipts = held()
+    const flight = s.tick(0)
+    await flush()
+    assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts"], "the read is in flight, and the busy state is the confirmed one")
+    assert.deepEqual(s.cancels, [], "nothing has asked for it to end")
+    stop(s)
+    await flush()
+    assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "the stop makes a heartbeat due, so the read gives way")
+    await flight
+    assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "and that is the only cancel")
+    assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts", "heartbeat"], "the heartbeat goes the moment the read has ended")
+    assert.deepEqual(s.log.at(-1).fields.state, { title: "synthetic", native_state: "unknown", stopped: true, plan_mode: false })
+    assert.equal(s.workers.length, 1, "a cancelled read is not a failure: no rejoin")
+    assert.notEqual(globalThis[Symbol.for("agent-chat.pi.disabled")], true)
+  })
+}
+
+// The same holds for the mark. A mark goes in any state, so it can be in flight while the session is stopped. Local input ends the
+// stop: the state is not the one that the worker confirmed, so the mark gives way, the heartbeat of the resumed state goes right
+// after it, and the mark that was ended is not sent again before the next pass.
+test("when local input ends a stop while a receipts mark is in flight, the mark ends at once and the heartbeat of the resumed state goes right after it", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed, confirm: "later" })
+  await s.tick(0) // the notice is sent, and Pi has not yet reported it as output
+  s.confirm()
+  s.emit("agent_settled", { aborted: true }) // the turn is aborted: the session is stopped, and the mark waits
+  s.server.gates.receipts_delivered = held()
+  const start = s.log.length
+  const flight = s.tick() // the stopped state is sent, the delivery poll goes, and the mark is held
+  await flush()
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts_delivered"], "the mark is in flight, and the stopped state is the confirmed one")
+  assert.deepEqual(s.cancels, [], "nothing has asked for it to end")
+  s.emit("input", { source: "interactive" }, s.ctx) // the user types: the stop ends
+  await flush()
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts_delivered" }], "the resumed state is not the confirmed one, so the mark gives way")
+  await flight
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts_delivered" }], "and that is the only cancel")
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts_delivered", "heartbeat"], "the heartbeat goes the moment the mark has ended")
+  assert.deepEqual(s.log.at(-1).fields.state, { title: "synthetic", native_state: "busy", stopped: false, plan_mode: false })
+  assert.deepEqual(s.log.filter(entry => entry.op === "receipts_delivered").map(entry => entry.fields), [{ receipts: ids(feed) }], "the mark that was ended is not sent again before the next pass")
+  assert.equal(s.workers.length, 1, "a cancelled mark is not a failure: no rejoin")
+})
+
+// A stop that puts the state back where the worker holds it makes no heartbeat due, so it ends nothing, as an event that finds the
+// state confirmed ends nothing. The join confirmed the stopped state. The heartbeat of the busy state that local input made due was
+// refused as a brief outage, which sent nothing, so the worker still holds the stopped state, and the receipts read goes out with
+// the busy state unconfirmed and no entry asking for it. The abort puts the state back to the confirmed one.
+test("a stop that returns the state to the confirmed one while a receipts read is in flight ends nothing, and no heartbeat follows", async () => {
+  const s = await session({ rows: [row(1)] }) // the join confirmed the stopped state, and the input that ended the stop has asked for a compare
+  const start = s.log.length
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: the busy state is refused and stays unconfirmed
+  s.server.gates.receipts = held()
+  const flight = s.tick(0)
+  await flush()
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts"], "the busy state was refused, and the read is in flight")
+  assert.deepEqual(s.cancels, [], "nothing has asked for it to end")
+  s.emit("agent_settled", { aborted: true }) // the stop: the state is the one that the worker holds
+  await flush()
+  assert.equal(s.statuses.at(-1), "Agent Chat: stopped (type to resume)", "the footer shows the stop")
+  assert.deepEqual(s.cancels, [], "no heartbeat is due, so nothing ends the request in flight")
+  s.workers[0].endHeld() // the request ends as it would of itself, and not by a cancel
+  await flight
+  assert.deepEqual(s.cancels, [])
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts"], "and the state that is confirmed is not sent again")
+})
+
 // A delivery poll and a receipts request both wait when a heartbeat is refused: the poll goes first, the retry follows it, and the
 // receipts request follows the retry. A poll tick sets both at once, so this is the order after every tick that finds a change.
 test("a refused heartbeat with a delivery poll and a receipts request both waiting: the poll, then the retry, then the receipts request", async () => {
@@ -978,7 +1062,8 @@ test("a refused heartbeat with a delivery poll and a receipts request both waiti
 
 // Review of #191, round 7, finding 1: the reviewer's run sent a delivery poll, the state A (refused), the state B (refused), a
 // delivery poll, A, and then the receipts request. That is the order of the scheduler: the receipts request is the last of the
-// three, so it goes only when no heartbeat and no delivery poll is due, whatever was refused before. It is late, and not lost.
+// three, so it goes only when no heartbeat and no delivery poll is due, whatever was refused before. It is late, and lost only if
+// its message expires first: the server feed stops offering the receipt of an expired message.
 test("the receipts request goes last: a state that is due again and a delivery poll both go before it, and it goes once nothing is due", async () => {
   const s = await session({ rows: [row(1)] })
   const start = await primed(s)
@@ -1010,7 +1095,7 @@ test("the receipts request goes last: a state that is due again and a delivery p
   assert.deepEqual(opsSince(s, start).filter(op => op !== "tick"), ["pending", "heartbeat", "heartbeat", "pending", "heartbeat", "receipts"],
     "a delivery poll, A, B, a delivery poll, A, and the receipts request last")
   assert.deepEqual(s.cancels, [], "no receipts request was in flight to end")
-  assert.equal(s.receiptSends().length, 1, "the request was late and not lost: its row is shown")
+  assert.equal(s.receiptSends().length, 1, "the request was late, and a receipt is lost only if its message expires first: its row is shown")
 })
 
 // A heartbeat and a delivery poll take turns, and a receipts request between them gives no turn back: the heartbeat of this run
