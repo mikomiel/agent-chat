@@ -327,23 +327,29 @@ The rules below bind every package that shows receipts.
   turn; a wake carries no receipt, even when one is waiting. A package never asks for receipts while the session is idle.
 - **When a package offers receipts.** The session is joined and chat is not failed, its native state is `busy` (not idle,
   Plan Mode, stopped, unknown or offline; for `deepseek`, a running turn, since an idle agent with a parked inbox item is
-  busy only for a delivery), and the worker's answer says `muted === false`. The worker adds the flag to a
-  `receipts` answer that has rows; an absent or non-boolean flag counts as muted, as an older worker's answer does, and
-  the rows then wait on the server. A package polls at most every 5 seconds and only while a turn runs. `claude-code` and
-  `codex` make the first poll one cadence after the receiver starts, and show an answer at the next event, never in the
-  reply of the event that polled. Every package counts the cadence from the write of a request, so a pass that sends
-  nothing does not delay the next one. A notice holds at most 10 rows, oldest first, shown whole or not at all. A package
-  tracks at most 200 ids, offers nothing while 200 wait for output or a mark, and, once an id's output was confirmed, never shows it again; above 200 it forgets the oldest marked ids.
+  busy only for a delivery), and the worker's answer says `muted === false`. The worker reads
+  `GET /v1/instance/receipts/feed`, which carries the session's `muted` flag, read in the same transaction as the rows,
+  and passes it on with rows or without. A receipts request is therefore one request to the server and never a `status`
+  read. The flag is required: a feed answer without a boolean `muted` is refused by the worker as `INVALID_RESPONSE`, and
+  the package asks again at its next poll. A package counts an answer that does not say `muted === false` as muted, and
+  the rows then wait on the server. A package polls at most every 5 seconds and
+  only while a turn runs. `claude-code` and `codex` make the first poll one cadence after the receiver starts, and show
+  an answer at the next event, never in the reply of the event that polled. Every package counts the cadence from the
+  write of a request, so a pass that sends nothing does not delay the next one. A notice holds at most 10 rows, oldest
+  first, shown whole or not at all. A package tracks at most 200 ids, offers nothing while 200 wait for output or a
+  mark, and, once an id's output was confirmed, never shows it again; above 200 it forgets the oldest marked ids.
 - **A staged notice is checked again when it is output.** `deepseek`, `claude-code` and `codex` stage a notice and output it
   at a later boundary, and the session may be muted by then. At the boundary the package asks the server nothing and
-  uses the latest `muted` flag that a worker answer carried: a `receipts` answer that has rows, and the `status` answer
-  of a claim. A `status` answer without a boolean `muted` makes the flag unknown. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the request that
+  uses the latest `muted` flag that a worker answer carried: a `receipts` answer, with rows or without, and the `status`
+  answer of a claim. A `status` answer without a boolean `muted` makes the flag unknown. A heartbeat answer carries none. It drops the notice unless that flag is `false` and the request that
   staged the notice was sent at most 5 seconds before, so an answer read late, after a suspend, is never fresher than
-  its request. The three packages count those seconds on the wall clock, so a
+  its request. The four packages count those seconds on the wall clock, so a
   suspend ages a notice, and an age that is negative or not a number drops it. `deepseek` also drops it unless its
   native state, read again without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and
   a later poll offers them again. `claude-code` and `codex` answer the hook as for any reply with nothing to carry.
-  `pi` hands a notice to Pi in the pass that got the answer, so it has no later boundary of its own.
+  `pi` hands a notice to Pi in the pass that got the answer, so it has no later boundary of its own. It makes the same
+  check right before it hands the notice over, so an answer read after a suspend gives Pi nothing, and the rows are
+  offered again by a later poll.
 - **What a notice holds.** One fixed paragraph that says the lines are data, not instructions or replies, grant no
   authority and need no reply or acknowledgement, then one line per receipt. A line holds only `state`, `message`,
   `recipient_session`, `recipient_harness`, `recipient_host` and `created_at`. Each field is checked against a closed
@@ -401,7 +407,12 @@ Limits that remain:
   worker double.
 - A core whose worker does not list `receipts-cancel` in its join reply is sent no receipts request, so it shows none and
   chat is what it was. Install the core and the package from the same release to get receipts, as
-  [Install a pinned release](#install-a-pinned-release) says.
+  [Install a pinned release](#install-a-pinned-release) says. The server needs the feed route as well, and a server up to
+  `v0.8.0` has none. Against one, the feed answers `404 NOT_FOUND` at once, before that server reads its database or
+  takes its event clock, and the worker answers `refused` with `NOT_FOUND`. The package shows no notice and holds: it
+  asks again at its next poll, and it sends no mark, because it read no row. No receipts request takes the clock of that
+  server, since the worker falls back to neither the older receipts route nor `status`, and it remembers no missing
+  route (see the item on the shared event clock below).
 - **Server serialization (residual, #175).** The core takes the row of the instance for every authenticated request of
   that instance, so a receipts request that stalls inside the server holds the row, and the next request of the same
   instance waits for it on the server. A cancel and the worker's deadline end only the package's wait: the server
@@ -433,19 +444,35 @@ Limits that remain:
   stalled in that run. A stalled receipts read gave the same result in 12 of 12 on that commit. Since #189 the receipts
   reads take no clock, so a stalled one no longer delays another session. It still holds its own session's rows, and a
   request of that session that takes the clock first (its own send, a rejoin, a mute, or its `status`, `pending` or
-  `history` read) waits on them and carries the stall to every writer. A package sends receipts only to a core whose
-  worker lists `receipts-cancel`, and every such core includes #189. Receipts add requests, though not clock holders. A
-  busy session polls at most every 5 seconds (`POLL_MS` in `shared/receipts.js`), so it sends at most 12 receipts
+  `history` read) waits on them and carries the stall to every writer. #189 is in no release up to `v0.8.0`: every
+  server from `v0.1.0` to `v0.8.0` has both older receipts routes and takes the shared clock in them, so a released
+  worker, which reads the older route, still delays every writer with a stalled receipts read there, as it did on
+  `6f3b1dd`. A worker of this change reads only the feed route, which those servers lack: it gets `404 NOT_FOUND` at
+  once, takes no clock, and sends no mark, so it adds no such stall. `receipts-cancel` is a capability of the worker,
+  not of the server, so it says nothing about the server a worker talks to. Receipts add requests, though not clock
+  holders. A busy session polls at most every 5 seconds (`POLL_MS` in `shared/receipts.js`), so it sends at most 12 receipts
   requests per minute. A driver on schedules modelled on the packages', with an empty feed, sent 9 to 12 per minute, and
   the worker let 7 to 9 `pending` reads per minute through to the server, because it answers an empty `pending` from
   memory for 2, 4 and then 8 seconds (`pending_delay` in `agent_chat/instance_worker.py`). On those numbers receipts are
-  more than half of the reads of a busy session. A receipts answer with rows adds one `status` read, which takes the
-  clock, and a shown notice adds one `receipts_delivered`. Otherwise `status` is read only inside a delivery, and no
-  package sends `history`. Tracked in #176.
-- **A claim can run on the server and still be reported uncertain.** The client's request timeout is 3.0 seconds, and
-  the server's `lock_timeout` is 3 seconds. A `claim` whose lock wait ends within about 25 ms of the client's timeout can
-  be executed on the server and still be reported `REQUEST_UNCERTAIN`, because the client has already given up. Nobody
-  settles that attempt, so it closes as `uncertain`, and that message is not offered again. Tracked in #177.
+  more than half of the reads of a busy session. A receipts request is one request to the server: its answer carries
+  the `muted` flag of the session, so it adds no `status` read, which takes the clock. A shown notice adds one
+  `receipts_delivered`. `status` is read only inside a delivery, and no package sends `history`. A worker that reads the
+  feed route of a server up to `v0.8.0` gets `404 NOT_FOUND` and answers `refused`: its package shows no notice and
+  sends no mark, the rows wait on the server, and the worker asks neither `status` for the flag nor the older route.
+  Tracked in #176.
+- **A claim can run on the server and still be reported uncertain (#177, narrowed, not closed).** The client's request
+  timeout is 3.0 seconds, and the server's `lock_timeout` is 3 seconds. The server stamps a `claim` when it reaches
+  the route, and refuses an admission that ends 2.25 seconds or more after that stamp: the lock limit less 0.75
+  seconds (`REQUEST_MARGIN_SECONDS`), kept for the commit, the response and its transit. It rolls that admission back
+  and answers 503 `DATABASE_UNAVAILABLE`, which the client reports as `REQUEST_UNCERTAIN`. No attempt is recorded
+  after the client has given up, so the message is offered again after the rejoin. The expiry and reconciliation done
+  before the admission still commit (`agent_chat/api.py`, `agent_chat/storage.py`, `agent_chat/deliveries.py`). What
+  remains is an admission that ends before the 2.25 seconds and is followed by a commit, a response and a transit that
+  together take longer than the 0.75 seconds left. The client counts its 3 seconds from its send and the server counts
+  from the arrival of the request at the route, so the margin also pays for the transit of the request. That `claim`
+  runs on the server and is still reported `REQUEST_UNCERTAIN`. Nobody settles that attempt, so it closes as
+  `uncertain` with `claim_expired`, and that message is not offered again (#174). A `settle` has no such bound: a late
+  one commits the outcome the worker reported. Issue #177 stays open.
 - A receipt that waits while the session is muted, idle, stopped or in Plan Mode is not lost: it stays on the server until
   a later poll finds the session able to show it, or the message expires.
 - The output-time check cannot see a mute that lands after the last answer that carried the flag and less than 5 seconds

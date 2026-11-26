@@ -415,6 +415,32 @@ test("nothing is output when the session shut down while the poll was in flight"
   assert.equal(s.sent.length, 0)
 })
 
+// The age rule the other packages apply since 3a77c6a. Pi hands a notice to Pi in the pass that got the answer, so the check
+// sits just before the message. The age is counted from before the request was written, so an answer that the lifecycle
+// reads late, after the host suspended, is not fresher than its request: the mute flag it carries may be stale.
+test("a notice is as old as the request that asked for it: an answer read after a suspend is dropped, and its row is offered again", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed })
+  let answerLate
+  s.server.receiptsReply = new Promise(resolve => { answerLate = resolve })
+  const tick = s.tick(0)
+  await flush()
+  assert.equal(s.count("receipts"), 1, "the poll is waiting for its answer")
+  answerLate({ receipts: feed, muted: false }) // the worker wrote its answer ...
+  s.clock.t += 60_000 // ... and the host suspended before the lifecycle read it
+  await tick
+  assert.equal(s.sent.length, 0, "the notice is older than one cadence, counted from its request: Pi is given nothing")
+  assert.equal(s.count("receipts_delivered"), 0, "and a dropped notice is not marked")
+  // Its id was never issued, so the next poll offers the same row: it is then shown, confirmed and marked.
+  s.server.receiptsReply = null
+  await s.tick()
+  assert.equal(s.count("receipts"), 2, "the id was never marked: the feed is asked again")
+  assert.equal(s.receiptSends().length, 1, "and the same row is shown")
+  assert.ok(s.receiptSends()[0].payload.content.includes(feed[0].message_id))
+  await s.tick()
+  assert.deepEqual(s.log.find(entry => entry.op === "receipts_delivered").fields, { receipts: ids(feed) })
+})
+
 test("a thrown worker error on a receipts request takes the rejoin path, like any request", async t => {
   t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] })
   for (const op of ["receipts", "receipts_delivered"]) {

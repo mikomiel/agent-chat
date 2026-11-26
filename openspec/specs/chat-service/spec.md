@@ -436,6 +436,18 @@ The service MUST record a sender receipt, at most once per message, recipient an
 - **THEN** an event write by an instance of another session, such as the settlement of its delivery attempt, completes without waiting for that transaction
 - **AND** the write is recorded while the receipts transaction is still open
 
+### Requirement: The feed route reports the mute flag of its session
+`GET /v1/instance/receipts/feed` MUST answer the sender's undelivered receipts with the `muted` flag of the sender's own session, always present and read in the same transaction as the rows, so that a reader needs no `status` request, which takes the event clock. `GET /v1/instance/receipts` MUST keep its released answer, which has no `muted`.
+
+#### Scenario: The feed route reports the mute flag
+- **WHEN** the sender's instance reads the feed route before its session is muted, and again after
+- **THEN** the first answer carries `muted` as `false` and the second as `true`, whether or not the answer has rows
+- **AND** the answer needs no `status` request for the flag
+
+#### Scenario: The released route keeps its answer
+- **WHEN** the sender's instance reads `GET /v1/instance/receipts`, muted or not
+- **THEN** the answer has exactly the keys `instance_id`, `session_id` and `receipts`, and the same rows as the feed route
+
 ### Requirement: Receipt policy follows the message kind
 The service MUST create sender receipts by default for `question` and `consultation`. For `message` and `reply` it MUST create them only when the sender set `receipts` to true. It MUST NOT create them for `status`, the coordination kinds, room state or a message published without a session.
 

@@ -600,12 +600,25 @@ A package that shows sender receipts MUST offer them only while the session is j
 - **AND** the receipts stay pending on the server
 
 ### Requirement: A staged sender receipts notice is checked again when it is output
-A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest worker answer's `muted` flag is `false` (a `status` answer without a boolean one makes it unknown) and the answer that staged it came at most 5 seconds before. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
+A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest worker answer's `muted` flag is `false` (a `status` answer without a boolean one makes it unknown) and the request that asked for the notice was written at most 5 seconds before. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
 
 #### Scenario: A mute after the notice was staged
-- **WHEN** a `status` answer says the session is muted, or more than 5 seconds pass, after the answer that staged a notice and before its output
+- **WHEN** a `status` answer says the session is muted, or more than 5 seconds pass after the request that staged a notice was written, and before its output
 - **THEN** no notice is output, and `claude-code` and `codex` answer the hook as for a reply with nothing to carry
 - **AND** the ids are not marked, and a later poll offers the rows again
+
+#### Scenario: An answer read late
+- **WHEN** a package reads a `receipts` answer more than 5 seconds after it wrote the request, for example after the host was suspended
+- **THEN** the notice that answer staged is dropped at its output, because it is as old as its request
+- **AND** the ids are not marked, and a later poll offers the rows again
+
+### Requirement: `pi` checks a receipts notice right before it hands it to Pi
+`pi` hands a receipts notice to Pi in the pass that got the answer, so it has no later boundary. It MUST make the check of a staged notice right before it hands the notice over, and MUST NOT hand over a notice that fails it. A notice it drops MUST NOT be marked, and its rows MUST be offered again.
+
+#### Scenario: A `pi` answer read after a suspend
+- **WHEN** `pi` reads a `receipts` answer more than 5 seconds after it wrote the request
+- **THEN** `pi` hands no notice to Pi and marks no id
+- **AND** a later poll offers the rows again
 
 ### Requirement: `deepseek` outputs a staged receipts notice only into a running turn
 `deepseek` MUST also drop a staged receipts notice at output unless its native state, read without side effect, is a running turn outside Plan Mode. A notice it drops MUST NOT be marked, and its rows MUST be offered again.

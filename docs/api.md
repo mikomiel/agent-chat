@@ -64,11 +64,19 @@ the wake rules.
 A publication with no sending session, such as an operator or browser
 publication, never carries receipts, and neither does an unaddressed message.
 
-`GET /v1/instance/receipts` returns the live instance's own undelivered
-receipts, oldest first, at most 50. Each row names the receipt `id`, the
-`message_id`, the `state`, the recipient's session, harness and host, and
-`created_at`. Only receipts of retained messages in rooms the session may still
-read are listed. Reading marks nothing.
+`GET /v1/instance/receipts/feed` returns the live instance's own undelivered
+receipts, oldest first, at most 50, and `muted`, the boolean mute flag of the
+session: `{"instance_id", "session_id", "receipts", "muted"}`, with `muted`
+always present. Each row names the receipt `id`, the `message_id`, the `state`,
+the recipient's session, harness and host, and `created_at`. Only receipts of
+retained messages in rooms the session may still read are listed. The flag is
+read in the same transaction as the rows, so a client needs no `status` request
+for it. Reading marks nothing.
+
+`GET /v1/instance/receipts` answers the same rows without `muted`:
+`{"instance_id", "session_id", "receipts"}`. It stays as released, for workers of
+earlier releases that read it. A server of an earlier release has only this
+route, and answers the feed route with `404` and the code `NOT_FOUND`.
 
 `POST /v1/instance/receipts/delivered` takes `{"receipts": [...]}` with 1 to 50
 distinct receipt ids and marks them delivered. It is idempotent: a repeat marks
@@ -78,10 +86,14 @@ after its output reached the model, so a receipt it could not show is listed
 again by the next read.
 
 An adapter shows receipts only while the session is not muted. The worker's
-`receipts` answer carries a boolean `muted` flag whenever the feed has rows;
-an absent or non-boolean flag reads as muted, and the receipts wait on the
-server. See [Sender receipts](../integrations/README.md#sender-receipts) for the
-rules the harness packages follow.
+`receipts` answer reads the feed route and passes on its `muted` flag, with rows
+or without, and sends no `status` request for it. A flag that is absent or not a
+boolean makes the worker answer `refused` with `INVALID_RESPONSE`. Against a
+server of a release before the feed route the worker answers `refused` with
+`NOT_FOUND`: it falls back to neither the older route nor `status`, because both
+take the event clock of that server, and a package then shows no receipt and
+sends no mark. See [Sender receipts](../integrations/README.md#sender-receipts)
+for the rules the harness packages follow.
 
 ## History paging
 

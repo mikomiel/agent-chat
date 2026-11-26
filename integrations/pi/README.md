@@ -137,7 +137,9 @@ fits on `cli` fits on every route.
   message with `triggerTurn: false`, so they never start a turn. It asks only
   while Pi's native state is busy and shows rows only when the worker's answer
   says the session is not muted: an idle, stopped, Plan Mode, unknown or muted
-  session leaves them on the server. After Pi's `message_start` carries the
+  session leaves them on the server. An answer that is read more than 5 seconds
+  after its request was written, as after a suspend, is dropped before Pi gets
+  it, and a later poll offers its rows again. After Pi's `message_start` carries the
   message's own marker object, the next pass marks exactly those ids delivered;
   a refused or failed mark is sent again at the next pass. A pass sends one
   request, the mark that waits or else the poll, so a mark that keeps failing

@@ -77,10 +77,15 @@ _UNDELIVERED = """
 """
 
 
-def sender_feed(db: Connection[dict[str, Any]], actor: Actor) -> dict[str, Any]:
+def sender_feed(db: Connection[dict[str, Any]], actor: Actor, *, with_muted: bool = False) -> dict[str, Any]:
     """The live instance's own undelivered receipts, oldest first; reading marks nothing delivered.
 
     Only receipts of retained messages in rooms the session may still read are shown.
+
+    `with_muted` adds the session's `muted` flag, because a receipt waits while its session is muted. The flag is read
+    under the session row lock that `lock_agent` holds, so it cannot change before this read ends, and a reader needs
+    no `status` request for it, which takes the event clock. `GET /v1/instance/receipts/feed` asks for it. The route
+    of the released workers, `GET /v1/instance/receipts`, keeps its answer without it.
 
     It takes no event clock, which a stalled read would hold against every event writer (#176): the row locks of
     `lock_agent` and `visible` carry the authorization, so a revocation still waits for this read and a read that
@@ -93,7 +98,12 @@ def sender_feed(db: Connection[dict[str, Any]], actor: Actor) -> dict[str, Any]:
         lock_agent(db, actor)
         rooms = [room["id"] for room in visible(db, actor)]
         rows = db.execute(_UNDELIVERED, (actor.session_id, rooms, RECEIPT_FEED_LIMIT)).fetchall()
-        return {"session_id": actor.session_id, "instance_id": actor.instance_id, "receipts": rows}
+        feed: dict[str, Any] = {"session_id": actor.session_id, "instance_id": actor.instance_id, "receipts": rows}
+        if with_muted:
+            session = db.execute("SELECT muted FROM agent_chat.sessions WHERE id = %s", (actor.session_id,)).fetchone()
+            assert session is not None  # `lock_agent` holds the row
+            feed["muted"] = session["muted"]
+        return feed
 
 
 def mark_delivered(db: Connection[dict[str, Any]], actor: Actor, request: ReceiptDelivery) -> dict[str, Any]:

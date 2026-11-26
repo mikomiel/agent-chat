@@ -365,6 +365,14 @@ def create_app(
         # The sender's non-waking receipt ledger is independent of delivery admission: an ack needs no claim.
         return receipts.sender_feed(db, authenticate(db, token))
 
+    @app.get("/v1/instance/receipts/feed")
+    def sender_receipts_feed(
+        token: Annotated[str, Depends(bearer)], db: Annotated[Connection[dict[str, Any]], Depends(connection)]
+    ):
+        # The same ledger with the session's `muted` flag. A server of an earlier release answers NOT_FOUND here from
+        # its router, while the route above keeps its released answer for the workers of those releases.
+        return receipts.sender_feed(db, authenticate(db, token), with_muted=True)
+
     @app.post("/v1/instance/receipts/delivered")
     def sender_receipts_delivered(
         payload: ReceiptDelivery,

@@ -343,9 +343,15 @@ def _receipt(row: dict[str, Any]) -> dict[str, str]:
 
 
 def receipts(instance: JoinedInstance, *, deadline: float | None = None) -> dict[str, Any]:
-    """The session's own undelivered sender receipts, oldest first. Reading marks nothing delivered."""
+    """The session's own undelivered sender receipts, oldest first, and its `muted` flag.
+
+    Reading marks nothing delivered. It reads `GET /v1/instance/receipts/feed`, which carries the flag, so no `status`
+    request is needed for it. The flag is required and must be a boolean, else the answer is INVALID_RESPONSE. A server
+    of an earlier release has no such route and answers NOT_FOUND at once, before it reads the database or takes the
+    event clock. There is no fallback.
+    """
     result = _request(
-        instance, "GET", "/v1/instance/receipts", invalid="INVALID_RESPONSE", deadline=deadline
+        instance, "GET", "/v1/instance/receipts/feed", invalid="INVALID_RESPONSE", deadline=deadline
     )
     try:
         rows = result["receipts"]
@@ -354,9 +360,12 @@ def receipts(instance: JoinedInstance, *, deadline: float | None = None) -> dict
         items = [_receipt(row) for row in rows]
         if len({item["id"] for item in items}) != len(items):
             raise ValueError("duplicate receipt")
+        muted = result["muted"]
+        if type(muted) is not bool:
+            raise ValueError("invalid muted flag")
     except (ValueError, TypeError, KeyError, AttributeError):
         raise ChatError("INVALID_RESPONSE") from None
-    return {"receipts": items}
+    return {"receipts": items, "muted": muted}
 
 
 def receipts_delivered(

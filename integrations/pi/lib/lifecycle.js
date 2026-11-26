@@ -325,11 +325,20 @@ export function createAgentChat(pi, config, {
 
   async function offerReceipts() {
     const record = live
+    // The notice is as old as the request that asked for it: its age is counted from here, before the request is written. An
+    // answer read late, after a suspend, is then never fresher than that request, and its mute flag cannot look new.
+    const askedAt = now()
     const answer = await receiptsRequest("receipts")
-    if (live !== record || !offerable()) return
+    if (live !== record) return
+    // The flag of this answer is the latest known, whether or not the turn it was asked for is still running.
+    receiptState = receipts.muteSeen(receiptState, answer)
+    if (!offerable()) return
     const rows = receipts.offer(receiptState, answer)
     const notice = rows.length ? renderReceiptNotice(rows, MAX_CONTEXT_BYTES) : null
     if (notice === null) return
+    // Pi is given the message in this pass, so this is the one place to check the notice again. One older than a cadence is
+    // dropped before it is issued: its ids stay unmarked, and a later poll offers them again.
+    if (!receipts.showable(receiptState, askedAt, now())) return
     // Object identity binds the confirmation to this one output, as for a delivery. `triggerTurn: false` never starts a turn:
     // Pi (1.5.0 and 1.5.2, sendCustomMessage) appends the message once the running turn's tool results are in, or at once when
     // no turn runs, and emits message_start with this same details object. The state is set before the call because the

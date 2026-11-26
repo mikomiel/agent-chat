@@ -50,8 +50,8 @@ IDLE_SECONDS = 90
 # which `_settle` sends again itself, so it has no streak either. Receipts are advisory and have no streak: a receipt
 # read or mark that fails, whatever the code or the length of the failure, answers `refused` and never ends the
 # worker, because the parent offers the receipt again at its next poll. Liveness stays with heartbeat, pending
-# and claim, which fail closed. The receipts read includes the session's mute flag (`_receipts_with_mute`), so a
-# failed mute read is the same refusal, not the fatal `status` request.
+# and claim, which fail closed. The receipts read carries the session's mute flag, so a parent never asks `status`
+# for it: `status` is fatal in this worker, and a failed one would end the session over an advisory receipt.
 PENDING_OUTAGE = frozenset({"TRANSPORT_UNAVAILABLE", "SERVICE_UNAVAILABLE"})
 HEARTBEAT_OUTAGE = PENDING_OUTAGE | {"REQUEST_UNCERTAIN"}
 RECEIPTS_OPERATIONS = frozenset({"receipts", "receipts_delivered"})
@@ -74,16 +74,24 @@ class _ReceiptsCancelled(Interrupted):
     """What CANCEL_SIGNAL raises inside a receipts request. SIGTERM and the alarm raise a plain `Interrupted`."""
 
 
-def _deferrable(handler: Callable[[int, Any], None]) -> Callable[[int, Any], None]:
+def _deferrable(
+    handler: Callable[[int, Any], None], arrived: Callable[[], None] | None = None
+) -> Callable[[int, Any], None]:
     """Wrap a handler that raises, so that the client can hold a call back while it starts a request's timer thread.
 
     An exception from a handler is not safe inside `Thread.start`. The wrapper asks the client first
     (`defer_signal`). A call that the client holds back is recorded and returns with nothing changed; the client calls
-    the handler again once the start is over. Only that call latches, records or raises, so each flag is set once.
-    With nothing held back, a call goes straight to the handler.
+    the handler again once the start is over. Only that call latches or raises, so a cancel's latch is set once. With
+    nothing held back, a call goes straight to the handler.
+
+    `arrived` runs first on every call, held back or not, and only records that the signal came, which is safe inside
+    the start. A signal that ends the worker needs it: the replay of a held signal can be cut short by a cancel that
+    runs first, and the worker must have recorded the signal by then.
     """
 
     def run(signum: int, frame: Any) -> None:
+        if arrived is not None:
+            arrived()
         if not defer_signal(signum):
             handler(signum, frame)
 
@@ -275,24 +283,6 @@ def _delivery(
     raise ChatError("INVALID_REQUEST")
 
 
-def _receipts_with_mute(instance: instance_client.JoinedInstance, *, deadline: float) -> dict[str, Any]:
-    """The receipt feed, and the session's `muted` flag when the feed has rows, as one answer.
-
-    A receipt waits while the session is muted, so the parent needs the flag before it shows one. `status` is a
-    fatal request in this worker: a parent that asked for it separately would end the session over an advisory
-    receipt. The flag is read here instead, inside the receipt refusal, so a failed or malformed read answers
-    `refused` for the whole request and the worker keeps serving. An empty feed has nothing to hold, so it needs no
-    flag. An older worker never sends one, which a parent must read as muted.
-    """
-    feed = instance_client.receipts(instance, deadline=deadline)
-    if feed["receipts"]:
-        muted = instance_client.status(instance, deadline=deadline).get("muted")
-        if type(muted) is not bool:
-            raise ChatError("INVALID_RESPONSE")
-        feed["muted"] = muted
-    return feed
-
-
 def main() -> int:
     instance = None
     directory: Path | None = None
@@ -314,18 +304,16 @@ def main() -> int:
     cancel_window = "latch"
     cancel_latched = False  # a cancel arrived that no request has answered; a receipts request that follows answers it
 
-    def _terminate(signum: int, frame: Any) -> None:
+    def _note_terminated() -> None:
         # SIGTERM makes the blocked request fail like a transport error. Record it so it is never tolerated.
         nonlocal terminated
         terminated = True
-        _interrupt(signum, frame)
 
-    def _alarm(signum: int, frame: Any) -> None:
+    def _note_alarmed() -> None:
         # The alarm also reaches a receipts request as a failed transport. Record it, so that `_receipt` ends the
         # worker on it instead of answering `refused`.
         nonlocal alarmed
         alarmed = True
-        _interrupt(signum, frame)
 
     def _outage(op: str, error: ChatError, codes: frozenset[str]) -> bool:
         if terminated or error.code not in codes:
@@ -371,8 +359,10 @@ def main() -> int:
         finally:
             cancel_latched = False  # whatever this request's signal was, it is answered
 
-    signal.signal(signal.SIGALRM, _deferrable(_alarm))
-    signal.signal(signal.SIGTERM, _deferrable(_terminate))
+    # A fatal signal records itself when it arrives, also when the client holds its raise back: a cancel that runs
+    # first in the replay would otherwise leave `_receipt` with no fatal flag, and it would answer `refused`.
+    signal.signal(signal.SIGALRM, _deferrable(_interrupt, _note_alarmed))
+    signal.signal(signal.SIGTERM, _deferrable(_interrupt, _note_terminated))
     signal.signal(CANCEL_SIGNAL, _deferrable(_cancel))
     signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
     try:
@@ -450,7 +440,7 @@ def main() -> int:
                 result = instance_client.status(instance)
             elif operation == "receipts" and set(request) == {"id", "op"}:
                 # Receipts never wake: the parent outputs them at its next native boundary, then marks them.
-                result = _receipt(_receipts_with_mute, instance)
+                result = _receipt(instance_client.receipts, instance)
             elif operation == "receipts_delivered" and set(request) == {"id", "op", "receipts"}:
                 receipts = ReceiptDelivery(receipts=request["receipts"])
                 # A refusal marks nothing: the parent keeps its evidence and marks again at its next poll.

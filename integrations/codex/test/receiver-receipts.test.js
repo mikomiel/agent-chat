@@ -353,6 +353,22 @@ for (const [name, reply] of [
   })
 }
 
+// A server of a release before the feed route answers NOT_FOUND to it, and the worker passes that on as a refusal. No answer
+// ever carried a row, so nothing is staged, tracked or marked. Every later poll asks again, and chat stays on.
+test("a NOT_FOUND refusal of the feed shows no notice and sends no mark, and every later poll asks again", async () => {
+  const r = await ready({ rows: [rcpt(1)] })
+  r.server.receipts = { refused: "NOT_FOUND" }
+  for (let polls = 1; polls <= 3; polls += 1) {
+    await r.op(turn())
+    assert.equal(r.count("receipts"), polls, "the feed is asked")
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }], "and nothing is shown")
+    await r.clock.advance(POLL_MS)
+  }
+  assert.equal(r.count("receipts_delivered"), 0, "no mark is sent")
+  assert.equal(r.worker.bootIds.length, 1, "the same worker keeps serving")
+  assert.notEqual(r.receiver.state(), "offline")
+})
+
 test("a row that fails the notice's checks is never shown, and an answer that is not a list shows nothing", async () => {
   const r = await ready()
   const replies = [

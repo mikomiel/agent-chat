@@ -73,9 +73,10 @@ export function offer(state, answer) {
 }
 
 /**
- * The state after a worker answer. An answer that carries a `muted` key, a `receipts` answer that has rows or a `status`
- * answer, replaces the latest mute flag, whatever its value; every other answer, or a value that is no object, changes
- * nothing. It reads and never throws, so a package may call it on any answer, between a claim and its settle too.
+ * The state after a worker answer. An answer that carries a `muted` key replaces the latest mute flag, whatever its
+ * value: a `receipts` answer does, with rows or without, and so does a `status` answer a package maps to one. Every
+ * other answer, or a value that is no object, changes nothing. It reads and never throws, so a package may call it on
+ * any answer, between a claim and its settle too.
  */
 export const muteSeen = (state, answer) => (answer !== null && typeof answer === "object" && "muted" in answer ? { ...state, muted: answer.muted } : state)
 

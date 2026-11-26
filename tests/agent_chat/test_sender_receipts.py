@@ -303,6 +303,53 @@ def test_feed_and_delivered_marks_are_owner_scoped_and_idempotent_over_http(proc
     assert http_api("GET", "/v1/instance/receipts", token=sender_token)[1]["receipts"] == []
 
 
+def test_the_feed_route_reports_the_muted_flag_of_its_own_session_over_http(process_api, credentials, register):
+    """A receipt waits while its session is muted, so the feed route carries the flag: a reader needs no `status`."""
+    http_api = process_api.request
+    sender_token, sender = register(process_api, credentials, "sender")
+    target_token, target = register(process_api, credentials, "target")
+
+    def flags():
+        feeds = [
+            http_api("GET", "/v1/instance/receipts/feed", token=token)[1] for token in (sender_token, target_token)
+        ]
+        assert all(set(feed) == {"instance_id", "session_id", "receipts", "muted"} for feed in feeds)
+        return [feed["muted"] for feed in feeds]
+
+    assert flags() == [False, False]
+    assert http_api("POST", f"/v1/sessions/{sender['session_id']}/mute", {"muted": True}, sender_token)[0] == 200
+    assert flags() == [True, False]  # the flag is the reader's own, not another session's
+    assert http_api("POST", f"/v1/sessions/{target['session_id']}/mute", {"muted": True}, target_token)[0] == 200
+    assert http_api("POST", f"/v1/sessions/{sender['session_id']}/mute", {"muted": False}, sender_token)[0] == 200
+    assert flags() == [False, True]
+
+
+def test_the_released_receipts_route_keeps_its_answer_and_the_feed_route_adds_only_the_flag_over_http(
+    process_api, credentials, register
+):
+    """Workers of earlier releases read `GET /v1/instance/receipts`: its answer has exactly the keys it always had."""
+    http_api = process_api.request
+    sender_token, sender = register(process_api, credentials, "sender")
+    target_token, target = register(process_api, credentials, "target")
+    status, question = http_api(
+        "POST",
+        f"/v1/rooms/{credentials.room}/messages",
+        {"kind": "question", "body": "synthetic", "recipients": [target["session_id"]]},
+        sender_token,
+        {"Idempotency-Key": str(uuid4())},
+    )
+    assert status == 200
+    assert http_api("POST", f"/v1/messages/{question['id']}/ack", {}, target_token)[0] == 200
+    identity = {"instance_id": sender["instance_id"], "session_id": sender["session_id"]}
+    for muted in (False, True):
+        assert http_api("POST", f"/v1/sessions/{sender['session_id']}/mute", {"muted": muted}, sender_token)[0] == 200
+        status, released = http_api("GET", "/v1/instance/receipts", token=sender_token)
+        assert status == 200 and set(released) == {"instance_id", "session_id", "receipts"}  # no flag, muted or not
+        status, feed = http_api("GET", "/v1/instance/receipts/feed", token=sender_token)
+        assert status == 200 and feed == {**released, "muted": muted}  # the same ledger, and the flag besides
+        assert {key: released[key] for key in identity} == identity and len(released["receipts"]) == 1
+
+
 @pytest.mark.parametrize(
     "payload", [{}, {"receipts": []}, {"receipts": ["x"]}, {"receipts": [str(uuid4())] * 51}, {"receipts": 1},
                 {"receipts": [str(uuid4())], "extra": True}],
@@ -316,6 +363,7 @@ def test_a_delivered_mark_is_strictly_shaped(process_api, credentials, register,
 def test_only_a_live_instance_reads_or_marks_receipts(http_api, credentials):
     for method, path, payload in (
         ("GET", "/v1/instance/receipts", None),
+        ("GET", "/v1/instance/receipts/feed", None),
         ("POST", "/v1/instance/receipts/delivered", {"receipts": [str(uuid4())]}),
     ):
         status, body = http_api(method, path, payload, credentials.operator)
