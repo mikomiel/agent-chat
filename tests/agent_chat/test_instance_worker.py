@@ -400,7 +400,7 @@ def _timed_worker(
             return binding | {"id": path.split("/")[-2], **payload}
         if path == "/v1/instance/receipts/feed":
             return binding | {"receipts": feed or []} | ({} if muted is None else {"muted": muted})
-        if path == "/v1/instance/receipts/delivered":
+        if path == "/v1/instance/receipts/feed/delivered":
             return binding | {"delivered": payload["receipts"]}
         if path == "/v1/instance/status":
             return binding
@@ -1455,7 +1455,7 @@ class _ReceiptsServer(BaseHTTPRequestHandler):
         extra: dict[str, Any] = {}
         if self.path == "/v1/instance/receipts/feed":
             extra = {"receipts": [], "muted": False}
-        elif self.path == "/v1/instance/receipts/delivered":
+        elif self.path == "/v1/instance/receipts/feed/delivered":
             extra = {"delivered": posted["receipts"]}
         body = json.dumps({**self.identity, **extra}).encode()
         self.send_response(200)
@@ -1474,7 +1474,7 @@ def test_a_stalled_receipts_request_is_refused_inside_its_deadline_and_the_worke
 ) -> None:
     """A real socket and the real clock: the worker's own clock stub would make every deadline look long past."""
     frame, _key = RECEIPT_OPERATIONS[operation]
-    path = "/v1/instance/receipts/feed" if operation == "receipts" else "/v1/instance/receipts/delivered"
+    path = "/v1/instance/receipts/feed" if operation == "receipts" else "/v1/instance/receipts/feed/delivered"
     instance = instance_client.JoinedInstance(
         InstanceSecret("stalled-native", uuid4(), "1" * 64, "http://127.0.0.1:1"),
         uuid4(), uuid4(), uuid4(), "synthetic-host", "pi",
@@ -1569,22 +1569,32 @@ class _FeedServer(_ReceiptsServer):
     do_GET = do_POST = _answer
 
 
-class _NoFeedServer(_FeedServer):
-    """A server of a release before the feed: it has no `receipts/feed` route, and its router answers NOT_FOUND to it.
+# The two routes a server of a release before the feed lacks: the read of the feed, and the mark that goes with it.
+FEED_ROUTES = ("/v1/instance/receipts/feed", "/v1/instance/receipts/feed/delivered")
 
-    Its other routes answer as `_FeedServer` does, so a request that fell back to one of them would show in `paths`.
+
+class _NoFeedServer(_FeedServer):
+    """A server of a release before the feed: it has neither `receipts/feed` route, and its router answers NOT_FOUND.
+
+    Its other routes answer as `_FeedServer` does, the released receipts and mark routes included, so a request that
+    fell back to one of them would show in `paths`.
     """
 
-    def _answer(self) -> None:
-        if self.path != "/v1/instance/receipts/feed":
-            return super()._answer()
+    def _refuse(self, status: int, code: str) -> None:
+        """Answer the request with an error body and no row, after the request body is read, and record its path."""
         type(self).paths.append(self.path)
-        body = json.dumps({"error": {"code": "NOT_FOUND"}}).encode()
-        self.send_response(404)
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        body = json.dumps({"error": {"code": code}}).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _answer(self) -> None:
+        if self.path not in FEED_ROUTES:
+            return super()._answer()
+        self._refuse(404, "NOT_FOUND")
 
     do_GET = do_POST = _answer
 
@@ -1658,20 +1668,76 @@ def test_a_receipts_request_with_rows_is_one_request_and_takes_its_flag_from_the
 def test_a_server_without_the_feed_route_is_refused_once_per_request_and_asked_nothing_else(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
-    """A real socket and the real client: a server of a release before the feed answers 404 NOT_FOUND to it.
+    """A real socket and the real client: a server of a release before the feed answers 404 NOT_FOUND to both routes.
 
-    The `receipts` and `status` routes of such a server take the shared event clock, so the worker never asks them of
-    it: no fallback, and no mark, as no receipt id was ever read. NOT_FOUND is a soft refusal like any other. The
-    worker answers `refused`, serves the next request, and asks the feed again: no latch stops it.
+    The `receipts`, `delivered` and `status` routes of such a server take the shared event clock, so the worker asks
+    it for none of them: the read goes to the feed and the mark to `feed/delivered`, and neither falls back. NOT_FOUND
+    is a soft refusal like any other. The worker answers `refused`, serves the next request, and asks again: no latch
+    stops it.
     """
     _NoFeedServer.paths = []
-    code, replies = _serve_worker(monkeypatch, tmp_path, _NoFeedServer, [{"op": "receipts"}, {"op": "receipts"}])
+    frames = [{"op": "receipts"}, {"op": "receipts"}, RECEIPT_OPERATIONS["receipts_delivered"][0]]
+    code, replies = _serve_worker(monkeypatch, tmp_path, _NoFeedServer, frames)
     assert code == 0
     refused = {"refused": "NOT_FOUND"}
-    assert replies[1:] == [{"id": 1, "result": refused}, {"id": 2, "result": refused}]
-    # One request for each frame, both to the feed: none to the released `receipts` route, to `status` or to
-    # `delivered`. The end after them is the worker's own, at the end of its input.
-    assert _NoFeedServer.paths == ["/v1/instance/receipts/feed"] * 2 + ["/v1/instance/end"]
+    assert replies[1:] == [{"id": 1, "result": refused}, {"id": 2, "result": refused}, {"id": 3, "result": refused}]
+    # One request for each frame: the reads to the feed and the mark to the mark that goes with it, none to the
+    # released `receipts` route, to `status` or to the released `delivered`. The end after them is the worker's own,
+    # at the end of its input.
+    assert _NoFeedServer.paths == (
+        ["/v1/instance/receipts/feed"] * 2 + ["/v1/instance/receipts/feed/delivered", "/v1/instance/end"]
+    )
+
+
+class _RolledBackServer(_NoFeedServer):
+    """A server that is rolled back to a release before the feed, between a mark that fails and its retry.
+
+    Until then its feed answers rows and its mark answers a bare 503, as a server does that has lost its database. Then
+    it is the server of `_NoFeedServer`, which has neither feed route and takes the clock in its released ones.
+    """
+
+    rolled_back = False
+
+    def _answer(self) -> None:
+        if type(self).rolled_back:
+            return _NoFeedServer._answer(self)
+        if self.path == "/v1/instance/receipts/feed/delivered":
+            type(self).rolled_back = True
+            return self._refuse(503, "DATABASE_UNAVAILABLE")
+        return _FeedServer._answer(self)
+
+    do_GET = do_POST = _answer
+
+
+def test_a_mark_kept_across_a_rollback_of_the_server_reaches_no_route_that_takes_the_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A real socket and the real client: the package keeps the confirmed ids after a refused mark, and retries them.
+
+    The feed read gives rows and the first mark is refused. The server is then rolled back to a release before the
+    feed, and the retry has no new feed read before it. It posts to `feed/delivered`, which that server lacks, and gets
+    NOT_FOUND from the router. The released `delivered` route of that server takes the event clock, and no request of
+    the worker reaches it, nor the released `receipts` route.
+    """
+    rows = [_receipt_row("handed"), _receipt_row()]
+    mark = {"op": "receipts_delivered", "receipts": [row["id"] for row in rows]}
+    _RolledBackServer.paths, _RolledBackServer.rows, _RolledBackServer.muted = [], rows, False
+    _RolledBackServer.rolled_back = False
+    code, replies = _serve_worker(monkeypatch, tmp_path, _RolledBackServer, [{"op": "receipts"}, mark, mark])
+    assert code == 0
+    assert [reply["result"] for reply in replies[1:]] == [
+        {"receipts": rows, "muted": False},
+        {"refused": "REQUEST_UNCERTAIN"},  # the 503 of a POST: whether the mark landed is not known
+        {"refused": "NOT_FOUND"},  # the retry, after the rollback
+    ]
+    # The mark route twice and nothing else: the worker never asks the released `delivered` or `receipts` route. The
+    # end after them is the worker's own, at the end of its input.
+    assert _RolledBackServer.paths == [
+        "/v1/instance/receipts/feed",
+        "/v1/instance/receipts/feed/delivered",
+        "/v1/instance/receipts/feed/delivered",
+        "/v1/instance/end",
+    ]
 
 
 # The receipts cancel. A parent with a delivery, a heartbeat or a state report to send ends a receipts request that
@@ -2043,7 +2109,7 @@ def test_a_real_cancel_signal_ends_a_held_receipts_request_at_once_and_the_worke
 ) -> None:
     """A real socket, the real client, the real clock and a real signal sent once the server holds the request."""
     frame, _key = RECEIPT_OPERATIONS[operation]
-    path = "/v1/instance/receipts/feed" if operation == "receipts" else "/v1/instance/receipts/delivered"
+    path = "/v1/instance/receipts/feed" if operation == "receipts" else "/v1/instance/receipts/feed/delivered"
     instance = instance_client.JoinedInstance(
         InstanceSecret("held-native", uuid4(), "1" * 64, "http://127.0.0.1:1"), uuid4(), uuid4(), uuid4(),
         "synthetic-host", "pi",
@@ -2125,7 +2191,7 @@ def test_a_real_alarm_during_a_held_receipts_request_still_ends_the_worker(
     receipts request that took the converted alarm for an ordinary failure would answer `refused` and serve on.
     """
     frame, _key = RECEIPT_OPERATIONS[operation]
-    path = "/v1/instance/receipts/feed" if operation == "receipts" else "/v1/instance/receipts/delivered"
+    path = "/v1/instance/receipts/feed" if operation == "receipts" else "/v1/instance/receipts/feed/delivered"
     instance = instance_client.JoinedInstance(
         InstanceSecret("alarmed-native", uuid4(), "1" * 64, "http://127.0.0.1:1"), uuid4(), uuid4(), uuid4(),
         "synthetic-host", "pi",

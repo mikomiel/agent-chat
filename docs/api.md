@@ -78,22 +78,32 @@ for it. Reading marks nothing.
 earlier releases that read it. A server of an earlier release has only this
 route, and answers the feed route with `404` and the code `NOT_FOUND`.
 
-`POST /v1/instance/receipts/delivered` takes `{"receipts": [...]}` with 1 to 50
-distinct receipt ids and marks them delivered. It is idempotent: a repeat marks
-nothing new and still lists the id in `delivered`. An id that belongs to
+`POST /v1/instance/receipts/feed/delivered` takes `{"receipts": [...]}` with 1 to
+50 distinct receipt ids and marks them delivered. It is idempotent: a repeat
+marks nothing new and still lists the id in `delivered`. An id that belongs to
 another session is ignored and not disclosed. An adapter marks a receipt only
 after its output reached the model, so a receipt it could not show is listed
 again by the next read.
 
+`POST /v1/instance/receipts/delivered` is the same mark under its released name,
+with the same body and the same answer. It stays as released, for workers of
+earlier releases that mark with it. A server of an earlier release answers the
+mark route of the feed, as it does the feed route, with `404` and the code
+`NOT_FOUND`.
+
 An adapter shows receipts only while the session is not muted. The worker's
 `receipts` answer reads the feed route and passes on its `muted` flag, with rows
 or without, and sends no `status` request for it. A flag that is absent or not a
-boolean makes the worker answer `refused` with `INVALID_RESPONSE`. Against a
+boolean makes the worker answer `refused` with `INVALID_RESPONSE`. The worker's
+`receipts_delivered` answer posts to the mark route of the feed. Against a
 server of a release before the feed route the worker answers `refused` with
-`NOT_FOUND`: it falls back to neither the older route nor `status`, because both
-take the event clock of that server, and a package then shows no receipt and
-sends no mark. See [Sender receipts](../integrations/README.md#sender-receipts)
-for the rules the harness packages follow.
+`NOT_FOUND`, to the read and to the mark alike. It falls back to no older route
+and not to `status`, because each of them takes the event clock of that server.
+A package then shows no receipt. A package keeps the ids it confirmed after a
+refused mark, so a mark it retries after a rollback of the server gets the same
+answer from the router and takes no clock. See
+[Sender receipts](../integrations/README.md#sender-receipts) for the rules the
+harness packages follow.
 
 ## History paging
 

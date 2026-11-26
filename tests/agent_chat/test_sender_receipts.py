@@ -350,6 +350,53 @@ def test_the_released_receipts_route_keeps_its_answer_and_the_feed_route_adds_on
         assert {key: released[key] for key in identity} == identity and len(released["receipts"]) == 1
 
 
+def test_the_mark_route_of_the_feed_marks_over_http_and_the_released_mark_route_keeps_its_answer(
+    process_api, credentials, register
+):
+    """The mark that goes with the feed has its own name, which a server of an earlier release lacks.
+
+    A mark kept across a rollback of the server then answers NOT_FOUND from the router and takes no clock. The released
+    route marks as before for a worker of an earlier release: the two are one mark under two names.
+    """
+    http_api = process_api.request
+    sender_token, sender = register(process_api, credentials, "sender")
+    target_token, target = register(process_api, credentials, "target")
+    for _ in range(2):
+        status, question = http_api(
+            "POST",
+            f"/v1/rooms/{credentials.room}/messages",
+            {"kind": "question", "body": "synthetic", "recipients": [target["session_id"]]},
+            sender_token,
+            {"Idempotency-Key": str(uuid4())},
+        )
+        assert status == 200
+        assert http_api("POST", f"/v1/messages/{question['id']}/ack", {}, target_token)[0] == 200
+    feed_route, mark_route = "/v1/instance/receipts/feed", "/v1/instance/receipts/feed/delivered"
+    status, feed = http_api("GET", feed_route, token=sender_token)
+    assert status == 200
+    first, second = (row["id"] for row in feed["receipts"])
+    sender_answer = {"instance_id": sender["instance_id"], "session_id": sender["session_id"]}
+    target_answer = {"instance_id": target["instance_id"], "session_id": target["session_id"]}
+    # The recipient marks nothing of the sender's.
+    foreign = http_api("POST", mark_route, {"receipts": [first]}, target_token)
+    assert foreign == (200, {**target_answer, "delivered": []})
+    assert len(http_api("GET", feed_route, token=sender_token)[1]["receipts"]) == 2
+    # The owner marks its own; an unknown ID beside it is ignored, and a repeat is the same answer.
+    payload = {"receipts": [first, str(uuid4())]}
+    marked = http_api("POST", mark_route, payload, sender_token)
+    assert marked == (200, {**sender_answer, "delivered": [first]})
+    assert http_api("POST", mark_route, payload, sender_token) == marked
+    assert [row["id"] for row in http_api("GET", feed_route, token=sender_token)[1]["receipts"]] == [second]
+    # The released route is still there, with the answer it always had, and marks the other.
+    released = http_api("POST", "/v1/instance/receipts/delivered", {"receipts": [second]}, sender_token)
+    assert released == (200, {**sender_answer, "delivered": [second]})
+    assert http_api("GET", feed_route, token=sender_token)[1]["receipts"] == []
+    # The same strict shape as the released mark.
+    for invalid in ({}, {"receipts": []}, {"receipts": ["x"]}, {"receipts": [first], "extra": True}):
+        status, body = http_api("POST", mark_route, invalid, sender_token)
+        assert (status, body["error"]["code"]) == (422, "INVALID_REQUEST")
+
+
 @pytest.mark.parametrize(
     "payload", [{}, {"receipts": []}, {"receipts": ["x"]}, {"receipts": [str(uuid4())] * 51}, {"receipts": 1},
                 {"receipts": [str(uuid4())], "extra": True}],
@@ -365,6 +412,7 @@ def test_only_a_live_instance_reads_or_marks_receipts(http_api, credentials):
         ("GET", "/v1/instance/receipts", None),
         ("GET", "/v1/instance/receipts/feed", None),
         ("POST", "/v1/instance/receipts/delivered", {"receipts": [str(uuid4())]}),
+        ("POST", "/v1/instance/receipts/feed/delivered", {"receipts": [str(uuid4())]}),
     ):
         status, body = http_api(method, path, payload, credentials.operator)
         assert (status, body["error"]["code"]) == (403, "SESSION_FORBIDDEN")

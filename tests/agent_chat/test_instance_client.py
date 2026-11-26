@@ -931,6 +931,19 @@ def test_receipts_refuse_a_muted_flag_that_is_not_a_boolean(monkeypatch, muted):
         instance_client.receipts(instance)
 
 
+def test_receipts_delivered_posts_to_the_mark_route_that_goes_with_the_feed(monkeypatch):
+    asked = uuid4()
+    instance = _canned(
+        monkeypatch, lambda instance_id, _session: {"instance_id": instance_id, "delivered": [str(asked)]},
+    )
+    answer = instance_client.receipts_delivered(instance, ReceiptDelivery(receipts=(asked,)))
+    assert answer == {"delivered": [str(asked)]}
+    # The mark with its own route, which a server of an earlier release lacks: a mark kept across a rollback of the
+    # server answers NOT_FOUND there, before the clock. The released `delivered` route takes the clock on such a
+    # server, and there is no fallback to it.
+    assert instance_client.Client.asked == [("POST", "/v1/instance/receipts/feed/delivered")]
+
+
 def test_receipts_delivered_refuses_an_id_it_did_not_ask_for(monkeypatch):
     asked = uuid4()
     for delivered in ([str(uuid4())], [str(asked), str(asked)], "x"):

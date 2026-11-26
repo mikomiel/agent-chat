@@ -407,12 +407,17 @@ Limits that remain:
   worker double.
 - A core whose worker does not list `receipts-cancel` in its join reply is sent no receipts request, so it shows none and
   chat is what it was. Install the core and the package from the same release to get receipts, as
-  [Install a pinned release](#install-a-pinned-release) says. The server needs the feed route as well, and a server up to
-  `v0.8.0` has none. Against one, the feed answers `404 NOT_FOUND` at once, before that server reads its database or
-  takes its event clock, and the worker answers `refused` with `NOT_FOUND`. The package shows no notice and holds: it
-  asks again at its next poll, and it sends no mark, because it read no row. No receipts request takes the clock of that
-  server, since the worker falls back to neither the older receipts route nor `status`, and it remembers no missing
-  route (see the item on the shared event clock below).
+  [Install a pinned release](#install-a-pinned-release) says. The server needs two routes as well: the feed route and
+  the mark that goes with it, `POST /v1/instance/receipts/feed/delivered`. A server up to `v0.8.0` has neither. Against
+  one, the feed answers `404 NOT_FOUND` at once, before that server reads its database or takes its event clock, and the
+  worker answers `refused` with `NOT_FOUND`. The package shows no notice and holds: it asks again at its next poll. The
+  mark has a new route too, because a package keeps its confirmed ids after a refused mark. If the server is rolled back
+  to such a release before the retry, the retry has no new feed read before it, and the released mark route of that
+  server takes the event clock. The worker never posts there: the mark route of the feed answers `404 NOT_FOUND` at once
+  and takes no clock. The mark does not land, so the package keeps its ids, holds the feed poll as for any refused mark,
+  and sends the mark again at its next pass. No receipts request takes the clock of that server, since the worker falls
+  back to neither older receipts route nor `status`, and it remembers no missing route (see the item on the shared event
+  clock below).
 - **Server serialization (residual, #175).** The core takes the row of the instance for every authenticated request of
   that instance, so a receipts request that stalls inside the server holds the row, and the next request of the same
   instance waits for it on the server. A cancel and the worker's deadline end only the package's wait: the server
@@ -447,8 +452,9 @@ Limits that remain:
   `history` read) waits on them and carries the stall to every writer. #189 is in no release up to `v0.8.0`: every
   server from `v0.1.0` to `v0.8.0` has both older receipts routes and takes the shared clock in them, so a released
   worker, which reads the older route, still delays every writer with a stalled receipts read there, as it did on
-  `6f3b1dd`. A worker of this change reads only the feed route, which those servers lack: it gets `404 NOT_FOUND` at
-  once, takes no clock, and sends no mark, so it adds no such stall. `receipts-cancel` is a capability of the worker,
+  `6f3b1dd`. A worker of this change reads only the feed route and marks only at the mark route of the feed, and those
+  servers lack both: it gets `404 NOT_FOUND` at once for either and takes no clock, so it adds no such stall, even for a
+  mark kept across a rollback of the server. `receipts-cancel` is a capability of the worker,
   not of the server, so it says nothing about the server a worker talks to. Receipts add requests, though not clock
   holders. A busy session polls at most every 5 seconds (`POLL_MS` in `shared/receipts.js`), so it sends at most 12 receipts
   requests per minute. A driver on schedules modelled on the packages', with an empty feed, sent 9 to 12 per minute, and
@@ -457,9 +463,9 @@ Limits that remain:
   more than half of the reads of a busy session. A receipts request is one request to the server: its answer carries
   the `muted` flag of the session, so it adds no `status` read, which takes the clock. A shown notice adds one
   `receipts_delivered`. `status` is read only inside a delivery, and no package sends `history`. A worker that reads the
-  feed route of a server up to `v0.8.0` gets `404 NOT_FOUND` and answers `refused`: its package shows no notice and
-  sends no mark, the rows wait on the server, and the worker asks neither `status` for the flag nor the older route.
-  Tracked in #176.
+  feed route of a server up to `v0.8.0` gets `404 NOT_FOUND` and answers `refused`: its package shows no notice, the
+  rows wait on the server, and the worker asks neither `status` for the flag nor the older route. A mark that the
+  package kept gets the same answer from the mark route of the feed. Tracked in #176.
 - **A claim can run on the server and still be reported uncertain (#177, narrowed, not closed).** The client's request
   timeout is 3.0 seconds, and the server's `lock_timeout` is 3 seconds. The server stamps a `claim` when it reaches
   the route, and refuses an admission that ends 2.25 seconds or more after that stamp: the lock limit less 0.75

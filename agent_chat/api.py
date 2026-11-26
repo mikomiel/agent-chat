@@ -381,6 +381,17 @@ def create_app(
     ):
         return receipts.mark_delivered(db, authenticate(db, token), payload)
 
+    @app.post("/v1/instance/receipts/feed/delivered")
+    def sender_receipts_feed_delivered(
+        payload: ReceiptDelivery,
+        token: Annotated[str, Depends(bearer)],
+        db: Annotated[Connection[dict[str, Any]], Depends(connection)],
+    ):
+        # The same mark as the route above, under a name that a server of an earlier release lacks. That server answers
+        # NOT_FOUND from its router, so a mark kept across a rollback of the server never reaches the route that takes
+        # its clock.
+        return receipts.mark_delivered(db, authenticate(db, token), payload)
+
     @app.post("/v1/sessions/{session}/mute")
     def mute(
         session: UUID, payload: Mute, request: Request, db: Annotated[Connection[dict[str, Any]], Depends(connection)]

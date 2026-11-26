@@ -371,11 +371,16 @@ def receipts(instance: JoinedInstance, *, deadline: float | None = None) -> dict
 def receipts_delivered(
     instance: JoinedInstance, request: ReceiptDelivery, *, deadline: float | None = None
 ) -> dict[str, Any]:
-    """Mark receipts the adapter output as delivered; only the session's own are marked, and a repeat is safe."""
+    """Mark receipts the adapter output as delivered; only the session's own are marked, and a repeat is safe.
+
+    It posts to `POST /v1/instance/receipts/feed/delivered`, the mark that goes with the feed. A server of an earlier
+    release has no such route and answers NOT_FOUND at once, before it reads the database or takes the event clock, so
+    a mark kept until after a rollback of the server takes no clock either. There is no fallback to the released route.
+    """
     if not isinstance(request, ReceiptDelivery):
         raise ChatError("INVALID_REQUEST")
     result = _request(
-        instance, "POST", "/v1/instance/receipts/delivered", request.model_dump(mode="json"), deadline=deadline
+        instance, "POST", "/v1/instance/receipts/feed/delivered", request.model_dump(mode="json"), deadline=deadline
     )
     try:
         delivered = result["delivered"]
