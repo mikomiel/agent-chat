@@ -517,7 +517,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // later is dropped, even when it is handled before the timer: it counts as no answer, and it is not recorded. Resolves
   // { plan, seq }: `plan` true (Plan Mode), false (another mode it confirmed), or null (not known: no time left, an unknown
   // mode, a refusal, a failure, a timeout), and `seq` the read's place in `reads`. A mode it confirmed is recorded for the
-  // heartbeat (noteReading).
+  // heartbeat (noteReading); when that changes the Plan Mode the heartbeat reports, a report is queued at once, as for any
+  // other change of state, and the hook does not wait for it.
   async function readMode(record, deadline) {
     const ms = Math.min(READ_MS, deadline - now() - CLAIM_MARGIN_MS)
     if (!(ms > 0)) return { plan: null, seq: reads }
@@ -529,7 +530,11 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const answer = await Promise.race([Promise.resolve().then(() => thread.readMode({ ms })).catch(() => null), expired])
     clearTimeoutImpl(timer)
     const plan = typeof answer?.plan === "boolean" && now() < end ? answer.plan : null
-    if (live === record && threadBound) noteReading(plan, mine, at)
+    if (live === record && threadBound) {
+      const shown = reportedPlan()
+      noteReading(plan, mine, at)
+      if (reportedPlan() !== shown) void report()
+    }
     return { plan, seq: mine }
   }
 
@@ -553,10 +558,13 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // Send `text` to the consumer, then wait for its write receipt. Handed means the
   // hook wrote and flushed the output; it does not mean the model has read it. Right before the write the hook is asked once
   // more: one that is gone, or past its `deadline`, gets nothing, and nothing was written; so does one whose mode read
-  // (`seq`, from modeAllows) a later read overtook with Plan Mode. Once the text is sent, only the receipt says what became of it.
+  // (`seq`, from modeAllows) a later read overtook with Plan Mode, and one that the hint alone allowed (`seq` 0, the thread
+  // was unbound) when a bind has bound the thread since: the mode of a bound thread is not the hint's to decide, and no read
+  // of it was taken. Once the text is sent, only the receipt says what became of it.
   async function hand(link, text, until, deadline, announce, seq) {
     if (!eligible(false)) return { result: { outcome: "deferred", reason: chatState() ?? "unknown" }, replied: false }
     if (planSince(seq)) return { result: { outcome: "deferred", reason: "plan" }, replied: false }
+    if (seq === 0 && threadBound) return { result: { outcome: "deferred", reason: "unknown" }, replied: false }
     if (link.closed || deadline <= now()) return { result: NOT_WRITTEN, replied: false }
     if (until <= now()) return { result: UNCERTAIN, replied: false }
     const sent = await link.send({ context: text, ack: true })

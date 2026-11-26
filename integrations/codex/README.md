@@ -278,7 +278,9 @@ sends its request: it does not wait for the worker to end its instance.
   started later and confirms another mode lifts a Plan reading; a hint, an
   unknown mode, a failed read and an answer after the read's time do not, and
   they drop nothing. A `plan` hint still reports Plan Mode, unless a read that
-  started after its hook event confirmed another mode. The server offers nothing while
+  started after its hook event confirmed another mode. A hook's mode read that
+  changes the Plan Mode reported queues a heartbeat at once, as any other change
+  of state does; the hook does not wait for it. The server offers nothing while
   the heartbeat reports Plan Mode, so while it does, a hook that may claim
   takes a mode read before its state report, and that read can lift it. A bind
   that leaves the thread unbound (the provider changed) discards the last read
@@ -313,7 +315,10 @@ sends its request: it does not wait for the worker to end its instance.
   batch that it refuses right before the write settles `deferred` with reason
   `plan`. The hook is still answered. The
   `permission_mode` hint can only refuse. Without `appServer`, or while the
-  thread is unbound, nothing is read and the hint decides. When the claim is
+  thread is unbound, nothing is read and the hint decides; a claim that the
+  hint allowed hands nothing, and settles `deferred` with reason `unknown`,
+  when a bind (a heartbeat tick, which reads nothing while the session is
+  busy) has bound the thread before the write. When the claim is
   granted, after the status request, and right before the notice is written,
   it checks that the hook is still connected and in time; a hook that is not
   gets nothing more (after the grant, not even a status request). This check

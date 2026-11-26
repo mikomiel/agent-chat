@@ -730,11 +730,16 @@ A package MUST send a receipts request only to a worker whose join reply lists `
 - **THEN** the worker ends with an error frame and does not answer `refused` for that receipts request
 
 ### Requirement: Sender receipts never wake and never change delivery
-A package MUST output a receipts notice only at a native boundary of a turn that already runs, and MUST NOT start a turn, claim, settle, steer or wake for it. A pending receipt MUST NOT change the bytes of a claim, a handoff, a settle, a heartbeat, a binding announcement or a wake, and a receipts request MUST NOT sit between a claim and its settle.
+A package MUST output a receipts notice only at a native boundary of a turn that already runs, and MUST NOT start a turn, claim, settle, steer or wake for it. A pending receipt MUST NOT change the bytes of a claim, a handoff, a settle, a heartbeat, a binding announcement or a wake, and a receipts request MUST NOT sit between a claim and its settle. Only a native mode that `codex` reads before a notice MAY withhold an output and update `plan_mode`; it MUST NOT let one out.
 
 #### Scenario: Receipts pending
 - **WHEN** receipts are pending
 - **THEN** every delivery, binding announcement and wake that the package outputs, and every claim, settle and heartbeat request it makes, is byte-identical to that of a session with no receipts pending
+
+#### Scenario: A `codex` mode read before a notice
+- **WHEN** `codex` reads the collaboration mode before it outputs a staged notice, and the read confirms `plan`
+- **THEN** the notice is not output, a claimed batch whose write follows settles `deferred` with reason `plan`, and the heartbeat reports `plan_mode` true
+- **AND** a read that confirms another mode lets out nothing that the same session without receipts would not output
 
 ### Requirement: A package marks only the receipts its harness confirmed
 A package MUST send `receipts_delivered` with exactly the ids a notice showed, and only after its harness confirmed the output. A `refused` or malformed answer MUST NOT end chat, and the ids of a mark that was refused or failed MUST be sent again at the next poll.

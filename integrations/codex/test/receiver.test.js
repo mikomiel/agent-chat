@@ -2040,6 +2040,39 @@ test("the app-server says Plan Mode while the hook says default: no claim, no pr
   assert.deepEqual(r.worker.ops("pending").length, 1)
 })
 
+test("a hook's mode read that confirms Plan Mode, while the published state is not Plan Mode, is reported at once", async () => {
+  const thread = threadDouble({ mode: { plan: true } })
+  const r = await rig({ thread, handlers: deliverable() })
+  await r.begin()
+  const hook = await r.op(turn())
+  assert.deepEqual(hook.sent, [{ context: null }])
+  await settle()
+  const beats = r.worker.ops("heartbeat").map(entry => entry.state.plan_mode)
+  assert.deepEqual(beats, [false, true], "the hook's report says what the hint said, then the read's Plan Mode goes out, with no tick")
+})
+
+// A bind can bind the thread while a claim that the hint alone allowed is out: a heartbeat tick binds again, and reads
+// nothing while the session is busy. The hint is then stale for a thread whose mode can be read, and no read was taken.
+test("a claim that the hint allowed while the thread was unbound hands nothing when a bind has bound the thread since", async () => {
+  let bind = { status: "stale_binding" }
+  let open
+  const thread = threadDouble({ bind: () => bind, mode: { plan: true } })
+  const r = await rig({ thread, handlers: deliverable({ claim: fields => new Promise(resolve => { open = () => resolve({ dispatch: true, attempt_id: "attempt-1", reservation_ms: 30_000, messages: fields.messages.map(id => validRow(id)) }) }) }) })
+  await r.begin()
+  await r.clock.advance(29_000) // the tick at 30 s is close
+  const pending = r.op(turn()) // the hint says default, and the thread is unbound: no read
+  await settle()
+  assert.equal(typeof open, "function", "the claim is out")
+  assert.deepEqual(thread.modeReads, [])
+  bind = { status: "bound" }
+  await r.clock.advance(1_000) // the tick binds the thread, and reads nothing: the session is busy
+  assert.equal(thread.calls.filter(call => call === "bind").length, 2)
+  open()
+  const hook = await pending
+  assert.deepEqual(hook.sent, [{ context: null }], "nothing is handed")
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "unknown" }])
+})
+
 test("a mode read that fails, answers malformed or cannot tell the mode holds the output: the hook is answered, and the worker keeps serving", async () => {
   for (const [label, answer] of [
     ["a read that throws", () => Promise.reject(new Error("APP_SERVER_CLOSED"))],
