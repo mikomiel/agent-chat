@@ -411,29 +411,37 @@ Limits that remain:
   `DATABASE_UNAVAILABLE` after 3.01 seconds, which the worker reports as `SERVICE_UNAVAILABLE`. That is a brief outage
   on `pending`: no rejoin, chat stays on, and the next poll asks again, and the hook or the delivery poll that sent it
   delivers nothing. A POST that meets the same timeout, a `claim` or a `settle`, answers `REQUEST_UNCERTAIN` by the
-  client's mapping of a 5xx on a submitted request (`agent_chat/client.py`), and the worker that gets it exits, so the
-  package rejoins. That is why no package sends one first after a cancel. The next item measures the same wait for a
-  read of another instance. A receipts request takes milliseconds when the server is healthy, so this needs a stall in
-  the server itself. The packages cannot end work on the server, and this change does not remove it.
+  client's mapping of a 5xx on a submitted request (`agent_chat/client.py`). A `claim` is not sent again: the worker
+  that gets it exits, so the package rejoins. A `settle` that gets a 5xx or no status is sent again every 0.5 seconds
+  until 1 second before the worker's 20 second request deadline (#188), so it fails only behind a stall longer than
+  that. That is why no package sends one first after a cancel. The next item measures the same wait for a read of
+  another instance. A receipts request takes milliseconds when the server is healthy, so this needs a stall in the
+  server itself. The packages cannot end work on the server, and this change does not remove it.
 - **A stalled server read blocks the event-writing requests of every instance.** A read of the core holds the event
-  clock shared until its transaction ends: `pending`, `status`, `history` and the receipts reads all do. A `claim`, a
-  `settle` and a `send` of any instance need the clock exclusively. A read that stalls for more than 3 seconds, the
-  server's `lock_timeout`, therefore holds them until each is refused with 503 `DATABASE_UNAVAILABLE`, which the client
-  reports as `REQUEST_UNCERTAIN` for a POST. The `pending`, the heartbeat and the `status` of other instances pass. A
-  worker that gets `REQUEST_UNCERTAIN` for a `claim` or a `settle` exits, and its package rejoins. A `claim` leaves no
-  row, and the message is offered again after the rejoin. A `settle` leaves its attempt to close as `uncertain` with
-  `claim_expired`, and that message is not offered again (#174). This exists without receipts. Measured once on `main`
-  (`6f3b1dd`), outside the test suite, through the real worker, with a `pending` of one instance stalled for 3.5 to 8.3
-  seconds: a second instance with a message waiting got `REQUEST_UNCERTAIN` 3.01 seconds after its request in 12 of 12
-  trials, 6 `claim` and 6 `settle`. A stalled receipts read gave the same result in 12 of 12. `status` and `history`
-  take the same lock and were not stalled in that run. Receipts add reads to it. A busy session polls at most every 5
-  seconds (`POLL_MS` in `shared/receipts.js`), so it sends at most 12 receipts requests per minute. A driver on
-  schedules modelled on the packages', with an empty feed, sent 9 to 12 per minute, and the worker let 7 to 9 `pending`
-  reads per minute through to the server, because it answers an empty `pending` from memory for 2, 4 and then 8
-  seconds (`pending_delay` in `agent_chat/instance_worker.py`). On those numbers receipts are more than half of the
-  reads of a busy session. A receipts answer with rows adds one `status` read, and a shown notice adds one
-  `receipts_delivered`. Otherwise `status` is read only inside a delivery, and no package sends `history`. Tracked in
-  #176.
+  clock shared until its transaction ends: `pending`, `status` and `history` do. A `claim`, a `settle` and a `send` of
+  any instance need the clock exclusively. A read that stalls for more than 3 seconds, the server's `lock_timeout`,
+  therefore holds them until each is refused with 503 `DATABASE_UNAVAILABLE`, which the client reports as
+  `REQUEST_UNCERTAIN` for a POST. The `pending`, the heartbeat and the `status` of other instances pass. A worker that
+  gets `REQUEST_UNCERTAIN` for a `claim` exits, and its package rejoins. A `claim` leaves no row, and the message is
+  offered again after the rejoin. The worker sends a refused `settle` again until its deadline, about 19 seconds after
+  it started (#188). Only a stall that outlasts that ends the worker and leaves the attempt to close as `uncertain` with
+  `claim_expired`, and that message is not offered again (#174). The in-process `Adapter` (`agent_chat/adapter.py`)
+  sends a settlement once, so for it a refusal after 3 seconds already does that. This exists without receipts. Measured
+  once on `main` (`6f3b1dd`, before #188), outside the test suite, through the real worker, with a `pending` of one
+  instance stalled for 3.5 to 8.3 seconds: a second instance with a message waiting got `REQUEST_UNCERTAIN` 3.01 seconds
+  after its request in 12 of 12 trials, 6 `claim` and 6 `settle`. `status` and `history` take the same lock and were not
+  stalled in that run. A stalled receipts read gave the same result in 12 of 12 on that commit. Since #189 the receipts
+  reads take no clock, so a stalled one no longer delays another session. It still holds its own session's rows, and a
+  request of that session that takes the clock first (its own send, a rejoin, a mute, or its `status`, `pending` or
+  `history` read) waits on them and carries the stall to every writer. A package sends receipts only to a core whose
+  worker lists `receipts-cancel`, and every such core includes #189. Receipts add requests, though not clock holders. A
+  busy session polls at most every 5 seconds (`POLL_MS` in `shared/receipts.js`), so it sends at most 12 receipts
+  requests per minute. A driver on schedules modelled on the packages', with an empty feed, sent 9 to 12 per minute, and
+  the worker let 7 to 9 `pending` reads per minute through to the server, because it answers an empty `pending` from
+  memory for 2, 4 and then 8 seconds (`pending_delay` in `agent_chat/instance_worker.py`). On those numbers receipts are
+  more than half of the reads of a busy session. A receipts answer with rows adds one `status` read, which takes the
+  clock, and a shown notice adds one `receipts_delivered`. Otherwise `status` is read only inside a delivery, and no
+  package sends `history`. Tracked in #176.
 - **A claim can run on the server and still be reported uncertain.** The client's request timeout is 3.0 seconds, and
   the server's `lock_timeout` is 3 seconds. A `claim` whose lock wait ends within about 25 ms of the client's timeout can
   be executed on the server and still be reported `REQUEST_UNCERTAIN`, because the client has already given up. Nobody
