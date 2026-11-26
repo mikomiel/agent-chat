@@ -13,6 +13,12 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
         raise ChatError("INVALID_REQUEST")
     with db.transaction():
         clock = events.lock(db)
+        # The clock is held to the commit, so a wait in this transaction stalls every event writer. Prune therefore
+        # never waits for a clockless receipts transaction (`receipts.sender_feed`, `receipts.mark_delivered`). The
+        # end of a lapsed instance and the leaf delete skip a row such a transaction holds (`SKIP LOCKED`) and leave
+        # it to a later pass; the redaction takes `FOR NO KEY UPDATE`, which the `KEY SHARE` of a mark does not
+        # conflict with. The membership step selects only sessions with no open instance, and a receipts call locks
+        # the memberships of its session only after `lock_agent` has found its own instance live.
         # Age out memberships first so a session whose instance is ended below keeps its membership for this pass:
         # a message addressed to the session stays acceptable for a week after its last heartbeat. The 168 hours
         # (seven days) far exceed the lease; rejoining recreates the row (`INSERT ... ON CONFLICT DO NOTHING`).
@@ -33,12 +39,14 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
         ).rowcount
         # End instances whose heartbeat lapsed a day ago, before reconcile, so the same pass settles their attempts.
         # A live worker heartbeats every 30 seconds against a 90 second lease; only dead processes match.
+        # SKIP LOCKED: `lock_actor` holds the instance row `FOR UPDATE` until a second statement has checked the lease,
+        # so a clockless receipts call holds a lapsed instance for that moment and then fails.
         ended_instances = db.execute(
             """
             WITH lapsed AS (
                 SELECT id FROM agent_chat.instances
                 WHERE ended_at IS NULL AND heartbeat_at <= clock_timestamp() - interval '24 hours'
-                ORDER BY heartbeat_at, id LIMIT %s FOR UPDATE
+                ORDER BY heartbeat_at, id LIMIT %s FOR UPDATE SKIP LOCKED
             ) UPDATE agent_chat.instances SET ended_at = clock_timestamp()
               WHERE id IN (SELECT id FROM lapsed) RETURNING id
         """,
@@ -62,12 +70,13 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             floor = event["position"]
         removed_events = db.execute("DELETE FROM agent_chat.events WHERE position <= %s", (floor,)).rowcount
         db.execute("UPDATE agent_chat.event_clock SET retained_floor = %s WHERE singleton", (floor,))
+        # NO KEY UPDATE does not conflict with the KEY SHARE that a clockless receipts mark may hold on these rows.
         redacted = db.execute(
             """
             WITH expired AS (
                 SELECT id FROM agent_chat.messages
                 WHERE expires_at <= clock_timestamp() AND body IS NOT NULL
-                ORDER BY expires_at, id LIMIT %s FOR UPDATE
+                ORDER BY expires_at, id LIMIT %s FOR NO KEY UPDATE
             ) UPDATE agent_chat.messages SET body = NULL
               WHERE id IN (SELECT id FROM expired) RETURNING id
         """,
@@ -93,6 +102,8 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
         ).rowcount
         # Remove leaf tombstones only. A retained child or event keeps its parent.
         # Subsequent batches collect ancestors, including the final thread root.
+        # SKIP LOCKED: a clockless receipts mark can hold a leaf `FOR KEY SHARE` while it waits for a receipt row, and
+        # every other message locker runs under the clock held here. Such a leaf is collected by a later pass.
         deleted = db.execute(
             """
             WITH leaves AS (
@@ -105,7 +116,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
                   AND (m.id <> t.root_message_id OR NOT EXISTS (
                       SELECT 1 FROM agent_chat.messages sibling WHERE sibling.thread_id = t.id AND sibling.id <> m.id
                   ))
-                ORDER BY m.expires_at, m.id LIMIT %s FOR UPDATE OF m
+                ORDER BY m.expires_at, m.id LIMIT %s FOR UPDATE OF m SKIP LOCKED
             ) DELETE FROM agent_chat.messages WHERE id IN (SELECT id FROM leaves) RETURNING thread_id
         """,
             (limit,),

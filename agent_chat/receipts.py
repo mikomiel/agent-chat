@@ -81,9 +81,15 @@ def sender_feed(db: Connection[dict[str, Any]], actor: Actor) -> dict[str, Any]:
     """The live instance's own undelivered receipts, oldest first; reading marks nothing delivered.
 
     Only receipts of retained messages in rooms the session may still read are shown.
+
+    It takes no event clock, which a stalled read would hold against every event writer (#176): the row locks of
+    `lock_agent` and `visible` carry the authorization, so a revocation still waits for this read and a read that
+    waited re-evaluates the rows. A request that targets this same session takes the clock first and then waits on
+    the instance or session row held here, so it can still hold the clock while a read of that session stalls. Such a
+    request is a write (its own send, a rejoin, a mute) or a read (`status`, `pending`, `history`), whose shared clock
+    blocks every writer all the same.
     """
     with db.transaction():
-        events.read_clock(db)
         lock_agent(db, actor)
         rooms = [room["id"] for room in visible(db, actor)]
         rows = db.execute(_UNDELIVERED, (actor.session_id, rooms, RECEIPT_FEED_LIMIT)).fetchall()
@@ -94,18 +100,39 @@ def mark_delivered(db: Connection[dict[str, Any]], actor: Actor, request: Receip
     """Record that the adapter output these receipts. Idempotent; IDs of another session are ignored, not disclosed.
 
     `delivered` lists the requested IDs the session owns, whether this call or an earlier one marked them.
+
+    It takes no event clock either (see `sender_feed`), and `lock_agent` carries the authorization. The clock also kept
+    it apart from `retention.prune`, whose delete of a tombstoned message cascades to these rows. So the messages are
+    locked first, in prune's order, and held to commit. Prune never waits for this call: its redaction takes
+    `FOR NO KEY UPDATE`, and its leaf delete and its end of a lapsed instance skip a row held here and do that work
+    in a later pass. This call may wait for a leaf delete already in progress: one statement, in the same order,
+    while it holds no receipt row. The same-session limit of `sender_feed` applies.
     """
+    owned = (list(request.receipts), actor.session_id)
     with db.transaction():
-        events.read_clock(db)
         lock_agent(db, actor)
+        # Prune locks messages by (expires_at, id), then deletes them and, by cascade, their receipts. The UPDATE below
+        # locks receipt rows in the planner's order, which could cross that cascade. So lock the messages first, in
+        # prune's order, and keep them to commit. Prune skips a message held here (`SKIP LOCKED`) and its redaction
+        # takes NO KEY UPDATE, so it never waits for this call. KEY SHARE waits only for FOR UPDATE, which on messages
+        # only a leaf delete takes: this call can wait for one already in progress, in this same order, holding no
+        # receipt row.
+        db.execute(
+            """
+            SELECT m.id FROM agent_chat.messages m JOIN agent_chat.sender_receipts sr ON sr.message_id = m.id
+            WHERE sr.id = ANY(%s::uuid[]) AND sr.sender_session_id = %s
+            ORDER BY m.expires_at, m.id FOR KEY SHARE OF m
+        """,
+            owned,
+        )
         rows = db.execute(
             """
             UPDATE agent_chat.sender_receipts SET delivered_at = COALESCE(delivered_at, clock_timestamp())
             WHERE id = ANY(%s::uuid[]) AND sender_session_id = %s RETURNING id
         """,
-            (list(request.receipts), actor.session_id),
+            owned,
         ).fetchall()
-        # The UPDATE can wait on a receipt row lock. Recheck the lease after that wait.
+        # The message locks and the UPDATE can wait on a row lock. Recheck the lease after those waits.
         require_live(db, actor)
         return {
             "session_id": actor.session_id,
