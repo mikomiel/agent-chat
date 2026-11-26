@@ -171,13 +171,15 @@ function hookDouble({ events, receipt = "written", answer = true, sendOk = true 
   }
 }
 
-// The app-server end of one thread whose queue probe passed, so the wake poll runs and an idle session can be woken.
+// The app-server end of one thread whose queue probe passed, so the wake poll runs and an idle session can be woken. `mode`
+// answers the mode read that a turn hook takes before an output: not Plan Mode unless a test says so.
 const IDLE = { reason: null, observed: { status: "idle", stopped: false, plan: false } }
-function threadDouble() {
+function threadDouble({ mode = () => ({ plan: false }) } = {}) {
   const thread = {
-    wakes: [], adds: [], route: true,
+    wakes: [], adds: [], modeReads: 0, route: true,
     async bind() { return { status: "bound" } },
     async observe() { return IDLE },
+    async readMode() { thread.modeReads += 1; return mode() },
     async wake(request) {
       thread.wakes.push(request)
       const stale = request.proceed?.(IDLE) ?? null
@@ -405,6 +407,144 @@ test("a notice is shown only by an event that has nothing else to carry: never i
   assert.match(start.sent[0].context, /^Agent Chat is available to this session/)
   assert.ok(!start.sent[0].context.includes(NOTICE_HEAD), "no receipts in an announcement")
   assert.equal(s.count("receipts_delivered"), 0)
+})
+
+// #152: a staged notice is output only after a read of the collaboration mode that its own hook took after the event arrived
+// and that confirmed a mode that is not Plan Mode, as a claim is (receiver.test.js). The hint that the hook gave can be stale.
+test("Plan Mode set in the app-server while the hook's pending request is out: no claim, no receipt context and no mark", async () => {
+  for (const batch of [[], [uid(1)]]) {
+    let mode = { plan: false }
+    const thread = threadDouble({ mode: () => mode })
+    const r = await staged({ rows: [rcpt(1)], thread })
+    r.server.pending = batch
+    let open
+    r.server.gates.pending = new Promise(resolve => { open = resolve })
+    const hook = hookDouble({ events: r.events })
+    const asked = r.count("pending")
+    const event = r.op(turn(), hook) // the hook says default
+    await settle()
+    assert.equal(r.count("pending"), asked + 1, `batch ${batch.length}: the hook's pending request is out`)
+    mode = { plan: true } // the operator switches the session to Plan Mode meanwhile
+    delete r.server.gates.pending
+    open()
+    await event
+    assert.deepEqual(hook.sent, [{ context: null }], `batch ${batch.length}: no receipt context and no delivery`)
+    assert.equal(r.count("claim"), 0, `batch ${batch.length}: nothing claimed`)
+    assert.equal(r.count("receipts_delivered"), 0, `batch ${batch.length}: nothing marked`)
+    assert.ok(thread.modeReads >= 1, `batch ${batch.length}: the mode was read after the pending answer`)
+    // The notice was dropped unmarked: once the mode is default again, a later poll offers the row, and it is shown and marked.
+    mode = { plan: false }
+    r.server.pending = []
+    await r.clock.advance(POLL_MS)
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }], `batch ${batch.length}: this event polls again`)
+    const shown = (await r.op(turn())).sent[0]
+    assert.ok(isNoticeText(shown.context), `batch ${batch.length}: and the next one shows the row`)
+    assert.deepEqual(r.marks(), [{ receipts: [rcpt(1).id] }], `batch ${batch.length}`)
+  }
+})
+
+test("a staged notice is not output when the mode read fails or cannot tell the mode: it is dropped unmarked, and the hook is answered", async () => {
+  for (const [label, answer] of [["a failed read", () => Promise.reject(new Error("APP_SERVER_CLOSED"))], ["an unknown mode", () => ({ plan: null })]]) {
+    let mode = answer
+    const thread = threadDouble({ mode: () => mode() })
+    const r = await staged({ rows: [rcpt(1)], thread })
+    assert.deepEqual((await r.op(turn())).sent, [{ context: null }], label)
+    assert.equal(r.count("receipts_delivered"), 0, label)
+    mode = () => ({ plan: false })
+    await r.clock.advance(POLL_MS)
+    await r.op(turn())
+    assert.ok(isNoticeText((await r.op(turn())).sent[0].context), `${label}: the row comes back`)
+  }
+})
+
+// Two hooks of one turn read the mode at once: one to claim, one to show a staged notice. The answers can come in any order,
+// and the read that started later is the newer word on the mode, whichever answers first.
+// A mode that answers each read in turn: a function answers at once, `"held"` waits until the test releases it.
+function modeQueue(answers) {
+  const releases = []
+  let index = 0
+  const mode = () => {
+    const answer = answers[index++] ?? (() => ({ plan: false }))
+    if (answer !== "held") return answer()
+    return new Promise(resolve => { releases.push(resolve) })
+  }
+  return { mode, release: value => releases.shift()(value) }
+}
+
+test("a claim's mode read that a later-started read overtook with Plan Mode claims nothing, and hands nothing", async () => {
+  // The later read's Plan Mode comes in before the earlier read's default.
+  {
+    const reads = modeQueue(["held", () => ({ plan: true })])
+    const thread = threadDouble({ mode: reads.mode })
+    const r = await staged({ rows: [rcpt(1)], thread })
+    r.server.pending = [uid(1)]
+    const claiming = hookDouble({ events: r.events })
+    const first = r.op(turn(), claiming) // its pending answer is in, and its mode read is out
+    await settle()
+    assert.equal(thread.modeReads, 1, "the claim's read is the first one")
+    const notice = await r.op(turn({ event: "tool" })) // the notice's read starts later and answers Plan Mode
+    assert.deepEqual(notice.sent, [{ context: null }], "the notice is not shown in Plan Mode")
+    reads.release({ plan: false }) // the claim's read answers default, last
+    await first
+    assert.equal(r.count("claim"), 0, "a read that started later confirmed Plan Mode: nothing is claimed")
+    assert.deepEqual(claiming.sent, [{ context: null }], "and nothing is handed")
+    assert.equal(r.count("settle"), 0)
+    assert.equal(r.count("receipts_delivered"), 0)
+  }
+  // The later read's Plan Mode comes in after the claim, before the write.
+  {
+    const reads = modeQueue([() => ({ plan: false }), () => ({ plan: true })])
+    const thread = threadDouble({ mode: reads.mode })
+    const r = await staged({ rows: [rcpt(1)], thread })
+    r.server.pending = [uid(1)]
+    let open
+    r.server.gates.status = new Promise(resolve => { open = resolve })
+    const claiming = hookDouble({ events: r.events })
+    const first = r.op(turn(), claiming)
+    await settle()
+    assert.equal(r.count("claim"), 1, "the claim's own read allowed it, and the status request is out")
+    const notice = await r.op(turn({ event: "tool" }))
+    assert.deepEqual(notice.sent, [{ context: null }])
+    delete r.server.gates.status
+    open()
+    await first
+    assert.deepEqual(claiming.sent, [{ context: null }], "right before the write, the newer Plan Mode reading refuses it")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "plan" }])
+  }
+})
+
+test("a read that confirmed Plan Mode and answers after a later-started read could not tell the mode is still the heartbeat's reading", async () => {
+  const reads = modeQueue(["held", () => ({ plan: null })])
+  const thread = threadDouble({ mode: reads.mode })
+  const r = await staged({ rows: [rcpt(1)], thread })
+  r.server.pending = [uid(1)]
+  const first = r.op(turn()) // the claim's read is out
+  await settle()
+  await r.op(turn({ event: "tool" })) // the notice's read starts later and cannot tell the mode
+  reads.release({ plan: true }) // the claim's read answers Plan Mode
+  await first
+  assert.equal(r.count("claim"), 0)
+  await r.clock.advance(HEARTBEAT_MS)
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true, "an unknown answer drops no mode that a read confirmed")
+})
+
+// A notice may withhold an output, never let one out (chat-clients spec, "Sender receipts never wake and never change
+// delivery"). So the `default` that its read confirms lets that notice out and nothing else: it does not lift a Plan reading,
+// which holds the wake and every claim after the turn too.
+test("a notice's mode read that answers default shows the notice but does not lift a Plan reading: after Stop the heartbeat still says Plan Mode", async () => {
+  let reads = 0
+  const thread = threadDouble({ mode: () => (++reads === 1 ? { plan: true } : { plan: false }) })
+  const r = await staged({ rows: [rcpt(1)], thread })
+  r.server.pending = [uid(1)]
+  const hook = await r.op(turn({ event: "tool" })) // the claim's read finds Plan Mode, then the notice's read finds default
+  assert.equal(reads, 2)
+  assert.equal(r.count("claim"), 0)
+  assert.ok(isNoticeText(hook.sent[0].context), "the notice's own read allows that notice")
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true, "the Plan reading was reported")
+  await r.op(stopEvent) // no periodic read follows
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true }, "still Plan Mode")
+  assert.equal(r.count("claim"), 0)
+  assert.deepEqual(thread.wakes, [], "no wake")
 })
 
 test("a Stop event replies with nothing but its acknowledgement and drops the staged notice", async () => {
