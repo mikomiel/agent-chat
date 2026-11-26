@@ -4,6 +4,8 @@ import json
 import signal
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from hashlib import sha256
 from http.client import HTTPConnection
 from pathlib import Path
@@ -13,8 +15,9 @@ from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from psycopg.errors import LockNotAvailable
 
-from agent_chat import deliveries, receipts, sessions, state
+from agent_chat import auth, deliveries, receipts, sessions, state
 from agent_chat.auth import authenticate_producer
 from agent_chat.models import (
     COORDINATION_KINDS,
@@ -28,6 +31,7 @@ from agent_chat.models import (
 )
 from agent_chat.publication import publish, request_digest
 from agent_chat.retention import prune
+from agent_chat.storage import connect
 
 EXCLUDED_KINDS = ("status", *COORDINATION_KINDS)
 ROOT = Path(__file__).resolve().parents[2]
@@ -473,3 +477,410 @@ def test_a_real_worker_ends_a_held_receipts_read_on_the_cancel_signal_and_serves
             stall.release.set()
             if process.poll() is None:
                 process.kill()
+
+
+# Receipts take no event clock (#176). What a stalled receipts transaction may still hold is the rows below.
+
+#: Seconds the settle of another instance may take while a receipts transaction stalls. The service ends a lock wait
+#: after 3 s (`agent_chat.storage.LOCK_TIMEOUT_MS`), so a settle queued behind the event clock cannot meet this bound.
+SETTLE_BOUND = 2
+
+#: What the receipts transaction of the sender locks for authorization, and the statement that revokes it.
+#: Each entry is the revoking statement and the fragment its lock wait shows in `pg_stat_activity`.
+REVOCATIONS = {
+    "grant": (
+        "DELETE FROM agent_chat.principal_rooms WHERE principal_id = %(principal)s AND room_id = %(room)s",
+        "DELETE FROM agent_chat.principal_rooms",
+    ),
+    "membership": (
+        "DELETE FROM agent_chat.memberships WHERE session_id = %(session)s",
+        "DELETE FROM agent_chat.memberships",
+    ),
+    "principal": (
+        "UPDATE agent_chat.principals SET revoked = true WHERE id = %(principal)s",
+        "UPDATE agent_chat.principals",
+    ),
+    "instance": (
+        "UPDATE agent_chat.instances SET ended_at = clock_timestamp() WHERE id = %(instance)s",
+        "UPDATE agent_chat.instances",
+    ),
+}
+
+#: The row a revocation deletes, locked by another transaction, and the fragment a feed that waits on it shows.
+HELD_ACCESS = {
+    "grant": (
+        "SELECT 1 FROM agent_chat.principal_rooms "
+        "WHERE principal_id = %(principal)s AND room_id = %(room)s FOR UPDATE",
+        "agent_chat.principal_rooms",
+    ),
+    "membership": (
+        "SELECT 1 FROM agent_chat.memberships WHERE session_id = %(session)s FOR UPDATE",
+        "agent_chat.memberships",
+    ),
+}
+
+
+def access(room, actor):
+    return {
+        "principal": actor.principal_id, "room": room, "session": actor.session_id, "instance": actor.instance_id
+    }
+
+
+def other_instance_attempt(db, room, operator, actor_factory):
+    """A second ready instance with a granted, unsettled attempt on an operator question: it shares no row with
+    the sender, so only the event clock can make its settle wait on a receipts transaction."""
+    other = actor_factory(room)
+    ready(db, other)
+    question = send(db, operator, room, "question", (other.session_id,))["id"]
+    grant = deliveries.claim(db, other, uuid4(), DeliveryClaim(messages=(question,)))
+    assert grant["dispatch"] is True
+    return other, grant["attempt"]["id"]
+
+
+def settle_in_thread(pool, database, other, attempt):
+    def settle():
+        with connect(database) as connection:
+            return deliveries.result(connection, other, attempt, DeliveryResult(outcome="handed"))
+
+    return pool.submit(settle)
+
+
+def assert_settled_within_bound(db, settling, attempt):
+    done, _ = wait({settling}, timeout=SETTLE_BOUND)
+    assert done, "the settle of another instance waited for a stalled receipts transaction"
+    assert settling.result()["outcome"] == "handed"
+    # Recorded and committed while the receipts transaction is still open.
+    recorded = db.execute("SELECT outcome FROM agent_chat.delivery_attempts WHERE id = %s", (attempt,)).fetchone()
+    assert recorded == {"outcome": "handed"}
+
+
+def test_a_stalled_feed_read_does_not_delay_the_settle_of_another_instance(
+    db, database, actors, actor_factory, lock_wait
+):
+    """The feed used to hold the event clock shared for its whole transaction, and a settle takes it exclusively."""
+    room, sender, target, operator = actors
+    receipts.acknowledge(db, target, send(db, sender, room, "question", (target.session_id,))["id"])
+    other, attempt = other_instance_attempt(db, room, operator, actor_factory)
+
+    def read():
+        with connect(database) as reader:
+            return receipts.sender_feed(reader, sender)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with db.transaction():
+            # Another transaction holds the sender's membership row, so the feed waits inside `visible`.
+            db.execute("SELECT 1 FROM agent_chat.memberships WHERE session_id = %s FOR UPDATE", (sender.session_id,))
+            reading = pool.submit(read)
+            lock_wait("agent_chat.memberships", timeout=5)
+            assert_settled_within_bound(db, settle_in_thread(pool, database, other, attempt), attempt)
+            assert not reading.done()
+        (row,) = reading.result(timeout=5)["receipts"]
+    assert row["state"] == "acked"
+
+
+def test_a_stalled_delivered_mark_does_not_delay_the_settle_of_another_instance(
+    db, database, actors, actor_factory, lock_wait
+):
+    """The mark used to hold the event clock shared while its UPDATE waited on a receipt row."""
+    room, sender, target, operator = actors
+    receipts.acknowledge(db, target, send(db, sender, room, "question", (target.session_id,))["id"])
+    (receipt,) = receipts.sender_feed(db, sender)["receipts"]
+    other, attempt = other_instance_attempt(db, room, operator, actor_factory)
+
+    def mark():
+        with connect(database) as writer:
+            return receipts.mark_delivered(writer, sender, ReceiptDelivery(receipts=(receipt["id"],)))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        with db.transaction():
+            db.execute("SELECT 1 FROM agent_chat.sender_receipts WHERE id = %s FOR UPDATE", (receipt["id"],))
+            marking = pool.submit(mark)
+            lock_wait("SET delivered_at", timeout=5)
+            assert_settled_within_bound(db, settle_in_thread(pool, database, other, attempt), attempt)
+            assert not marking.done()
+        assert marking.result(timeout=5)["delivered"] == [receipt["id"]]
+
+
+@pytest.mark.parametrize(
+    ("call", "change"),
+    [
+        ("feed", "grant"),
+        ("feed", "membership"),
+        ("feed", "principal"),
+        ("feed", "instance"),
+        ("mark", "principal"),
+        ("mark", "instance"),
+    ],
+)
+def test_an_open_receipts_transaction_holds_the_sender_access_until_it_commits(
+    db, database, actors, lock_wait, call, change
+):
+    """Without the clock, the row locks of `lock_agent` and `visible` are the whole authorization of a receipts
+    call, so a revocation must still wait for the transaction that read under it."""
+    room, sender, _target, _operator = actors
+    statement, fragment = REVOCATIONS[change]
+    params = access(room, sender)
+
+    def revoke():
+        with connect(database) as other:
+            return other.execute(statement, params).rowcount
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with db.transaction():
+            if call == "feed":
+                receipts.sender_feed(db, sender)
+            else:
+                receipts.mark_delivered(db, sender, ReceiptDelivery(receipts=(uuid4(),)))
+            pending = pool.submit(revoke)
+            lock_wait(fragment, timeout=5)
+            assert not pending.done(), "a revocation overtook the receipts transaction that was reading under it"
+        assert pending.result(timeout=5) == 1
+
+
+@pytest.mark.parametrize("revoked", ["grant", "membership"])
+def test_a_feed_that_waited_behind_a_revocation_shows_no_receipt_of_the_room(db, database, actors, lock_wait, revoked):
+    room, sender, target, _operator = actors
+    receipts.acknowledge(db, target, send(db, sender, room, "question", (target.session_id,))["id"])
+    assert len(receipts.sender_feed(db, sender)["receipts"]) == 1  # The same reader sees it before the revocation.
+    params = access(room, sender)
+    hold, held_fragment = HELD_ACCESS[revoked]
+    revoke, _ = REVOCATIONS[revoked]
+
+    def read():
+        with connect(database) as reader:
+            return receipts.sender_feed(reader, sender)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with db.transaction():
+            db.execute(hold, params)
+            reading = pool.submit(read)
+            lock_wait(held_fragment, timeout=5)
+            assert not reading.done()
+            assert db.execute(revoke, params).rowcount == 1
+        feed = reading.result(timeout=5)
+    assert feed["receipts"] == []
+    assert len(ledger(db)) == 1  # Hidden, not deleted.
+
+
+def test_a_delivered_mark_locks_its_messages_in_retention_order_before_any_receipt_row(
+    db, database, actors, lock_wait
+):
+    """Prune deletes a tombstoned message and, by cascade, its receipts, locking messages by `expires_at, id`.
+    Without the clock, a mark that locked receipt rows first could deadlock with that cascade. So it locks the
+    messages in prune's order first, and while it waits for one it holds no receipt row.
+
+    A literal deadlock cannot be forced here: the order of the cascade and the order in which an UPDATE locks
+    rows are the planner's. The order of the mark's own locks can be observed, and it is what removes the cycle.
+    """
+    room, sender, target, _operator = actors
+    # The later-expiring message has the smaller id and the older receipt, so that neither the id order nor
+    # the order of creation is the retention order.
+    late, early = sorted((send(db, sender, room, "question", (target.session_id,))["id"] for _ in range(2)), key=str)
+    for message in (late, early):
+        receipts.acknowledge(db, target, message)
+    for message, hours in ((late, 2), (early, 1)):
+        db.execute(
+            "UPDATE agent_chat.messages SET expires_at = clock_timestamp() + make_interval(hours => %s) WHERE id = %s",
+            (hours, message),
+        )
+    delivered = sorted(row["id"] for row in receipts.sender_feed(db, sender)["receipts"])
+    assert len(delivered) == 2
+
+    def mark():
+        with connect(database) as writer:
+            return receipts.mark_delivered(writer, sender, ReceiptDelivery(receipts=tuple(delivered)))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with db.transaction():
+            # A stand-in for prune, which holds the later message while it works through its batch.
+            db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s FOR UPDATE", (late,))
+            marking = pool.submit(mark)
+            lock_wait("agent_chat.messages", timeout=5)
+            with connect(database) as probe:
+                # The mark holds the earlier message, so a prune that wanted it would wait: no crossed order.
+                with pytest.raises(LockNotAvailable):
+                    probe.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s FOR UPDATE NOWAIT", (early,))
+                # It holds no receipt row yet, so the cascade of a prune cannot wait on it either.
+                locked = probe.execute(
+                    "SELECT id FROM agent_chat.sender_receipts WHERE sender_session_id = %s FOR UPDATE NOWAIT",
+                    (sender.session_id,),
+                ).fetchall()
+                assert sorted(row["id"] for row in locked) == delivered
+            assert not marking.done()
+        assert marking.result(timeout=5)["delivered"] == delivered
+
+
+def wait_until_finished_or_waiting(lock_wait, future, fragment, timeout=5):
+    """Return once `future` has finished, or waits on a row lock inside a statement containing `fragment`."""
+    deadline = time.monotonic() + timeout
+    while not future.done():
+        try:
+            return lock_wait(fragment, timeout=0)
+        except AssertionError:  # `lock_wait` reports "not waiting yet" as a failed assertion.
+            assert time.monotonic() < deadline, "the call neither finished nor waited on a row lock: " + fragment
+            wait({future}, timeout=0.01)
+
+
+def test_prune_skips_a_message_a_stalled_mark_holds_and_never_waits_for_it(
+    db, database, actors, actor_factory, lock_wait
+):
+    """Prune holds the event clock for its whole transaction, so a wait inside it delays every event writer.
+    A mark holds its messages `FOR KEY SHARE` while its UPDATE waits for a receipt row, here one that another
+    transaction holds. Prune must redact the expired message that the mark holds, which `FOR NO KEY UPDATE` allows,
+    and skip the leaf that the mark holds, which a leaf delete would wait for. The settle of another instance,
+    started once prune has finished or waits, must complete. After the release the mark completes and a second
+    prune collects the leaf.
+    """
+    room, sender, target, operator = actors
+    leaf = send(db, sender, room, "question", (target.session_id,))["id"]
+    receipts.acknowledge(db, target, leaf)
+    redacted = send(db, sender, room, "question", (target.session_id,))["id"]
+    receipts.acknowledge(db, target, redacted)
+    receipt_of = {row["message_id"]: row["id"] for row in receipts.sender_feed(db, sender)["receipts"]}
+    both = sorted(receipt_of.values())
+    assert len(both) == 2
+    # An earlier prune tombstones the leaf, which expires first, but its events keep it. They age out in the prune
+    # under test, and that makes the leaf collectable. The other message expires later and keeps its body and its
+    # events, so the prune under test redacts it and does not collect it.
+    db.execute(
+        "UPDATE agent_chat.messages SET expires_at = clock_timestamp() - interval '2 hours' WHERE id = %s", (leaf,)
+    )
+    earlier = prune(db)
+    assert (earlier["redacted"], earlier["deleted"]) == (1, 0)
+    db.execute(
+        "UPDATE agent_chat.events SET created_at = clock_timestamp() - interval '721 hours' WHERE message_id = %s",
+        (leaf,),
+    )
+    db.execute(
+        "UPDATE agent_chat.messages SET expires_at = clock_timestamp() - interval '1 hour' WHERE id = %s", (redacted,)
+    )
+    other, attempt = other_instance_attempt(db, room, operator, actor_factory)
+
+    def run_prune():
+        with connect(database) as pruner:
+            return prune(pruner)
+
+    def mark():
+        with connect(database) as writer:
+            return receipts.mark_delivered(writer, sender, ReceiptDelivery(receipts=tuple(both)))
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        with db.transaction():
+            db.execute("SELECT 1 FROM agent_chat.sender_receipts WHERE id = %s FOR UPDATE", (receipt_of[redacted],))
+            marking = pool.submit(mark)
+            lock_wait("SET delivered_at", timeout=5)  # The mark holds both messages and waits for the receipt row.
+            pruning = pool.submit(run_prune)
+            wait_until_finished_or_waiting(lock_wait, pruning, "agent_chat.messages")
+            assert_settled_within_bound(db, settle_in_thread(pool, database, other, attempt), attempt)
+            assert pruning.done(), "prune waited for a message that a stalled mark holds"
+            assert not marking.done()
+            first = pruning.result()
+            assert (first["redacted"], first["deleted"]) == (1, 0)
+            assert db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s", (leaf,)).fetchone() is not None
+        assert marking.result(timeout=5)["delivered"] == both
+    second = prune(db)
+    assert (second["redacted"], second["deleted"]) == (0, 1)
+    assert db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s", (leaf,)).fetchone() is None
+    (kept,) = db.execute("SELECT id, delivered_at IS NOT NULL AS delivered FROM agent_chat.sender_receipts").fetchall()
+    assert (kept["id"], kept["delivered"]) == (receipt_of[redacted], True)
+
+
+def test_prune_skips_a_lapsed_instance_a_receipts_call_holds_and_never_waits_for_it(
+    db, database, actors, actor_factory, lock_wait, monkeypatch
+):
+    """`lock_actor` locks the instance row `FOR UPDATE` and checks the lease in a second statement, so a receipts call
+    on a lapsed instance holds that row, without the event clock, between the two. Prune holds the clock for its whole
+    transaction and ends an instance that lapsed a day ago, so a wait for that row would delay every event writer. It
+    must skip the instance and leave it to a later pass. The feed here is held between its lock and its check. The
+    settle of another instance, started once prune has finished or waits, must complete. After the release the feed
+    fails with the lease error, and a second prune ends the instance.
+    """
+    room, sender, _target, operator = actors
+    other, attempt = other_instance_attempt(db, room, operator, actor_factory)
+    db.execute(
+        "UPDATE agent_chat.instances SET heartbeat_at = clock_timestamp() - interval '25 hours' WHERE id = %s",
+        (sender.instance_id,),
+    )
+    checking, release = Event(), Event()
+    lease_check = auth.require_live
+
+    def held_check(connection, actor):
+        if actor.instance_id == sender.instance_id:
+            checking.set()
+            assert release.wait(timeout=10), "the test never released the lease check"
+        return lease_check(connection, actor)
+
+    monkeypatch.setattr(auth, "require_live", held_check)
+
+    def read():
+        with connect(database) as reader:
+            return receipts.sender_feed(reader, sender)
+
+    def run_prune():
+        with connect(database) as pruner:
+            return prune(pruner)
+
+    def ended():
+        row = db.execute("SELECT ended_at FROM agent_chat.instances WHERE id = %s", (sender.instance_id,)).fetchone()
+        return row["ended_at"] is not None
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        try:
+            reading = pool.submit(read)
+            assert checking.wait(timeout=5), "the feed never reached its lease check"
+            pruning = pool.submit(run_prune)
+            wait_until_finished_or_waiting(lock_wait, pruning, "agent_chat.instances")
+            assert_settled_within_bound(db, settle_in_thread(pool, database, other, attempt), attempt)
+            assert pruning.done(), "prune waited for a lapsed instance that a receipts call holds"
+            assert not reading.done()
+            assert pruning.result()["ended_instances"] == 0
+            assert not ended()
+        finally:
+            release.set()
+        with pytest.raises(ChatError, match="^STALE_INSTANCE$"):
+            reading.result(timeout=5)
+    assert prune(db)["ended_instances"] == 1
+    assert ended()
+
+
+def test_a_delivered_mark_breaks_an_expiry_tie_by_message_id(db, database, actors, lock_wait):
+    """Prune orders messages by `expires_at, id`. Of two that expire at the same instant the mark takes the lower id
+    first, so while it waits for the higher one it holds the lower one and no receipt row.
+
+    Without that tie-break a tie keeps the order of the plan: the heap order of the receipts for the bitmap scan the
+    planner picks, their id order for an index scan. So the higher message gets the receipt that is created first and
+    has the lower id, and it comes first in either.
+    """
+    room, sender, target, _operator = actors
+    low, high = sorted((send(db, sender, room, "question", (target.session_id,))["id"] for _ in range(2)), key=str)
+    for message, number in ((high, 1), (low, 2)):
+        receipts.acknowledge(db, target, message)
+        db.execute("UPDATE agent_chat.sender_receipts SET id = %s WHERE message_id = %s", (UUID(int=number), message))
+    db.execute(
+        "UPDATE agent_chat.messages SET expires_at = now() + interval '1 hour' WHERE id = ANY(%s)", ([low, high],)
+    )
+    delivered = sorted(row["id"] for row in receipts.sender_feed(db, sender)["receipts"])
+    assert len(delivered) == 2
+
+    def mark():
+        with connect(database) as writer:
+            return receipts.mark_delivered(writer, sender, ReceiptDelivery(receipts=tuple(delivered)))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with db.transaction():
+            # A stand-in for prune, which holds the higher message while it works through its batch.
+            db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s FOR UPDATE", (high,))
+            marking = pool.submit(mark)
+            lock_wait("agent_chat.messages", timeout=5)
+            with connect(database) as probe:
+                # The mark holds the lower message, so a prune that wanted it would wait: no crossed order.
+                with pytest.raises(LockNotAvailable):
+                    probe.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s FOR UPDATE NOWAIT", (low,))
+                # It holds no receipt row yet, so the cascade of a prune cannot wait on it either.
+                locked = probe.execute(
+                    "SELECT id FROM agent_chat.sender_receipts WHERE sender_session_id = %s FOR UPDATE NOWAIT",
+                    (sender.session_id,),
+                ).fetchall()
+                assert sorted(row["id"] for row in locked) == delivered
+            assert not marking.done()
+        assert marking.result(timeout=5)["delivered"] == delivered
