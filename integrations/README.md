@@ -326,7 +326,8 @@ The rules below bind every package that shows receipts.
   path, the first hook claims, and no hook waits behind another hook's delivery. `claude-code` also records the state of
   a report that queues behind a receipts request as it queues, so that second hook sends no second report.
   `pi` and `deepseek` cancel when a heartbeat or a delivery poll falls due while
-  their receipts request is in flight, and send none while either is due. The worker's own deadline for a receipts request, 2 seconds
+  their receipts request is in flight, and send none while either is due; in `pi`, a state that the worker has just
+  refused yields to that request and does not end it. The worker's own deadline for a receipts request, 2 seconds
   (`RECEIPT_SECONDS` in `agent_chat/instance_worker.py`), stays as the backstop for a request that nothing ends. The
   tests hold a receipts request on a gate that nothing releases, so only the cancel can end it, and a hook delivers
   while it is held: client-side, no hook skips its claim for a receipts request. The first request after a cancel is

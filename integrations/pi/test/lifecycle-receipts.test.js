@@ -855,6 +855,91 @@ test("a refused heartbeat that a re-evaluation asked for is sent again after the
     "the delivery poll follows the first refusal, and the receipts request follows the second, each before the retry")
 })
 
+// Review of #191: the snapshot that the worker has just refused yields to a receipts request, and an entry that finds that same
+// snapshot again ends nothing: it makes nothing due that the request in flight does not already wait for. This brings the loop
+// to the point where that matters. A delivery poll is out, the state changes, and the heartbeat of the new state, T, is
+// refused while only a receipts request is due. The receipts request goes out and is held, and T's retry waits behind it.
+// `flight` is the poll tick that began the run, and `start` is where the log counts from.
+async function yieldedToReceipts(s) {
+  const start = await primed(s)
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat is refused and stays unconfirmed
+  let endPoll
+  s.server.gates.pending = new Promise(resolve => { endPoll = resolve })
+  const flight = s.tick() // the delivery poll is out, and a receipts request waits behind it
+  await flush()
+  s.ctx.sessionManager.getSessionName = () => "renamed" // a state report is due; the loop is busy, so the event asks for a compare
+  s.emit("session_tree", {}, s.ctx)
+  let endBeat
+  s.server.gates.heartbeat = new Promise(resolve => { endBeat = resolve })
+  delete s.server.gates.pending
+  endPoll()
+  await flush() // the poll is done, the compare finds the change, and T is out
+  s.emit("session_compact", {}, s.ctx) // asks for a compare, so that T is due again once this one is refused
+  s.server.gates.receipts = held()
+  delete s.server.gates.heartbeat
+  endBeat()
+  await flush() // T is refused while only the receipts request is due: that goes first
+  delete s.server.gates.receipts // a later receipts request is answered; the one in flight stays held
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts"], "the receipts request that T yielded to is in flight")
+  assert.deepEqual(s.cancels, [], "and nothing has ended it")
+  return { start, flight }
+}
+
+for (const [name, enter] of [
+  ["a session_tree event", s => s.emit("session_tree", {}, s.ctx)],
+  ["a session_compact event", s => s.emit("session_compact", {}, s.ctx)],
+  ["the keep-alive tick", s => s.lifecycle.heartbeat()],
+]) {
+  test(`${name} that finds the snapshot just refused does not end the receipts request it yielded to: heartbeat, receipts, heartbeat`, async () => {
+    const s = await session({ rows: [row(1)] })
+    const { start, flight } = await yieldedToReceipts(s)
+    await enter(s)
+    await flush()
+    assert.deepEqual(s.cancels, [], "the state is the one just refused, and the request it waits for is in flight: nothing ends it")
+    s.workers[0].endHeld() // the request ends as it would of itself, and not by a cancel
+    await flight
+    assert.deepEqual(s.cancels, [])
+    assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts", "heartbeat"],
+      "with no delivery poll due, the retry goes right after the receipts request")
+    assert.equal(s.log.at(-1).fields.state.title, "renamed", "and it carries the snapshot that was refused")
+  })
+}
+
+test("a poll tick ends the receipts request that the refused state yielded to, and the delivery poll goes before the retry", async () => {
+  const s = await session({ rows: [row(1)] })
+  const { start, flight } = await yieldedToReceipts(s)
+  const second = s.tick() // a delivery poll falls due: it ends the request, as it ends any
+  await Promise.all([flight, second])
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "one cancel, made for the poll")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts", "tick", "pending", "heartbeat", "receipts"],
+    "the poll the cancel was made for goes before the retry, and the end of the receipts request does not lift the refusal")
+})
+
+test("an entry that finds another state ends the receipts request that the refused state yielded to, and that state goes at once", async () => {
+  const s = await session({ rows: [row(1)] })
+  const { start, flight } = await yieldedToReceipts(s)
+  s.ctx.sessionManager.getSessionName = () => "renamed again" // not the snapshot that was refused
+  s.emit("session_tree", {}, s.ctx)
+  await flight
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "a changed state is due at once, and the request in flight gives way")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts", "heartbeat"])
+  assert.equal(s.log.at(-1).fields.state.title, "renamed again")
+})
+
+// The refusal belongs to one run: the loop that ends forgets it, and the next run starts with none. The first entry of that run
+// sends the same state again before its delivery poll, once, as it does for any entry that finds a state unconfirmed.
+test("a run forgets the refusal of the run before it: its first request sends the state again, before its delivery poll", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.ctx.sessionManager.getSessionName = () => "renamed"
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE"
+  await s.lifecycle.heartbeat() // nothing else is due, so the run ends with that snapshot refused
+  await s.tick() // the next run finds the same snapshot, with a delivery poll and a receipts request due
+  assert.deepEqual(opsSince(s, start), ["heartbeat", "tick", "heartbeat", "pending", "receipts"],
+    "the retry goes first, once, and the poll and the receipts request follow it")
+  assert.deepEqual(s.cancels, [])
+})
+
 // A host suspend lapses the lease on the wall clock alone (#132), and the first poll tick after the resume renders it. The tick
 // renders the footer before it looks at the single flight, so a request in flight holds nothing back. A heartbeat that was sent
 // before the suspend and is answered after it renews nothing: it is older than the lease on the wall clock.

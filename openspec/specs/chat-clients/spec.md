@@ -552,8 +552,8 @@ A state change that a poll or an event sees while a request other than a receipt
 - **THEN** that heartbeat is sent again at most once for each such poll or event, and never in a loop
 - **AND** a state that stays unconfirmed is sent again by the next poll that finds no request in flight
 
-### Requirement: `pi` sends a refused heartbeat again only after the delivery poll that waits
-When the worker answers a heartbeat `refused` and a delivery poll waits, the `pi` package MUST send the poll before it sends that state again, so a heartbeat that is refused after every tick cannot keep the poll from running. This is the one exception to sending a changed state before a waiting request. When no poll waits and a receipts request does, that request MUST go before the retry. A state that differs from the refused one is no exception: it MUST go before the poll.
+### Requirement: `pi` sends a refused heartbeat again only after the request that waited for it
+A delivery poll or a receipts request that was waiting when the worker refused a heartbeat MUST go before that state is sent again, unless another state is confirmed meanwhile. In that run the refused state also yields to either one that falls due later, until a delivery poll has run or a heartbeat is confirmed. The next run forgets the refusal, so the entry that starts it may send the state before its poll. Any other changed state goes first, and a delivery poll goes before a receipts request.
 
 #### Scenario: A refusal that outlasts every tick
 - **WHEN** each heartbeat is answered `refused` after a poll tick has come, so a delivery poll is due each time
@@ -568,6 +568,16 @@ When the worker answers a heartbeat `refused` and a delivery poll waits, the `pi
 - **WHEN** a heartbeat is refused after an event asked for a compare, no delivery poll is due, and a receipts request is
 - **THEN** the receipts request is sent before the retry
 
+#### Scenario: A receipts request that the refused state yielded to
+- **WHEN** a heartbeat is refused while a receipts request is due, that request is out, and an event or the keep-alive finds the same state
+- **THEN** the receipts request is not ended, and the retry follows it
+- **AND** a poll tick that comes while it is out ends it, and the delivery poll goes before the retry
+
+#### Scenario: The keep-alive finds the state just refused
+- **WHEN** a changed heartbeat is refused, a delivery poll waits, and the 30-second tick then finds the same state due
+- **THEN** the delivery poll is sent first, and the retry follows it: heartbeat, delivery poll, heartbeat
+- **AND** an event that asks for a heartbeat of the same state is treated the same way
+
 #### Scenario: A further change after a refusal
 - **WHEN** a heartbeat is refused, and the state then differs from the refused one while a delivery poll waits
 - **THEN** the heartbeat of the new state is sent before the delivery poll
@@ -580,8 +590,14 @@ When the worker answers a heartbeat `refused` and a delivery poll waits, the `pi
 - **WHEN** a heartbeat that an event found in flight is refused and no delivery poll or receipts request is due
 - **THEN** that state is sent again once, at once
 
-### Requirement: `pi` ends its instance at `session_shutdown` and starts a replacing runtime stopped
-`session_shutdown` MUST stop the `pi` worker, end the instance and return a promise that Pi awaits before a replacing runtime starts. The promise MUST settle when every worker that the package stopped has closed, a rejoin's included, or after 6 seconds. No other event, including `session_before_switch` and `session_before_fork`, MAY end an instance. A replacing runtime MUST start stopped and join with the native session id of its own `session_start`, and MUST start no worker once chat is off.
+#### Scenario: Any order of ticks, events and answers
+- **WHEN** poll ticks, keep-alive ticks and events come in any order while each request is confirmed, refused as a brief outage, or held until a later tick
+- **THEN** the loop ends and a later poll tick finds it free
+- **AND** a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again, unless another state is confirmed meanwhile, and a changed state is never left behind a delivery poll
+- **AND** no request is sent twice for one due flag
+
+### Requirement: `pi` asks for the end of its instance at `session_shutdown` and starts a replacing runtime stopped
+`session_shutdown` MUST stop the `pi` worker, which requests the instance's end, and return a promise that Pi awaits before a replacing runtime starts. The promise MUST settle when every worker that the package stopped has closed, a rejoin's included, or after 6 seconds. Neither the request nor the close proves that the server accepted the end. No other event MAY end an instance. A replacing runtime MUST start stopped, join with its own native session id and start no worker once chat is off.
 
 #### Scenario: A runtime is replaced
 - **WHEN** Pi emits `session_shutdown` to the old runtime and then `session_start` to a new one, with the reason `reload`, `new`, `resume` or `fork`
@@ -601,6 +617,10 @@ When the worker answers a heartbeat `refused` and a delivery poll waits, the `pi
 #### Scenario: A worker that does not close at shutdown
 - **WHEN** Pi emits `session_shutdown` and a worker that the package stopped has not closed 6 seconds later
 - **THEN** the promise that the handler returns settles at that time, with that worker still not closed
+
+#### Scenario: A delivery whose hand-off is held
+- **WHEN** Pi has the message of a claimed delivery and has not reported it, and Pi emits `session_shutdown` or the worker exits
+- **THEN** nothing is settled and no worker starts, whether Pi reports the message later or the hand-off times out
 
 #### Scenario: An event that precedes a switch
 - **WHEN** Pi emits `session_before_switch` or `session_before_fork`
@@ -637,22 +657,17 @@ When the worker answers a heartbeat `refused` and a delivery poll waits, the `pi
 - **WHEN** `connect` is called while a worker joins or serves
 - **THEN** it starts no second worker and stops none
 
-### Requirement: A `pi` disconnect ends the connect call that waits
-`disconnect` MUST end the `connect` call that is out: that call MUST start no worker afterwards, whether it waits for a close, joins or waits for the answer to its first heartbeat. A `connect` that comes after a `disconnect` MUST NOT wait for the call that the `disconnect` ended, unlike other calls: it waits and starts on its own, so one worker starts once every worker that the package stopped has closed, or after 6 seconds. The ended call MUST NOT end or replace the call that follows it.
+### Requirement: A `pi` disconnect ends the instance for good
+`disconnect` MUST end the instance as `session_shutdown` and the off latch do: it MUST stop the live worker, and no `connect` after it MAY start a worker, nor MAY the `connect` call that is out, whether it waits for a close, joins or waits for the answer to its first heartbeat.
 
 #### Scenario: A disconnect during a wait
 - **WHEN** `connect` waits for a worker that has not closed, `disconnect` is called, and that worker then closes
 - **THEN** the call that waited starts no worker
 
-#### Scenario: A connect right after a disconnect
-- **WHEN** `disconnect` is called while a worker joins, or while the answer to its first heartbeat is out, and `connect` is called at once
-- **THEN** one worker starts after the old worker has closed, and none starts from the call that the `disconnect` ended
-- **AND** the answer that the old worker owes, when it comes, starts no worker
-
-#### Scenario: A call after the wait of an ended call
-- **WHEN** `disconnect` ends a call that waits, a `connect` follows and waits, the wait of the ended call reaches its bound first, and a third call comes
-- **THEN** the third call gets the call that follows the `disconnect` and starts no worker of its own
-- **AND** one worker starts, and a join that meets `BINDING_CONFLICT` is followed by its back-off
+#### Scenario: A connect after a disconnect
+- **WHEN** `disconnect` is called and `connect` follows, while the old worker is still closing or after it has closed
+- **THEN** the call that waits for the close starts no worker, and nor does a call after it
+- **AND** no binding is published
 
 ### Requirement: Compaction and tree navigation keep the `pi` binding
 Tree navigation and compaction MUST keep the `pi` binding and MUST NOT join again. While Pi is not idle, in a compaction or a tree summary, the package MUST report `busy` and claim nothing. `session_tree`, `session_compact` and `session_compact_failed` MUST make it read the state at once, with the context that the event carries.
@@ -913,7 +928,7 @@ A package's receipts pass MUST send at most one receipts request: the mark that 
 - **AND** the delivery still counts the agent as busy and starts no turn
 
 ### Requirement: A receipts request gives way to every other request
-A package MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, MUST repeat the cancel every few milliseconds until that request answers, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
+A package MUST end a receipts request in flight with the worker's cancel when a heartbeat (`pi`: not a refused state that yields), a state report, a delivery poll or a claim falls due, MUST repeat the cancel every few milliseconds until that request answers, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
 
 #### Scenario: A request falls due while a receipts request is in flight
 - **WHEN** a heartbeat, a state report, a delivery poll or a claim falls due while a receipts request is in flight and nothing releases that request

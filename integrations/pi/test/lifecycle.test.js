@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PassThrough } from "node:stream"
 import agentChatExtension from "../extensions/agent-chat.js"
-import { createAgentChat } from "../lib/lifecycle.js"
+import { createAgentChat, nextRequest } from "../lib/lifecycle.js"
 import { startWorker } from "../lib/worker.js"
 import { MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
 import { renderNotice } from "../lib/notice.js"
@@ -29,7 +29,8 @@ const joined = {
 const attempt = "44444444-4444-4444-8444-444444444444"
 const message = { id: "55555555-5555-4555-8555-555555555555", kind: "message", sender: { session_id: "peer-1" }, created_at: "2026-01-01T00:00:00Z" }
 
-function fakePi({ throwOnSend = false } = {}) {
+// `holdSend` leaves a delivery unreported until the test emits `message_start` for it, as Pi does while it is busy.
+function fakePi({ throwOnSend = false, holdSend = false } = {}) {
   const handlers = new Map()
   const sent = []
   const notices = []
@@ -41,7 +42,7 @@ function fakePi({ throwOnSend = false } = {}) {
     sendMessage(payload, options) {
       if (throwOnSend) throw new Error("native send refused")
       sent.push({ payload, options })
-      queueMicrotask(() => emit("message_start", { message: { ...payload, role: "custom" } }))
+      if (!holdSend) queueMicrotask(() => emit("message_start", { message: { ...payload, role: "custom" } }))
     },
   }
   // Returns what the handlers returned, as Pi awaits them: a test that needs the result of a shutdown awaits it.
@@ -54,18 +55,39 @@ function fakePi({ throwOnSend = false } = {}) {
   return { pi, emit, ctx, sent, notices, statuses, commands, handlers }
 }
 
-// `holdClose` keeps `closed` pending after stop() until the test calls release(), as a worker that takes time to exit.
+// `holdClose` keeps `closed` pending after stop() until the test calls release(), as a worker that takes time to exit. As the
+// real worker does (lib/worker.js), stop() ends the request that is still waiting for its answer at once, with
+// CHAT_REQUEST_UNCERTAIN and that request's operation; the answer that is owed after that comes to nobody.
 function fakeWorker({ ready = Promise.resolve(joined), answer = () => ({}), holdClose = false } = {}) {
   const requests = []
   let stops = 0
   let close
+  let pending = null // { op, reject }: the request whose answer is owed
   const closed = new Promise(resolve => { close = resolve })
   return {
     ready, closed, requests,
     get stops() { return stops },
     release: () => close({ code: 0, signal: null }),
-    request(op, fields) { requests.push({ op, fields }); return Promise.resolve(answer(op, fields)) },
-    stop() { stops += 1; if (!holdClose) close({ code: 0, signal: null }); return closed },
+    request(op, fields) {
+      requests.push({ op, fields })
+      const owed = answer(op, fields) // a throw stays synchronous, as it always did
+      return new Promise((resolve, reject) => {
+        const entry = { op, reject }
+        pending = entry
+        const done = settle => value => { if (pending === entry) pending = null; settle(value) }
+        Promise.resolve(owed).then(done(resolve), done(reject))
+      })
+    },
+    stop() {
+      stops += 1
+      if (pending) {
+        const { op, reject } = pending
+        pending = null
+        reject(Object.assign(new Error("CHAT_REQUEST_UNCERTAIN"), { code: "CHAT_REQUEST_UNCERTAIN", operation: op }))
+      }
+      if (!holdClose) close({ code: 0, signal: null })
+      return closed
+    },
   }
 }
 
@@ -1599,6 +1621,171 @@ test("an event that found a heartbeat in flight gets one retry at once when it i
   assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "heartbeat"], "one retry for the event, and its refusal ends it")
 })
 
+// The 30-second keep-alive is one more source of a due heartbeat, and the rule for a refused snapshot holds for it as for any
+// other: a changed heartbeat that is refused, with a poll tick and the keep-alive tick both come meanwhile, finds the snapshot
+// that was just refused due again, and the delivery poll goes before it.
+test("a keep-alive tick that finds the snapshot just refused waits for the delivery poll: heartbeat, poll, heartbeat", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker } = session
+  const before = worker.requests.length
+  session.state.idle = false
+  session.refusal.code = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat that is not held is refused as well
+  const release = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds the change and sends it, and its answer is held; the poll is queued behind it
+  await flush()
+  await lifecycle.heartbeat() // the 30-second tick comes while that heartbeat is out
+  release({ refused: "TRANSPORT_UNAVAILABLE" })
+  await flight
+  const sent = worker.requests.slice(before)
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "pending", "heartbeat"], "the poll goes between the two")
+  assert.equal(sent[0].fields.state.native_state, "busy")
+  assert.deepEqual(sent[2].fields.state, sent[0].fields.state, "the keep-alive carries the snapshot that was refused")
+})
+
+// The scheduler is one pure decision over what is due: a heartbeat goes first, unless it is the snapshot that was just refused
+// while a delivery poll or a receipts pass waits; then the delivery poll, then the receipts pass; nothing due is null. All 16
+// combinations of the four flags, in the order dirty, pollDue, receiptsDue, sameAsRefused.
+const NEXT_REQUEST = [
+  [[0, 0, 0, 0], null], [[0, 0, 0, 1], null],
+  [[0, 0, 1, 0], "receipts"], [[0, 0, 1, 1], "receipts"],
+  [[0, 1, 0, 0], "poll"], [[0, 1, 0, 1], "poll"],
+  [[0, 1, 1, 0], "poll"], [[0, 1, 1, 1], "poll"],
+  [[1, 0, 0, 0], "heartbeat"], [[1, 0, 0, 1], "heartbeat"],
+  [[1, 0, 1, 0], "heartbeat"], [[1, 0, 1, 1], "receipts"],
+  [[1, 1, 0, 0], "heartbeat"], [[1, 1, 0, 1], "poll"],
+  [[1, 1, 1, 0], "heartbeat"], [[1, 1, 1, 1], "poll"],
+]
+test("nextRequest chooses the request for each of the 16 combinations of what is due", () => {
+  assert.equal(new Set(NEXT_REQUEST.map(([flags]) => flags.join(""))).size, 16, "every combination is listed once")
+  for (const [[dirty, pollDue, receiptsDue, sameAsRefused], expected] of NEXT_REQUEST) {
+    const due = { dirty: dirty === 1, pollDue: pollDue === 1, receiptsDue: receiptsDue === 1, sameAsRefused: sameAsRefused === 1 }
+    assert.equal(nextRequest(due), expected, JSON.stringify(due))
+  }
+})
+
+// An entry that finds a receipts request in flight asks `nextRequest` with that request counted as waiting (`receiptsDue`), and
+// ends the request unless the answer is "receipts". For a snapshot that is not the one just refused the answer is "receipts"
+// exactly when no heartbeat and no delivery poll is due, so the rule ends the request exactly when `dirty || pollDue`, as it
+// did before the entry asked. The snapshot just refused yields to the request in flight, and only a delivery poll ends it.
+test("nextRequest, asked about a receipts request in flight, answers receipts exactly when no heartbeat and no delivery poll is due", () => {
+  for (const dirty of [false, true]) {
+    for (const pollDue of [false, true]) {
+      const other = nextRequest({ dirty, pollDue, receiptsDue: true, sameAsRefused: false })
+      assert.equal(other === "receipts", !dirty && !pollDue, `a snapshot that is not the one just refused: dirty ${dirty}, pollDue ${pollDue}`)
+      const refused = nextRequest({ dirty, pollDue, receiptsDue: true, sameAsRefused: true })
+      assert.equal(refused === "receipts", !pollDue, `the snapshot just refused: dirty ${dirty}, pollDue ${pollDue}`)
+    }
+  }
+})
+
+// Every interleaving, to depth 4, of three kinds of entry (a poll tick, the 30-second keep-alive tick and an event that changes
+// the state, here a compaction) with two kinds of answer (confirmed, and the refusal of a tolerated outage), against a worker
+// that holds each request until the script answers it, so an entry can come in while any request is out and an answer after any
+// entry. A sequence starts with an entry, since an answer to nothing is no step. After the script every request that is still out
+// is answered the same way until the loop ends, once with each answer. For every sequence:
+//  - the loop ends, and the next poll tick finds it free and sends a request;
+//  - a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again (the rule reads
+//    "a delivery poll or a receipts request": this worker never has a receipts request in flight, so only the poll is checked
+//    here, and lifecycle-receipts.test.js checks the receipts request);
+//  - a changed state is never left behind a delivery poll, unless it is the snapshot that was just refused;
+//  - no due flag is spent twice: no more heartbeats than entries, no more delivery polls than poll ticks.
+const ENTRIES = ["poll", "beat", "event"]
+const ANSWERS = ["confirmed", "refused"]
+const REFUSAL = { refused: "TRANSPORT_UNAVAILABLE" }
+
+async function interleaving(script, drain) {
+  const { pi, emit, ctx } = fakePi()
+  const state = { idle: true }
+  ctx.isIdle = () => state.idle
+  const snapshot = () => (state.idle ? "idle" : "busy") // the only part of a heartbeat that the script changes
+  const problems = []
+  const count = { heartbeats: 0, polls: 0, entries: 0, ticks: 0 }
+  // What the worker has confirmed and what it has refused, a poll tick that no delivery poll has taken, and the snapshot that was
+  // refused while one waited.
+  const model = { confirmed: "idle", refused: null, pollWaiting: false, heldBack: null }
+  let armed = false // the invariants hold from the first step of the script, not for the join
+  let held = null // the request whose answer is out: { op, text, resolve }
+  const worker = fakeWorker({
+    answer: (op, fields) => {
+      const text = op === "heartbeat" ? fields.state.native_state : null
+      if (armed && op === "heartbeat") {
+        count.heartbeats += 1
+        if (text === model.heldBack) problems.push("a snapshot that was refused while a delivery poll waited went ahead of that poll")
+      }
+      if (armed && op === "pending") {
+        count.polls += 1
+        model.pollWaiting = false
+        model.heldBack = null
+        if (snapshot() !== model.confirmed && snapshot() !== model.refused) problems.push("a changed state waited behind a delivery poll")
+      }
+      return new Promise(resolve => { held = { op, text, resolve } })
+    },
+  })
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => worker, now: () => 1000 })
+  async function reply(value) {
+    if (!held) return
+    const { op, text, resolve } = held
+    held = null
+    if (op !== "heartbeat") model.refused = null // a poll is done: the snapshot that waited for it is due again
+    else if (value.refused) Object.assign(model, { refused: text, heldBack: model.pollWaiting ? text : null })
+    else Object.assign(model, { confirmed: text, refused: null, heldBack: null })
+    resolve(value)
+    await flush()
+  }
+  const answerAll = async value => { for (let step = 0; step < 12 && held; step += 1) await reply(value) }
+  const steps = {
+    poll: async () => { count.entries += 1; count.ticks += 1; model.pollWaiting = true; void lifecycle.poll(); await flush() },
+    beat: async () => { count.entries += 1; void lifecycle.heartbeat(); await flush() },
+    event: async () => {
+      count.entries += 1
+      state.idle = !state.idle
+      emit("session_compact", { type: "session_compact" }, ctx)
+      await flush()
+    },
+    confirmed: () => reply({}),
+    refused: () => reply(REFUSAL),
+  }
+
+  emit("session_start", {}, ctx) // the join, and then the interactive input that makes the idle flag count: idle is what is confirmed
+  await flush()
+  await answerAll({})
+  emit("input", { source: "interactive" }, ctx)
+  void lifecycle.poll()
+  await flush()
+  await answerAll({})
+  armed = true
+  for (const step of script) await steps[step]()
+  await answerAll(drain === "refused" ? REFUSAL : {})
+  if (held) problems.push("the loop did not end")
+  if (count.heartbeats > count.entries) problems.push(`${count.heartbeats} heartbeats for ${count.entries} entries`)
+  if (count.polls > count.ticks) problems.push(`${count.polls} delivery polls for ${count.ticks} poll ticks`)
+  armed = false
+  void lifecycle.poll() // the next tick finds the loop free
+  await flush()
+  if (!held) problems.push("the next poll tick sent nothing: the loop was not free")
+  await answerAll({})
+  if (held) problems.push("the loop did not end after the next poll tick")
+  return problems
+}
+
+test("every interleaving of poll ticks, keep-alive ticks, events and answers to depth 4 keeps the scheduler's rules", async () => {
+  let words = [[]]
+  const scripts = []
+  for (let depth = 1; depth <= 4; depth += 1) {
+    words = words.flatMap(word => [...ENTRIES, ...ANSWERS].map(step => [...word, step]))
+    scripts.push(...words.filter(word => ENTRIES.includes(word[0])))
+  }
+  assert.equal(scripts.length, 3 * (1 + 5 + 25 + 125), "every sequence that starts with an entry")
+  const failures = []
+  for (const script of scripts) {
+    for (const drain of ANSWERS) {
+      const problems = await interleaving(script, drain)
+      if (problems.length) failures.push(`${script.join(" ")}, then ${drain}: ${problems.join("; ")}`)
+    }
+  }
+  assert.deepEqual(failures, [])
+})
+
 // One Pi extension runtime: the real factory on its own extension API, for the session `native`, with a worker that joins as
 // `instance`. Pi builds one for every session start. `log` records the order of the joins; `extra` replaces options, such as the timers.
 function runtime(native, instance = joined, log = [], extra = {}) {
@@ -1900,74 +2087,23 @@ test("a connect call that comes while a flight is out gets that flight, and one 
   assert.equal(workers.length, 2, "one worker, however many calls")
 })
 
-// disconnect() ends the authority of the flight that is out. The call that follows it is a flight of its own, and the old flight
-// starts nothing, whatever it was doing: waiting for a close, joining, or waiting for its first heartbeat.
-test("disconnect then connect while the first heartbeat is held: one new worker starts after the old close, and none from the old flight", async () => {
-  const { pi, emit, ctx } = fakePi()
-  const workers = []
-  let answerLate
-  const late = new Promise(resolve => { answerLate = resolve })
-  const lifecycle = createAgentChat(pi, config, {
-    ...timers, now: () => 1000,
-    startProcess: () => {
-      const index = workers.length
-      const worker = fakeWorker({
-        ready: Promise.resolve(index === 0 ? joined : instanceTwo),
-        holdClose: index === 0,
-        answer: op => (op === "heartbeat" && index === 0 ? late : op === "pending" ? { messages: [] } : {}),
-      })
-      workers.push(worker)
-      return worker
-    },
-  })
-  emit("session_start", {}, ctx) // the first flight joins, and the answer to its first heartbeat is held
+// The exit that an earlier worker reports is a report about that worker. A close that comes after the bound, when its replacement
+// has joined, is the one case on the usual path where a worker closes while another record is live.
+test("an old worker that closes after its replacement joined does not end the replacement", async t => {
+  resetLatchAfter(t)
+  const { lifecycle, workers, fail, retries, clock } = await rejoinTeardown()
+  await fail()
+  retries[0].fn() // the rejoin timer fires: the flight waits for the old close, which is held
   await flush()
-  assert.deepEqual(workers[0].requests.map(row => row.op), ["heartbeat"])
-  const ended = lifecycle.disconnect()
-  const again = lifecycle.connect()
+  clock.fire(CLOSE_WAIT_MS) // the bound ends the wait, and the replacement joins
   await flush()
-  assert.equal(workers.length, 1, "the new flight waits for the old close")
-  workers[0].release()
+  assert.equal(workers.length, 2)
+  assert.match(lifecycle.binding(), /boot-2\.json/)
+  workers[0].release() // the old worker reports its exit at last
   await flush()
-  await ended
-  assert.equal(workers.length, 2, "one new worker starts after it")
-  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
-  answerLate({}) // the old flight's heartbeat is answered at last
-  await flush()
-  await again
-  assert.equal(workers.length, 2, "and the old flight starts none")
-  assert.equal(workers[0].requests.length, 1, "nothing more goes to the old worker")
-  assert.equal(workers[1].requests[0].op, "heartbeat", "the new instance publishes its state")
-})
-
-test("disconnect then connect while a worker joins: the new worker starts after the old close, and the interrupted join starts none", async () => {
-  const { pi, emit, ctx } = fakePi()
-  const workers = []
-  let admit
-  const admitted = new Promise(resolve => { admit = resolve })
-  const lifecycle = createAgentChat(pi, config, {
-    ...timers, now: () => 1000,
-    startProcess: () => {
-      const index = workers.length
-      const worker = fakeWorker({ ready: index === 0 ? admitted.then(() => joined) : Promise.resolve(instanceTwo), holdClose: index === 0 })
-      workers.push(worker)
-      return worker
-    },
-  })
-  emit("session_start", {}, ctx) // the first worker is joining
-  const ended = lifecycle.disconnect()
-  const again = lifecycle.connect()
-  await flush()
-  assert.equal(workers.length, 1, "the new flight waits for the old close")
-  workers[0].release()
-  await flush()
-  await ended
-  assert.equal(workers.length, 2, "one new worker starts after it")
-  admit() // the interrupted join is answered at last
-  await flush()
-  await again
-  assert.equal(workers.length, 2, "and the interrupted join starts none")
-  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
+  assert.equal(workers[1].stops, 0, "the replacement is not stopped")
+  assert.match(lifecycle.binding(), /boot-2\.json/, "and still serves")
+  assert.notEqual(lifecycle.state(), "offline", "chat is not turned off")
 })
 
 test("a disconnect during the close wait of a flight: that flight starts no worker once the wait is over", async () => {
@@ -1982,54 +2118,83 @@ test("a disconnect during the close wait of a flight: that flight starts no work
   assert.equal(workers.length, 1, "the flight that the disconnect ended starts nothing")
 })
 
-test("a disconnect during the close wait of a flight, then a connect: one worker starts, not two, and the back-off holds", async () => {
-  const conflict = Object.assign(new Error("BINDING_CONFLICT"), { code: "BINDING_CONFLICT", operation: "join" })
-  const { lifecycle, workers, fail, retries, clock } = await rejoinTeardown(
-    index => (index === 1 ? { ready: Promise.reject(conflict), holdClose: true } : {}))
-  await fail()
-  retries[0].fn() // the old flight waits for the old close, which is held
-  await flush()
-  void lifecycle.disconnect()
-  void lifecycle.connect() // a flight of its own, with a wait of its own
-  await flush()
-  for (const timer of clock.left(CLOSE_WAIT_MS)) { // the waits reach their bounds, one after the other
-    clock.run(timer)
-    await flush()
-  }
-  assert.equal(workers.length, 2, "one worker started, and its join met the conflict")
-  assert.equal(clock.left(5000).length, 1, "the failed join set a back-off")
-  await flush()
-  assert.equal(workers.length, 2, "and nothing starts before it is over")
-})
-
-// The flight that a disconnect ended may end after the flight that followed it began. It clears its own handle and no other, so a
-// call that comes in between gets the new flight, and not a third one with a wait of its own that would end past the back-off.
-test("the flight that a disconnect ended leaves the handle of the flight after it: a call in between gets that flight, and the back-off holds", async () => {
-  const conflict = Object.assign(new Error("BINDING_CONFLICT"), { code: "BINDING_CONFLICT", operation: "join" })
-  const { lifecycle, workers, fail, retries, clock } = await rejoinTeardown(
-    index => (index === 1 ? { ready: Promise.reject(conflict), holdClose: true } : {}))
-  await fail()
-  retries[0].fn() // the old flight waits for the old close, which is held
-  await flush()
-  const [oldWait] = clock.left(CLOSE_WAIT_MS)
-  void lifecycle.disconnect()
-  const next = lifecycle.connect() // a flight of its own, with a wait of its own
-  await flush()
-  const nextWait = clock.left(CLOSE_WAIT_MS).at(-1)
-  clock.run(oldWait) // the bound of the old flight comes first: it starts nothing, and it ends
+// disconnect() ends the instance for good, as a shutdown or the off latch does: no call that follows it starts a worker, the
+// call that waits for a close included. The extension calls it only at those two points, and neither is followed by a start.
+test("connect() after disconnect() starts nothing, whether it comes during the close wait or after it", async () => {
+  const { pi, emit, ctx } = fakePi()
+  const workers = []
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000,
+    startProcess: () => { const worker = fakeWorker({ holdClose: true }); workers.push(worker); return worker },
+  })
+  emit("session_start", {}, ctx)
   await flush()
   assert.equal(workers.length, 1)
-  assert.equal(lifecycle.connect(), next, "a call while the new flight waits gets that flight")
-  clock.run(nextWait)
+  const ended = lifecycle.disconnect()
+  const during = lifecycle.connect() // it would wait for the close, and then start
   await flush()
-  assert.equal(workers.length, 2, "the new flight starts one worker, and its join meets the conflict")
-  assert.equal(clock.left(5000).length, 1, "the failed join set a back-off")
-  for (const timer of clock.left(CLOSE_WAIT_MS)) { // every other wait reaches its bound
-    clock.run(timer)
-    await flush()
-  }
-  assert.equal(workers.length, 2, "and none of them starts a worker before the back-off is over")
+  workers[0].release()
+  await flush()
+  await ended
+  await during
+  assert.equal(workers.length, 1, "the call that waited for the close starts nothing")
+  await lifecycle.connect()
+  assert.equal(workers.length, 1, "nor does a call after it")
+  assert.equal(lifecycle.binding(), null, "and no binding is published")
 })
+
+// A native hand-off that is held is the one wait with no request in flight: the delivery is claimed, Pi has the message and has
+// not reported it, and the loop is out. What ends the instance meanwhile leaves its continuation nothing to send. A shutdown
+// does, and so does a worker that exits, which turns chat off for good: no rejoin follows, so no replacement can join while
+// the continuation is out.
+for (const [name, interrupt] of [
+  ["the runtime shuts down", ({ emit }) => emit("session_shutdown", { type: "session_shutdown", reason: "reload" })],
+  ["the worker exits", ({ worker }) => worker.release()],
+]) {
+  test(`a delivery whose hand-off is held settles nothing and starts no worker when ${name}`, async t => {
+    resetLatchAfter(t)
+    const { pi, emit, ctx, sent } = fakePi({ holdSend: true })
+    const clock = manualTimeouts()
+    const workers = []
+    let offered = false
+    const lifecycle = createAgentChat(pi, config, {
+      ...timers, now: () => 1000, random: () => 0,
+      setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl,
+      startProcess: () => {
+        const worker = fakeWorker({
+          answer: op => {
+            if (op === "pending") return { messages: offered ? [message.id] : [] }
+            if (op === "claim") return {
+              dispatch: true, attempt_id: attempt, reservation_ms: 20_000,
+              messages: [{ ...message, room_id: joined.room_id, history_after: "history-cursor-1", body: "synthetic body", sender_session_id: "peer-1", created_at: message.created_at }],
+            }
+            return op === "status" ? { muted: false } : {}
+          },
+        })
+        workers.push(worker)
+        return worker
+      },
+    })
+    emit("session_start", {}, ctx)
+    await flush()
+    emit("input", { source: "interactive" }, ctx)
+    offered = true
+    const flight = lifecycle.poll()
+    await flush()
+    const [worker] = workers
+    assert.equal(sent.length, 1, "the message is with Pi, and its report is held")
+    assert.equal(worker.requests.at(-1).op, "status", "the loop is out and no request is in flight")
+    interrupt({ emit, worker })
+    await flush()
+    emit("message_start", { message: { ...sent[0].payload, role: "custom" } }) // Pi reports the message at last
+    await flight
+    assert.equal(worker.requests.some(row => row.op === "settle"), false, "nothing is settled")
+    for (const timer of [...clock.log]) clock.run(timer) // every timer that is left, a rejoin's included
+    await flush()
+    await lifecycle.connect()
+    assert.equal(workers.length, 1, "and no worker starts")
+  })
+}
 
 test("the extension ends its instance on session_shutdown only, never on session_before_switch or session_before_fork", () => {
   const { handlers } = runtime("native-1")

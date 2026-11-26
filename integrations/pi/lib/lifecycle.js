@@ -8,6 +8,7 @@
 // separate non-waking message. They never touch the claim, settle, heartbeat or binding path. Only a worker whose join reply
 // names `receipts-cancel` is asked for them, and they give way: a heartbeat or a delivery poll that falls due while a
 // receipts request is in flight ends it with the worker's cancel signal, and the loop sends no receipts request while one is due.
+// The snapshot that the worker has just refused is not due while that request waits: it yields to it (`nextRequest`).
 import { randomUUID } from "node:crypto"
 import { loadConfig, PI_CHAT_CONFIG_ENV } from "./config.js"
 import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "./channel.js"
@@ -32,6 +33,21 @@ const RECEIPTS_TYPE = "agent-chat-receipts"
 const NO_LIVE_INSTANCE = "Agent Chat: no live instance"
 
 const requestFailure = (error, operation) => Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation })
+
+// The request that the single flight sends next. The drive loop asks once for every pass, with what is due, whatever made a
+// heartbeat due: a change that an entry found, an entry that skipped its compare, the 30-second keep-alive or an event. A
+// heartbeat goes first, except for the snapshot that the worker has just refused while a delivery poll or a receipts pass
+// waits: that one goes after them, so a heartbeat that is refused after every tick cannot keep them from running. The poll
+// goes before the receipts pass, and nothing due is `null`. An entry that finds a receipts request in flight asks it too, with
+// that request counted as waiting (`receiptsDue`), and ends the request unless the answer is "receipts": for a snapshot that
+// is not the one just refused that is exactly when a heartbeat or a delivery poll is due, and the snapshot just refused ends
+// it only for a delivery poll.
+export function nextRequest({ dirty, pollDue, receiptsDue, sameAsRefused }) {
+  if (dirty && !(sameAsRefused && (pollDue || receiptsDue))) return "heartbeat"
+  if (pollDue) return "poll"
+  if (receiptsDue) return "receipts"
+  return null
+}
 
 // agent_chat.models.Heartbeat: <=128 characters, <=512 UTF-8 bytes, no control
 // or bidirectional characters. An unusable advisory title is omitted.
@@ -72,10 +88,10 @@ export function createAgentChat(pi, config, {
   let dirty = false
   let pollDue = false
   let receiptsDue = false
-  let reading = false // a receipts request is out on the worker: a heartbeat or a delivery poll that falls due ends it
+  let reading = null // the record whose receipts request is out on its worker: a heartbeat or a delivery poll that falls due ends it
   let recheck = false // an entry found the loop busy and skipped the compare: the loop compares the state before its next request
+  let refusedText = null // the snapshot whose heartbeat the worker just refused, as JSON. A run starts with none; a confirmed heartbeat or a delivery poll pass ends it
   let connecting = null // the one flight of connect(): the wait for the closing workers, the start and the join
-  let flightEpoch = 0 // counted by disconnect(): a flight that began before it starts no worker
   let receiptState = receipts.createReceipts()
   let pendingReceipts = null // { marker, ids }: sent to Pi, not yet confirmed by message_start
   let prompts = 0
@@ -171,14 +187,12 @@ export function createAgentChat(pi, config, {
     if (record?.worker) endWorker(record.worker)
   }
 
-  // Stops the live worker, if there is one, and returns a promise for the close of every worker still exiting: the one
-  // stopped here, and one that an earlier failure stopped, which `live` no longer names. It settles after CLOSE_WAIT_MS at
-  // the latest.
+  // Ends this instance for good, as a shutdown or the off latch does: it stops the live worker, if there is one, and no
+  // connect() starts a worker after it, one whose wait is out included. It returns a promise for the close of every worker
+  // still exiting: the one stopped here, and one that an earlier failure stopped, which `live` no longer names. It settles
+  // after CLOSE_WAIT_MS at the latest.
   function disconnect() {
-    // The flight that is out loses its authority and its place: it starts nothing once its wait is over, and the next connect()
-    // is a flight of its own.
-    flightEpoch += 1
-    connecting = null
+    closed = true
     clearTimers()
     stopLive()
     return allClosed()
@@ -280,9 +294,12 @@ export function createAgentChat(pi, config, {
     ].join("\n")
   }
 
-  function request(operation, fields) {
-    if (!live) return Promise.reject(Object.assign(new Error("CHAT_WORKER_CLOSED"), { code: "CHAT_WORKER_CLOSED", operation }))
-    return live.worker.request(operation, fields)
+  // The one way that a request reaches a worker, and the whole ownership rule of the loop: a request goes through the record
+  // that its caller was started for, and is refused once that record is no longer the live one. A loop or a continuation that
+  // outlives its instance therefore reaches no worker, and above all not the one that replaced it.
+  function request(record, operation, fields) {
+    if (live !== record) return Promise.reject(Object.assign(new Error("CHAT_WORKER_CLOSED"), { code: "CHAT_WORKER_CLOSED", operation }))
+    return record.worker.request(operation, fields)
   }
 
   function refused(result) {
@@ -301,48 +318,50 @@ export function createAgentChat(pi, config, {
     // send it again at once. A refused one is retried by the next entry. A busy loop is not compared here, since a heartbeat
     // of that state may be in flight and would go out twice; the exception is a receipts request, which holds no heartbeat, so
     // a change found then is a state report that is due now. An entry that skips the compare sets `recheck` instead, and the
-    // loop compares once before it chooses its next request, so a change seen during a slow request is published right after
-    // it, ahead of a delivery poll or a receipts request that waits, and not at a later tick that finds the loop free. That
-    // compare takes the current state and the last confirmed one of the current record, so a change that reverted meanwhile
+    // loop compares once at the top of its next pass, so a change seen during a slow request is published right after it,
+    // ahead of a delivery poll or a receipts request that waits, and not at a later tick that finds the loop free. That
+    // compare takes the current state and the last confirmed one of the loop's record, so a change that reverted meanwhile
     // sends nothing. One compare spends the flag, so a refused heartbeat is sent again at most once for each entry that
-    // skipped, never in a loop. That retry goes after a delivery poll or a receipts pass that waits, not before it: a refused
-    // heartbeat that outlasts a tick would otherwise be followed by another of the same state for every tick, and the poll
-    // would never run. Any other change goes first.
-    if (!busy || reading) dirty ||= live.published !== JSON.stringify(heartbeatState(state))
-    else recheck = true
+    // skipped, never in a loop.
+    const entryText = !busy || reading ? JSON.stringify(heartbeatState(state)) : null
+    if (entryText === null) recheck = true
+    else dirty ||= live.published !== entryText
     if (busy) {
-      // What is due waits for the single flight. A receipts request in flight would hold it, so it is ended: the worker
-      // answers it `refused` within milliseconds, and the loop takes what is due. A re-evaluation that finds nothing due
-      // ends nothing.
-      if (reading && (dirty || pollDue)) live.worker.cancel()
+      // What is due waits for the single flight. A receipts request in flight would hold it, so the entry asks `nextRequest`
+      // what goes next, with that request counted as waiting, and ends it unless the answer is "receipts": the worker answers
+      // `refused` within milliseconds, and the loop takes what is due. A re-evaluation that finds nothing due ends nothing, and
+      // nor does an entry that finds the snapshot just refused, which yields to the request in flight like any other.
+      if (reading && nextRequest({ dirty, pollDue, receiptsDue: true, sameAsRefused: entryText === refusedText }) !== "receipts")
+        reading.worker.cancel()
       return
     }
     busy = true
-    let refusedText = null // the snapshot whose heartbeat was just refused, as JSON; any other request ends it
+    refusedText = null // every run starts with no refusal
+    // The loop belongs to the instance that is live now. It ends when that record is no longer live, and every request that
+    // it makes goes through that record (`request`), so it never reaches the worker of an instance that replaced it.
+    const record = live
     try {
-      // One request for each pass, chosen once `recheck` is spent: a heartbeat when one is due, else the delivery poll, else
-      // the receipts pass. Whatever fell due during the last request is therefore seen before the next one is chosen: a
-      // heartbeat goes before a queued poll, and the receipts request is sent only when neither is due, with nothing awaited
-      // between that check and the write, and `receiptsDue` stays set until then. A pass that has only `recheck` to spend
-      // sends nothing and ends the loop. The compare finds the snapshot that was just refused again, while a poll or a
-      // receipts pass waits: the flag then stays set, so the poll goes first and the retry follows it. Heartbeat and poll
-      // alternate that way, and neither holds the other back. A snapshot that differs from the refused one goes at once.
-      while ((dirty || pollDue || receiptsDue || recheck) && live && !disabled()) {
+      // One request for each pass, chosen by `nextRequest` once `recheck` is spent into `dirty`, so whatever fell due during
+      // the last request is seen before the next one is chosen, and from whatever source: a heartbeat goes before a queued
+      // poll, and the receipts request is sent only when neither is due, with nothing awaited between that choice and the
+      // write, and `receiptsDue` stays set until then. A pass that has only `recheck` to spend sends nothing and ends the
+      // loop. The snapshot that was just refused yields to a poll or a receipts pass that waits, and `dirty` stays set, so
+      // its retry follows that pass. Heartbeat and poll alternate that way, and neither holds the other back. A snapshot
+      // that differs from the refused one goes at once. A confirmed heartbeat and a delivery poll pass end the refusal, and a
+      // receipts pass does not: a poll that fell due while the receipts request was out still goes before the retry, and the
+      // retry follows the request at once when no poll waits.
+      while (live === record && !disabled() && (dirty || pollDue || receiptsDue || recheck)) {
+        const snapshot = heartbeatState()
+        const text = JSON.stringify(snapshot)
         if (recheck) {
           recheck = false
-          const current = JSON.stringify(heartbeatState())
-          if (current !== live.published) {
-            if (current === refusedText && (pollDue || receiptsDue)) recheck = true
-            else dirty = true
-          }
+          if (text !== record.published) dirty = true
         }
-        if (dirty) {
+        const next = nextRequest({ dirty, pollDue, receiptsDue, sameAsRefused: text === refusedText })
+        if (next === "heartbeat") {
           dirty = false
-          const record = live
-          const snapshot = heartbeatState()
-          const text = JSON.stringify(snapshot)
           const stamp = lease.stamp() // taken before the request is written: the lease runs from the send, not the reply
-          const result = await request("heartbeat", { state: snapshot })
+          const result = await request(record, "heartbeat", { state: snapshot })
           if (refused(result)) {
             refusedText = text
             if (REJOIN_AFTER.has(result.refused) && !BRIEF_OUTAGE.has(result.refused))
@@ -354,19 +373,19 @@ export function createAgentChat(pi, config, {
             refusedText = null
             lease.confirm(stamp)
           }
-        } else {
-          refusedText = null // a poll or a receipts pass is the turn that a refused snapshot waits for: its retry follows
-          if (pollDue) {
-            pollDue = false
-            await pollOnce()
-          } else if (receiptsDue) {
-            receiptsDue = false
-            await receiptsPass()
-          }
-        }
+        } else if (next === "poll") {
+          pollDue = false
+          await pollOnce(record)
+          refusedText = null
+        } else if (next === "receipts") {
+          receiptsDue = false
+          await receiptsPass(record)
+        } else break
       }
     } catch (error) {
-      handleFailure(requestFailure(error, error?.operation))
+      // A failure of a record that is no longer live is the end of that instance, or a stop that it asked for, and not one of
+      // the instance that replaced it: it is dropped, and never stops the live one.
+      if (live === record) handleFailure(requestFailure(error, error?.operation))
     } finally {
       busy = false
       recheck = false // an entry that finds the loop free compares the state itself
@@ -380,15 +399,15 @@ export function createAgentChat(pi, config, {
   // the next cadence once the mark has landed. A pass with nothing to ask spends nothing. A request that is thrown because
   // the worker stopped, died or timed out goes to handleFailure like any other. A refused or malformed answer, and every
   // other error here, is held: it never ends chat and never reaches a delivery.
-  async function receiptsPass() {
+  async function receiptsPass(record) {
     try {
       if (!cancelsReceipts(joined) || !receipts.due(receiptState, now())) return
       if (receipts.toMark(receiptState).length > 0) {
         receiptState = receipts.polled(receiptState, now())
-        await markReceipts()
+        await markReceipts(record)
       } else if (offerable()) {
         receiptState = receipts.polled(receiptState, now())
-        await offerReceipts()
+        await offerReceipts(record)
       }
     } catch (error) {
       if (error?.receipts === true && typeof error.code === "string" && error.code !== "CHAT_REQUEST_INVALID") throw error
@@ -398,28 +417,28 @@ export function createAgentChat(pi, config, {
   // Receipts are shown only inside a turn that already runs, and one output at a time.
   function offerable() { return !pendingReceipts && chatState() === "busy" }
 
-  // `reading` is true from the write until the answer, so a heartbeat or a poll that falls due meanwhile ends the request.
-  async function receiptsRequest(operation, fields) {
-    reading = true
-    try { return await request(operation, fields) } catch (error) {
+  // `reading` names the record from the write until the answer, so a heartbeat or a poll that falls due meanwhile ends the
+  // request, as `drive` decides with `nextRequest`.
+  async function receiptsRequest(record, operation, fields) {
+    reading = record
+    try { return await request(record, operation, fields) } catch (error) {
       throw Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation, receipts: true })
-    } finally { reading = false }
+    } finally { reading = null }
   }
 
   // Exactly the ids whose output Pi confirmed, and never an empty list: the worker ends on one. An answer that is not a
   // success keeps the ids for the next pass. The state is the lifecycle's, so a rejoin marks them through the new worker.
-  async function markReceipts() {
+  async function markReceipts(record) {
     const ids = receipts.toMark(receiptState)
-    const answer = await receiptsRequest("receipts_delivered", { receipts: ids })
+    const answer = await receiptsRequest(record, "receipts_delivered", { receipts: ids })
     if (receipts.accepted(answer)) receiptState = receipts.marked(receiptState, ids)
   }
 
-  async function offerReceipts() {
-    const record = live
+  async function offerReceipts(record) {
     // The notice is as old as the request that asked for it: its age is counted from here, before the request is written. An
     // answer read late, after a suspend, is then never fresher than that request, and its mute flag cannot look new.
     const askedAt = now()
-    const answer = await receiptsRequest("receipts")
+    const answer = await receiptsRequest(record, "receipts")
     if (live !== record) return
     // The flag of this answer is the latest known, whether or not the turn it was asked for is still running.
     receiptState = receipts.muteSeen(receiptState, answer)
@@ -449,10 +468,10 @@ export function createAgentChat(pi, config, {
     if (pending) receiptState = receipts.released(receiptState, pending.ids)
   }
 
-  async function pollOnce() {
+  async function pollOnce(record) {
     const bodies = config.noticeBodies === true
-    const candidates = await request("pending", bodies ? { bodies: true } : {})
-    if (!live) return
+    const candidates = await request(record, "pending", bodies ? { bodies: true } : {})
+    if (live !== record) return
     const refusal = refused(candidates)
     if (refusal) {
       if (REJOIN_AFTER.has(refusal) && !BRIEF_OUTAGE.has(refusal))
@@ -468,12 +487,12 @@ export function createAgentChat(pi, config, {
       ? packCandidates({ messages: ids, sizes: candidates.sizes, retry: candidates.retry }, { joined, python: config.python, bound: NOTICE_BOUND, route: config.toolRoute })
       : ids
     const started = now()
-    const grant = await request("claim", {
+    const grant = await request(record, "claim", {
       key: randomUUID(),
       messages: claimIds,
       ...(bodies ? { bodies: true } : {}),
     })
-    if (!live) return
+    if (live !== record) return
     const claimRefusal = refused(grant)
     if (claimRefusal) {
       if (REJOIN_AFTER.has(claimRefusal)) throw Object.assign(new Error(claimRefusal), { code: claimRefusal, operation: "claim" })
@@ -484,8 +503,8 @@ export function createAgentChat(pi, config, {
     let result
     if (!(remaining > 500)) result = { outcome: "uncertain", reason: "transport_ambiguous" }
     else {
-      const state = await request("status")
-      if (!live) return
+      const state = await request(record, "status")
+      if (live !== record) return
       const stateRefusal = refused(state)
       if (stateRefusal) {
         if (REJOIN_AFTER.has(stateRefusal)) throw Object.assign(new Error(stateRefusal), { code: stateRefusal, operation: "status" })
@@ -504,8 +523,8 @@ export function createAgentChat(pi, config, {
           : await sendNative(content, grant.attempt_id, started + Number(grant.reservation_ms))
       }
     }
-    if (!live) return
-    const settled = await request("settle", { attempt: grant.attempt_id, result })
+    if (live !== record) return
+    const settled = await request(record, "settle", { attempt: grant.attempt_id, result })
     const settleRefusal = refused(settled)
     if (settleRefusal && REJOIN_AFTER.has(settleRefusal))
       throw Object.assign(new Error(settleRefusal), { code: settleRefusal, operation: "settle" })
@@ -541,25 +560,25 @@ export function createAgentChat(pi, config, {
     })
   }
 
-  // No worker starts for a runtime that shut down, once chat is off, while another one joins or serves, or with no session.
+  // No worker starts for an instance that was disconnected or shut down, once chat is off, while another one joins or serves,
+  // or with no session.
   const mayNotStart = () => closed || disabled() || live || !context || !nativeSessionId
 
   // The wait for the closing workers, the start after it and the join are one flight. A call that comes while one is out gets
   // that flight and starts nothing: calls whose waits ended at different times would each start a worker, and the second
   // would join at once, past the back-off that the failed join of the first asked for. The flight clears itself when it ends,
-  // and only itself, so a call after that is made as before, with a rejoin timer that is still pending as well. disconnect()
-  // drops the flight that is out, and a call after it is a flight of its own.
+  // so a call after that is made as before, with a rejoin timer that is still pending as well. A disconnect() ends the
+  // instance for good: the flight that is out and every later call start nothing.
   function connect() {
     if (connecting) return connecting
     const flight = (async () => {
-      try { await connectOnce() } finally { if (connecting === flight) connecting = null }
+      try { await connectOnce() } finally { connecting = null }
     })()
     connecting = flight
     return flight
   }
 
   async function connectOnce() {
-    const epoch = flightEpoch
     // One live record at a time: a call, while one worker joins or serves, starts nothing and stops nothing.
     if (mayNotStart()) return
     // A worker that joins with the native session id of one that is still exiting meets BINDING_CONFLICT, as after a rejoin
@@ -569,7 +588,7 @@ export function createAgentChat(pi, config, {
     // a disconnect() may have come first. A disconnect() in the join is seen below, as `live` is no longer this record.
     if (closing.size) {
       await allClosed()
-      if (mayNotStart() || epoch !== flightEpoch) return
+      if (mayNotStart()) return
     }
     try { policy.check() } catch (error) { return failClosed(error) }
     rejoinTimer = null
@@ -652,7 +671,6 @@ export function createAgentChat(pi, config, {
   // stopped has closed, one that a rejoin stopped before the shutdown included, so no replacement joins beside a live old one,
   // or after CLOSE_WAIT_MS, so a child that never closes cannot hold the replacement for ever.
   pi.on("session_shutdown", () => {
-    closed = true
     nativeSessionId = null
     joined = null
     status(undefined)

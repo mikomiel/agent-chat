@@ -133,11 +133,19 @@ fits on `cli` fits on every route.
   ahead of a delivery poll or a receipts request that waited behind it, not at a later
   poll, and a change that has reverted by then sends nothing, because presence reports
   the current state.
-  A refused heartbeat is sent again at most once for each poll that asked, never in a loop.
-  A delivery poll that waits goes before that retry, or a receipts request when no poll waits:
-  a heartbeat that is refused after every tick would otherwise be followed by another of the
-  same state each time, and the poll would never run. Heartbeat and poll take turns, and a
-  state that differs from the refused one goes first.
+  A refused heartbeat is sent again at most once for each poll or event that asked, never in a loop.
+  One rule chooses the next request, whatever made a heartbeat due: a poll's comparison, an
+  event or the 30-second keep-alive. A delivery poll or a receipts request that was waiting
+  when the worker refused a heartbeat goes before that state is sent again, unless another state
+  is confirmed meanwhile, and the poll goes before the receipts request. A heartbeat that is refused after every tick would otherwise be followed by
+  another of the same state each time, and the poll would never run. Within one run the refused
+  state also yields to a poll or a receipts request that falls due later, until a delivery poll
+  has run or a heartbeat is confirmed. Any other changed state goes first, and heartbeat and
+  poll take turns. The next run forgets the refusal, so each poll tick, event or keep-alive that
+  starts a run may send the state before its poll, once. A keep-alive that finds the snapshot
+  just refused waits for the poll like any other, so the order is heartbeat, poll, heartbeat.
+  The same rule decides whether an entry ends a receipts request in flight (see the receipts
+  bullet): it counts that request as waiting, and ends it unless it is what goes next.
   `session_tree`, `session_compact` and `session_compact_failed`
   ask for the same comparison at once, with the context they carry; the poll finds the
   same change, so nothing depends on them.
@@ -166,7 +174,9 @@ fits on `cli` fits on every route.
   prompt and not aborted. A claimed batch becomes one `agent-chat` custom
   message with `triggerTurn: true`; the extension reports `handed` only after
   Pi's `message_start` event carries the same marker object. A missing event
-  inside the reservation is `uncertain`, never a replay. With `noticeBodies`,
+  inside the reservation is `uncertain`, never a replay. If the instance ends while that
+  report is awaited, at shutdown or when the worker exits, nothing is settled and no worker
+  starts. With `noticeBodies`,
   the extension reads each candidate's size from `pending` and claims the
   longest prefix that one 8 KiB notice is estimated to carry; a retry batch is
   claimed whole. A body that outgrows the estimate can still be cut after the
@@ -190,7 +200,9 @@ fits on `cli` fits on every route.
   heartbeat or a delivery poll that falls due while the request is in flight
   ends it with the worker's cancel signal, and the pass sends no request while
   either is due. A state change that the comparison finds then is a heartbeat
-  that fell due; a re-evaluation that finds nothing due ends nothing. The signal
+  that fell due; a re-evaluation that finds nothing due ends nothing, and nor does an
+  entry that finds the snapshot the worker has just refused, which yields to the request
+  in flight: only a delivery poll, or a state that differs from the refused one, ends it. The signal
   is repeated every 5 milliseconds until the worker
   answers, so a cancel that reaches the worker before it has read the request,
   which the worker drops, is followed by one that ends it. That is client-side
@@ -231,10 +243,12 @@ fits on `cli` fits on every route.
   turned off. The wait, the start and the join are one flight: a call that comes while one
   is out waits for it and starts nothing, so calls whose waits would end at different times
   start one worker, and a failed join is followed by its back-off, not by a second start.
-  `disconnect()` ends the flight that is out: it starts no worker once its wait is over, and
-  the next `connect()` is a flight of its own, which the ended one never replaces or clears.
-  The extension calls it only at shutdown and when chat is turned off, and each of them also
-  stops every later start.
+  `disconnect()` ends the instance for good, as shutdown and the off latch do: it stops the
+  live worker, and no later `connect()` starts one, nor does the flight that is out. The
+  extension calls it only at those two points, and neither is followed by a start. A request
+  goes to a worker only through the instance that its caller was started for, so a loop or a
+  continuation that outlives its instance reaches no worker, and above all not the one that
+  replaced it.
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for the process. The native session,
   CI and any submitted work are unchanged. The footer then says `no live instance`.
@@ -246,13 +260,13 @@ fits on `cli` fits on every route.
 - **Replacement, compaction and tree.** Pi replaces the extension runtime for
   `/reload`, `/new`, `/resume` and `/fork` (and `/clone`, which is a fork): it emits
   `session_shutdown` to the old runtime, awaits its handlers, loads a new runtime and
-  emits `session_start` with the same reason. The extension ends its instance on
-  `session_shutdown` only, and its handler returns once every worker that is still
-  closing has exited, one that a rejoin stopped earlier included, so no old worker is
-  still ending its instance when the new one joins, or after 6 seconds, so a child that
-  never exits cannot hold the replacement for ever. An exit is not proof that the server
-  accepted `end`: a join that still meets the old instance, because its `end` failed, is
-  retried after a back-off. It subscribes to no
+  emits `session_start` with the same reason. The extension stops its worker, which
+  requests the end of the instance, on `session_shutdown` only, and its handler returns
+  once every worker that is still closing has exited, one that a rejoin stopped earlier
+  included, so no old worker is still ending its instance when the new one joins, or after
+  6 seconds, so a child that never exits cannot hold the replacement for ever. Neither the
+  request nor the exit is proof that the server accepted `end`: a join that still meets the
+  old instance, because its `end` failed, is retried after a back-off. It subscribes to no
   `session_before_switch` or `session_before_fork`, because another handler can cancel
   those and the instance would end for a switch that never happened. The new runtime
   starts stopped. A chat session is keyed by the native session id: `/reload` and
@@ -318,10 +332,14 @@ fail-closed latching and the shared notice vectors, with the claim packing for
 bodies mode, the lease and the footer vocabulary (a lapse that holds until a confirmed
 heartbeat), presence on change (a change seen during a slow request included, sent
 ahead of a poll that waited behind it, and a refused heartbeat that takes turns with the
-poll), the replacement of the runtime for each `session_start` reason (a reload during a
-rejoin, a close that never comes, calls whose waits end at different times and a
-disconnect during a wait included), tree navigation and compaction, and sender
+poll, whether a poll, an event or the keep-alive asked for it: the scheduler is checked for
+each of the 16 combinations of what is due, and the delivery poll for every interleaving of
+ticks, events and answers to depth 4), the replacement of the runtime for each `session_start` reason (a
+reload during a rejoin, a close that never comes, calls whose waits end at different times,
+a disconnect that no later connect undoes and a delivery whose hand-off is held when the
+instance ends included), tree navigation and compaction, and sender
 receipts: the offer rules, the confirmation and the mark,
-one request per pass, and that a delivery and the binding are byte-identical with
-receipts pending. It
+one request per pass, that a receipts request gives way (to a state that differs from the
+refused one and to a poll, and not to an entry that finds the snapshot just refused), and
+that a delivery and the binding are byte-identical with receipts pending. It
 needs no PostgreSQL, no service and no credential.
