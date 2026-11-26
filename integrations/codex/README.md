@@ -269,8 +269,8 @@ sends its request: it does not wait for the worker to end its instance.
   offline or was overtaken by a hook event is dropped, and the poll waits 10
   seconds before it reads again. Polls never overlap. Once a hook event has
   discarded the last read, the state that decides delivery follows the hook's
-  hint, which can only refuse an output there: every output during a running
-  turn takes a mode read of its own (see Busy delivery). The heartbeat keeps a
+  hint, which can only refuse an output there: every chat output during a
+  running turn takes a mode read of its own (see Busy delivery). The heartbeat keeps a
   record of its own: `plan_mode` comes from the read of any kind that confirmed
   the mode and started last (a heartbeat read, a wake's reading, a hook's mode
   read), whenever its answer came, and a hook event does not discard it (a
@@ -296,8 +296,8 @@ sends its request: it does not wait for the worker to end its instance.
   the connect (at most 7.5 seconds), and the receiver gets that wait less 1.5
   seconds (at most 6) for the whole reply, its state report included. The
   receiver starts a claim only with 2.5 seconds of that left. With `appServer`
-  and a bound thread, one rule holds for every output during a running turn, a
-  claimed batch and a staged receipts notice alike: right before the claim
+  and a bound thread, one rule holds for every chat output during a running
+  turn, a claimed batch and a staged receipts notice alike: right before the claim
   (after the `pending` answer) and right before the notice, the receiver reads
   the thread's collaboration mode on a connection of its own
   (`thread/loaded/list`, then `thread/resume` with `excludeTurns`), and only a
@@ -316,8 +316,10 @@ sends its request: it does not wait for the worker to end its instance.
   a read that started after the hook's own and confirmed Plan Mode refuses the
   output too, whether it answered first or answers before the write. A claimed
   batch that it refuses right before the write settles `deferred` with reason
-  `plan`. The hook is still answered. The
-  `permission_mode` hint can only refuse. Without `appServer`, or while the
+  `plan`. The hook is still answered. A binding announcement carries no chat
+  content, so the mode read does not gate it: a hook with nothing else to carry
+  still outputs a binding whose write is not confirmed yet, in any mode, as
+  session start does. The `permission_mode` hint can only refuse. Without `appServer`, or while the
   thread is unbound, nothing is read and the hint decides; a claim that the
   hint allowed hands nothing, and settles `deferred` with reason `unknown`,
   when a bind (a heartbeat tick, which reads nothing while the session is

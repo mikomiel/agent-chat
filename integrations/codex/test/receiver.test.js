@@ -2040,6 +2040,22 @@ test("the app-server says Plan Mode while the hook says default: no claim, no pr
   assert.deepEqual(r.worker.ops("pending").length, 1)
 })
 
+// The mode read gates chat content. A binding announcement carries none, so a hook in Plan Mode with nothing else to
+// carry still outputs a binding whose write is not confirmed yet, as session start does.
+test("a binding still to be announced goes out alone when the hook's read confirms Plan Mode", async () => {
+  const thread = threadDouble({ mode: { plan: true } })
+  const r = await rig({ thread, handlers: deliverable() })
+  await r.op({ op: "start", wait_ms: 5000 }, hookDouble({ events: r.events, receipt: "failed" }))
+  const reads = thread.modeReads.length
+  const hook = await r.op(turn())
+  assert.equal(thread.modeReads.length, reads + 1, "the hook takes its own read of the mode")
+  assert.deepEqual(r.worker.ops("claim"), [], "nothing is claimed")
+  assert.deepEqual(r.worker.ops("settle"), [], "and nothing is settled")
+  assert.equal(hook.sent.length, 1)
+  assert.match(hook.sent[0].context ?? "", /^Agent Chat is available/, "the binding goes out")
+  assert.equal(hook.sent[0].context.includes(uid(1)), false, "and nothing else")
+})
+
 test("a hook's mode read that confirms Plan Mode, while the published state is not Plan Mode, is reported at once", async () => {
   const thread = threadDouble({ mode: { plan: true } })
   const r = await rig({ thread, handlers: deliverable() })

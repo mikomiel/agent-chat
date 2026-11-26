@@ -628,7 +628,7 @@ A package that stages a receipts notice and outputs it at a later boundary MUST 
 - **THEN** no message is appended and the ids are not marked
 
 ### Requirement: `codex` outputs into a running turn only after a fresh read of the collaboration mode
-While its app-server thread is bound, `codex` MUST read the thread's collaboration mode right before each claim of a prompt or tool hook and before it outputs a staged receipts notice. The read MUST start after that hook event arrived and answer within 3 seconds and at least 2.5 seconds before the hook's deadline. Only such a read that confirms a mode other than `plan` MAY let the output out. The `permission_mode` hint MAY only refuse it.
+While its app-server thread is bound, `codex` MUST read the thread's collaboration mode right before each claim of a prompt or tool hook and before it outputs a staged receipts notice. The read MUST start after that hook event arrived and answer within 3 seconds and at least 2.5 seconds before the hook's deadline. Only such a read that confirms a mode other than `plan` MAY let the output out. The `permission_mode` hint MAY only refuse it. A binding announcement carries no chat content: this read MUST NOT gate it.
 
 #### Scenario: Plan Mode in the app-server while the hook says default
 - **WHEN** the hook's `permission_mode` is `default` and the read finds the mode `plan`
@@ -639,6 +639,10 @@ While its app-server thread is bound, `codex` MUST read the thread's collaborati
 - **WHEN** the mode changes to `plan` after the hook event arrived and before the hook's read
 - **THEN** no batch is claimed, no receipts notice is output and no receipt is marked
 - **AND** a later poll offers the rows of the dropped notice again
+
+#### Scenario: A binding still to be announced in Plan Mode
+- **WHEN** a hook's read confirms `plan` and the binding announcement's write is not confirmed yet
+- **THEN** nothing is claimed or settled, and the hook outputs the binding announcement alone
 
 #### Scenario: A read that fails, times out or is malformed
 - **WHEN** the read is refused, fails, gives an unknown mode, answers in another shape or does not end in its time
@@ -658,7 +662,7 @@ While its app-server thread is bound, `codex` MUST read the thread's collaborati
 - **THEN** it counts as no answer: nothing is output, and the heartbeat does not record it
 
 ### Requirement: The `codex` heartbeat reports Plan Mode from the last-started read of the mode
-`codex` MUST report `plan_mode` from the read that confirmed the collaboration mode and started last, and a hook event MUST NOT discard it. Only a read that started later and confirms a mode other than `plan` MAY lift a Plan reading; a `permission_mode` hint, an unknown mode, a failed read and a late answer MUST NOT. A `plan` hint MUST report Plan Mode unless a read that started after its hook event confirmed another mode.
+`codex` MUST report `plan_mode` from the read that confirmed the collaboration mode and started last, and a hook event MUST NOT discard it. A read taken before a receipts notice counts here only when it confirms `plan`. Only a read that started later and confirms a mode other than `plan` MAY lift a Plan reading; a `permission_mode` hint, an unknown mode, a failed read and a late answer MUST NOT. A `plan` hint MUST report Plan Mode unless a read that started after its hook event confirmed another mode.
 
 #### Scenario: A Plan reading during a running turn
 - **WHEN** a hook's read finds the mode `plan` and later hooks say `default`
