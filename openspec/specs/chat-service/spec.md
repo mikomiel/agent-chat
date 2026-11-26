@@ -436,6 +436,34 @@ The service MUST record a sender receipt, at most once per message, recipient an
 - **THEN** an event write by an instance of another session, such as the settlement of its delivery attempt, completes without waiting for that transaction
 - **AND** the write is recorded while the receipts transaction is still open
 
+### Requirement: The feed route reports the mute flag of its session
+`GET /v1/instance/receipts/feed` MUST answer the sender's undelivered receipts with the `muted` flag of the sender's own session, always present and read in the same transaction as the rows, so that a reader needs no `status` request, which takes the event clock. `GET /v1/instance/receipts` MUST keep its released answer, which has no `muted`.
+
+#### Scenario: The feed route reports the mute flag
+- **WHEN** the sender's instance reads the feed route before its session is muted, and again after
+- **THEN** the first answer carries `muted` as `false` and the second as `true`, whether or not the answer has rows
+- **AND** the answer needs no `status` request for the flag
+
+#### Scenario: The released route keeps its answer
+- **WHEN** the sender's instance reads `GET /v1/instance/receipts`, muted or not
+- **THEN** the answer has exactly the keys `instance_id`, `session_id` and `receipts`, and the same rows as the feed route
+
+### Requirement: The mark that goes with the feed has its own route
+`POST /v1/instance/receipts/feed/delivered` MUST mark receipts delivered as `POST /v1/instance/receipts/delivered` does, with the same body, owner scope and answer, and the released route MUST keep its answer. The worker MUST read at the feed route and mark at this route, never at a released route, which takes the event clock on a server of an earlier release. That server lacks both new routes and answers NOT_FOUND from its router, so a mark kept across a rollback takes no clock.
+
+#### Scenario: The mark route of the feed marks
+- **WHEN** the sender's instance posts receipt ids to the mark route of the feed, and posts them again
+- **THEN** each answer lists the ids as `delivered`, and ids that are not the instance's own are ignored without disclosure
+
+#### Scenario: The released mark route keeps its answer
+- **WHEN** the sender's instance marks a receipt at `POST /v1/instance/receipts/delivered`
+- **THEN** the receipt is marked and the answer has the shape it always had
+
+#### Scenario: A mark kept across a rollback of the server
+- **WHEN** a mark is refused, the server is rolled back to a release before the feed, and the worker retries the mark with no new feed read
+- **THEN** the worker's request goes to the mark route of the feed and is answered with `NOT_FOUND`
+- **AND** the worker sends no request to a released receipts route or to `status`
+
 ### Requirement: Receipt policy follows the message kind
 The service MUST create sender receipts by default for `question` and `consultation`. For `message` and `reply` it MUST create them only when the sender set `receipts` to true. It MUST NOT create them for `status`, the coordination kinds, room state or a message published without a session.
 

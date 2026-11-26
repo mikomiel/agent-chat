@@ -6,13 +6,15 @@ import http.client
 import ipaddress
 import json
 import os
+import signal
 import socket
 import ssl
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Generator, Sequence
+from contextlib import contextmanager
 from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
@@ -201,6 +203,80 @@ def resolve_origin(server_origin: str, *, deadline: float) -> tuple[Address, ...
     return addresses
 
 
+#: The signals that handlers gave to `defer_signal` while `_deferring_signals` ran: each once, in the order it came.
+#: None at every other time, and on every thread but the main one, which is the only thread that runs a handler.
+_deferred: list[int] | None = None
+
+
+def defer_signal(signum: int) -> bool:
+    """Call this first in a signal handler that raises; when it answers True, return at once and change nothing.
+
+    True means that the client is starting a watchdog timer on the main thread, where an exception from a handler is
+    not safe, and that `signum` is recorded. The client runs the handler again with `signal.raise_signal` as soon as
+    the start is over. That run gets False, so the handler does its work, and raises, once, where an exception is
+    safe. A signal that comes twice meanwhile is recorded once, as the kernel does for a standard signal.
+    """
+    if _deferred is None:
+        return False
+    if signum not in _deferred:
+        _deferred.append(signum)
+    return True
+
+
+@contextmanager
+def _deferring_signals() -> Generator[None]:
+    """Make `defer_signal` answer True until the block ends, then run each handler that it held back.
+
+    Only on the main thread; a handler never runs on another thread, so there nothing changes. Every recorded
+    handler runs even when an earlier one raises: a cancel that raised first must not hide a SIGTERM behind it, whose
+    handler records that it came. The first exception then leaves the block; a later one is dropped.
+    """
+    global _deferred
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    recorded: list[int] = []
+    _deferred = recorded
+    try:
+        yield
+    finally:
+        # Clear first: a signal that comes from here on runs its handler at once, which is safe outside the start.
+        _deferred = None
+        failure: BaseException | None = None
+        for signum in recorded:
+            try:
+                signal.raise_signal(signum)
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure
+
+
+def _start_timer(timer: threading.Timer) -> None:
+    """Start `timer` so that no signal handler raises inside `Thread.start`, whose wait is not safe against one.
+
+    Two guards, because each covers what the other cannot:
+
+    - A handler that calls `defer_signal` waits until the start is over, then runs once. This holds when the process
+      has another thread. The kernel gives a signal that is aimed at the process to any thread that does not block
+      it, and the interpreter then runs the handler on the main thread at its next check, which can be inside the
+      start. Blocking signals on the main thread does not stop that.
+    - With every signal blocked on this thread, a handler runs only inside the `pthread_sigmask` call that unblocks
+      them, after the start. This covers a handler that does not call `defer_signal`, such as the default SIGINT
+      handler, but only while no other thread can take the signal.
+    """
+    with _deferring_signals():
+        if not hasattr(signal, "pthread_sigmask"):
+            timer.start()
+            return
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+        try:
+            timer.start()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 class _DeadlineWatchdog:
     """Interrupt blocked transport I/O when the whole-operation deadline expires.
 
@@ -223,7 +299,15 @@ class _DeadlineWatchdog:
         self._expired = threading.Event()
         self._timer = threading.Timer(max(0.0, deadline - time.monotonic()), self._interrupt)
         self._timer.daemon = True
-        self._timer.start()
+        # A signal handler that raises (the worker's receipts cancel, its alarm, SIGTERM) must not raise inside
+        # `Thread.start`, whose wait on an internal condition is not safe against an asynchronous exception;
+        # `_start_timer` keeps it out. The caller never gets the watchdog of a constructor that raises, so nobody else
+        # can cancel a timer that is already running when a handler raises after the start.
+        try:
+            _start_timer(self._timer)
+        except BaseException:
+            self._timer.cancel()
+            raise
 
     def _interrupt(self) -> None:
         self._expired.set()

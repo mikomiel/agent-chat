@@ -619,11 +619,13 @@ class _Canned:
     """A server reply fixed by the test, for the response shapes a real server never sends."""
 
     reply: dict = {}
+    asked: list = []  # each (method, path) the client sent; `_canned` gives every double its own list
 
     def __init__(self, *_args, **_kwargs):
         pass
 
-    def request(self, *_args, **_kwargs):
+    def request(self, method=None, path=None, *_args, **_kwargs):
+        self.asked.append((method, path))
         return json.loads(json.dumps(self.reply))
 
 
@@ -633,7 +635,7 @@ def _canned(monkeypatch, reply):
         binding=SimpleNamespace(server_origin="http://127.0.0.1:9", token="t"), instance_id=uuid4(), session_id=uuid4()
     )
     fixed = reply(str(instance.instance_id), str(instance.session_id))
-    monkeypatch.setattr(instance_client, "Client", type("Canned", (_Canned,), {"reply": fixed}))
+    monkeypatch.setattr(instance_client, "Client", type("Canned", (_Canned,), {"reply": fixed, "asked": []}))
     return instance
 
 
@@ -842,7 +844,9 @@ def test_receipts_whitelist_names_every_field_and_drops_upstream_extras(monkeypa
     row = _receipt_row()
     instance = _canned(
         monkeypatch,
-        lambda instance_id, session_id: {"instance_id": instance_id, "session_id": session_id, "receipts": [row]},
+        lambda instance_id, session_id: {
+            "instance_id": instance_id, "session_id": session_id, "receipts": [row], "muted": False,
+        },
     )
     (item,) = instance_client.receipts(instance)["receipts"]
     assert set(item) == {
@@ -870,7 +874,9 @@ def test_receipts_refuse_a_malformed_row_as_invalid(monkeypatch, changes):
     row = _receipt_row(**changes)
     instance = _canned(
         monkeypatch,
-        lambda instance_id, session_id: {"instance_id": instance_id, "session_id": session_id, "receipts": [row]},
+        lambda instance_id, session_id: {
+            "instance_id": instance_id, "session_id": session_id, "receipts": [row], "muted": False,
+        },
     )
     with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
         instance_client.receipts(instance)
@@ -880,10 +886,62 @@ def test_receipts_refuse_a_malformed_row_as_invalid(monkeypatch, changes):
 def test_receipts_refuse_a_malformed_or_oversized_list(monkeypatch, rows):
     instance = _canned(
         monkeypatch,
-        lambda instance_id, session_id: {"instance_id": instance_id, "session_id": session_id, "receipts": rows},
+        lambda instance_id, session_id: {
+            "instance_id": instance_id, "session_id": session_id, "receipts": rows, "muted": False,
+        },
     )
     with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
         instance_client.receipts(instance)
+
+
+@pytest.mark.parametrize("muted", [False, True])
+def test_receipts_read_the_feed_route_and_pass_on_its_muted_flag(monkeypatch, muted):
+    row = _receipt_row()
+    instance = _canned(
+        monkeypatch,
+        lambda instance_id, session_id: {
+            "instance_id": instance_id, "session_id": session_id, "receipts": [row], "muted": muted,
+        },
+    )
+    answer = instance_client.receipts(instance)
+    assert answer["muted"] is muted and [item["id"] for item in answer["receipts"]] == [row["id"]]
+    assert set(answer) == {"receipts", "muted"}
+    # The route that carries the flag. A server without it answers NOT_FOUND, and there is no other route to try.
+    assert instance_client.Client.asked == [("GET", "/v1/instance/receipts/feed")]
+
+
+def test_receipts_refuse_a_feed_without_a_muted_flag(monkeypatch):
+    instance = _canned(
+        monkeypatch,
+        lambda instance_id, session_id: {"instance_id": instance_id, "session_id": session_id, "receipts": []},
+    )
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        instance_client.receipts(instance)
+
+
+@pytest.mark.parametrize("muted", [None, "yes", "false", 1, 0, [], {}])
+def test_receipts_refuse_a_muted_flag_that_is_not_a_boolean(monkeypatch, muted):
+    instance = _canned(
+        monkeypatch,
+        lambda instance_id, session_id: {
+            "instance_id": instance_id, "session_id": session_id, "receipts": [], "muted": muted,
+        },
+    )
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        instance_client.receipts(instance)
+
+
+def test_receipts_delivered_posts_to_the_mark_route_that_goes_with_the_feed(monkeypatch):
+    asked = uuid4()
+    instance = _canned(
+        monkeypatch, lambda instance_id, _session: {"instance_id": instance_id, "delivered": [str(asked)]},
+    )
+    answer = instance_client.receipts_delivered(instance, ReceiptDelivery(receipts=(asked,)))
+    assert answer == {"delivered": [str(asked)]}
+    # The mark with its own route, which a server of an earlier release lacks: a mark kept across a rollback of the
+    # server answers NOT_FOUND there, before the clock. The released `delivered` route takes the clock on such a
+    # server, and there is no fallback to it.
+    assert instance_client.Client.asked == [("POST", "/v1/instance/receipts/feed/delivered")]
 
 
 def test_receipts_delivered_refuses_an_id_it_did_not_ask_for(monkeypatch):

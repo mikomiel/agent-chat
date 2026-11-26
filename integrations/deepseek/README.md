@@ -82,7 +82,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `directory` | Absolute directory for this process's binding record, private to the user. |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
-| `python` | Absolute interpreter that can import `agent_chat`. |
+| `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 
@@ -109,7 +109,8 @@ The service and its host-token provisioning are documented in the product
 [integrations README](../README.md#tool-route) gives the exact text and the room
 each route takes.
 
-- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
+  the binding ends them with the one receipts sentence.
 - `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
   has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
 - `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
@@ -183,6 +184,46 @@ fits on `cli` fits on every route.
   remote unmute never clears it.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
+- **Sender receipts.** While a turn runs, at most every 5 seconds, the plugin
+  asks the worker for the `handed` and `acked` receipts of messages this session
+  sent and stages up to 10 of the oldest as one notice. `agent/pre-step`
+  appends it to a model step that is already entering, as one message with
+  source `plugin:agent-chat-receipts`. On the first step of a turn it does so
+  only when that step already has a message of its own, because a notice is
+  never the reason for a step, and the plugin never calls `agent.steer` for a
+  receipt. It asks only while a turn runs, that is while the agent's status is
+  `running`: an idle agent whose Web prompt is parked behind a maintenance task
+  is busy for a delivery, which starts no turn, but is asked for no receipts.
+  It stages rows only when the worker's answer says the session is not muted. At that step the notice is
+  checked again, with no request: the latest mute flag any worker answer
+  carried must be `false`, the notice must be at most 5 seconds old, and the
+  agent must still run a turn outside Plan Mode, read without side effect;
+  otherwise the notice is dropped and its rows are offered again. The pass
+  reads the agent the same way, so a state it cannot read holds receipts for
+  that pass and does not stop chat. A pass sends one request, the mark that
+  waits or else the poll. It gives way: a heartbeat or a delivery poll that
+  falls due while the request is in flight ends it with the worker's cancel
+  signal, and the pass sends no request while either is due. The signal is
+  repeated every 5 milliseconds until the worker answers, so a cancel that
+  reaches the worker before it has read the request, which the worker drops,
+  is followed by one that ends it. That is
+  client-side only: a receipts read that stalls inside the server keeps the row
+  of the instance, so the heartbeat or the `pending` that goes first after the
+  cancel waits for it, up to 3 seconds, and is refused if the row is still held.
+  Nothing is delivered then, and the message stays on the server. Only a worker
+  whose join reply lists `receipts-cancel` is asked for receipts; an older core
+  shows none. The `session/event`
+  `user/message` that carries the appended message's id confirms the notice, and
+  the next pass marks exactly those ids delivered. A notice that is not
+  confirmed is released at `agent_settled`, and one not yet taken by a step is
+  released when its worker is retired (a rejoin, or chat ending), so a worker
+  that rejoins without `receipts-cancel` shows none. A refused or failed mark is
+  sent again at the next pass. A fault in the receipts step itself, a refused answer
+  and a malformed answer never isolate the agent; a thrown error that carries a
+  code takes the path it takes on any request. Receipts never change the bytes
+  of a delivery, a heartbeat or the binding. The binding ends its route lines
+  with one sentence that tells the model how to ask for receipts. The
+  [receipts contract](../README.md#sender-receipts) has the rules.
 - **Rejoin.** A worker error or a request timeout that carries
   `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or
   `REQUEST_UNCERTAIN`, and a join `BINDING_CONFLICT`, start a bounded rejoin:
@@ -200,9 +241,11 @@ fits on `cli` fits on every route.
 
 ## Limitations (0.1)
 
-- **No sender receipts.** This version neither reads nor renders the `handed`
-  and `acked` receipts of messages the session sent. The server keeps them
-  pending; their absence does not change delivery.
+- **Receipts are untested live.** Sender receipts have run only against
+  doubles. The confirmation, a `session/event` `user/message` that carries the
+  appended message's id, follows the DSH `0.2.2-rc.1` and `0.2.2-rc.5` sources;
+  no live DSH run has shown it. Without that event the plugin would show the
+  same receipts again in each later turn and never mark them.
 - **Optional title.** The heartbeat title is present only when
   `ctx.get("sessionTitle")` exists and returns usable text. The native title
   read is not exercised by these contract tests.
@@ -250,5 +293,9 @@ the rejoin policy pinned to `agent_chat/models.py`, lifecycle delivery and
 settlement with doubles, the shared notice vectors, the claim packing for bodies
 mode, and the delivery fence
 (claim, steer throw, retraction, discard, Plan Mode, unreadable projections,
-mute, expired reservation, throwing native call and disposal). It needs no
-DSH install, no PostgreSQL, no service and no credential.
+mute, expired reservation, throwing native call and disposal), and sender
+receipts: the offer rules, the `agent/pre-step` append, the output-time check
+(mute, age, Plan Mode), the confirmation and the mark, one request per pass, the
+read of the native state that latches nothing, and that a delivery and the
+binding are byte-identical with receipts pending. It needs no DSH install, no
+PostgreSQL, no service and no credential.

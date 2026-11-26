@@ -29,6 +29,10 @@
  * with `data.reason = { kind: 'aborted', reason: { kind: 'user' } }`, Plan Mode
  * through the `plan` unit of ctx.sessionProjections, the optional
  * ctx.sessionTitle service and agent.steer / agent.inbox.remove.
+ *
+ * SENDER RECEIPTS take the other route and never steer. The lifecycle stages a notice while a turn runs, `agent/pre-step`
+ * appends it to a step that already runs, and the `session/event` `user/message` carrying that message's id confirms it
+ * (the same event DSH's own tool-jobs plugin matches by id). See integrations/README.md, "Sender receipts".
  */
 import { randomUUID } from "node:crypto"
 import { loadConfig } from "../lib/config.js"
@@ -121,6 +125,7 @@ async function defaultLoadParts() {
 
 // Agent Chat messages are coordination data, never authorization.
 const CONTEXT_SOURCE_KIND = "plugin:agent-chat-context"
+const RECEIPTS_SOURCE_KIND = "plugin:agent-chat-receipts"
 
 /**
  * The plugin, as a factory so node:test can inject the environment and the
@@ -271,7 +276,7 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
             if (state) void dispose(agent, state)
           } catch { /* nothing to recover */ }
         }),
-        webCtx.on("agent/pre-step", async ({ agent }, next) => {
+        webCtx.on("agent/pre-step", async ({ agent, step }, next) => {
           const decision = await next()
           try {
             const state = states.get(agent)
@@ -287,6 +292,20 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
               })
               state.bootstrap = content
             }
+            // A receipts fault never reaches isolate(): chat and the step go on without the notice.
+            try {
+              // DSH spends no model call on a first step whose decision is empty (its "removed waking message" case). A
+              // notice is never the reason for a step, so it waits for a step that something else already owns.
+              const receipt = step === 1 && decision.messages.length === 0 ? null : state.lifecycle?.receiptsNotice?.()
+              if (receipt) {
+                added.push({
+                  id: receipt.id,
+                  role: "user",
+                  source: { kind: RECEIPTS_SOURCE_KIND },
+                  content: [{ type: "text", text: receipt.text }],
+                })
+              }
+            } catch { /* held: the notice is released when the turn ends */ }
             return added.length ? { ...decision, messages: [...decision.messages, ...added] } : decision
           } catch (error) { isolate(agent, error); return decision }
         }),
@@ -325,6 +344,12 @@ export function createAgentChat({ env = process.env, loadParts = defaultLoadPart
             }
             if (event?.type === "session/title") {
               route(agent, state => state.fire("session_info_changed", {}))
+              return
+            }
+            // The native session logged a user message: it confirms a receipts notice that carried this id. A throw is
+            // caught by this listener's own catch, at its end, and never isolates the agent.
+            if (event?.type === "user/message") {
+              state?.lifecycle?.receiptsConfirmed?.(event.data?.id)
               return
             }
             if (event?.type !== "turn/end") return

@@ -124,26 +124,47 @@ export function createDelivery(ctx, agent, {
     try { ctx.logger?.warn?.(`agent-chat: chat stopped for one agent, state unclassifiable (${cause})`) } catch { /* advisory */ }
   }
 
-  // null means "eligible right now". Any state this cannot classify sets the
-  // stop latch, so only a later Web prompt can restore delivery.
-  function state(token = capture()) {
-    if (!unchanged(token)) return "stale_binding"
-    if (disabled) return "offline"
-    if (stopped) return "stopped"
+  // The classification, with no side effect: null means "eligible right now". A state this cannot read is `unknown`, and
+  // `failed` carries the cause so the one caller that may act on it can.
+  function classify(token) {
+    if (!unchanged(token)) return { reason: "stale_binding" }
+    if (disabled) return { reason: "offline" }
+    if (stopped) return { reason: "stopped" }
     try {
-      if (inPlanMode()) return "plan"
+      if (inPlanMode()) return { reason: "plan" }
       const status = agent.status
       const { nextStep, nextTurn } = agent.inbox
       if (!["idle", "running"].includes(status) || !Array.isArray(nextStep) || !Array.isArray(nextTurn)) {
         throw new Error("agent state unclassifiable")
       }
-      if (status === "running" || pending || nextStep.length > 0 || nextTurn.length > 0) return "busy"
-      return null
+      if (status === "running" || pending || nextStep.length > 0 || nextTurn.length > 0) return { reason: "busy" }
+      return { reason: null }
     } catch (error) {
-      latch()
-      warnUnclassifiable(error)
-      return "unknown"
+      return { reason: "unknown", failed: { error } }
     }
+  }
+
+  // The delivery's question. Any state this cannot classify sets the stop latch, so only a later Web prompt can restore
+  // delivery.
+  function state(token = capture()) {
+    const { reason, failed } = classify(token)
+    if (failed) {
+      latch()
+      warnUnclassifiable(failed.error)
+    }
+    return reason
+  }
+
+  // The same classification for a reader that only observes, such as the sender receipts: it never latches, never
+  // warns and never fences. A state it cannot read is `unknown`, and nothing else changes: whether the agent may
+  // receive a delivery stays the delivery's own decision, made by `state` at its own question.
+  // `running` asks whether a turn runs now, which is narrower than `busy`. The delivery counts an idle agent with a parked
+  // inbox item or a steer in flight as busy, so that it starts no second turn; such an agent runs no turn. With `running`,
+  // `busy` is answered only while `agent.status` is `running`, and an idle agent is answered null, whatever is parked.
+  function peek({ running = false } = {}) {
+    const reason = classify(capture()).reason
+    if (!running || reason !== "busy") return reason
+    try { return agent.status === "running" ? "busy" : null } catch { return "unknown" }
   }
 
   function heartbeatState() {
@@ -259,6 +280,7 @@ export function createDelivery(ctx, agent, {
     capture,
     chatState: () => state(),
     state,
+    peek,
     heartbeatState,
     deliver,
     sendChat,

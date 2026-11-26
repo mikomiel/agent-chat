@@ -9,7 +9,18 @@ import { isAbsolute } from "node:path"
 const MAX_FRAME = 128 * 1024
 const REQUEST_MS = 22_000 // the worker's 20s I/O deadline plus exit/IPC margin
 const CLOSE_MS = 5000
-const OPERATIONS = new Set(["join", "heartbeat", "status", "end", "pending", "claim", "settle"])
+const OPERATIONS = new Set(["join", "heartbeat", "status", "end", "pending", "claim", "settle", "receipts", "receipts_delivered"])
+// A receipts request is the only one a signal may end: the worker answers it `refused` and serves on. Only a worker whose
+// join reply names the capability is signalled, because one without the handler would die of the signal, and only such a
+// worker is asked for receipts at all (`cancelsReceipts`): a receipts request that cannot be ended would hold the worker's
+// one request slot, and every hook, heartbeat and state report behind it.
+const CANCELLABLE = new Set(["receipts", "receipts_delivered"])
+// A signal names no request. The worker drops one that lands after it answered a receipts request and before it read the
+// next, because that one may be late for the request it answered; so a cancel is sent again every CANCEL_REPEAT_MS until
+// the answer is read, and the first signal the worker takes after it read the request ends it.
+const CANCEL_REPEAT_MS = 5
+const CANCEL_CAPABILITY = "receipts-cancel"
+export const cancelsReceipts = joined => Array.isArray(joined?.capabilities) && joined.capabilities.includes(CANCEL_CAPABILITY)
 
 const failure = (code, operation) => Object.assign(new Error(code), operation === undefined ? { code } : { code, operation })
 
@@ -37,7 +48,9 @@ export function describeFailure(error) {
 // environment is deliberately empty: a DSH process carries provider and tool
 // credentials that do not belong in the worker. The host token travels on
 // stdin after imports; -I keeps the working directory off sys.path.
-export function startWorker(config, { nativeSessionId, bootId, harness = "deepseek" }, { spawnImpl = spawn } = {}) {
+export function startWorker(config, { nativeSessionId, bootId, harness = "deepseek" }, {
+  spawnImpl = spawn, setIntervalImpl = setInterval, clearIntervalImpl = clearInterval,
+} = {}) {
   if (![config.python, config.directory].every(value => typeof value === "string" && isAbsolute(value)) ||
       typeof nativeSessionId !== "string" || !nativeSessionId ||
       typeof bootId !== "string" || !bootId ||
@@ -54,14 +67,21 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "deepse
   let exited = false
   let termTimer = null
   let killTimer = null
+  let cancels = false // the join reply said that this worker ends a receipts request on SIGUSR1
   let resolveClosed
   const closed = new Promise(resolve => { resolveClosed = resolve })
+
+  // The request has its answer or has failed: its deadline and the repeat of its cancel end with it.
+  function settle(request) {
+    pending = null
+    clearTimeout(request.timer)
+    clearIntervalImpl(request.repeat)
+  }
 
   function rejectPending(code, workerCode) {
     if (!pending) return
     const request = pending
-    pending = null
-    clearTimeout(request.timer)
+    settle(request)
     request.reject(Object.assign(failure(code, request.op), workerCode === undefined ? {} : { workerCode }))
   }
 
@@ -75,6 +95,21 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "deepse
     return closed
   }
 
+  // Ends the receipts request in flight, if there is one: the worker answers it `refused` within milliseconds, and the request
+  // that waited behind it goes next. The signal goes at once and is repeated until the answer is read (CANCEL_REPEAT_MS); a
+  // second call adds nothing. A repeat that crosses the answer lands before the next request is read, and the worker drops
+  // it. A worker that is stopping or has exited has no request in flight: stop() and the close handler settle it first.
+  function cancel() {
+    if (!cancels || !pending || !CANCELLABLE.has(pending.op) || pending.repeat !== undefined) return
+    const request = pending
+    const signal = () => {
+      if (pending !== request) return
+      try { child.kill("SIGUSR1") } catch { /* gone */ }
+    }
+    request.repeat = setIntervalImpl(signal, CANCEL_REPEAT_MS)
+    signal()
+  }
+
   // Installed before anything touches the pipes: a spawn that fails after it
   // returned (EMFILE, ENFILE) emits `error` on the next tick, and an `error` with
   // no listener would end the DSH process.
@@ -84,7 +119,7 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "deepse
     // start failed, and nothing is left to end.
     exited = true
     resolveClosed({ code: null, signal: null, started: false })
-    return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, stop, closed }
+    return { ready: Promise.reject(failure("CHAT_WORKER_UNAVAILABLE", "join")), request, cancel, stop, closed }
   }
   child.stdin.on("error", () => { rejectPending("CHAT_REQUEST_UNCERTAIN"); void stop() })
   child.on("close", (code, signal) => {
@@ -116,8 +151,7 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "deepse
         throw failure("CHAT_PROTOCOL_INVALID")
       }
       const request = pending
-      pending = null
-      clearTimeout(request.timer)
+      settle(request)
       request.resolve(frame.result)
     } catch (error) {
       const code = error?.code === "CHAT_PROTOCOL_INVALID" || error?.code === "CHAT_WORKER_REFUSED"
@@ -155,6 +189,9 @@ export function startWorker(config, { nativeSessionId, bootId, harness = "deepse
     native_session_id: nativeSessionId,
     boot_id: bootId,
     harness,
+  }).then(joined => {
+    cancels = cancelsReceipts(joined)
+    return joined
   })
-  return { ready, request, stop, closed }
+  return { ready, request, cancel, stop, closed }
 }

@@ -41,6 +41,9 @@ When writes are enabled:
 
 - `send` — publish a message. Supply a stable idempotency `key`; retrying with
   the same key is safe. Put the body in the `body` argument, never in the key.
+  Set `receipts: true` on an addressed message or reply to learn, without waking
+  anyone, when it is handed over or acknowledged; a question or consultation
+  carries receipts without it.
 - `reply` — answer one message. The one-step form derives an idempotency key
   from your session and the parent message.
 - `ack` — acknowledge one addressed message after processing it.

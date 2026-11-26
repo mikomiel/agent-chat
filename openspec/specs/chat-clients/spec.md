@@ -1,7 +1,7 @@
 # chat-clients Specification
 
 ## Purpose
-Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, and how the OpenCode plugin delivers from the host's idle hook.
+Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, the sender receipts that a harness package shows without waking it, and how the OpenCode plugin delivers from the host's idle hook.
 
 ## Requirements
 
@@ -13,6 +13,7 @@ After a successful join the adapter MUST expose `python`, `instance_file`, `room
 - **THEN** the context carries the eight binding fields and the route lines of the configured tool route
 - **AND** on the `cli` route, and in the fallback lines of the `mcp-with-cli-fallback` route, it names the interpreter form and the environment variable the CLI needs
 - **AND** on the `mcp` and `mcp-with-cli-fallback` routes it tells the model to call the agent-chat MCP `bind` tool, when the server exposes one, with exactly the `instance_file` shown, and again whenever a later binding shows a different one
+- **AND** a package that shows sender receipts ends its route lines with one sentence that tells the model how to ask for them: `send/reply --receipts asks for handed/acked receipts.` on the `cli` route, and `send/reply receipts=true asks for handed/acked receipts.` on the `mcp` and `mcp-with-cli-fallback` routes, except in a binding that goes with a notice that fits only without that sentence
 - **AND** it carries no token and no other session's binding
 
 #### Scenario: Tool route
@@ -542,12 +543,16 @@ The caller MUST pass `bound`, the UTF-8 bytes it may send, with its own prefix a
 - **THEN** the renderer returns nothing
 
 ### Requirement: A batch with no notice is deferred, never partly delivered
-A package MUST settle a batch for which the renderer returns nothing as `deferred` with reason `offline`, and MUST NOT send a partial or metadata notice in its place.
+A package MUST settle a batch for which the renderer returns nothing as `deferred` with reason `offline`, and MUST NOT send a partial or metadata notice in its place. When a notice fits only beside a binding without its receipts sentence, the package MUST send that binding with it and MUST NOT defer the batch.
 
 #### Scenario: The renderer returns nothing
 - **WHEN** a claimed batch has a message that fails its pattern, or a batch that does not fit at cap 0
 - **THEN** the package settles the batch as `deferred` with reason `offline`
 - **AND** it sends no text to the session
+
+#### Scenario: A batch that fits only beside the binding without the receipts sentence
+- **WHEN** `claude-code` or `codex` claims a retry batch whose notice does not fit beside the binding still to be shown, and fits beside that binding without the receipts sentence
+- **THEN** the hook carries that binding and the notice, and the batch settles `handed`
 
 ### Requirement: A package claims the longest prefix that one notice is estimated to carry
 Before the claim, the package MUST take the longest prefix of the pending candidates, and at least one, whose estimated rendering fits `bound`. The estimate MUST budget the widest header, markers and pointer for each message and 3 rendered bytes for each stored body byte, up to the body cap. It MUST claim a retry batch, or a batch for which the server reported no sizes, whole. A missing or invalid size MUST count as a full body.
@@ -584,6 +589,135 @@ The Python reference (`agent_chat/notice.py`) and the shared JavaScript renderer
 
 #### Scenario: A package copy drifts
 - **WHEN** a delivering package's `lib/notice.js` differs by one byte from `integrations/shared/notice.js`
+- **THEN** that package's tests fail
+
+### Requirement: A package offers sender receipts only to a busy, unmuted session
+A package that shows sender receipts MUST offer them only while the session is joined, its native state is busy and the worker's `receipts` answer carries `muted` as `false`; an absent or non-boolean `muted` MUST count as muted. It MUST ask for them at most every 5 seconds and only while a turn runs, MUST show at most 10 of the oldest rows in one notice, each row whole or not at all, and MUST NOT show an id again once its output was confirmed.
+
+#### Scenario: A session that cannot show receipts
+- **WHEN** the session is idle, stopped, in Plan Mode, in an unknown state or muted, or the worker's answer carries no boolean `muted`
+- **THEN** the package shows no receipt and no notice is output
+- **AND** the receipts stay pending on the server
+
+### Requirement: A staged sender receipts notice is checked again when it is output
+A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest worker answer's `muted` flag is `false` (a `status` answer without a boolean one makes it unknown) and the request that asked for the notice was written at most 5 seconds before. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
+
+#### Scenario: A mute after the notice was staged
+- **WHEN** a `status` answer says the session is muted, or more than 5 seconds pass after the request that staged a notice was written, and before its output
+- **THEN** no notice is output, and `claude-code` and `codex` answer the hook as for a reply with nothing to carry
+- **AND** the ids are not marked, and a later poll offers the rows again
+
+#### Scenario: An answer read late
+- **WHEN** a package reads a `receipts` answer more than 5 seconds after it wrote the request, for example after the host was suspended
+- **THEN** the notice that answer staged is dropped at its output, because it is as old as its request
+- **AND** the ids are not marked, and a later poll offers the rows again
+
+### Requirement: `pi` checks a receipts notice right before it hands it to Pi
+`pi` hands a receipts notice to Pi in the pass that got the answer, so it has no later boundary. It MUST make the check of a staged notice right before it hands the notice over, and MUST NOT hand over a notice that fails it. A notice it drops MUST NOT be marked, and its rows MUST be offered again.
+
+#### Scenario: A `pi` answer read after a suspend
+- **WHEN** `pi` reads a `receipts` answer more than 5 seconds after it wrote the request
+- **THEN** `pi` hands no notice to Pi and marks no id
+- **AND** a later poll offers the rows again
+
+### Requirement: `deepseek` outputs a staged receipts notice only into a running turn
+`deepseek` MUST also drop a staged receipts notice at output unless its native state, read without side effect, is a running turn outside Plan Mode. A notice it drops MUST NOT be marked, and its rows MUST be offered again.
+
+#### Scenario: Plan Mode after the notice was staged
+- **WHEN** `deepseek` finds its native state idle, stopped, unknown or in Plan Mode at the step that would carry a staged notice
+- **THEN** no message is appended and the ids are not marked
+
+### Requirement: A receipts pass sends one request and reads the native state without side effect
+A package's receipts pass MUST send at most one receipts request: the mark that waits or, when none waits, the feed poll. A mark that is not accepted MUST hold the feed poll until it lands. A pass that sends nothing MUST NOT delay the next one. `deepseek` MUST read its native state for receipts with a read that does not stop chat, log a warning or fence a delivery, and a state that read cannot classify MUST hold receipts for that pass and change nothing else.
+
+#### Scenario: A mark waits
+- **WHEN** a mark is waiting at a pass and the feed poll is due too
+- **THEN** the pass sends only the mark, and the feed poll waits for the next cadence after the mark landed
+
+#### Scenario: A pass that sends nothing
+- **WHEN** a pass gives way to a request queued behind it, or finds the turn over, and sends no receipts request
+- **THEN** the next pass of a running turn may poll at once
+
+#### Scenario: An unreadable native state in a receipts pass
+- **WHEN** `deepseek` cannot read its native state during a receipts pass
+- **THEN** it sends no receipts request and chat stays on
+- **AND** a later delivery is handed with no new Web prompt
+
+### Requirement: `deepseek` counts only a running turn as busy for receipts
+`deepseek`'s native-state read for receipts MUST count the agent as busy only while its status is `running`. An idle agent whose inbox holds a parked item is busy for a delivery, which MUST still start no turn, but runs no turn and MUST NOT be asked for receipts.
+
+#### Scenario: A Web prompt parked while the agent is idle
+- **WHEN** a `deepseek` agent is idle and a Web prompt waits in its inbox, as it does while a maintenance task runs
+- **THEN** the receipts pass sends no `receipts` request and no notice is appended
+- **AND** the delivery still counts the agent as busy and starts no turn
+
+### Requirement: A receipts request gives way to every other request
+A package MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, MUST repeat the cancel every few milliseconds until that request answers, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
+
+#### Scenario: A request falls due while a receipts request is in flight
+- **WHEN** a heartbeat, a state report, a delivery poll or a claim falls due while a receipts request is in flight and nothing releases that request
+- **THEN** the package cancels the receipts request, and sends the due request when the worker has answered the cancel
+- **AND** the package holds the `refused` answer like any refusal, changes no state for it, and keeps the ids of a mark that was ended
+- **AND** chat stays on, and those ids are marked at a later pass
+
+### Requirement: `receipts-cancel` gates receipts requests and ends only a receipts request
+A package MUST send a receipts request only to a worker whose join reply lists `receipts-cancel` in `capabilities`, and MUST release a notice staged and not yet output when its worker is retired. A worker that lists `receipts-cancel` MUST let a cancel end only the receipts request it was sent for, and MUST still end on its alarm or on `SIGTERM` during a receipts request.
+
+#### Scenario: A worker without the capability
+- **WHEN** a worker's join reply has no `capabilities` list, or the list does not contain `receipts-cancel`
+- **THEN** the package sends no `receipts` and no `receipts_delivered` request to it
+- **AND** every delivery, heartbeat, claim and settle is what it is without receipts
+
+#### Scenario: A rejoin onto another worker
+- **WHEN** a rejoin starts a worker whose join reply differs in `capabilities` from the worker before it
+- **THEN** the package follows the join reply of the worker that serves, and of no other
+- **AND** a notice staged for the worker before it, and not yet output, is not shown, and its rows are offered again by a later feed
+
+#### Scenario: A cancel arrives after the receipts request has its answer
+- **WHEN** the worker receives the cancel signal after a receipts request has its answer and before it reads the next request
+- **THEN** the worker drops the signal
+- **AND** the next request, a retry of the same mark included, is sent to the server and answered
+
+#### Scenario: A cancel lands before the worker reads the receipts request it was sent for
+- **WHEN** a package writes a receipts request right after the answer to another one and cancels it, and the first signal lands before the worker has read that request
+- **THEN** the worker drops that signal, as it does for any cancel in that window, and the package sends it again every few milliseconds until the request answers
+- **AND** the first signal that lands after the worker read the request ends it, so a request queued behind it waits milliseconds, not the 2-second receipt deadline
+- **AND** a repeat that lands after the answer is dropped, and the next request is sent to the server and answered
+
+#### Scenario: The alarm fires during a receipts request
+- **WHEN** the worker's alarm fires while a receipts request runs, also while the HTTP client waits for the answer
+- **THEN** the worker ends with an error frame and does not answer `refused` for that receipts request
+
+### Requirement: Sender receipts never wake and never change delivery
+A package MUST output a receipts notice only at a native boundary of a turn that already runs, and MUST NOT start a turn, claim, settle, steer or wake for it. A pending receipt MUST NOT change the bytes of a claim, a handoff, a settle, a heartbeat, a binding announcement or a wake, and a receipts request MUST NOT sit between a claim and its settle.
+
+#### Scenario: Receipts pending
+- **WHEN** receipts are pending
+- **THEN** every delivery, binding announcement and wake that the package outputs, and every claim, settle and heartbeat request it makes, is byte-identical to that of a session with no receipts pending
+
+### Requirement: A package marks only the receipts its harness confirmed
+A package MUST send `receipts_delivered` with exactly the ids a notice showed, and only after its harness confirmed the output. A `refused` or malformed answer MUST NOT end chat, and the ids of a mark that was refused or failed MUST be sent again at the next poll.
+
+#### Scenario: A notice that reached the model
+- **WHEN** the harness confirms that a receipts notice was output
+- **THEN** the package sends `receipts_delivered` with exactly the ids in that notice, and never an empty list
+- **AND** a notice that was not confirmed is not marked, and its rows are offered again
+
+#### Scenario: A refusal or a failed mark
+- **WHEN** either receipts operation answers `refused` or something malformed
+- **THEN** chat stays on, heartbeat, claim and settle keep running, and the package asks again at its next poll
+- **AND** the ids of a mark that was refused are kept, and after a rejoin they are marked through the new instance
+
+#### Scenario: A transport failure on a receipts request
+- **WHEN** a receipts request throws a transport error that carries a code, such as `REQUEST_UNCERTAIN`
+- **THEN** the package handles it as it handles that error on any other request: a rejoin within the budget, or fail closed
+- **AND** `CHAT_REQUEST_INVALID` and an error that carries no code are held, and chat stays on
+
+### Requirement: Sender receipts use the shared state machine and renderer unchanged
+A package that shows sender receipts MUST ship `lib/receipts.js` as a byte-identical copy of `integrations/shared/receipts.js`, and its tests MUST fail when the copy differs. Its receipt notice MUST come from `renderReceiptNotice` in its `lib/notice.js` copy, which passes the vectors in `integrations/receipt-vectors.json`.
+
+#### Scenario: A receipts copy drifts
+- **WHEN** a package's `lib/receipts.js` differs by one byte from `integrations/shared/receipts.js`
 - **THEN** that package's tests fail
 
 ### Requirement: The OpenCode plugin delivers only when its config turns delivery on

@@ -252,7 +252,9 @@ def test_full_http_mutation_and_native_deny_matrix_has_no_chat_effects(
         ("POST", "/v1/instance/deliveries/claim", {"messages": [str(message["id"])]}, 401),
         ("POST", f"/v1/instance/deliveries/{attempt}/result", {"outcome": "handed"}, 401),
         ("GET", "/v1/instance/receipts", None, 401),
+        ("GET", "/v1/instance/receipts/feed", None, 401),
         ("POST", "/v1/instance/receipts/delivered", {"receipts": [str(uuid4())]}, 401),
+        ("POST", "/v1/instance/receipts/feed/delivered", {"receipts": [str(uuid4())]}, 401),
         (
             "POST",
             f"/v1/rooms/{room}/state",

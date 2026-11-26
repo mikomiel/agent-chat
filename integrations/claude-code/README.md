@@ -83,7 +83,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `directory` | Absolute state directory, created beforehand, owned by the current user, mode `0700`. It holds the binding record and the receiver socket, so its path must be 71 bytes or fewer. |
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
-| `python` | Absolute interpreter that can import `agent_chat`. |
+| `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 | `idleWakeHoldSeconds` | Optional. A positive integer: how many seconds the idle-wake waiter holds before it leaves. The default is `3540` (59 minutes). A value below `10` holds for `10` seconds and a value above `8385` holds for `8385` seconds: both are raised or cut, never refused. The loader validates the parsed JSON number, so a literal that JSON parses to a whole number (such as `1.0`) is accepted as that number. Any other value keeps chat off: zero, a negative or fractional number, a string, or any other type. See [Limitations](#limitations). |
@@ -118,7 +118,9 @@ The service and its host-token provisioning are documented in the product
 [integrations README](../README.md#tool-route) gives the exact text and the room
 each route takes.
 
-- Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
+- Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
+  the binding ends them with the one receipts sentence (except in the one case
+  under "Large retry batches" below).
 - `"mcp"`: the tools of the MCP server named `agent-chat` (`bind` when the server
   has it, `who`, `history`, `send`, `ack`, `reply`), and no CLI.
 - `"mcp-with-cli-fallback"`: the MCP tools, the CLI only while that server or its
@@ -133,8 +135,10 @@ rejoin the binding says to call `bind` again with the new `instance_file`.
 Known limit: the binding is longer on the `mcp` routes, and the 4,096-byte
 announcement caps the interpreter path and the state directory together. With a
 63-character host, a UUID session id and plain ASCII paths, the fallback route
-leaves 2,698 bytes for the two paths, `mcp` 2,902, against 3,041 on `cli`. A
-longer binding is not announced.
+leaves 2,641 bytes for the two paths, `mcp` 2,845, against 2,987 on `cli`. A
+longer binding is not announced. These numbers include the sentence at the end
+of the binding that tells the model how to ask for receipts: 54 bytes on `cli`
+and 57 on each `mcp` route.
 
 ## Behaviour
 
@@ -166,9 +170,17 @@ or a stop. Only the idle-wake waiter exits 2.
   non-string `permission_mode` is `unknown` and claims nothing.
 - **Settlement.** `handed` is reported only after the hook has written the
   output and its write callback has fired, and said so over the socket. A
-  refused output settles `failed`; a failed write, a missing receipt or a
-  reservation too short to write inside settles `uncertain`. Nothing is ever
-  replayed.
+  refused output settles `failed`. A claimed batch whose hook (a prompt or
+  tool hook, or the idle-wake waiter) had already left when the receiver came
+  to write it, because its connection closed or its hold ended, settles
+  `deferred` (`offline`): nothing was sent, so it is retryable. The ledger accepts
+  that settlement only while the reservation holds; one that reaches it after
+  the reservation expired is closed by the ledger as `uncertain`
+  (`claim_expired`, `agent_chat/deliveries.py`), like any expired claim. A
+  failed write, a missing receipt, a connection that closed once the notice was
+  sent, or a reservation too short to write inside settles `uncertain`, and the
+  ledger does not offer that batch again. The receiver never writes the same
+  attempt twice.
 - **Output cap.** Claude Code caps each hook `additionalContext`,
   `systemMessage` and plain output string at 10,000 characters and replaces a
   longer one with a file and a preview. Nothing here relies on that. The
@@ -181,6 +193,44 @@ or a stop. Only the idle-wake waiter exits 2.
   refuses any text over the cap as a second check.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
+- **Sender receipts.** After the reply of a `UserPromptSubmit` or `PostToolUse`
+  hook, at most every 5 seconds and only while the session is busy, the receiver
+  asks the worker for the `handed` and `acked` receipts of messages this session
+  sent. The first poll comes one cadence after the receiver starts. The cadence
+  counts from the write of a request: a pass that sends nothing, because it gave
+  way or the turn ended, does not delay the next one. When the
+  worker's answer says the session is not muted, up to 10 of the oldest rows are
+  staged as one notice, and the next prompt or tool event carries it as
+  `additionalContext`. Only a reply that would otherwise carry nothing does, so
+  a notice never shares an output or its cap with the binding or a delivery. It
+  is never in a `Stop` reply, in the idle-wake waiter or in an exit 2, so it
+  cannot wake the session. The notice is checked again when a hook would carry
+  it, with no request: the latest mute flag any worker answer carried must be
+  `false` and the notice at most 5 seconds old, otherwise it is dropped, the
+  hook is answered as for any reply with nothing to carry, and its rows are
+  offered again. When the hook's receipt says it wrote the text, the
+  receiver marks exactly those ids delivered at once; a refused or failed mark
+  is sent again at the next pass. A pass sends one request, the mark that waits
+  or else the poll. A staged notice that was not shown is
+  released at `Stop` and when its worker is retired (a rejoin, or chat ending),
+  so a worker that rejoins without `receipts-cancel` shows none; its rows come
+  back with a later feed. Confirmed ids wait for a worker that can mark them.
+  The request runs after the hook's reply, queued like any
+  other, and it never replaces a claim. It gives way: a claim, a heartbeat or a
+  state report that queues behind it ends it with the worker's cancel signal, so,
+  client-side, none of them waits for it beyond the worker's answer to the
+  signal, and no hook skips its claim for it. The signal is repeated every 5
+  milliseconds until the worker answers, so a cancel that reaches the worker
+  before it has read the request, which the worker drops, is followed by one
+  that ends it. The server is another wait: a
+  receipts read that stalls inside it keeps the row of the instance, so the
+  request that goes first after the cancel, the `pending` that opens a claim or
+  a heartbeat, waits for it, up to 3 seconds, and is refused if the row is still
+  held. That hook then delivers nothing, and the message stays on the server for
+  the next one. Only a worker whose join reply lists `receipts-cancel` is asked
+  for receipts; an older core shows none. The binding
+  ends its route lines with one sentence that tells the model how to ask for
+  receipts. The [receipts contract](../README.md#sender-receipts) has the rules.
 - **Delegated sessions.** A hook payload that carries `agent_id` (a subagent
   or an in-process teammate) is ignored: no join, no claim, no output.
   `agent_type` alone does not count, because `claude --agent <name>` sets it in
@@ -275,9 +325,11 @@ or a stop. Only the idle-wake waiter exits 2.
 - **Self-started turns.** `UserPromptSubmit` also fires for a scheduled task,
   a background subagent report and a message from another session. Each is a
   turn start to the receiver and may be delivered to.
-- **No sender receipts.** This version neither reads nor renders the receipts
-  of messages the session sent. They never wake a model, so their absence does
-  not change delivery.
+- **Receipts are untested live.** Sender receipts have run only against doubles
+  and one test of the real hook command, receiver and socket with a worker
+  double; no Claude Code session has shown a notice. As for a delivery, the
+  hook's receipt means the text was flushed, not read, and a receipt is marked
+  at that point.
 - **No title.** `session_title` reaches hooks only for a custom-titled session
   and is not forwarded. The server keeps the stored title.
 - **Large retry batches.** A retry batch is claimed whole, up to 16 messages.
@@ -286,12 +338,16 @@ or a stop. Only the idle-wake waiter exits 2.
   widest. With the notice, the delivery line and the two line feeds after the
   announcement counted, the 10,000-byte output cap leaves 2,848 bytes for an
   announcement in the first case and 2,224 bytes in the second. The
-  announcement is 1,016 bytes in the receiver tests and never more than 4,096.
+  announcement is 1,070 bytes in the receiver tests and never more than 4,096.
   An announcement larger than that room leaves less than the batch needs, so
-  the renderer returns nothing and the batch is deferred.
+  the renderer returns nothing and the batch is deferred. When the notice fits
+  only beside the announcement without its receipts sentence (54 bytes on `cli`,
+  57 on each `mcp` route), that announcement goes instead, so the sentence never
+  makes a batch wait that fit before it. That announcement counts as shown, and
+  the sentence returns with the next one, at a session start or a rejoin.
 - **Fallback route room beside an announcement.** On `mcp-with-cli-fallback`
-  an announcement and the notice after it take 341 bytes more than on `cli` in
-  metadata mode and 279 bytes more in bodies mode, so a batch beside an
+  an announcement and the notice after it take 344 bytes more than on `cli` in
+  metadata mode and 282 bytes more in bodies mode, so a batch beside an
   announcement is claimed and then deferred that many bytes sooner.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
   [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
@@ -351,7 +407,10 @@ the rejoin policy pinned to `agent_chat/models.py`, the shared notice vectors
 and the byte bound with the announcement counted, the socket and its start handshake, the receiver's state, delivery,
 settlement, rejoin and shutdown with a manual clock, the idle-wake waiter through
 a rejoin episode, the hook commands with payload doubles (output cap, write
-receipts, delegated refusal, idle wake exit code and hold), the plugin shape that
-Claude Code reads, and runs of the real hook and receiver processes against a
-fake worker. It needs no Claude Code install, no PostgreSQL, no service and no
-credential.
+receipts, delegated refusal, idle wake exit code and hold), sender receipts (the
+offer rules, the output-time check (mute and age), the confirmation and the
+mark, one request per pass, that a delivery and the binding are byte-identical
+with receipts pending, and that `Stop` and the waiter carry no notice), the
+plugin shape that Claude Code reads, and runs of the real hook and receiver
+processes against a fake worker. It needs no Claude Code install, no
+PostgreSQL, no service and no credential.

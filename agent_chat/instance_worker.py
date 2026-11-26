@@ -11,6 +11,15 @@ worker. A join that sends nothing keeps its record, for a retry of the same boot
 stale sweep. Every later request connects only to those addresses, in order, and performs no name
 resolution; TLS still verifies the host name. When none of them accepts a connection the request fails
 with TRANSPORT_UNAVAILABLE. Only the next join, the parent's rejoin, resolves again.
+
+The join reply names what this worker can do beyond the base requests (`capabilities`). `receipts-cancel` means
+that SIGUSR1 ends a receipts request that is running, which then answers `refused`, so that a delivery never waits
+in this worker behind advisory work; the server finishes the request. Nothing else ends on it, and it never ends the
+worker. A signal that lands after a receipts request has its answer and before the next frame is read may be late for
+that request, and is dropped. Anywhere else outside a receipts request it is remembered once: a receipts request
+read next answers `refused` without asking, and any other request read next forgets it. A signal names no request, so a
+parent repeats it every few milliseconds until the request answers: the first one that lands after this worker read the
+request ends it, and one that crosses the answer is dropped.
 """
 
 import json
@@ -24,11 +33,16 @@ from typing import Any
 from uuid import UUID
 
 from . import instance_client, instance_file
-from .client import Interrupted
+from .client import Interrupted, defer_signal
 from .models import LEASE_SECONDS, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 
 MAX_FRAME = 128 * 1024
 REQUEST_SECONDS = 20
+# A receipts request holds the parent's one request slot. A parent that has a delivery, a heartbeat or a state
+# report to send ends it with CANCEL_SIGNAL; this deadline, well inside the alarm's REQUEST_SECONDS, is what ends
+# one that nobody asks to end. A request that runs out answers `refused` like any other receipts failure, and the
+# parent asks again at its next poll.
+RECEIPT_SECONDS = 2.0
 IDLE_SECONDS = 90
 # A server restart fails a poll or a heartbeat without ending the session. Each op tolerates its own
 # unbroken failure streak for less than the server lease; one success of that op ends the streak.
@@ -36,10 +50,15 @@ IDLE_SECONDS = 90
 # which `_settle` sends again itself, so it has no streak either. Receipts are advisory and have no streak: a receipt
 # read or mark that fails, whatever the code or the length of the failure, answers `refused` and never ends the
 # worker, because the parent offers the receipt again at its next poll. Liveness stays with heartbeat, pending
-# and claim, which fail closed. The receipts read includes the session's mute flag (`_receipts_with_mute`), so a
-# failed mute read is the same refusal, not the fatal `status` request.
+# and claim, which fail closed. The receipts read carries the session's mute flag, so a parent never asks `status`
+# for it: `status` is fatal in this worker, and a failed one would end the session over an advisory receipt.
 PENDING_OUTAGE = frozenset({"TRANSPORT_UNAVAILABLE", "SERVICE_UNAVAILABLE"})
 HEARTBEAT_OUTAGE = PENDING_OUTAGE | {"REQUEST_UNCERTAIN"}
+RECEIPTS_OPERATIONS = frozenset({"receipts", "receipts_delivered"})
+# The signal that ends a receipts request, fixed at import: the worker names it in its join reply, and a parent
+# signals only a worker that did, because a process without the handler would die of it.
+CANCEL_SIGNAL = signal.SIGUSR1
+CAPABILITIES = ("receipts-cancel",)
 # A settlement with no answer is sent again after this pause. One try can take 3 s (the client's step), so the
 # pause only keeps a refused connection from spinning; it is not a back-off.
 SETTLE_PAUSE_SECONDS = 0.5
@@ -49,6 +68,34 @@ SETTLE_MARGIN_SECONDS = 1.0
 
 def _interrupt(_signum: int, _frame: Any) -> None:
     raise Interrupted("worker interrupted")
+
+
+class _ReceiptsCancelled(Interrupted):
+    """What CANCEL_SIGNAL raises inside a receipts request. SIGTERM and the alarm raise a plain `Interrupted`."""
+
+
+def _deferrable(
+    handler: Callable[[int, Any], None], arrived: Callable[[], None] | None = None
+) -> Callable[[int, Any], None]:
+    """Wrap a handler that raises, so that the client can hold a call back while it starts a request's timer thread.
+
+    An exception from a handler is not safe inside `Thread.start`. The wrapper asks the client first
+    (`defer_signal`). A call that the client holds back is recorded and returns with nothing changed; the client calls
+    the handler again once the start is over. Only that call latches or raises, so a cancel's latch is set once. With
+    nothing held back, a call goes straight to the handler.
+
+    `arrived` runs first on every call, held back or not, and only records that the signal came, which is safe inside
+    the start. A signal that ends the worker needs it: the replay of a held signal can be cut short by a cancel that
+    runs first, and the worker must have recorded the signal by then.
+    """
+
+    def run(signum: int, frame: Any) -> None:
+        if arrived is not None:
+            arrived()
+        if not defer_signal(signum):
+            handler(signum, frame)
+
+    return run
 
 
 def _read(expected: int) -> dict[str, Any] | None:
@@ -236,24 +283,6 @@ def _delivery(
     raise ChatError("INVALID_REQUEST")
 
 
-def _receipts_with_mute(instance: instance_client.JoinedInstance) -> dict[str, Any]:
-    """The receipt feed, and the session's `muted` flag when the feed has rows, as one answer.
-
-    A receipt waits while the session is muted, so the parent needs the flag before it shows one. `status` is a
-    fatal request in this worker: a parent that asked for it separately would end the session over an advisory
-    receipt. The flag is read here instead, inside the receipt refusal, so a failed or malformed read answers
-    `refused` for the whole request and the worker keeps serving. An empty feed has nothing to hold, so it needs no
-    flag. An older worker never sends one, which a parent must read as muted.
-    """
-    feed = instance_client.receipts(instance)
-    if feed["receipts"]:
-        muted = instance_client.status(instance).get("muted")
-        if type(muted) is not bool:
-            raise ChatError("INVALID_RESPONSE")
-        feed["muted"] = muted
-    return feed
-
-
 def main() -> int:
     instance = None
     directory: Path | None = None
@@ -266,28 +295,75 @@ def main() -> int:
     published_state: Heartbeat | None = None
     failing_since: dict[str, float] = {}
     terminated = False
+    alarmed = False  # the alarm fired in the receipts request that runs; the client reports it as a failed transport
+    # What CANCEL_SIGNAL does now. "open": a receipts request runs, and the signal ends it. "answered": a receipts
+    # request has its answer and the next frame is not read yet, so the signal may be late for that request and is
+    # dropped; a parent that meant it for the next request repeats it until that one answers. "latch": anywhere else,
+    # the signal is remembered for a receipts request that comes next. One store moves between them, so no signal can
+    # land between two of them.
+    cancel_window = "latch"
+    cancel_latched = False  # a cancel arrived that no request has answered; a receipts request that follows answers it
 
-    def _terminate(signum: int, frame: Any) -> None:
+    def _note_terminated() -> None:
         # SIGTERM makes the blocked request fail like a transport error. Record it so it is never tolerated.
         nonlocal terminated
         terminated = True
-        _interrupt(signum, frame)
+
+    def _note_alarmed() -> None:
+        # The alarm also reaches a receipts request as a failed transport. Record it, so that `_receipt` ends the
+        # worker on it instead of answering `refused`.
+        nonlocal alarmed
+        alarmed = True
 
     def _outage(op: str, error: ChatError, codes: frozenset[str]) -> bool:
         if terminated or error.code not in codes:
             return False
         return monotonic() - failing_since.setdefault(op, monotonic()) < LEASE_SECONDS
 
-    def _receipt(call: Callable[..., Any], *arguments: Any) -> Any:
-        try:
-            return call(*arguments)
-        except ChatError as error:
-            if terminated:  # SIGTERM interrupted the call: a stop still ends the worker
-                raise
-            return {"refused": error.code}
+    def _cancel(_signum: int, _frame: Any) -> None:
+        nonlocal cancel_window, cancel_latched
+        if cancel_window == "answered":
+            return
+        cancel_latched = True
+        if cancel_window == "open":
+            cancel_window = "latch"  # one interrupt per request: a second signal latches, it never raises again
+            raise _ReceiptsCancelled("receipts request cancelled")
 
-    signal.signal(signal.SIGALRM, _interrupt)
-    signal.signal(signal.SIGTERM, _terminate)
+    def _receipt(call: Callable[..., Any], *arguments: Any) -> Any:
+        nonlocal alarmed, cancel_window, cancel_latched
+        alarmed = False  # only an alarm inside this receipts request counts; other requests keep their outage rules
+        try:
+            try:
+                try:
+                    # From this store until the `finally`, everything is inside the outer `try`, so a cancel that
+                    # lands anywhere in the request, or in its clean-up, is answered below. Before it, the handler only
+                    # latches.
+                    cancel_window = "open"
+                    if cancel_latched:
+                        raise _ReceiptsCancelled("receipts request cancelled before it began")
+                    return call(*arguments, deadline=monotonic() + RECEIPT_SECONDS)
+                finally:
+                    # The request has its answer. A signal from here until the next frame is read was sent for it, and
+                    # must not reach the next request, which can be a retry the server has never seen.
+                    cancel_window = "answered"
+            except _ReceiptsCancelled:
+                if terminated or alarmed:  # SIGTERM or the alarm came with it: either still ends the worker
+                    raise
+                return {"refused": "CLI_INTERRUPTED"}
+            except ChatError as error:
+                if terminated or alarmed:  # SIGTERM or the alarm interrupted the call: either still ends the worker
+                    raise
+                if cancel_latched:  # the cancel interrupted the client, which reported it as a failed transport
+                    return {"refused": "CLI_INTERRUPTED"}
+                return {"refused": error.code}
+        finally:
+            cancel_latched = False  # whatever this request's signal was, it is answered
+
+    # A fatal signal records itself when it arrives, also when the client holds its raise back: a cancel that runs
+    # first in the replay would otherwise leave `_receipt` with no fatal flag, and it would answer `refused`.
+    signal.signal(signal.SIGALRM, _deferrable(_interrupt, _note_alarmed))
+    signal.signal(signal.SIGTERM, _deferrable(_interrupt, _note_terminated))
+    signal.signal(CANCEL_SIGNAL, _deferrable(_cancel))
     signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
     try:
         request = _read(0)
@@ -306,6 +382,7 @@ def main() -> int:
                     "host": instance.host,
                     "harness": instance.harness,
                     "instance_file": str(directory / f"{instance.binding.boot_id}.json"),
+                    "capabilities": list(CAPABILITIES),
                 },
             },
             credentials,
@@ -320,9 +397,12 @@ def main() -> int:
             signal.setitimer(signal.ITIMER_REAL, IDLE_SECONDS)
             request = _read(sequence)
             signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
+            cancel_window = "latch"  # a new request: a signal from now on is for a receipts request this one may be
             if request is None:
                 break
             operation = request.get("op")
+            if operation not in RECEIPTS_OPERATIONS:
+                cancel_latched = False  # a cancel is for a receipts request; it never carries over to another kind
             if operation == "heartbeat" and set(request) == {"id", "op", "state"}:
                 state = Heartbeat.model_validate(request["state"])
                 try:
@@ -360,7 +440,7 @@ def main() -> int:
                 result = instance_client.status(instance)
             elif operation == "receipts" and set(request) == {"id", "op"}:
                 # Receipts never wake: the parent outputs them at its next native boundary, then marks them.
-                result = _receipt(_receipts_with_mute, instance)
+                result = _receipt(instance_client.receipts, instance)
             elif operation == "receipts_delivered" and set(request) == {"id", "op", "receipts"}:
                 receipts = ReceiptDelivery(receipts=request["receipts"])
                 # A refusal marks nothing: the parent keeps its evidence and marks again at its next poll.

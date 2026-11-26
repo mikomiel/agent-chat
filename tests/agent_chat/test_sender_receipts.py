@@ -1,10 +1,17 @@
 """Sender receipts (migration 007): non-waking, at most one per message, recipient and state, policy by kind."""
 
 import json
+import signal
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from hashlib import sha256
-from threading import Event
+from http.client import HTTPConnection
+from pathlib import Path
+from threading import Event, Thread
+from time import monotonic, sleep
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -27,6 +34,7 @@ from agent_chat.retention import prune
 from agent_chat.storage import connect
 
 EXCLUDED_KINDS = ("status", *COORDINATION_KINDS)
+ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -295,6 +303,100 @@ def test_feed_and_delivered_marks_are_owner_scoped_and_idempotent_over_http(proc
     assert http_api("GET", "/v1/instance/receipts", token=sender_token)[1]["receipts"] == []
 
 
+def test_the_feed_route_reports_the_muted_flag_of_its_own_session_over_http(process_api, credentials, register):
+    """A receipt waits while its session is muted, so the feed route carries the flag: a reader needs no `status`."""
+    http_api = process_api.request
+    sender_token, sender = register(process_api, credentials, "sender")
+    target_token, target = register(process_api, credentials, "target")
+
+    def flags():
+        feeds = [
+            http_api("GET", "/v1/instance/receipts/feed", token=token)[1] for token in (sender_token, target_token)
+        ]
+        assert all(set(feed) == {"instance_id", "session_id", "receipts", "muted"} for feed in feeds)
+        return [feed["muted"] for feed in feeds]
+
+    assert flags() == [False, False]
+    assert http_api("POST", f"/v1/sessions/{sender['session_id']}/mute", {"muted": True}, sender_token)[0] == 200
+    assert flags() == [True, False]  # the flag is the reader's own, not another session's
+    assert http_api("POST", f"/v1/sessions/{target['session_id']}/mute", {"muted": True}, target_token)[0] == 200
+    assert http_api("POST", f"/v1/sessions/{sender['session_id']}/mute", {"muted": False}, sender_token)[0] == 200
+    assert flags() == [False, True]
+
+
+def test_the_released_receipts_route_keeps_its_answer_and_the_feed_route_adds_only_the_flag_over_http(
+    process_api, credentials, register
+):
+    """Workers of earlier releases read `GET /v1/instance/receipts`: its answer has exactly the keys it always had."""
+    http_api = process_api.request
+    sender_token, sender = register(process_api, credentials, "sender")
+    target_token, target = register(process_api, credentials, "target")
+    status, question = http_api(
+        "POST",
+        f"/v1/rooms/{credentials.room}/messages",
+        {"kind": "question", "body": "synthetic", "recipients": [target["session_id"]]},
+        sender_token,
+        {"Idempotency-Key": str(uuid4())},
+    )
+    assert status == 200
+    assert http_api("POST", f"/v1/messages/{question['id']}/ack", {}, target_token)[0] == 200
+    identity = {"instance_id": sender["instance_id"], "session_id": sender["session_id"]}
+    for muted in (False, True):
+        assert http_api("POST", f"/v1/sessions/{sender['session_id']}/mute", {"muted": muted}, sender_token)[0] == 200
+        status, released = http_api("GET", "/v1/instance/receipts", token=sender_token)
+        assert status == 200 and set(released) == {"instance_id", "session_id", "receipts"}  # no flag, muted or not
+        status, feed = http_api("GET", "/v1/instance/receipts/feed", token=sender_token)
+        assert status == 200 and feed == {**released, "muted": muted}  # the same ledger, and the flag besides
+        assert {key: released[key] for key in identity} == identity and len(released["receipts"]) == 1
+
+
+def test_the_mark_route_of_the_feed_marks_over_http_and_the_released_mark_route_keeps_its_answer(
+    process_api, credentials, register
+):
+    """The mark that goes with the feed has its own name, which a server of an earlier release lacks.
+
+    A mark kept across a rollback of the server then answers NOT_FOUND from the router and takes no clock. The released
+    route marks as before for a worker of an earlier release: the two are one mark under two names.
+    """
+    http_api = process_api.request
+    sender_token, sender = register(process_api, credentials, "sender")
+    target_token, target = register(process_api, credentials, "target")
+    for _ in range(2):
+        status, question = http_api(
+            "POST",
+            f"/v1/rooms/{credentials.room}/messages",
+            {"kind": "question", "body": "synthetic", "recipients": [target["session_id"]]},
+            sender_token,
+            {"Idempotency-Key": str(uuid4())},
+        )
+        assert status == 200
+        assert http_api("POST", f"/v1/messages/{question['id']}/ack", {}, target_token)[0] == 200
+    feed_route, mark_route = "/v1/instance/receipts/feed", "/v1/instance/receipts/feed/delivered"
+    status, feed = http_api("GET", feed_route, token=sender_token)
+    assert status == 200
+    first, second = (row["id"] for row in feed["receipts"])
+    sender_answer = {"instance_id": sender["instance_id"], "session_id": sender["session_id"]}
+    target_answer = {"instance_id": target["instance_id"], "session_id": target["session_id"]}
+    # The recipient marks nothing of the sender's.
+    foreign = http_api("POST", mark_route, {"receipts": [first]}, target_token)
+    assert foreign == (200, {**target_answer, "delivered": []})
+    assert len(http_api("GET", feed_route, token=sender_token)[1]["receipts"]) == 2
+    # The owner marks its own; an unknown ID beside it is ignored, and a repeat is the same answer.
+    payload = {"receipts": [first, str(uuid4())]}
+    marked = http_api("POST", mark_route, payload, sender_token)
+    assert marked == (200, {**sender_answer, "delivered": [first]})
+    assert http_api("POST", mark_route, payload, sender_token) == marked
+    assert [row["id"] for row in http_api("GET", feed_route, token=sender_token)[1]["receipts"]] == [second]
+    # The released route is still there, with the answer it always had, and marks the other.
+    released = http_api("POST", "/v1/instance/receipts/delivered", {"receipts": [second]}, sender_token)
+    assert released == (200, {**sender_answer, "delivered": [second]})
+    assert http_api("GET", feed_route, token=sender_token)[1]["receipts"] == []
+    # The same strict shape as the released mark.
+    for invalid in ({}, {"receipts": []}, {"receipts": ["x"]}, {"receipts": [first], "extra": True}):
+        status, body = http_api("POST", mark_route, invalid, sender_token)
+        assert (status, body["error"]["code"]) == (422, "INVALID_REQUEST")
+
+
 @pytest.mark.parametrize(
     "payload", [{}, {"receipts": []}, {"receipts": ["x"]}, {"receipts": [str(uuid4())] * 51}, {"receipts": 1},
                 {"receipts": [str(uuid4())], "extra": True}],
@@ -308,7 +410,9 @@ def test_a_delivered_mark_is_strictly_shaped(process_api, credentials, register,
 def test_only_a_live_instance_reads_or_marks_receipts(http_api, credentials):
     for method, path, payload in (
         ("GET", "/v1/instance/receipts", None),
+        ("GET", "/v1/instance/receipts/feed", None),
         ("POST", "/v1/instance/receipts/delivered", {"receipts": [str(uuid4())]}),
+        ("POST", "/v1/instance/receipts/feed/delivered", {"receipts": [str(uuid4())]}),
     ):
         status, body = http_api(method, path, payload, credentials.operator)
         assert (status, body["error"]["code"]) == (403, "SESSION_FORBIDDEN")
@@ -326,6 +430,149 @@ def test_an_ended_instance_cannot_read_its_receipts(db, actors):
     ):
         with pytest.raises(ChatError, match="^STALE_INSTANCE$"):
             call()
+
+
+def test_a_receipts_read_that_stalls_holds_the_instance_row_for_a_concurrent_pending(
+    http_api, credentials, register, lock_wait, monkeypatch
+):
+    """The server serializes one instance's requests on its row, receipts included, whoever still waits for them.
+
+    A receipts read that stops after `lock_actor` keeps the row until its transaction ends, also when its client
+    has gone: the worker abandons a read at its 2 s deadline, and the server does not know. A `pending` of the same
+    instance parks behind it, answers once it ends, and ends with a coded outage only after the service's 3 s lock
+    limit. This is a residual of every client-side design; it is measured here, not removed.
+    """
+    port = http_api.args[0]
+    token, _ = register(SimpleNamespace(request=http_api), credentials, "row-lock")
+    real = receipts.visible
+    stall = SimpleNamespace(entered=Event(), release=Event())
+
+    def stalled(db, actor, **kwargs):
+        stall.entered.set()
+        stall.release.wait(10)
+        return real(db, actor, **kwargs)
+
+    monkeypatch.setattr(receipts, "visible", stalled)
+
+    def abandon_a_read():
+        """Send the read and walk away, as the worker does at its deadline."""
+        stall.entered, stall.release = Event(), Event()
+        client = HTTPConnection("127.0.0.1", port, timeout=5)
+        client.request("GET", "/v1/instance/receipts", headers={"Authorization": "Bearer " + token})
+        assert stall.entered.wait(5), "the read never reached its stall"
+        client.close()
+
+    def ask(answers):
+        started = monotonic()
+        answer = http_api("GET", "/v1/instance/deliveries/pending", token=token)
+        answers.append((answer, started, monotonic()))
+
+    # The holder ends after 1 s: the pending parked behind an abandoned read answers, and only after it ended.
+    abandon_a_read()
+    answers = []
+    waiter = Thread(target=ask, args=(answers,))
+    waiter.start()
+    lock_wait("agent_chat.instances")
+    sleep(1)
+    released = monotonic()
+    stall.release.set()
+    waiter.join(8)
+    assert len(answers) == 1
+    (status, body), started, ended = answers[0]
+    assert (status, body["messages"]) == (200, [])
+    assert ended >= released and ended - started < 3
+
+    # The holder outlasts the lock limit: the pending ends with the database outage code, after about 3 s.
+    abandon_a_read()
+    answers = []
+    waiter = Thread(target=ask, args=(answers,))
+    waiter.start()
+    waiter.join(8)
+    assert len(answers) == 1
+    (status, body), started, ended = answers[0]
+    assert (status, body["error"]["code"]) == (503, "DATABASE_UNAVAILABLE")
+    assert 2.9 <= ended - started < 5
+    stall.release.set()
+
+    # The abandoned read ends too, and the row is free again: the next pending answers.
+    answers = []
+    ask(answers)
+    assert answers[0][0][0] == 200
+
+
+def test_a_real_worker_ends_a_held_receipts_read_on_the_cancel_signal_and_serves_the_next_pending(
+    http_api, credentials, tmp_path, monkeypatch
+):
+    """The cancel signal and the server's row lock together, through the real worker process and a real SIGUSR1.
+
+    Cancelling ends the client's wait, not the server's transaction. The worker answers at once and keeps serving;
+    the next `pending` of the same instance waits for the row, and ends as the brief outage the receivers already
+    tolerate if the transaction outlasts the client's 3 s socket timeout.
+    """
+    directory = tmp_path / "binding"
+    directory.mkdir(mode=0o700)
+    join = {
+        "id": 0, "op": "join", "enabled": True, "directory": str(directory), "native_session_id": "cancel-native",
+        "boot_id": str(uuid4()), "server_origin": f"http://127.0.0.1:{http_api.args[0]}",
+        "host_token": credentials.agent, "harness": "pi",
+    }
+    stall = SimpleNamespace(armed=False, entered=Event(), release=Event())
+    real = receipts.visible
+
+    def held(db, actor, **kwargs):
+        if stall.armed:
+            stall.entered.set()
+            stall.release.wait(10)
+        return real(db, actor, **kwargs)
+
+    monkeypatch.setattr(receipts, "visible", held)
+
+    def ask(process, request):
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    with subprocess.Popen(
+        [sys.executable, "-m", "agent_chat.instance_worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=ROOT, env={},
+    ) as process:
+        try:
+            joined = ask(process, join)["result"]
+            assert joined["capabilities"] == ["receipts-cancel"]
+            # A signal while the worker is idle is for the request that follows, and no other. Whether the worker reads
+            # it before or after that request begins, the answer is the same, and the next request is served.
+            process.send_signal(signal.SIGUSR1)
+            assert ask(process, {"id": 1, "op": "receipts"}) == {"id": 1, "result": {"refused": "CLI_INTERRUPTED"}}
+            # A status read, not a pending: an empty pending is answered from the worker's own backoff for two seconds.
+            served = ask(process, {"id": 2, "op": "status"})["result"]
+            assert served["instance_id"] == joined["instance_id"] and "refused" not in served
+            # A read that the server holds, and a signal sent once it is in the server's hands.
+            stall.armed = True
+            process.stdin.write(json.dumps({"id": 3, "op": "receipts"}) + "\n")
+            process.stdin.flush()
+            assert stall.entered.wait(10)
+            started = monotonic()
+            process.send_signal(signal.SIGUSR1)
+            assert json.loads(process.stdout.readline()) == {"id": 3, "result": {"refused": "CLI_INTERRUPTED"}}
+            assert monotonic() - started < 1.5  # the worker's own deadline is 2 s: the signal ended it
+            # The abandoned read still holds the instance row on the server, so a pending now waits for it. It ends as
+            # an outage that the worker tolerates and the receivers read as brief: no rejoin, and chat stays on.
+            asked = monotonic()
+            answer = ask(process, {"id": 4, "op": "pending"})
+            assert answer["result"]["refused"] in {"SERVICE_UNAVAILABLE", "TRANSPORT_UNAVAILABLE"}
+            assert 2.5 < monotonic() - asked < 7
+            assert process.poll() is None
+            # The server's transaction ends, and the same worker serves the next pending.
+            stall.release.set()
+            assert ask(process, {"id": 5, "op": "pending"}) == {"id": 5, "result": {"messages": []}}
+            assert process.stdin is not None
+            process.stdin.close()
+            process.wait(timeout=30)
+            assert process.returncode == 0 and process.stderr is not None and process.stderr.read() == ""
+        finally:
+            stall.release.set()
+            if process.poll() is None:
+                process.kill()
 
 
 # Receipts take no event clock (#176). What a stalled receipts transaction may still hold is the rows below.

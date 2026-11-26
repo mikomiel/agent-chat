@@ -96,8 +96,11 @@ def test_a_producer_token_is_refused_on_every_other_route(http_api, database, cr
         ("GET", "/v1/instance/status"): ("/v1/instance/status", None, None, producer.token),
         ("GET", "/v1/instance/deliveries/pending"): ("/v1/instance/deliveries/pending", None, None, producer.token),
         ("GET", "/v1/instance/receipts"): ("/v1/instance/receipts", None, None, producer.token),
+        ("GET", "/v1/instance/receipts/feed"): ("/v1/instance/receipts/feed", None, None, producer.token),
         ("POST", "/v1/instance/receipts/delivered"): (
             "/v1/instance/receipts/delivered", {"receipts": [thing]}, None, producer.token),
+        ("POST", "/v1/instance/receipts/feed/delivered"): (
+            "/v1/instance/receipts/feed/delivered", {"receipts": [thing]}, None, producer.token),
         ("POST", "/v1/instance/deliveries/claim"): (
             "/v1/instance/deliveries/claim", {"messages": [thing]}, key, producer.token),
         ("POST", "/v1/instance/deliveries/{attempt}/result"): (
