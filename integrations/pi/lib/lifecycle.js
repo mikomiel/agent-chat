@@ -8,8 +8,8 @@
 // separate non-waking message. They never touch the claim, settle, heartbeat or binding path. Only a worker whose join reply
 // names `receipts-cancel` is asked for them, and they give way: a heartbeat or a delivery poll that falls due while a
 // receipts request is in flight ends it with the worker's cancel signal, and the loop sends no receipts request while one is due.
-// A state that the worker refused in this run is not due while that request waits: it yields to it (`nextRequest`). What is due
-// is read from facts when a request is chosen (`due`), never from a flag that an earlier request left set.
+// A heartbeat and a delivery poll take turns, so neither holds the other back (`nextRequest`); the receipts request is the last of
+// the three. What is due is read from facts when a request is chosen (`due`), never from a flag that an earlier request left set.
 import { randomUUID } from "node:crypto"
 import { loadConfig, PI_CHAT_CONFIG_ENV } from "./config.js"
 import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "./channel.js"
@@ -37,14 +37,15 @@ const requestFailure = (error, operation) => Object.assign(error ?? new Error("C
 
 // The request that the single flight sends next. The drive loop asks once for every pass, with what is due: a heartbeat is due
 // when one was asked for outright (`beat`) or when an entry asked for a compare and the state is not the one that the worker
-// confirmed (`due`, in `createAgentChat`). A heartbeat goes first, except for a state that the worker refused in this run while
-// a delivery poll or a receipts pass waits: that one goes after them, so a heartbeat that is refused after every tick cannot
-// keep them from running. The poll goes before the receipts pass, and nothing due is `null`. An entry that finds a receipts
-// request in flight asks it too, with that request counted as waiting (`receiptsDue`), and ends the request unless the answer
-// is "receipts": for a state that was not refused in this run that is exactly when a heartbeat or a delivery poll is due, and a
-// state that was refused ends it only for a delivery poll.
-export function nextRequest({ dirty, pollDue, receiptsDue, sameAsRefused }) {
-  if (dirty && !(sameAsRefused && (pollDue || receiptsDue))) return "heartbeat"
+// confirmed (`due`, in `createAgentChat`). A heartbeat goes first, but it takes turns with the delivery poll: once a heartbeat has
+// gone in this run since the last delivery poll pass (`beatSincePoll`), a poll that waits goes before the next heartbeat, whether
+// the heartbeats are confirmed or refused. So in one instance at most one heartbeat goes between a poll tick and the next poll
+// (a new instance sends its first heartbeat at its join), and at most one poll between a due heartbeat and the next heartbeat, a
+// further one only when the state is the confirmed one again. The receipts pass is the last, and nothing due is `null`. An entry that
+// finds a receipts request in flight asks it too, with that request counted as waiting (`receiptsDue`), and ends the request
+// unless the answer is "receipts", which is exactly when no heartbeat and no delivery poll is due.
+export function nextRequest({ dirty, pollDue, receiptsDue, beatSincePoll }) {
+  if (dirty && !(beatSincePoll && pollDue)) return "heartbeat"
   if (pollDue) return "poll"
   if (receiptsDue) return "receipts"
   return null
@@ -91,7 +92,7 @@ export function createAgentChat(pi, config, {
   let pollDue = false
   let receiptsDue = false
   let reading = null // the record whose receipts request is out on its worker: a heartbeat or a delivery poll that falls due ends it
-  const refusedStates = new Set() // the states, as JSON, whose heartbeat the worker refused in this run. A run starts with none; a delivery poll pass or a confirmed heartbeat ends them
+  let beatSincePoll = false // a heartbeat was sent in this run since the last delivery poll pass: a poll that waits goes before the next one. A run starts with none, and a receipts pass does not end it
   let connecting = null // the one flight of connect(): the wait for the closing workers, the start and the join
   let receiptState = receipts.createReceipts()
   let pendingReceipts = null // { marker, ids }: sent to Pi, not yet confirmed by message_start
@@ -326,47 +327,45 @@ export function createAgentChat(pi, config, {
     if (busy) {
       // What is due waits for the single flight, and a request in flight is not compared with here, since a heartbeat of that
       // state may be among them and would go out twice: the loop compares at its next pass, so a change seen during a slow
-      // request is published right after it, ahead of a delivery poll or a receipts request that waits, and a change that has
-      // reverted by then sends nothing. A receipts request holds no heartbeat, but it would hold the flight, so the entry asks
-      // `nextRequest` what goes next, with that request counted as waiting, and ends it unless the answer is "receipts": the worker
-      // answers `refused` within milliseconds, and the loop takes what is due. The question is the loop's own, about the state as
-      // it is now, so a re-evaluation that finds nothing due ends nothing, and nor does one that finds a state that the worker
-      // refused in this run, which yields to the request in flight like any other.
+      // request is published right after it, ahead of a receipts request that waits and, unless that request was a heartbeat sent
+      // since the last delivery poll pass, ahead of a delivery poll, and a change that has reverted by then sends nothing. A
+      // receipts request holds no heartbeat, but it would hold the flight, so the entry asks `nextRequest` what goes next, with
+      // that request counted as waiting, and ends it unless the answer is "receipts": the worker answers `refused` within
+      // milliseconds, and the loop takes what is due. The question is the loop's own, about the state as it is now, so a
+      // re-evaluation that finds nothing due ends nothing.
       if (reading) {
         const text = JSON.stringify(heartbeatState(state))
-        if (nextRequest({ dirty: due(reading, text), pollDue, receiptsDue: true, sameAsRefused: refusedStates.has(text) }) !== "receipts")
+        if (nextRequest({ dirty: due(reading, text), pollDue, receiptsDue: true, beatSincePoll }) !== "receipts")
           reading.worker.cancel()
       }
       return
     }
     busy = true
-    refusedStates.clear() // every run starts with no refusal
+    beatSincePoll = false // every run starts with no heartbeat sent
     // The loop belongs to the instance that is live now. It ends when that record is no longer live, and every request that
     // it makes goes through that record (`request`), so it never reaches the worker of an instance that replaced it.
     const record = live
     try {
       // One request for each pass, chosen by `nextRequest` from what is due now, so whatever fell due during the last request is
-      // seen before the next one is chosen, and from whatever source: a heartbeat goes before a queued poll, and the receipts
-      // request is sent only when neither is due, with nothing awaited between that choice and the write, and `receiptsDue` stays
-      // set until then. A pass that finds the state confirmed spends the ask, and a pass that finds nothing due ends the loop.
-      // Sending a heartbeat spends the ask too, so a refused heartbeat is sent again at most once for each entry that asked, never
-      // in a loop. A state that was refused in this run yields to a poll or a receipts pass that waits, and stays due, so its retry
-      // follows that pass: heartbeat and poll alternate that way, and neither holds the other back. Every state refused in the
-      // run yields so, not only the latest, and any other changed state goes at once. A confirmed heartbeat and a delivery poll
-      // pass end the refusals, and a receipts pass does not: a poll that fell due while the receipts request was out still goes
-      // before the retry, and the retry follows the request at once when no poll waits.
+      // seen before the next one is chosen, and from whatever source: a heartbeat goes first, a delivery poll that waits goes
+      // before it once a heartbeat has gone since the last poll pass, and the receipts request is sent only when neither is due,
+      // with nothing awaited between that choice and the write, and `receiptsDue` stays set until then. So heartbeat and poll
+      // take turns, and neither holds the other back, whether the heartbeats are confirmed or refused; a receipts pass does not
+      // end the turn of the poll. A pass that finds the state confirmed spends the ask, and a pass that finds nothing due ends the
+      // loop. Sending a heartbeat spends the ask too, so a refused heartbeat is sent again at most once for each entry that
+      // asked, never in a loop.
       while (live === record && !disabled() && (beat || asked || pollDue || receiptsDue)) {
         const snapshot = heartbeatState()
         const text = JSON.stringify(snapshot)
         if (text === record.published) asked = false
-        const next = nextRequest({ dirty: due(record, text), pollDue, receiptsDue, sameAsRefused: refusedStates.has(text) })
+        const next = nextRequest({ dirty: due(record, text), pollDue, receiptsDue, beatSincePoll })
         if (next === "heartbeat") {
           beat = false
           asked = false
+          beatSincePoll = true // whatever the answer: a poll that waits goes before the next heartbeat
           const stamp = lease.stamp() // taken before the request is written: the lease runs from the send, not the reply
           const result = await request(record, "heartbeat", { state: snapshot })
           if (refused(result)) {
-            refusedStates.add(text)
             // A request that may have been applied leaves a changed state unconfirmed: the worker may hold it, so the next compare
             // sends the current state, whatever it is. A refused heartbeat of the state already confirmed leaves the worker holding
             // that state whether or not it was applied, and every other refusal means that nothing was sent: `published` stays.
@@ -377,13 +376,12 @@ export function createAgentChat(pi, config, {
             // Both stay with the instance that sent the request: the snapshot lives on its record, and the stamp of an ended
             // instance renews no lease, so a reply that arrives late changes nothing of the next instance.
             record.published = text
-            refusedStates.clear()
             lease.confirm(stamp)
           }
         } else if (next === "poll") {
           pollDue = false
           await pollOnce(record)
-          refusedStates.clear()
+          beatSincePoll = false // the turn of the heartbeat; a receipts pass does not give it
         } else if (next === "receipts") {
           receiptsDue = false
           await receiptsPass(record)

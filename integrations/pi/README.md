@@ -136,26 +136,31 @@ fits on `cli` fits on every route.
   It asks for one more comparison, which is made when the request is done, before the
   next request is chosen: a change seen during a slow request goes out right after it,
   ahead of a delivery poll or a receipts request that waited behind it, not at a later
-  poll, and a change that has reverted by then sends nothing, because presence reports
-  the current state.
+  poll; the one exception is a delivery poll that waited behind a heartbeat, which goes
+  first (see the turns below). A change that has reverted by then sends nothing, because
+  presence reports the current state.
   A refused heartbeat is sent again at most once for each poll or event that asked, never in a loop.
   One rule chooses the next request, and it reads what is due from facts when it chooses, not
   from a flag that an earlier request left set. A heartbeat is due when one was asked for
   outright (the 30-second keep-alive, a new title, the join), or when a poll or an event asked
-  for a comparison and the state is not the one that the worker confirmed. A delivery poll
-  that was waiting when the worker refused a heartbeat goes before that state is sent again,
-  unless another state is confirmed meanwhile; when no delivery poll was waiting, a receipts
-  request that was waiting goes before it. A poll tick makes both due at once, so after a tick
-  that found a change the order is poll, retry, receipts request. A heartbeat that is refused
-  after every tick would otherwise be followed by another of the same state each time, and
-  the poll would never run. Within one run every state that was refused yields likewise to a
-  poll or a receipts request that falls due later, until a delivery poll has run or a
-  heartbeat is confirmed, so a state that returns to an earlier refusal still waits. Any other
-  changed state goes first, and heartbeat and poll take turns. A state that has returned to the
-  confirmed one while it waited is not sent. The next run forgets the refusals, so each poll
-  tick, event or keep-alive that starts a run may send the state before its poll, once. A
-  keep-alive that finds a state just refused waits for the poll like any other, so the order
-  is heartbeat, poll, heartbeat.
+  for a comparison and the state is not the one that the worker confirmed. In one instance,
+  a heartbeat and a delivery poll take turns, whether the worker confirms or refuses. A due
+  heartbeat goes first, unless a heartbeat has gone in this run since the last delivery poll
+  pass and a poll waits: then the poll goes first, and its pass gives the turn back. So at
+  most one heartbeat goes between a poll tick and the next delivery poll, and at most one
+  delivery poll pass goes between a heartbeat falling due, by a keep-alive or a changed
+  state, and the next heartbeat; a further pass goes only when the state is the confirmed
+  one as that pass is chosen and no keep-alive asked: a state that has returned to the
+  confirmed one while it waited is not sent.
+  A heartbeat that is refused after every tick, or a title that changes during every slow
+  heartbeat, would otherwise be followed by another heartbeat each time, and the poll would
+  never run. Each run starts with no heartbeat sent, so the entry that starts it may send a
+  due heartbeat before its poll, once, and so does the first run of a new instance: a refusal
+  that ends an instance, `STALE_INSTANCE` for one, is followed by the rejoin and that first
+  heartbeat, so two heartbeats can go between one tick and its poll. A keep-alive that comes
+  while a heartbeat is out goes after a poll that waits, so the order is heartbeat, poll,
+  heartbeat. A receipts request goes last, when nothing else is due, and its pass does not
+  give the heartbeat's turn back.
   The same rule decides whether an entry ends a receipts request in flight (see the receipts
   bullet): it counts that request as waiting, and ends it unless it is what goes next.
   `session_tree`, `session_compact` and `session_compact_failed`
@@ -213,9 +218,7 @@ fits on `cli` fits on every route.
   ends it with the worker's cancel signal, and the pass sends no request while
   either is due. A state change that the comparison finds then is a heartbeat
   that fell due; a re-evaluation that finds nothing due ends nothing, a state that has
-  returned to the confirmed one included, and nor does an entry that finds a state the worker
-  refused in this run, which yields to the request in flight: only a delivery poll, or a
-  state that the worker has neither confirmed nor refused in the run, ends it. The signal
+  returned to the confirmed one included. The signal
   is repeated every 5 milliseconds until the worker
   answers, so a cancel that reaches the worker before it has read the request,
   which the worker drops, is followed by one that ends it. That is client-side
@@ -309,10 +312,12 @@ fits on `cli` fits on every route.
   not emit it, the receipts would be shown again in each later turn and never
   marked.
 - A receipts request is the last of the worker's requests: it goes only when
-  neither a heartbeat nor a delivery poll is due. While every heartbeat is
-  refused and outlasts a poll tick, heartbeat and delivery poll take turns, and
-  a receipts notice waits until that streak ends. Presence and deliveries keep
-  their place; receipts are late, not lost.
+  neither a heartbeat nor a delivery poll is due, and a due heartbeat or a poll
+  ends one that is in flight. In any streak of heartbeats or polls that keep
+  falling due, such as heartbeats that are refused or a title that changes at
+  every tick, heartbeat and delivery poll take turns and a receipts notice
+  waits until the streak ends. Presence and deliveries keep their place;
+  receipts are late, not lost.
 - Pi holds a `triggerTurn: false` message while a run is active and appends it
   at the end of the running turn, after the assistant message and every tool
   result, or when the run ends if that comes first (the Pi 1.5.0 and 1.5.2
@@ -344,19 +349,21 @@ budget/window/backoff, delivery and settlement, the system-prompt binding,
 fail-closed latching and the shared notice vectors, with the claim packing for
 bodies mode, the lease and the footer vocabulary (a lapse that holds until a confirmed
 heartbeat), presence on change (a change seen during a slow request included, sent
-ahead of a poll that waited behind it, a refused heartbeat that takes turns with the
-poll, whether a poll, an event or the keep-alive asked for it, every state refused in one
-run, and a state that returns to the confirmed one: the scheduler is checked for each of
-the 16 combinations of what is due, and its rules for every interleaving of ticks, events
-(busy or idle, a new title) and answers (confirmed, refused, refused as `REQUEST_UNCERTAIN`)
-to depth 4, from a confirmed state and from a changed one), the replacement of the runtime
+ahead of a receipts request that waited behind it and after a poll that waited behind a
+heartbeat, a heartbeat that takes turns with the poll whether the worker refuses or confirms
+it and whether a poll, an event or the keep-alive asked for it, and a state that returns to
+the confirmed one: the scheduler is checked for each of the 16 combinations of what is due
+and of whether a heartbeat has gone since the last poll, and for every interleaving of ticks,
+events (busy or idle, a new title) and answers (confirmed, refused, refused as
+`REQUEST_UNCERTAIN`) to depth 4, from a confirmed state and from a changed one, against the
+two turn rules, which are read off the request trace alone), the replacement of the runtime
 for each `session_start` reason (a
 reload during a rejoin, a close that never comes, calls whose waits end at different times,
 a disconnect that no later connect undoes and a delivery whose hand-off is held when the
 instance ends included), tree navigation and compaction, and sender
 receipts: the offer rules, the confirmation and the mark,
-one request per pass, that a receipts request gives way (to a state that is neither confirmed
-nor refused in the run and to a poll, and not to an entry that finds the state confirmed or
-refused), and
+one request per pass, that a receipts request gives way (to a due heartbeat and to a poll,
+and not to an entry that finds the state confirmed), goes last and does not give back the
+heartbeat's turn, and
 that a delivery and the binding are byte-identical with receipts pending. It
 needs no PostgreSQL, no service and no credential.

@@ -535,69 +535,68 @@ At every 2-second poll the `pi` package MUST compare the state that it would hea
 - **THEN** it sends no second heartbeat
 
 ### Requirement: `pi` compares the state again when a slow request is done
-A state change that a poll or an event sees while a request other than a receipts request is in flight MUST NOT start a second request. When that request is done, the `pi` package MUST compare the current state with the last confirmed state once, and send one heartbeat if they differ, before a waiting request, not at a later poll. A heartbeat that the worker answers `refused` MUST NOT be sent again in a loop: it is sent again at most once for each poll or event that found a request in flight.
+A state change that a poll or event sees during a request other than a receipts request MUST NOT start a second one. When that request is done, `pi` MUST compare the state with the confirmed one once and send a heartbeat if it differs, before a waiting request, not at a later poll, unless that request was a heartbeat sent since the last delivery poll pass: a waiting poll goes first. A refused heartbeat MUST NOT repeat in a loop: at most once for each poll or event that found a request in flight.
 
 #### Scenario: A change during a slow request
 - **WHEN** the session turns busy or enters Plan Mode while a pending read, a claim, a settlement or a heartbeat is in flight, and a poll finds that request in flight
-- **THEN** one heartbeat that carries the new state is sent when that request is done, not at a later poll
+- **THEN** one heartbeat that carries the new state is sent when that request is done, not at a later poll, unless that request is a heartbeat and a delivery poll waits behind it
 - **AND** nothing is sent if the state has changed back by then
 
 #### Scenario: A poll that waits behind a heartbeat
 - **WHEN** a poll finds a heartbeat in flight and leaves a delivery poll due, and the state changes while that heartbeat is out
-- **THEN** the heartbeat of the new state is sent when the first one is done, before the delivery poll
-- **AND** the delivery poll follows it
+- **THEN** the delivery poll is sent when the first heartbeat is done, before the heartbeat of the new state
+- **AND** the heartbeat of the new state follows the delivery poll
 
 #### Scenario: A refusal is not repeated in a loop
 - **WHEN** the worker answers `refused` to a heartbeat that was sent when a slow request was done, or that was in flight when a poll found it
 - **THEN** that heartbeat is sent again at most once for each such poll or event, and never in a loop
 - **AND** a state that stays unconfirmed is sent again by the next poll that finds no request in flight
 
-### Requirement: `pi` sends a refused heartbeat again only after the request that waited for it
-A delivery poll that was waiting when the worker refused a heartbeat MUST go before that state is sent again, unless another state is confirmed meanwhile; when no delivery poll was waiting, a receipts request that was waiting MUST go before it. In that run every refused state also yields until a delivery poll runs or a heartbeat is confirmed. The next run forgets the refusals. A `REQUEST_UNCERTAIN` refusal of a changed state leaves no confirmed state, so the next compare sends the current one.
+### Requirement: `pi` takes turns between a heartbeat and a delivery poll
+In one instance, a heartbeat and a delivery poll MUST take turns, whether the worker confirms or refuses: at most one heartbeat goes between a poll tick and the next delivery poll, and at most one delivery poll pass goes between a heartbeat falling due, by a keep-alive or a changed state, and the next heartbeat. A further pass goes only when the state is the confirmed one as that pass is chosen and no keep-alive asked. A `REQUEST_UNCERTAIN` refusal of a changed state leaves no confirmed state.
 
 #### Scenario: A refusal that outlasts every tick
-- **WHEN** each heartbeat is answered `refused` after a poll tick has come, so a delivery poll is due each time
-- **THEN** the delivery poll is sent after each refusal, before the retry
-- **AND** heartbeat and delivery poll take turns, and two heartbeats never follow each other while a poll waits
+- **WHEN** each heartbeat is answered `refused`, and a poll tick comes while each one is out, so that the tick asks for a compare and leaves a delivery poll due
+- **THEN** the delivery poll is sent after each refusal, and the retry that the tick asked for follows it
+- **AND** two heartbeats never follow each other while a poll waits
+
+#### Scenario: Heartbeats that are confirmed take their turn too
+- **WHEN** the title changes during each of several slow heartbeats, a poll tick comes with each change, and the worker confirms every heartbeat
+- **THEN** a delivery poll is sent after each heartbeat, and not after the last one only
+- **AND** at most one heartbeat goes between a poll tick and the next delivery poll
 
 #### Scenario: A delivery poll that is held
-- **WHEN** a refused heartbeat waits for a delivery poll, and another poll falls due while that poll is held
+- **WHEN** a heartbeat is refused after a poll tick asked for a compare, so that its retry waits for a delivery poll, and another poll tick comes while that poll is held
 - **THEN** the retry is sent when that poll is done, before the second poll
 
-#### Scenario: Only a receipts request waits
-- **WHEN** a heartbeat is refused after an event asked for a compare, no delivery poll is due, and a receipts request is
-- **THEN** the receipts request is sent before the retry
+#### Scenario: A keep-alive and a poll tick come while a delivery is held in its hand-off
+- **WHEN** a heartbeat has gone in the run, a delivery's hand-off is held, and a keep-alive tick and a poll tick come meanwhile
+- **THEN** the held pass settles first, the heartbeat that the keep-alive asked for goes second, and the delivery poll that waited goes third
+
+#### Scenario: The keep-alive asks again
+- **WHEN** a heartbeat is refused while a delivery poll waits, and the 30-second tick came while it was out
+- **THEN** the delivery poll is sent first, and the heartbeat that the tick asked for follows it: heartbeat, delivery poll, heartbeat
+- **AND** an event that asks for a compare of a state that the worker has not confirmed is treated the same way
+
+#### Scenario: A further change
+- **WHEN** a heartbeat is refused or confirmed while a delivery poll waits, and an event or a poll tick finds the state changed again while it was out
+- **THEN** the delivery poll is sent first, and the heartbeat of the new state follows it
 
 #### Scenario: A delivery poll and a receipts request both wait
-- **WHEN** a heartbeat is refused after a poll tick found a change, so that a delivery poll and a receipts request both wait
-- **THEN** the delivery poll is sent first, the retry second and the receipts request third
-- **AND** a poll tick makes both due at once, so this is the order after every tick that finds a change
+- **WHEN** a poll tick finds a change and its heartbeat is refused, and an event came while that heartbeat was out and asked for a compare, so that a delivery poll, a retry and a receipts request all wait
+- **THEN** the delivery poll is sent first, the retry that the event asked for second and the receipts request third
 
-#### Scenario: A receipts request that the refused state yielded to
-- **WHEN** a heartbeat is refused while a receipts request is due, that request is out, and an event or the keep-alive finds the same state
-- **THEN** the receipts request is not ended, and the retry follows it
-- **AND** a poll tick that comes while it is out ends it, and the delivery poll goes before the retry
+#### Scenario: Nothing waits
+- **WHEN** a heartbeat that an event found in flight is refused and no delivery poll is due
+- **THEN** that state is sent again once, at once, before a receipts request that waits
 
-#### Scenario: The keep-alive finds the state just refused
-- **WHEN** a changed heartbeat is refused, a delivery poll waits, and the 30-second tick then finds the same state due
-- **THEN** the delivery poll is sent first, and the retry follows it: heartbeat, delivery poll, heartbeat
-- **AND** an event that asks for a heartbeat of the same state is treated the same way
+#### Scenario: A state that has reverted to the confirmed one while a delivery poll is out
+- **WHEN** a poll tick finds a change, its heartbeat is refused as a brief outage that sent nothing, an event that came while it was out asked for a compare, and the state is the confirmed one again while the delivery poll that the tick queued is out
+- **THEN** no heartbeat follows that poll
 
-#### Scenario: A further change after a refusal
-- **WHEN** a heartbeat is refused, and the state then differs from the refused one while a delivery poll waits
-- **THEN** the heartbeat of the new state is sent before the delivery poll
-
-#### Scenario: Two states refused in one run
-- **WHEN** a heartbeat of one state is refused, the state changes and that heartbeat is refused too, and the state returns to the first one while a delivery poll waits
-- **THEN** the delivery poll is sent before the first state is sent again: heartbeat, heartbeat, delivery poll, heartbeat
-
-#### Scenario: A refused state that comes back
-- **WHEN** a heartbeat is refused, a different state is then confirmed, and the state returns to the refused one while a delivery poll waits
-- **THEN** the heartbeat of that state is sent before the delivery poll, as for any change
-
-#### Scenario: A refused state that has reverted to the confirmed one
-- **WHEN** a heartbeat is refused as a brief outage that sent nothing, its retry waits for a delivery poll or a receipts request, and the state is the confirmed one again meanwhile
-- **THEN** no heartbeat follows that request, and a receipts request that is out is not ended for it
+#### Scenario: A state that has reverted to the confirmed one while a receipts request is out
+- **WHEN** a heartbeat is refused as a brief outage that sent nothing, no entry asks for it again, and only a receipts request is due, so that it goes out, and the state is the confirmed one again while it is out
+- **THEN** an event that finds the state confirmed ends nothing, and no heartbeat follows the request
 
 #### Scenario: A refusal that may have been applied
 - **WHEN** a heartbeat of a changed state is refused as `REQUEST_UNCERTAIN`, and the state later returns to the one that was confirmed before it
@@ -609,14 +608,11 @@ A delivery poll that was waiting when the worker refused a heartbeat MUST go bef
 - **THEN** that state stays confirmed, because the worker holds it whether or not the request was applied
 - **AND** the next poll tick sends its delivery poll with no heartbeat before it
 
-#### Scenario: Nothing waits
-- **WHEN** a heartbeat that an event found in flight is refused and no delivery poll or receipts request is due
-- **THEN** that state is sent again once, at once
-
 #### Scenario: Any order of ticks, events and answers
 - **WHEN** poll ticks, keep-alive ticks and events that change busy or idle or the title come in any order, from a confirmed state and from a changed one, while each request is confirmed, refused as a brief outage, refused as `REQUEST_UNCERTAIN`, or held until a later tick
 - **THEN** the loop ends and a later poll tick finds it free
-- **AND** a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again, unless a state is confirmed meanwhile, whichever states were refused since, and a changed state that was not refused in the run is never left behind a delivery poll
+- **AND** at most one heartbeat goes between a poll tick and the next delivery poll
+- **AND** at most one delivery poll pass goes between a heartbeat falling due and the next heartbeat, and a further pass goes only when the state is the confirmed one as that pass is chosen and no keep-alive asked
 - **AND** a heartbeat of the confirmed state is sent only after an entry that asks for one outright, such as a keep-alive tick, or when a `REQUEST_UNCERTAIN` refusal of a changed state left no confirmed state
 - **AND** no request is sent twice for one due flag
 
@@ -952,7 +948,7 @@ A package's receipts pass MUST send at most one receipts request: the mark that 
 - **AND** the delivery still counts the agent as busy and starts no turn
 
 ### Requirement: A receipts request gives way to every other request
-A package MUST end a receipts request in flight with the worker's cancel when a heartbeat (`pi`: not a refused state that yields), a state report, a delivery poll or a claim falls due, MUST repeat the cancel every few milliseconds until that request answers, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
+A package MUST end a receipts request in flight with the worker's cancel when a heartbeat, a state report, a delivery poll or a claim falls due, MUST repeat the cancel every few milliseconds until that request answers, and MUST send no receipts request while one of them is due. A hook MUST NOT skip its claim because a receipts request is in flight. Client-side only: the first request after a cancel can wait up to 3 s for a server lock and then be refused.
 
 #### Scenario: A request falls due while a receipts request is in flight
 - **WHEN** a heartbeat, a state report, a delivery poll or a claim falls due while a receipts request is in flight and nothing releases that request

@@ -1487,8 +1487,9 @@ test("a heartbeat that is refused while an entry skipped is retried once for tha
   assert.ok(beats().slice(base).every(row => row.fields.state.native_state === "busy"))
 })
 
-// The loop takes the compare before it chooses its next request, so a poll that was queued behind a request does not go first.
-test("a delivery poll that is queued behind a held heartbeat waits for the heartbeat of the change that was seen meanwhile", async () => {
+// The loop takes the compare before it chooses its next request, and a heartbeat has gone in this run since the last delivery poll
+// pass: the poll that was queued behind that heartbeat goes first, and the change that was seen meanwhile follows it.
+test("a delivery poll that is queued behind a held heartbeat goes before the heartbeat of the change that was seen meanwhile", async () => {
   const session = await slowSession()
   const { lifecycle, worker, entries } = session
   const before = worker.requests.length
@@ -1503,9 +1504,9 @@ test("a delivery poll that is queued behind a held heartbeat waits for the heart
   await flight
   await flush()
   const sent = worker.requests.slice(before)
-  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "pending"], "the changed state goes before the queued poll")
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "pending", "heartbeat"], "the queued poll goes before the changed state")
   assert.equal(sent[0].fields.state.plan_mode, true)
-  assert.equal(sent[1].fields.state.plan_mode, false)
+  assert.equal(sent[2].fields.state.plan_mode, false)
 })
 
 // A heartbeat that is refused after more than one tick, with a poll queued behind it, is not sent again ahead of that poll,
@@ -1537,8 +1538,9 @@ test("a refused heartbeat that outlasts every tick does not hold back the delive
   assert.equal(worker.requests.slice(before).map(row => row.op).join(), [...ops, "pending"].join(), "and the next poll finds nothing to send")
 })
 
-// Only the snapshot that was refused waits for the poll. A state that differs from it is a change, and a change goes first.
-test("a refused heartbeat followed by a further change: the heartbeat of the new state still goes before the delivery poll", async () => {
+// A further change does not move the poll: a heartbeat has gone in this run since the last delivery poll pass, so the poll that
+// waits goes first, whatever state the next heartbeat carries.
+test("a refused heartbeat followed by a further change: the delivery poll goes before the heartbeat of the new state", async () => {
   const session = await slowSession()
   const { lifecycle, worker, entries } = session
   const before = worker.requests.length
@@ -1552,9 +1554,9 @@ test("a refused heartbeat followed by a further change: the heartbeat of the new
   release({ refused: "TRANSPORT_UNAVAILABLE" })
   await flight
   const sent = worker.requests.slice(before)
-  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "pending"], "the changed state goes before the poll")
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "pending", "heartbeat"], "the poll goes before the changed state")
   assert.equal(sent[0].fields.state.plan_mode, false)
-  assert.equal(sent[1].fields.state.plan_mode, true)
+  assert.equal(sent[2].fields.state.plan_mode, true)
 })
 
 // The retry waits for one poll, and not for the polls that fall due while that one is held: a held poll leaves another one due,
@@ -1581,8 +1583,9 @@ test("a refused heartbeat's retry waits for one delivery poll, not for the polls
     "the retry goes before the second poll")
 })
 
-// What waits for the poll is the snapshot that was just refused, and no other. One that was refused earlier, and then left
-// behind by a state that went through, is a change again when the state returns to it.
+// Nothing is remembered of a refusal: a snapshot that was refused, and then left behind by a state that went through, is a change
+// again when the state returns to it, and it goes like any other change. A heartbeat has gone in this run since the last delivery
+// poll pass, so the poll that waits goes before it.
 test("a snapshot that was refused, and then left behind by a state that went through, is a change again when the state returns to it", async () => {
   const session = await slowSession()
   const { lifecycle, worker, entries, emit, ctx } = session
@@ -1601,7 +1604,7 @@ test("a snapshot that was refused, and then left behind by a state that went thr
   releaseT({}) // T goes through
   await flight
   const sent = worker.requests.slice(before)
-  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "heartbeat", "pending"], "S goes before the poll")
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "pending", "heartbeat"], "S goes after the poll")
   assert.deepEqual(sent.filter(row => row.op === "heartbeat").map(row => row.fields.state.plan_mode), [false, true, false])
 })
 
@@ -1621,10 +1624,10 @@ test("an event that found a heartbeat in flight gets one retry at once when it i
   assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "heartbeat"], "one retry for the event, and its refusal ends it")
 })
 
-// The 30-second keep-alive is one more source of a due heartbeat, and the rule for a refused snapshot holds for it as for any
-// other: a changed heartbeat that is refused, with a poll tick and the keep-alive tick both come meanwhile, finds the snapshot
-// that was just refused due again, and the delivery poll goes before it.
-test("a keep-alive tick that finds the snapshot just refused waits for the delivery poll: heartbeat, poll, heartbeat", async () => {
+// The 30-second keep-alive is one more source of a due heartbeat, and it takes its turn as any other does: the heartbeat that a poll
+// tick sent for a change is refused, the keep-alive tick came while it was out, and the delivery poll that waited goes before the
+// heartbeat that the keep-alive asked for, since a heartbeat has gone since the last poll pass.
+test("a keep-alive tick that comes while a heartbeat is out waits for the delivery poll: heartbeat, poll, heartbeat", async () => {
   const session = await slowSession()
   const { lifecycle, worker } = session
   const before = worker.requests.length
@@ -1642,9 +1645,10 @@ test("a keep-alive tick that finds the snapshot just refused waits for the deliv
   assert.deepEqual(sent[2].fields.state, sent[0].fields.state, "the keep-alive carries the snapshot that was refused")
 })
 
-// Review of #191, round 6. What yields to the waiting delivery poll is every state that was refused in the run, and not only the
-// latest: A is refused, the state changes to B and B is refused, and the state returns to A while the poll still waits.
-test("a state refused earlier in the run still waits for the delivery poll when the state returns to it: heartbeat, heartbeat, poll, heartbeat", async () => {
+// Review of #191, round 7. No state is remembered as refused: A is refused, the state changes to B and B is refused, and the state
+// returns to A. The delivery poll that waited goes once, after A, and the heartbeat of A that follows B finds no poll waiting, so
+// it goes at once.
+test("a state sent earlier in the run is sent again when the state returns to it, with the delivery poll that waited after the first: heartbeat, poll, heartbeat, heartbeat", async () => {
   const session = await slowSession()
   const { lifecycle, worker, entries, emit, ctx } = session
   const before = worker.requests.length
@@ -1655,21 +1659,93 @@ test("a state refused earlier in the run still waits for the delivery poll when 
   await flush()
   entries.push(PLAN_ON) // Plan Mode starts: the state is B
   emit("session_compact", { type: "session_compact" }, ctx) // finds the loop busy and asks for a compare
-  releaseA({ refused: "TRANSPORT_UNAVAILABLE" }) // A is refused, and the compare finds B, which differs from it
+  releaseA({ refused: "TRANSPORT_UNAVAILABLE" }) // A is refused, and the compare finds B, which differs from it: the poll that waits goes first
   const releaseB = session.hold("heartbeat")
   await flush()
   entries.push(PLAN_OFF) // Plan Mode ends while B is out: the state is A again
   emit("session_compact", { type: "session_compact" }, ctx) // asks for another compare
-  releaseB({ refused: "TRANSPORT_UNAVAILABLE" }) // B is refused, and the compare finds A, which was refused too, with the poll waiting
+  releaseB({ refused: "TRANSPORT_UNAVAILABLE" }) // B is refused, and the compare finds A, with no poll waiting
   await flight
   const sent = worker.requests.slice(before)
-  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "pending", "heartbeat"], "the poll goes before A is sent again")
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "pending", "heartbeat", "heartbeat"], "the poll goes once, between A and B")
   assert.deepEqual(sent.filter(row => row.op === "heartbeat").map(row => row.fields.state.plan_mode), [false, true, false], "A, B, A")
 })
 
-// A refused state is due only while it differs from the state that the worker confirmed, at the moment of the choice. Busy is
-// refused, its retry yields to the delivery poll, and the turn ends while that poll is held: the state is the confirmed one again,
-// so no heartbeat follows the poll. This brings the loop to the point where the poll is out and held; `code` is the refusal.
+// Review of #191, round 7. Heartbeats that go through take their turn too. If a changed state always went first, a title that
+// changes during every slow heartbeat, with a poll tick, would keep the delivery poll from ever running, however many heartbeats
+// were confirmed. Here the title changes during each of four heartbeats and every one is confirmed: at most one heartbeat goes
+// between a poll tick and the next delivery poll, and the poll goes after each heartbeat.
+test("heartbeats that are confirmed do not starve the delivery poll: a title change during each slow heartbeat, and the poll goes after one", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker, ctx } = session
+  const before = worker.requests.length
+  let title = 0
+  ctx.sessionManager.getSessionName = () => `title ${title}`
+  let release = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds the new title and sends it, and its answer is held; the delivery poll is queued behind it
+  await flush()
+  for (let round = 1; round <= 3; round += 1) {
+    title = round // the title changes while that heartbeat is out
+    await lifecycle.poll() // a tick comes with it: it asks for a compare, and a delivery poll is due again
+    const answer = release
+    answer({}) // the heartbeat is confirmed: the delivery poll goes now, and the heartbeat of the new title after it
+    release = session.hold("heartbeat") // that one is held in its turn, so the title can change during it as well
+    await flush()
+  }
+  release({})
+  await flight
+  const sent = worker.requests.slice(before)
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "pending", "heartbeat", "pending", "heartbeat", "pending", "heartbeat"],
+    "the delivery poll goes between every two heartbeats")
+  assert.deepEqual(sent.filter(row => row.op === "heartbeat").map(row => row.fields.state.title), ["title 0", "title 1", "title 2", "title 3"])
+})
+
+// B2 against a delivery that is held in its hand-off: the pass is the one poll pass that goes between the keep-alive tick falling
+// due and the next heartbeat, and it was out already. A heartbeat went in this run before the pass, so the flag is set while it is
+// held, and a poll tick comes as well as the keep-alive tick. The pass ends, and its turn ends the flag: the heartbeat goes
+// before the poll that waits, as it would for a run in which no heartbeat had gone. Without the poll tick the order proves
+// nothing about the flag, and the server stops offering the message before the release, so the next poll finds nothing.
+test("a keep-alive tick and a poll tick that come while a delivery is held in its hand-off: the pass settles, the heartbeat goes, then the next delivery poll", async t => {
+  resetLatchAfter(t)
+  const { pi, emit, ctx, sent } = fakePi({ holdSend: true })
+  const clock = manualTimeouts()
+  let offered = false
+  const worker = fakeWorker({
+    answer: op => {
+      if (op === "pending") return { messages: offered ? [message.id] : [] }
+      if (op === "claim") return {
+        dispatch: true, attempt_id: attempt, reservation_ms: 20_000,
+        messages: [{ ...message, room_id: joined.room_id, history_after: "history-cursor-1", body: "synthetic body", sender_session_id: "peer-1", created_at: message.created_at }],
+      }
+      return op === "status" ? { muted: false } : {}
+    },
+  })
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000, random: () => 0, setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl,
+    startProcess: () => worker,
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx) // the state changes: the first entry after it sends a heartbeat before its poll
+  const before = worker.requests.length
+  offered = true
+  const flight = lifecycle.poll()
+  await flush()
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending", "claim", "status"], "the heartbeat went, and the pass is out")
+  assert.equal(sent.length, 1, "the message is with Pi, and its report is held")
+  void lifecycle.heartbeat() // the 30-second tick: a heartbeat is due
+  void lifecycle.poll() // and the next poll tick
+  offered = false // the server offers the message no more
+  emit("message_start", { message: { ...sent[0].payload, role: "custom" } }) // Pi reports the message at last
+  await flight
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending", "claim", "status", "settle", "heartbeat", "pending"],
+    "the pass settles first, then the heartbeat, then the delivery poll that waited")
+})
+
+// A state is due only while it differs from the state that the worker confirmed, at the moment of the choice. Busy is refused, and
+// a heartbeat has gone since the last poll pass, so the delivery poll goes before the retry. The turn ends while that poll is held:
+// the state is the confirmed one again, so no heartbeat follows the poll. This brings the loop to the point where the poll is out
+// and held; `code` is the refusal.
 async function revertedWhileThePollIsHeld(code) {
   const session = await slowSession()
   const { lifecycle, worker, emit, ctx } = session
@@ -1681,7 +1757,7 @@ async function revertedWhileThePollIsHeld(code) {
   await flush()
   emit("session_compact", { type: "session_compact" }, ctx) // finds the loop busy and asks for a compare
   const releasePoll = session.hold("pending")
-  releaseBeat({ refused: code }) // busy is refused and still due, so it yields to the delivery poll, which goes out and is held
+  releaseBeat({ refused: code }) // busy is refused and still due, but a heartbeat has gone since the last poll pass: the delivery poll goes out first, and is held
   await flush()
   assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending"], "the poll goes before the retry")
   session.state.idle = true // the turn ends while the poll is held
@@ -1702,8 +1778,8 @@ test("a state that returns to the confirmed one while the delivery poll is held 
 // REQUEST_UNCERTAIN is the one tolerated refusal after which the request may have been applied (agent_chat/client.py and
 // instance_client.py answer it for a request that may have been submitted): after a heartbeat of a changed state, here busy, the
 // worker may hold that state, and what it last confirmed is unknown. The other two mean that nothing was sent, so the confirmed
-// state stays as it was. This test holds with the sticky flag of the earlier scheduler too, so it pins the behaviour and does not
-// tell the two apart; the next test does.
+// state stays as it was. This test pins the case where the state reverts while the delivery poll is held; the next test pins the
+// rule for each of the three codes.
 test("a state that returns to the confirmed one after a REQUEST_UNCERTAIN refusal is sent: the worker may hold the state that was refused", async () => {
   const { session, flight, releasePoll, sent } = await revertedWhileThePollIsHeld("REQUEST_UNCERTAIN")
   session.refusal.code = null
@@ -1754,39 +1830,35 @@ test("a keep-alive of the confirmed state that is refused as REQUEST_UNCERTAIN l
   assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending", "pending"], "and nothing is sent for it later")
 })
 
-// The scheduler is one pure decision over what is due: a heartbeat goes first, unless it is the snapshot that was just refused
-// while a delivery poll or a receipts pass waits; then the delivery poll, then the receipts pass; nothing due is null. All 16
-// combinations of the four flags, in the order dirty, pollDue, receiptsDue, sameAsRefused.
+// The scheduler is one pure decision over what is due: a heartbeat goes first, unless a heartbeat has gone in this run since the
+// last delivery poll pass and a delivery poll waits; then the delivery poll, then the receipts pass; nothing due is null. All 16
+// combinations of the four flags, in the order dirty, pollDue, receiptsDue, beatSincePoll.
 const NEXT_REQUEST = [
   [[0, 0, 0, 0], null], [[0, 0, 0, 1], null],
   [[0, 0, 1, 0], "receipts"], [[0, 0, 1, 1], "receipts"],
   [[0, 1, 0, 0], "poll"], [[0, 1, 0, 1], "poll"],
   [[0, 1, 1, 0], "poll"], [[0, 1, 1, 1], "poll"],
   [[1, 0, 0, 0], "heartbeat"], [[1, 0, 0, 1], "heartbeat"],
-  [[1, 0, 1, 0], "heartbeat"], [[1, 0, 1, 1], "receipts"],
+  [[1, 0, 1, 0], "heartbeat"], [[1, 0, 1, 1], "heartbeat"],
   [[1, 1, 0, 0], "heartbeat"], [[1, 1, 0, 1], "poll"],
   [[1, 1, 1, 0], "heartbeat"], [[1, 1, 1, 1], "poll"],
 ]
 test("nextRequest chooses the request for each of the 16 combinations of what is due", () => {
   assert.equal(new Set(NEXT_REQUEST.map(([flags]) => flags.join(""))).size, 16, "every combination is listed once")
-  for (const [[dirty, pollDue, receiptsDue, sameAsRefused], expected] of NEXT_REQUEST) {
-    const due = { dirty: dirty === 1, pollDue: pollDue === 1, receiptsDue: receiptsDue === 1, sameAsRefused: sameAsRefused === 1 }
+  for (const [[dirty, pollDue, receiptsDue, beatSincePoll], expected] of NEXT_REQUEST) {
+    const due = { dirty: dirty === 1, pollDue: pollDue === 1, receiptsDue: receiptsDue === 1, beatSincePoll: beatSincePoll === 1 }
     assert.equal(nextRequest(due), expected, JSON.stringify(due))
   }
 })
 
 // An entry that finds a receipts request in flight asks `nextRequest` with that request counted as waiting (`receiptsDue`), and
-// ends the request unless the answer is "receipts". For a snapshot that is not the one just refused the answer is "receipts"
-// exactly when no heartbeat and no delivery poll is due, so the rule ends the request exactly when `dirty || pollDue`, as it
-// did before the entry asked. The snapshot just refused yields to the request in flight, and only a delivery poll ends it.
+// ends the request unless the answer is "receipts". The answer is "receipts" exactly when no heartbeat and no delivery poll is
+// due, whether or not a heartbeat has gone since the last poll pass: that flag orders a heartbeat and a poll, and never decides
+// whether either one waits. So the request ends exactly when `dirty || pollDue`, for every row of the table above.
 test("nextRequest, asked about a receipts request in flight, answers receipts exactly when no heartbeat and no delivery poll is due", () => {
-  for (const dirty of [false, true]) {
-    for (const pollDue of [false, true]) {
-      const other = nextRequest({ dirty, pollDue, receiptsDue: true, sameAsRefused: false })
-      assert.equal(other === "receipts", !dirty && !pollDue, `a snapshot that is not the one just refused: dirty ${dirty}, pollDue ${pollDue}`)
-      const refused = nextRequest({ dirty, pollDue, receiptsDue: true, sameAsRefused: true })
-      assert.equal(refused === "receipts", !pollDue, `the snapshot just refused: dirty ${dirty}, pollDue ${pollDue}`)
-    }
+  for (const [[dirty, pollDue, , beatSincePoll]] of NEXT_REQUEST) {
+    const answer = nextRequest({ dirty: dirty === 1, pollDue: pollDue === 1, receiptsDue: true, beatSincePoll: beatSincePoll === 1 })
+    assert.equal(answer === "receipts", dirty === 0 && pollDue === 0, `dirty ${dirty}, pollDue ${pollDue}, beatSincePoll ${beatSincePoll}`)
   }
 })
 
@@ -1798,19 +1870,58 @@ test("nextRequest, asked about a receipts request in flight, answers receipts ex
 // nothing is no step. It runs from two starts: with the state the one that the worker confirmed, and with the session already
 // busy, a change that no entry has seen, so that the first entry finds it and sends it. Only from the second start does a state
 // refused, another state refused and a return to the first, while the delivery poll waits, fall within four steps. After the
-// script every request that is still out is answered the same way until the loop ends, once with each answer. For every sequence:
+// script every request that is still out is answered the same way until the loop ends, once with each answer. The scheduler's two
+// turn rules are checked on the trace alone, the entries as the script makes them and every request as the worker gets it, and
+// read from what is due when the loop chooses:
+//  - B1: from a poll tick to the next delivery poll at most one heartbeat goes, and a delivery poll does follow the tick;
+//  - B2: from a heartbeat falling due (a keep-alive tick, or an entry that finds a state other than the confirmed one) to the next
+//    heartbeat at most one delivery poll pass goes, and a second one goes only when the state is the confirmed one at that pass and
+//    no keep-alive tick has come since: then no heartbeat is due. This worker never has a receipts request in flight, so the
+//    receipts pass has no turn here, and lifecycle-receipts.test.js checks where it goes;
 //  - the loop ends, and the next poll tick finds it free and sends a request;
-//  - a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again, unless a state is
-//    confirmed meanwhile, whichever state it was and however many others were refused since (the rule reads "a delivery poll or a
-//    receipts request": this worker never has a receipts request in flight, so only the poll is checked here, and
-//    lifecycle-receipts.test.js checks the receipts request);
-//  - a changed state is never left behind a delivery poll, unless it is a state that was refused since the last poll or confirm;
 //  - a heartbeat of the confirmed state is sent only when a keep-alive tick has come since the last heartbeat, or when the confirmed
 //    state is unknown, which a `REQUEST_UNCERTAIN` refusal of a changed state makes it;
 //  - no due flag is spent twice: no more heartbeats than entries, no more delivery polls than poll ticks.
+// The model keeps one thing, the state that the worker confirmed, for B2's exception and for the third check.
 const ENTRIES = ["poll", "beat", "event", "rename"]
 const ANSWERS = ["confirmed", "refused"]
 const REFUSALS = ["TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"] // what a refusal says: nothing was sent, or the request may have been applied
+
+// B1 and B2 over a trace of { t: "entry", kind } and { t: "request", op } items, each with the state of the session and the state
+// that the worker had confirmed at that moment.
+function turnProblems(trace) {
+  const problems = []
+  trace.forEach((item, at) => {
+    if (item.t !== "entry") return
+    const after = trace.slice(at + 1)
+    if (item.kind === "poll") {
+      const poll = after.findIndex(next => next.t === "request" && next.op === "pending")
+      if (poll < 0) problems.push("B1: a poll tick that no delivery poll followed")
+      else {
+        const heartbeats = after.slice(0, poll).filter(next => next.t === "request" && next.op === "heartbeat").length
+        if (heartbeats > 1) problems.push(`B1: ${heartbeats} heartbeats between a poll tick and the next delivery poll`)
+      }
+    }
+    if (item.kind === "beat" || item.snapshot !== item.confirmed) {
+      let passes = 0
+      let keepAlive = item.kind === "beat"
+      for (const next of after) {
+        if (next.t === "entry") {
+          if (next.kind === "beat") keepAlive = true
+          continue
+        }
+        if (next.op === "heartbeat") break
+        if (next.op !== "pending") continue
+        passes += 1
+        if (passes > 1 && (keepAlive || next.snapshot !== next.confirmed)) {
+          problems.push(`B2: delivery poll pass ${passes} went before the heartbeat that was due${keepAlive ? " for a keep-alive tick" : ""}`)
+          break
+        }
+      }
+    }
+  })
+  return problems
+}
 
 async function interleaving(script, drain, changed, code) {
   const refusal = { refused: code }
@@ -1821,26 +1932,22 @@ async function interleaving(script, drain, changed, code) {
   const snapshot = () => `${state.idle ? "idle" : "busy"} ${state.title}` // the only parts of a heartbeat that the script changes
   const problems = []
   const count = { heartbeats: 0, polls: 0, entries: 0, ticks: 0 }
-  // What the worker has confirmed, the states it has refused since the last poll or confirm, a poll tick that no delivery poll has
-  // taken, the states that were refused while one waited, and whether a keep-alive tick has come since the last heartbeat.
-  const model = { confirmed: "idle synthetic", refused: new Set(), pollWaiting: false, heldBack: new Set(), keepAlive: false }
+  // What the worker has confirmed (null when it is unknown), and whether a keep-alive tick has come since the last heartbeat.
+  const model = { confirmed: "idle synthetic", keepAlive: false }
+  const trace = []
+  const note = (t, name) => trace.push({ t, [t === "entry" ? "kind" : "op"]: name, snapshot: snapshot(), confirmed: model.confirmed })
   let armed = false // the invariants hold from the first step of the script, not for the join
   let held = null // the request whose answer is out: { op, text, resolve }
   const worker = fakeWorker({
     answer: (op, fields) => {
       const text = op === "heartbeat" ? `${fields.state.native_state} ${fields.state.title}` : null
+      if (armed) note("request", op)
       if (armed && op === "heartbeat") {
         count.heartbeats += 1
-        if (model.heldBack.has(text)) problems.push("a state that was refused while a delivery poll waited went ahead of that poll")
         if (text === model.confirmed && !model.keepAlive) problems.push("a heartbeat of the confirmed state was sent with no keep-alive due")
         model.keepAlive = false
       }
-      if (armed && op === "pending") {
-        count.polls += 1
-        model.pollWaiting = false
-        model.heldBack.clear()
-        if (snapshot() !== model.confirmed && !model.refused.has(snapshot())) problems.push("a changed state waited behind a delivery poll")
-      }
+      if (armed && op === "pending") count.polls += 1
       return new Promise(resolve => { held = { op, text, resolve } })
     },
   })
@@ -1849,32 +1956,26 @@ async function interleaving(script, drain, changed, code) {
     if (!held) return
     const { op, text, resolve } = held
     held = null
-    if (op !== "heartbeat") model.refused.clear() // a poll is done: the states that waited for it are due again
-    else if (value.refused) {
-      model.refused.add(text)
-      if (model.pollWaiting) model.heldBack.add(text)
-      if (value.refused === "REQUEST_UNCERTAIN" && text !== model.confirmed) model.confirmed = null // a changed state may have been applied: what the worker confirmed last is unknown
-    } else {
-      model.confirmed = text
-      model.refused.clear()
-      model.heldBack.clear()
-    }
+    if (op === "heartbeat" && !value.refused) model.confirmed = text
+    else if (op === "heartbeat" && value.refused === "REQUEST_UNCERTAIN" && text !== model.confirmed) model.confirmed = null // a changed state may have been applied: what the worker confirmed last is unknown
     resolve(value)
     await flush()
   }
   const answerAll = async value => { for (let step = 0; step < 12 && held; step += 1) await reply(value) }
   const steps = {
-    poll: async () => { count.entries += 1; count.ticks += 1; model.pollWaiting = true; void lifecycle.poll(); await flush() },
-    beat: async () => { count.entries += 1; model.keepAlive = true; void lifecycle.heartbeat(); await flush() },
+    poll: async () => { count.entries += 1; count.ticks += 1; note("entry", "poll"); void lifecycle.poll(); await flush() },
+    beat: async () => { count.entries += 1; model.keepAlive = true; note("entry", "beat"); void lifecycle.heartbeat(); await flush() },
     event: async () => {
       count.entries += 1
       state.idle = !state.idle
+      note("entry", "event")
       emit("session_compact", { type: "session_compact" }, ctx)
       await flush()
     },
     rename: async () => {
       count.entries += 1
       state.title = state.title === "synthetic" ? "renamed" : "synthetic"
+      note("entry", "rename")
       emit("session_tree", { type: "session_tree" }, ctx)
       await flush()
     },
@@ -1896,6 +1997,7 @@ async function interleaving(script, drain, changed, code) {
   if (held) problems.push("the loop did not end")
   if (count.heartbeats > count.entries) problems.push(`${count.heartbeats} heartbeats for ${count.entries} entries`)
   if (count.polls > count.ticks) problems.push(`${count.polls} delivery polls for ${count.ticks} poll ticks`)
+  problems.push(...turnProblems(trace))
   armed = false
   void lifecycle.poll() // the next tick finds the loop free
   await flush()
@@ -1926,6 +2028,49 @@ test("every interleaving of poll ticks, keep-alive ticks, events and answers to 
     }
   }
   assert.deepEqual(failures, [])
+})
+
+// The documented limit of the turn rule, pinned as it is and not as a guarantee. The rule holds inside one instance. A refusal that
+// ends the instance (STALE_INSTANCE) is followed by the rejoin, and the first run of the new instance starts with no heartbeat sent,
+// so that instance sends its first heartbeat before its delivery poll: two heartbeats, one for each instance, go between a poll
+// tick and the next delivery poll. The scheduler before the turn rule had this order too, so it is a limit and no regression, and the
+// trigger is an event: the poll tick of that scheduler does not compare a silently changed title, so an event leaves the heartbeat
+// due for the tick to carry. The enumeration above ends no instance, and the README says the same under "Presence". A change of this
+// order is a change of that claim.
+test("a heartbeat refused STALE_INSTANCE after a poll tick is followed by the new instance's first heartbeat before its delivery poll", async t => {
+  t.after(() => { delete globalThis[Symbol.for("agent-chat.pi.disabled")] })
+  const { pi, emit, ctx } = fakePi()
+  const workers = []
+  const retries = []
+  let failing = false
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers,
+    startProcess: () => {
+      const number = workers.length + 1
+      const worker = fakeWorker({
+        answer: op => (failing && number === 1 && op === "heartbeat" ? { refused: "STALE_INSTANCE" } : op === "pending" ? { messages: [] } : {}),
+      })
+      workers.push(worker)
+      return worker
+    },
+    now: () => 1000,
+    random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+  })
+  const trace = () => workers.flatMap((worker, index) => worker.requests.map(request => `${request.op}@${index + 1}`))
+  emit("session_start", {}, ctx)
+  await flush()
+  assert.deepEqual(trace(), ["heartbeat@1", "pending@1"], "the join: its first heartbeat, then its delivery poll")
+  emit("input", { source: "interactive" }, ctx) // the stop ends: the state has changed, and the event leaves a heartbeat due for the poll tick to carry
+  failing = true
+  await lifecycle.poll()
+  assert.deepEqual(trace().slice(2), ["heartbeat@1"], "the due heartbeat goes first, it is refused, and the delivery poll that waited goes nowhere")
+  assert.equal(retries.length, 1, "the refusal begins a rejoin")
+  retries[0].fn()
+  await flush()
+  assert.equal(workers.length, 2, "the rejoin starts the second instance")
+  assert.deepEqual(trace().slice(2), ["heartbeat@1", "heartbeat@2", "pending@2"],
+    "two heartbeats go between the poll tick and the next delivery poll, one on each instance")
 })
 
 // One Pi extension runtime: the real factory on its own extension API, for the session `native`, with a worker that joins as
