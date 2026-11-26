@@ -501,8 +501,10 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     // running turn. `observe` cannot give it then, because it stops at a thread that is not idle. `plan` is true for "plan",
     // false for "default", and null for anything else: another mode, a thread that is not loaded, an error, a timeout, and a
     // resume record that does not pass the checks of `observe` (this thread's own, complete, not a child) or that does not
-    // name the provider that the bind fixed. No bind fixed one: null too. A thread that is not loaded is not resumed, since a
-    // resume would load it. Every step ends within `ms`. `thread/resume` reports the thread's mode, the one that the next turn takes
+    // name the provider that the bind fixed. No bind fixed one: null too. Unlike `observe`, which keeps a mode next to a status
+    // it does not know, this read takes the mode only from a record whose status is `idle` or `active`: an output depends on
+    // it, and any other status (`systemError`, `notLoaded`, one this package does not know) is null. A thread that is not
+    // loaded is not resumed, since a resume would load it. Every step ends within `ms`. `thread/resume` reports the thread's mode, the one that the next turn takes
     // (`thread/settings/update` sets it "for subsequent turns"): no request reads the mode of the turn that runs.
     // A resume of a running thread sends that connection the thread's pending server requests (an approval, say), and the
     // first connection that answers one settles it: an error reply aborts it. So this connection answers none, and closing
@@ -515,7 +517,8 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
           if (!(await loaded(link, left))) return { plan: null }
           const resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(left))
           const record = resumed.thread
-          if (!resumedRecord(record) || isChildThread(record) || !complete(record) || record.modelProvider !== provider) return { plan: null }
+          if (!resumedRecord(record) || !["idle", "busy"].includes(statusOf(record)) || isChildThread(record) || !complete(record) ||
+            record.modelProvider !== provider) return { plan: null }
           const mode = resumed.collaborationMode?.mode
           return { plan: mode === "default" ? false : mode === "plan" ? true : null }
         }, { connectMs: Math.max(1, Math.min(CONNECT_MS, left())), answerRequests: false })

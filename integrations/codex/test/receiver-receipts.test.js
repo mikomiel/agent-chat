@@ -528,6 +528,25 @@ test("a read that confirmed Plan Mode and answers after a later-started read cou
   assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true, "an unknown answer drops no mode that a read confirmed")
 })
 
+// A notice may withhold an output, never let one out (chat-clients spec, "Sender receipts never wake and never change
+// delivery"). So the `default` that its read confirms lets that notice out and nothing else: it does not lift a Plan reading,
+// which holds the wake and every claim after the turn too.
+test("a notice's mode read that answers default shows the notice but does not lift a Plan reading: after Stop the heartbeat still says Plan Mode", async () => {
+  let reads = 0
+  const thread = threadDouble({ mode: () => (++reads === 1 ? { plan: true } : { plan: false }) })
+  const r = await staged({ rows: [rcpt(1)], thread })
+  r.server.pending = [uid(1)]
+  const hook = await r.op(turn({ event: "tool" })) // the claim's read finds Plan Mode, then the notice's read finds default
+  assert.equal(reads, 2)
+  assert.equal(r.count("claim"), 0)
+  assert.ok(isNoticeText(hook.sent[0].context), "the notice's own read allows that notice")
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true, "the Plan reading was reported")
+  await r.op(stopEvent) // no periodic read follows
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true }, "still Plan Mode")
+  assert.equal(r.count("claim"), 0)
+  assert.deepEqual(thread.wakes, [], "no wake")
+})
+
 test("a Stop event replies with nothing but its acknowledgement and drops the staged notice", async () => {
   const r = await staged({ rows: [rcpt(1)] })
   const stop = await r.op(stopEvent)

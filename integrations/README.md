@@ -326,9 +326,9 @@ The rules below bind every package that shows receipts.
   `Stop`, never the idle-wake waiter, never exit code 2. `codex` uses only the reply of a prompt or tool hook of a running
   turn; a wake carries no receipt, even when one is waiting. A package never asks for receipts while the session is idle.
   A pending receipt changes no claim, handoff, settle, heartbeat, binding announcement or wake, with one exception: the
-  read of the collaboration mode that `codex` takes before a notice. A native mode it confirms can withhold an output
-  (another hook's claimed batch then settles `deferred` with reason `plan`) and update `plan_mode`; it never lets one
-  out.
+  read of the collaboration mode that `codex` takes before a notice. Plan Mode that it confirms can withhold an output
+  (another hook's claimed batch then settles `deferred` with reason `plan`) and set `plan_mode`. Another mode that it
+  confirms lets that notice out and changes nothing else: it never lifts Plan Mode.
 - **When a package offers receipts.** The session is joined and chat is not failed, its native state is `busy` (not idle,
   Plan Mode, stopped, unknown or offline; for `deepseek`, a running turn, since an idle agent with a parked inbox item is
   busy only for a delivery), and the worker's answer says `muted === false`. The worker reads

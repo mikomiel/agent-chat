@@ -1066,6 +1066,19 @@ test("a mode read whose resume record is not this main thread's, as the bind fou
   })
 })
 
+// The mode decides an output, so it is taken only from a record that shows the thread loaded as codex-cli 0.172.0 documents
+// it, idle or active. The heartbeat read keeps a mode next to a status it does not know; this read does not.
+test("a mode read whose resume record shows a status other than idle or active is null", async () => {
+  for (const type of ["futureStatus", "systemError", "notLoaded", ""]) {
+    const over = { "thread/resume": () => ok({ thread: thread({ status: { type } }), collaborationMode: { mode: "default", settings: {} } }) }
+    assert.deepEqual((await modeWith(over)).result, { plan: null }, JSON.stringify(type))
+  }
+  for (const status of [{ type: "idle" }, { type: "active", activeFlags: [] }]) {
+    const over = { "thread/resume": () => ok({ thread: thread({ status }), collaborationMode: { mode: "default", settings: {} } }) }
+    assert.deepEqual((await modeWith(over)).result, { plan: false }, status.type)
+  }
+})
+
 test("a mode read ends within its time: a resume that never answers is null", async () => {
   const { result, took } = await modeWith({ "thread/resume": () => undefined }, { ms: 200 })
   assert.deepEqual(result, { plan: null })

@@ -280,7 +280,10 @@ sends its request: it does not wait for the worker to end its instance.
   they drop nothing. A `plan` hint still reports Plan Mode, unless a read that
   started after its hook event confirmed another mode. A hook's mode read that
   changes the Plan Mode reported queues a heartbeat at once, as any other change
-  of state does; the hook does not wait for it. The server offers nothing while
+  of state does; the hook does not wait for it. The read before a receipts
+  notice records only Plan Mode: its `default` lets that notice out and lifts
+  nothing (a notice may withhold an output, never let one out). The server
+  offers nothing while
   the heartbeat reports Plan Mode, so while it does, a hook that may claim
   takes a mode read before its state report, and that read can lift it. A bind
   that leaves the thread unbound (the provider changed) discards the last read
@@ -766,8 +769,10 @@ rule has already excluded.
    `plan` is Plan Mode, `default` is not, and everything else is unknown:
    another mode, no mode, a refused resume, an error, a timeout, and a resume
    record that the heartbeat read would not take (missing, another thread's,
-   incomplete or a child's) or that does not name the provider that the bind
-   fixed. The connection answers no
+   incomplete or a child's), that does not name the provider that the bind
+   fixed, or whose status is not `idle` or `active`. Unlike the heartbeat
+   read, which keeps a mode next to a status it does not know (`systemError`,
+   say), this read decides an output, so any other status is unknown. The connection answers no
    server request. A child found here ends nothing; the next heartbeat read
    decides.
 

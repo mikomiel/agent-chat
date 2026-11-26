@@ -518,8 +518,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // { plan, seq }: `plan` true (Plan Mode), false (another mode it confirmed), or null (not known: no time left, an unknown
   // mode, a refusal, a failure, a timeout), and `seq` the read's place in `reads`. A mode it confirmed is recorded for the
   // heartbeat (noteReading); when that changes the Plan Mode the heartbeat reports, a report is queued at once, as for any
-  // other change of state, and the hook does not wait for it.
-  async function readMode(record, deadline) {
+  // other change of state, and the hook does not wait for it. A read for a receipts notice (`withholdOnly`) records only
+  // Plan Mode: a notice may withhold an output, never let one out, so its `default` allows that notice alone and never
+  // lifts a Plan reading (a published Plan Mode holds the wake and every claim).
+  async function readMode(record, deadline, { withholdOnly = false } = {}) {
     const ms = Math.min(READ_MS, deadline - now() - CLAIM_MARGIN_MS)
     if (!(ms > 0)) return { plan: null, seq: reads }
     const at = epoch
@@ -530,7 +532,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     const answer = await Promise.race([Promise.resolve().then(() => thread.readMode({ ms })).catch(() => null), expired])
     clearTimeoutImpl(timer)
     const plan = typeof answer?.plan === "boolean" && now() < end ? answer.plan : null
-    if (live === record && threadBound) {
+    if (live === record && threadBound && !(withholdOnly && plan !== true)) {
       const shown = reportedPlan()
       noteReading(plan, mine, at)
       if (reportedPlan() !== shown) void report()
@@ -546,10 +548,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // and their answers can come in any order: a read that started after this one and confirmed Plan Mode refuses it too,
   // here and again right before the write (planSince). Resolves the read's `seq` for that check when it allows the output,
   // or null. Without a control socket, and while the thread is unbound, nothing is read and the state follows the hooks:
-  // the hint decides, as it does for the other state (`seq` 0).
-  async function modeAllows(record, link, deadline) {
+  // the hint decides, as it does for the other state (`seq` 0). A notice's read is `withholdOnly` (readMode).
+  async function modeAllows(record, link, deadline, options) {
     if (!thread || !threadBound) return 0
-    const { plan, seq } = await readMode(record, deadline)
+    const { plan, seq } = await readMode(record, deadline, options)
     const allows = plan === false && !planSince(seq) && live === record && !closed && !failure && !link.closed && eligible(false) &&
       deadline - now() >= CLAIM_MARGIN_MS
     return allows ? seq : null
@@ -863,7 +865,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (!notice || !live || !joined || closed || failure || chatState() !== "busy" || link.closed || deadline <= now()) return link.send({ context: null })
     // The ordering rule of a claim holds for the notice too (modeAllows). A notice it does not allow is dropped unmarked: its
     // rows come back with a later feed. Nothing waits between this check and the write.
-    if ((await modeAllows(live, link, deadline)) === null || staged !== notice || !receipts.showable(receiptState, notice.at, wall())) {
+    if ((await modeAllows(live, link, deadline, { withholdOnly: true })) === null || staged !== notice || !receipts.showable(receiptState, notice.at, wall())) {
       if (staged === notice) releaseReceipts()
       return link.send({ context: null })
     }
