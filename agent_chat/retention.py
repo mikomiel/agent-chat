@@ -62,7 +62,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
             floor = event["position"]
         removed_events = db.execute("DELETE FROM agent_chat.events WHERE position <= %s", (floor,)).rowcount
         db.execute("UPDATE agent_chat.event_clock SET retained_floor = %s WHERE singleton", (floor,))
-        # NO KEY UPDATE: a clockless receipts mark may hold KEY SHARE on these rows; only the leaf delete conflicts.
+        # NO KEY UPDATE does not conflict with the KEY SHARE that a clockless receipts mark may hold on these rows.
         redacted = db.execute(
             """
             WITH expired AS (
@@ -94,6 +94,9 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
         ).rowcount
         # Remove leaf tombstones only. A retained child or event keeps its parent.
         # Subsequent batches collect ancestors, including the final thread root.
+        # SKIP LOCKED: a clockless receipts mark can hold a leaf `FOR KEY SHARE` while it waits for a receipt row, and
+        # every other message locker runs under the clock held here. So prune never waits for a receipts transaction
+        # and never holds the clock behind one: a leaf such a mark holds is collected by a later pass.
         deleted = db.execute(
             """
             WITH leaves AS (
@@ -106,7 +109,7 @@ def prune(db: Connection[dict[str, Any]], limit: int = 100) -> dict[str, int]:
                   AND (m.id <> t.root_message_id OR NOT EXISTS (
                       SELECT 1 FROM agent_chat.messages sibling WHERE sibling.thread_id = t.id AND sibling.id <> m.id
                   ))
-                ORDER BY m.expires_at, m.id LIMIT %s FOR UPDATE OF m
+                ORDER BY m.expires_at, m.id LIMIT %s FOR UPDATE OF m SKIP LOCKED
             ) DELETE FROM agent_chat.messages WHERE id IN (SELECT id FROM leaves) RETURNING thread_id
         """,
             (limit,),

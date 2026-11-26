@@ -101,19 +101,21 @@ def mark_delivered(db: Connection[dict[str, Any]], actor: Actor, request: Receip
     `delivered` lists the requested IDs the session owns, whether this call or an earlier one marked them.
 
     It takes no event clock either (see `sender_feed`), and `lock_agent` carries the authorization. The clock also kept
-    it apart from `retention.prune`, whose delete of a tombstoned message cascades to these rows: the messages are now
-    locked first, in prune's order, so that this call holds no receipt row while it waits for prune. Prune's redaction
-    takes `FOR NO KEY UPDATE`, so the leaf delete is the only prune lock this call waits for. The same-session limit of
-    `sender_feed` applies.
+    it apart from `retention.prune`, whose delete of a tombstoned message cascades to these rows. So the messages are
+    locked first, in prune's order, and held to commit. Prune never waits for this call: its redaction takes
+    `FOR NO KEY UPDATE`, and its leaf delete skips a locked message and collects it in a later pass. This call may wait
+    for a leaf delete already in progress: one statement, in the same order, while it holds no receipt row. The
+    same-session limit of `sender_feed` applies.
     """
     owned = (list(request.receipts), actor.session_id)
     with db.transaction():
         lock_agent(db, actor)
         # Prune locks messages by (expires_at, id), then deletes them and, by cascade, their receipts. The UPDATE below
         # locks receipt rows in the planner's order, which could cross that cascade. So lock the messages first, in
-        # prune's order: this call then holds no receipt row while it waits for prune. KEY SHARE waits only for FOR
-        # UPDATE. On messages, only the leaf delete takes that (the redaction takes NO KEY UPDATE), so this call waits
-        # for that one statement only, and that statement locks in this same order.
+        # prune's order, and keep them to commit. Prune skips a message held here (`SKIP LOCKED`) and its redaction
+        # takes NO KEY UPDATE, so it never waits for this call. KEY SHARE waits only for FOR UPDATE, which on messages
+        # only a leaf delete takes: this call can wait for one already in progress, in this same order, holding no
+        # receipt row.
         db.execute(
             """
             SELECT m.id FROM agent_chat.messages m JOIN agent_chat.sender_receipts sr ON sr.message_id = m.id

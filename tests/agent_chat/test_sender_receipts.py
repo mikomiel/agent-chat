@@ -569,23 +569,23 @@ def wait_until_finished_or_waiting(lock_wait, future, fragment, timeout=5):
             wait({future}, timeout=0.01)
 
 
-def test_a_delivered_mark_does_not_deadlock_with_the_two_statements_of_a_prune(db, database, actors, lock_wait):
-    """Prune redacts expired messages and then deletes tombstoned leaves: two statements of one transaction, and
-    the locks of the first are still held while the second runs. A mark takes no clock, so it can run in between.
-    If it has locked a leaf that sorts first and then waits for a redacted message that sorts later, while prune
-    waits for that leaf, the two wait for each other. Each statement locks in order, so only the pair can cross.
-
-    The redaction takes `FOR NO KEY UPDATE`, which the `KEY SHARE` of the mark does not conflict with. A side
-    transaction holds the leaf `FOR KEY SHARE`, as another mark would, so prune stops in its leaf delete with the
-    redaction's lock held. With `FOR UPDATE` in the redaction, the mark then waits for the redacted message while
-    it holds the leaf, and PostgreSQL ends the cycle with a deadlock error. With `FOR NO KEY UPDATE` it finishes.
+def test_prune_skips_a_message_a_stalled_mark_holds_and_never_waits_for_it(
+    db, database, actors, actor_factory, lock_wait
+):
+    """Prune holds the event clock for its whole transaction, so a wait inside it delays every event writer.
+    A mark holds its messages `FOR KEY SHARE` while its UPDATE waits for a receipt row, here one that another
+    transaction holds. Prune must redact the expired message that the mark holds, which `FOR NO KEY UPDATE` allows,
+    and skip the leaf that the mark holds, which a leaf delete would wait for. The settle of another instance,
+    started once prune has finished or waits, must complete. After the release the mark completes and a second
+    prune collects the leaf.
     """
-    room, sender, target, _operator = actors
+    room, sender, target, operator = actors
     leaf = send(db, sender, room, "question", (target.session_id,))["id"]
     receipts.acknowledge(db, target, leaf)
     redacted = send(db, sender, room, "question", (target.session_id,))["id"]
     receipts.acknowledge(db, target, redacted)
-    both = sorted(row["id"] for row in receipts.sender_feed(db, sender)["receipts"])
+    receipt_of = {row["message_id"]: row["id"] for row in receipts.sender_feed(db, sender)["receipts"]}
+    both = sorted(receipt_of.values())
     assert len(both) == 2
     # An earlier prune tombstones the leaf, which expires first, but its events keep it. They age out in the prune
     # under test, and that makes the leaf collectable. The other message expires later and keeps its body and its
@@ -602,6 +602,7 @@ def test_a_delivered_mark_does_not_deadlock_with_the_two_statements_of_a_prune(d
     db.execute(
         "UPDATE agent_chat.messages SET expires_at = clock_timestamp() - interval '1 hour' WHERE id = %s", (redacted,)
     )
+    other, attempt = other_instance_attempt(db, room, operator, actor_factory)
 
     def run_prune():
         with connect(database) as pruner:
@@ -611,16 +612,65 @@ def test_a_delivered_mark_does_not_deadlock_with_the_two_statements_of_a_prune(d
         with connect(database) as writer:
             return receipts.mark_delivered(writer, sender, ReceiptDelivery(receipts=tuple(both)))
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         with db.transaction():
-            db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s FOR KEY SHARE", (leaf,))
-            pruning = pool.submit(run_prune)
-            lock_wait("WITH leaves AS", timeout=5)  # Prune has redacted its message and now waits for the leaf.
+            db.execute("SELECT 1 FROM agent_chat.sender_receipts WHERE id = %s FOR UPDATE", (receipt_of[redacted],))
             marking = pool.submit(mark)
-            wait_until_finished_or_waiting(lock_wait, marking, "FOR KEY SHARE OF m")
-    assert {"prune": pruning.exception(), "mark": marking.exception()} == {"prune": None, "mark": None}
-    assert marking.result()["delivered"] == both
-    assert (pruning.result()["redacted"], pruning.result()["deleted"]) == (1, 1)
+            lock_wait("SET delivered_at", timeout=5)  # The mark holds both messages and waits for the receipt row.
+            pruning = pool.submit(run_prune)
+            wait_until_finished_or_waiting(lock_wait, pruning, "agent_chat.messages")
+            assert_settled_within_bound(db, settle_in_thread(pool, database, other, attempt), attempt)
+            assert pruning.done(), "prune waited for a message that a stalled mark holds"
+            assert not marking.done()
+            first = pruning.result()
+            assert (first["redacted"], first["deleted"]) == (1, 0)
+            assert db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s", (leaf,)).fetchone() is not None
+        assert marking.result(timeout=5)["delivered"] == both
+    second = prune(db)
+    assert (second["redacted"], second["deleted"]) == (0, 1)
     assert db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s", (leaf,)).fetchone() is None
     (kept,) = db.execute("SELECT id, delivered_at IS NOT NULL AS delivered FROM agent_chat.sender_receipts").fetchall()
-    assert kept["delivered"] and kept["id"] in both
+    assert (kept["id"], kept["delivered"]) == (receipt_of[redacted], True)
+
+
+def test_a_delivered_mark_breaks_an_expiry_tie_by_message_id(db, database, actors, lock_wait):
+    """Prune orders messages by `expires_at, id`. Of two that expire at the same instant the mark takes the lower id
+    first, so while it waits for the higher one it holds the lower one and no receipt row.
+
+    Without that tie-break a tie keeps the order of the plan: the heap order of the receipts for the bitmap scan the
+    planner picks, their id order for an index scan. So the higher message gets the receipt that is created first and
+    has the lower id, and it comes first in either.
+    """
+    room, sender, target, _operator = actors
+    low, high = sorted((send(db, sender, room, "question", (target.session_id,))["id"] for _ in range(2)), key=str)
+    for message, number in ((high, 1), (low, 2)):
+        receipts.acknowledge(db, target, message)
+        db.execute("UPDATE agent_chat.sender_receipts SET id = %s WHERE message_id = %s", (UUID(int=number), message))
+    db.execute(
+        "UPDATE agent_chat.messages SET expires_at = now() + interval '1 hour' WHERE id = ANY(%s)", ([low, high],)
+    )
+    delivered = sorted(row["id"] for row in receipts.sender_feed(db, sender)["receipts"])
+    assert len(delivered) == 2
+
+    def mark():
+        with connect(database) as writer:
+            return receipts.mark_delivered(writer, sender, ReceiptDelivery(receipts=tuple(delivered)))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with db.transaction():
+            # A stand-in for prune, which holds the higher message while it works through its batch.
+            db.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s FOR UPDATE", (high,))
+            marking = pool.submit(mark)
+            lock_wait("agent_chat.messages", timeout=5)
+            with connect(database) as probe:
+                # The mark holds the lower message, so a prune that wanted it would wait: no crossed order.
+                with pytest.raises(LockNotAvailable):
+                    probe.execute("SELECT 1 FROM agent_chat.messages WHERE id = %s FOR UPDATE NOWAIT", (low,))
+                # It holds no receipt row yet, so the cascade of a prune cannot wait on it either.
+                locked = probe.execute(
+                    "SELECT id FROM agent_chat.sender_receipts WHERE sender_session_id = %s FOR UPDATE NOWAIT",
+                    (sender.session_id,),
+                ).fetchall()
+                assert sorted(row["id"] for row in locked) == delivered
+            assert not marking.done()
+        assert marking.result(timeout=5)["delivered"] == delivered
