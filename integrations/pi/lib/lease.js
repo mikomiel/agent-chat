@@ -3,8 +3,10 @@
 // there, so drift fails CI instead of changing the footer silently.
 //
 // The server counts that age on the wall clock, and a monotonic clock stops while the host is suspended. The tracker reads
-// both and is expired when either has counted LEASE_SECONDS: a suspend lapses it, and a wall clock set back cannot keep a
-// lapsed monotonic lease live. A wall clock set forward may show `no live instance` early, which is the safe side.
+// both and is expired when either has counted LEASE_SECONDS: a suspend lapses it. A lapse is latched. Once expired() has
+// returned true, it stays true until a confirmed request of the current epoch sets new deadlines, or reset() ends the
+// epoch, so a wall clock that is set back afterwards does not bring the state text back without a confirmed heartbeat. A
+// wall clock set forward may show `no live instance` early, until the next confirmed heartbeat, which is the safe side.
 //
 // The tracker is footer-only. It starts no rejoin episode, withdraws no binding and raises no fault; a refusal or an
 // error of the worker keeps its own path to those. It imports nothing, reads two clocks that a test injects, and owns one
@@ -22,9 +24,14 @@ export function createLease({
   let epoch = 0 // reset() ends an epoch: a reply to a request that was sent before it renews nothing
   let deadline = null // monotonic clock time at which the lease is over; null while no instance is held
   let wallDeadline = null // the same moment on the wall clock
+  let lapsed = false // set by the first expired() that finds a lapse on either clock; confirm() and reset() clear it
   let timer = null
 
-  const expired = () => deadline !== null && (clock() >= deadline || wall() >= wallDeadline)
+  const expired = () => {
+    if (deadline === null) return false
+    lapsed ||= clock() >= deadline || wall() >= wallDeadline
+    return lapsed
+  }
 
   function cancel() {
     clearTimeoutImpl(timer)
@@ -51,8 +58,9 @@ export function createLease({
     // A reply that carries no `refused`: the lease runs to LEASE_SECONDS after the request was sent, on each clock. A
     // refused reply, a thrown error and a request with no answer are not confirmed and do not come here.
     confirm(stamp) {
-      if (stamp?.epoch !== epoch) return
+      if (stamp?.epoch !== epoch) return // a reply of an ended instance renews nothing, and a latched lapse stays
       const was = expired()
+      lapsed = false // the new deadlines start a new lease: they are counted from an unlatched state
       deadline = stamp.at + LEASE_SECONDS * 1000
       wallDeadline = stamp.wallAt + LEASE_SECONDS * 1000
       arm()
@@ -63,6 +71,7 @@ export function createLease({
       epoch += 1
       deadline = null
       wallDeadline = null
+      lapsed = false
       cancel()
     },
     expired,

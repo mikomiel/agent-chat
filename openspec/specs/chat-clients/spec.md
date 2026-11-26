@@ -457,7 +457,7 @@ Only a `settle` try that gets no status, because the connection fails before the
 - **AND** a pause between tries that ends after the deadline starts no try, and the worker answers with the code of the last failure
 
 ### Requirement: The `pi` footer reads `no live instance` when the instance lease lapses
-The `pi` package MUST show `Agent Chat: no live instance` once 90 seconds have passed on the monotonic clock or on the wall clock since it sent the last join or heartbeat request that the worker answered without `refused`, and the state text again at the next such answer. This text MUST come before every state text. The lapse itself MUST change the footer only: it MUST NOT begin a rejoin episode, withdraw the binding context or raise a fault.
+The `pi` package MUST show `Agent Chat: no live instance` once 90 seconds have passed on the monotonic clock or on the wall clock since it sent the last join or heartbeat request that the worker answered without `refused`, and the state text again only at the next such answer, even if the wall clock is set back. This text MUST come before every state text. The lapse itself MUST change the footer only: it MUST NOT begin a rejoin episode, withdraw the binding context or raise a fault.
 
 #### Scenario: A brief outage
 - **WHEN** the worker answers a heartbeat or a pending read `refused` with `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN`, and the lease has not lapsed
@@ -480,9 +480,10 @@ The `pi` package MUST show `Agent Chat: no live instance` once 90 seconds have p
 - **AND** the lapse itself begins no rejoin episode, withdraws no binding context and raises no fault
 - **AND** the next heartbeat answered without `refused` shows the state text again
 
-#### Scenario: A wall clock set back
-- **WHEN** the wall clock is set back after the monotonic clock has counted 90 seconds from the send of the last request that was answered without `refused`
-- **THEN** the footer keeps reading `Agent Chat: no live instance`
+#### Scenario: A wall clock set back after a lapse
+- **WHEN** 90 seconds have passed on either clock since the send of the last request that was answered without `refused`, and the wall clock is then set back to a time before its own deadline, while the monotonic clock may not yet have counted 90 seconds
+- **THEN** the footer keeps reading `Agent Chat: no live instance` at every poll tick and after every heartbeat that the worker answers `refused`
+- **AND** the next heartbeat answered without `refused` shows the state text again
 
 #### Scenario: The lapse comes first
 - **WHEN** the lease lapses while the session is busy, stopped, paused or in Plan Mode
@@ -533,13 +534,35 @@ At every 2-second poll the `pi` package MUST compare the state that it would hea
 - **WHEN** a poll finds a heartbeat in flight
 - **THEN** it sends no second heartbeat
 
+### Requirement: `pi` compares the state again when a slow request is done
+A state change that a poll or an event sees while a request other than a receipts request is in flight MUST NOT start a second request. When that request is done, the `pi` package MUST compare the current state with the last confirmed state once, and send one heartbeat if they differ, not at a later poll. A heartbeat that the worker answers `refused` MUST NOT be sent again in a loop: it is sent again at most once for each poll or event that found a request in flight.
+
+#### Scenario: A change during a slow request
+- **WHEN** the session turns busy or enters Plan Mode while a pending read, a claim, a settlement or a heartbeat is in flight, and a poll finds that request in flight
+- **THEN** one heartbeat that carries the new state is sent when that request is done, not at a later poll
+- **AND** nothing is sent if the state has changed back by then
+
+#### Scenario: A refusal is not repeated in a loop
+- **WHEN** the worker answers `refused` to a heartbeat that was sent when a slow request was done, or that was in flight when a poll found it
+- **THEN** that heartbeat is sent again at most once for each such poll or event, and never in a loop
+- **AND** a state that stays unconfirmed is sent again by the next poll that finds no request in flight
+
 ### Requirement: `pi` ends its instance at `session_shutdown` and starts a replacing runtime stopped
-`session_shutdown` MUST stop the `pi` worker, end the instance and return the worker's close, which Pi awaits before a replacing runtime starts. No other event, including `session_before_switch` and `session_before_fork`, MAY end an instance. A replacing runtime MUST start stopped and join with the native session id of its own `session_start`, and MUST start no worker once chat is off. A second `connect` while a worker joins or serves MUST start none and stop none.
+`session_shutdown` MUST stop the `pi` worker, end the instance and return a promise that Pi awaits before a replacing runtime starts. The promise MUST settle when every worker that the package stopped has closed, a rejoin's included, or after 6 seconds. No other event, including `session_before_switch` and `session_before_fork`, MAY end an instance. A replacing runtime MUST start stopped and join with the native session id of its own `session_start`, and MUST start no worker once chat is off.
 
 #### Scenario: A runtime is replaced
 - **WHEN** Pi emits `session_shutdown` to the old runtime and then `session_start` to a new one, with the reason `reload`, `new`, `resume` or `fork`
 - **THEN** the old worker is closed before the new runtime joins
 - **AND** the new runtime joins with its own binding and starts stopped
+
+#### Scenario: A reload during a rejoin
+- **WHEN** a failure that calls for a rejoin has stopped the worker, that worker has not closed yet, and Pi emits `session_shutdown` for a reload, and that worker closes within 6 seconds
+- **THEN** the promise that the handler returns settles only after that worker has closed
+- **AND** the replacing runtime joins after it, so the old instance cannot answer its join with `BINDING_CONFLICT`
+
+#### Scenario: A worker that does not close at shutdown
+- **WHEN** Pi emits `session_shutdown` and a worker that the package stopped has not closed 6 seconds later
+- **THEN** the promise that the handler returns settles at that time, with that worker still not closed
 
 #### Scenario: An event that precedes a switch
 - **WHEN** Pi emits `session_before_switch` or `session_before_fork`
@@ -548,6 +571,19 @@ At every 2-second poll the `pi` package MUST compare the state that it would hea
 #### Scenario: Chat is off
 - **WHEN** chat was turned off and Pi replaces the runtime
 - **THEN** the new runtime starts no worker, and its footer reads `Agent Chat: no live instance`
+
+### Requirement: A `pi` worker waits for every worker that the package stopped to close, for 6 seconds at most
+`connect` MUST start no worker while another joins or serves, and none until every worker that the package stopped has closed, a rejoin's included. A wait MUST end after 6 seconds at the latest, and the worker then starts. After that wait it MUST check again that its runtime was not shut down and that chat was not turned off. Two calls that wait together MUST start one worker, and a call that finds a worker joining or serving MUST stop none.
+
+#### Scenario: A rejoin waits for the old worker
+- **WHEN** the rejoin timer fires while the worker that the rejoin stopped has not closed yet, and it closes within 6 seconds
+- **THEN** no worker starts until that one has closed, and then exactly one starts, however many calls waited
+- **AND** none starts if Pi shut the runtime down or the operator turned chat off during the wait
+
+#### Scenario: A worker that does not close before a rejoin
+- **WHEN** a rejoin waits and the worker that it stopped has not closed 6 seconds later
+- **THEN** the wait ends and the rejoin starts one worker
+- **AND** a join that still meets the old instance is refused with `BINDING_CONFLICT`, which the rejoin retries after a back-off
 
 #### Scenario: A second connect
 - **WHEN** `connect` is called while a worker joins or serves

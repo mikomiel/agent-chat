@@ -15,11 +15,16 @@ import { createLease } from "./lease.js"
 import { bindingRouteLines, packCandidates, receiptsHint, renderNotice, renderReceiptNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
 import * as receipts from "./receipts.js"
-import { cancelsReceipts, describeFailure, startWorker } from "./worker.js"
+import { CLOSE_MS, cancelsReceipts, describeFailure, startWorker } from "./worker.js"
 
 const HEARTBEAT_MS = 30_000
 const POLL_MS = 2_000
 const HANDOFF_MS = 5_000
+// The longest that a shutdown or a rejoin waits for the workers that were stopped to close: one second past CLOSE_MS, when
+// the worker sends SIGKILL, so it ends only for a child that has not reported its exit after that, as one that sleeps
+// uninterruptibly. A join that then still meets the old instance gets BINDING_CONFLICT, which a rejoin retries with a
+// back-off.
+const CLOSE_WAIT_MS = CLOSE_MS + 1_000
 const DISABLED = Symbol.for("agent-chat.pi.disabled")
 const RECEIPTS_TYPE = "agent-chat-receipts"
 // What the footer says while no instance serves: the lease lapsed, chat failed closed or the operator turned it off. A
@@ -68,6 +73,7 @@ export function createAgentChat(pi, config, {
   let pollDue = false
   let receiptsDue = false
   let reading = false // a receipts request is out on the worker: a heartbeat or a delivery poll that falls due ends it
+  let recheck = false // an entry found the loop busy and skipped the compare: the loop compares the state once its requests are done
   let receiptState = receipts.createReceipts()
   let pendingReceipts = null // { marker, ids }: sent to Pi, not yet confirmed by message_start
   let prompts = 0
@@ -76,6 +82,10 @@ export function createAgentChat(pi, config, {
   let displayedStatus
   let planSnapshot = null
   const attempts = new Map()
+  // The close of every worker that this instance stopped and whose exit has not been seen yet. A replacement joins with the
+  // native session id of the instance before it, so no worker starts, and no shutdown returns, while one of them is still
+  // exiting, for CLOSE_WAIT_MS at most. A member leaves the set when its close settles, however late, and none ever rejects.
+  const closing = new Set()
   const policy = createRejoinPolicy({ now, random })
   // Footer only: a lapsed lease changes the text and nothing else. It re-renders at its monotonic deadline and on a restoring
   // reply; a lapse that only the wall clock shows, as after a suspend, is rendered by the next tick, in showPresence.
@@ -126,6 +136,27 @@ export function createAgentChat(pi, config, {
     disableChat(describeFailure(error))
   }
 
+  // Asks the worker to stop and keeps its close in `closing` until it settles. The worker's own stop() ends stdin, sends
+  // SIGTERM after 3 s and SIGKILL after CLOSE_MS (worker.js); a close that still does not come is bounded by `allClosed`.
+  function endWorker(worker) {
+    void worker.stop()
+    const leave = () => closing.delete(ended)
+    const ended = Promise.resolve(worker.closed).then(leave, leave)
+    closing.add(ended)
+  }
+
+  // Settles once every worker that was stopped has closed, one that a rejoin stopped included, or after CLOSE_WAIT_MS,
+  // whichever comes first. It never rejects. A wait that has something to wait for has one timer: unreferenced, so it never
+  // keeps Pi alive, and cleared when the closes come first. A close that settles after the bound still leaves `closing`.
+  function allClosed() {
+    if (!closing.size) return Promise.resolve()
+    return new Promise(resolve => {
+      const timer = setTimeoutImpl(resolve, CLOSE_WAIT_MS)
+      timer?.unref?.()
+      void Promise.allSettled([...closing]).then(() => { clearTimeoutImpl(timer); resolve() })
+    })
+  }
+
   function stopLive() {
     const record = live
     live = null
@@ -135,13 +166,16 @@ export function createAgentChat(pi, config, {
     clearIntervalImpl(pollTimer)
     heartbeatTimer = null
     pollTimer = null
-    if (record?.worker) void record.worker.stop()
-    return record?.worker?.closed
+    if (record?.worker) endWorker(record.worker)
   }
 
+  // Stops the live worker, if there is one, and returns a promise for the close of every worker still exiting: the one
+  // stopped here, and one that an earlier failure stopped, which `live` no longer names. It settles after CLOSE_WAIT_MS at
+  // the latest.
   function disconnect() {
     clearTimers()
-    return stopLive()
+    stopLive()
+    return allClosed()
   }
 
   function handleFailure(error) {
@@ -256,12 +290,17 @@ export function createAgentChat(pi, config, {
     dirty ||= heartbeat
     pollDue ||= poll
     receiptsDue ||= poll
-    // The state is compared with the last one that this instance's worker confirmed once per entry, here, and never inside
-    // the loop: a heartbeat that comes back `refused` leaves it unconfirmed, and a compare in the loop would send it again at
-    // once. A refused one is retried by the next entry. A busy loop is not compared, since a heartbeat of that state may be in
-    // flight and would go out twice; the exception is a receipts request, which holds no heartbeat, so a change found then is
-    // a state report that is due now.
+    // The state is compared with the last one that this instance's worker confirmed once per entry, here, and not after every
+    // request in the loop: a heartbeat that comes back `refused` leaves it unconfirmed, and a compare after each request would
+    // send it again at once. A refused one is retried by the next entry. A busy loop is not compared here, since a heartbeat
+    // of that state may be in flight and would go out twice; the exception is a receipts request, which holds no heartbeat, so
+    // a change found then is a state report that is due now. An entry that skips the compare sets `recheck` instead, and the
+    // loop compares once when its requests are done, before it looks again at what is due: a change seen during a slow request
+    // is published right after it, not at a later tick that finds the loop free. That compare takes the current state and the
+    // last confirmed one of the current record, so a change that reverted meanwhile sends nothing. One compare spends the flag,
+    // so a refused heartbeat is sent again at most once for each entry that skipped, never in a loop.
     if (!busy || reading) dirty ||= live.published !== JSON.stringify(heartbeatState(state))
+    else recheck = true
     if (busy) {
       // What is due waits for the single flight. A receipts request in flight would hold it, so it is ended: the worker
       // answers it `refused` within milliseconds, and the loop takes what is due. A re-evaluation that finds nothing due
@@ -299,10 +338,18 @@ export function createAgentChat(pi, config, {
           receiptsDue = false
           await receiptsPass()
         }
+        // An entry skipped the compare while the requests above ran: it is made now, once, whatever the requests answered.
+        if (recheck) {
+          recheck = false
+          if (live) dirty ||= live.published !== JSON.stringify(heartbeatState(chatState()))
+        }
       }
     } catch (error) {
       handleFailure(requestFailure(error, error?.operation))
-    } finally { busy = false }
+    } finally {
+      busy = false
+      recheck = false // an entry that finds the loop free compares the state itself
+    }
   }
 
   // The sender receipts pass. It runs inside drive's single flight, after the delivery poll, so it never overlaps a request
@@ -473,9 +520,22 @@ export function createAgentChat(pi, config, {
     })
   }
 
+  // No worker starts for a runtime that shut down, once chat is off, while another one joins or serves, or with no session.
+  const mayNotStart = () => closed || disabled() || live || !context || !nativeSessionId
+
   async function connect() {
     // One live record at a time: a second call, while one worker joins or serves, starts nothing and stops nothing.
-    if (closed || disabled() || live || !context || !nativeSessionId) return
+    if (mayNotStart()) return
+    // A worker that joins with the native session id of one that is still exiting meets BINDING_CONFLICT, as after a rejoin
+    // that stopped the old worker moments before. Nothing is awaited while no worker is closing, so the usual start stays
+    // synchronous. The wait ends after CLOSE_WAIT_MS at the latest, and a join that then still meets the old instance is
+    // retried like any other BINDING_CONFLICT. After the wait, everything is checked again: a shutdown, the off latch or
+    // another call that started a worker may have come first, and from here to `live = record` nothing is awaited, so two
+    // calls never start two workers.
+    if (closing.size) {
+      await allClosed()
+      if (mayNotStart()) return
+    }
     try { policy.check() } catch (error) { return failClosed(error) }
     rejoinTimer = null
     let worker
@@ -487,7 +547,7 @@ export function createAgentChat(pi, config, {
     live = record
     try {
       const result = await worker.ready
-      if (live !== record || closed || disabled()) { void worker.stop(); return }
+      if (live !== record || closed || disabled()) { endWorker(worker); return }
       joined = result
       lease.confirm(stamp)
       policy.succeeded()
@@ -553,6 +613,9 @@ export function createAgentChat(pi, config, {
   pi.on("ui_prompt_start", () => { prompts += 1 })
   pi.on("ui_prompt_end", () => { prompts = Math.max(0, prompts - 1) })
   pi.on("session_info_changed", () => { if (live) void drive({ heartbeat: true }) })
+  // Pi awaits this handler before it starts a replacing runtime. The promise settles once every worker that this instance
+  // stopped has closed, one that a rejoin stopped before the shutdown included, so no replacement joins beside a live old one,
+  // or after CLOSE_WAIT_MS, so a child that never closes cannot hold the replacement for ever.
   pi.on("session_shutdown", () => {
     closed = true
     nativeSessionId = null

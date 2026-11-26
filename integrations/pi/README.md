@@ -126,6 +126,12 @@ fits on `cli` fits on every route.
   A changed snapshot that comes back `refused` stays unconfirmed, so the next poll
   sends it again; a refused keep-alive waits for the next 30-second heartbeat. A new
   instance after a rejoin starts with nothing confirmed.
+  A poll that finds another request in flight (a delivery poll, a claim, a settlement
+  or a heartbeat) sends nothing, because a heartbeat of that state may be among them.
+  It asks for one more comparison, which is made when the request is done: a change
+  seen during a slow request goes out right after it, not at a later poll, and a change
+  that has reverted by then sends nothing, because presence reports the current state.
+  A refused heartbeat is sent again at most once for each poll that asked, never in a loop.
   `session_tree`, `session_compact` and `session_compact_failed`
   ask for the same comparison at once, with the context they carry; the poll finds the
   same change, so nothing depends on them.
@@ -136,7 +142,9 @@ fits on `cli` fits on every route.
   `test/lease.test.js`) after the join or heartbeat that the worker answered without
   `refused`, counted from the moment the request was sent, on a monotonic clock and on the
   wall clock: the core counts on wall time and a monotonic clock stops while the host is
-  suspended, so the lease is over when either one has counted the 90 seconds. When the
+  suspended, so the lease is over when either one has counted the 90 seconds. A lapse
+  holds until a heartbeat is answered without `refused`: a wall clock that is set back
+  afterwards does not bring the state text back first. When the
   monotonic deadline passes, a timer on it (not the poll) sets the footer to
   `Agent Chat: no live instance`; a lapse that only the wall clock shows, as after a
   suspend, is set by the next poll tick, whatever request is in flight then. It replaces
@@ -202,6 +210,15 @@ fits on `cli` fits on every route.
   is spent and the next heartbeat or poll is the retry. A `refused`
   `STALE_INSTANCE` still rejoins. A lapsed lease alone starts nothing: when the outage
   outlasts the lease, the worker raises its own error, and that enters this path.
+  A rejoin starts its worker only after the worker that it stopped has closed, because
+  the new worker joins with the same native session id and would meet `BINDING_CONFLICT`
+  while the old instance is still live. The worker's own stop bounds that wait: it kills
+  a process that does not exit, 5 seconds after the stop. A child that still reports no
+  exit holds the rejoin no longer: the wait ends after 6 seconds at the latest, and a join
+  that still meets the old instance is retried after a back-off like any `BINDING_CONFLICT`.
+  The wait has one timer, unreferenced and cleared when the close comes first. After the
+  wait the rejoin checks again that the runtime was not shut down and that chat was not
+  turned off, and two calls start one worker.
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for the process. The native session,
   CI and any submitted work are unchanged. The footer then says `no live instance`.
@@ -214,8 +231,10 @@ fits on `cli` fits on every route.
   `/reload`, `/new`, `/resume` and `/fork` (and `/clone`, which is a fork): it emits
   `session_shutdown` to the old runtime, awaits its handlers, loads a new runtime and
   emits `session_start` with the same reason. The extension ends its instance on
-  `session_shutdown` only, and its handler returns once the worker has exited, so the
-  old instance has ended before the new one joins. It subscribes to no
+  `session_shutdown` only, and its handler returns once every worker that is still
+  closing has exited, one that a rejoin stopped earlier included, so the old instance
+  has ended before the new one joins, or after 6 seconds, so a child that never exits
+  cannot hold the replacement for ever. It subscribes to no
   `session_before_switch` or `session_before_fork`, because another handler can cancel
   those and the instance would end for a switch that never happened. The new runtime
   starts stopped. A chat session is keyed by the native session id: `/reload` and
@@ -273,8 +292,10 @@ node --test
 The suite covers config refusal, the join frame and frame validation, rejoin
 budget/window/backoff, delivery and settlement, the system-prompt binding,
 fail-closed latching and the shared notice vectors, with the claim packing for
-bodies mode, the lease and the footer vocabulary, presence on change, the replacement of
-the runtime for each `session_start` reason, tree navigation and compaction, and sender
+bodies mode, the lease and the footer vocabulary (a lapse that holds until a confirmed
+heartbeat), presence on change (a change seen during a slow request included), the
+replacement of the runtime for each `session_start` reason (a reload during a rejoin
+and a close that never comes included), tree navigation and compaction, and sender
 receipts: the offer rules, the confirmation and the mark,
 one request per pass, and that a delivery and the binding are byte-identical with
 receipts pending. It

@@ -611,7 +611,7 @@ const stdioChild = () => {
   const child = new EventEmitter()
   child.stdin = new PassThrough()
   child.stdout = new PassThrough()
-  child.kill = () => {}
+  child.kill = signal => { child.emit("close", null, signal) } // a killed process closes
   return child
 }
 
@@ -652,6 +652,7 @@ test("a worker request that outlives its deadline takes the rejoin path through 
   children[0].stdout.write(`${JSON.stringify({ id: 0, result: joined })}\n`)
   await flush() // joined and bound; the first heartbeat is written and never answered
   clock.fire(22_000)
+  clock.fire(5000) // the worker's own SIGKILL timer: the stopped process exits, and the rejoin waits for that
   await flush()
   assert.doesNotMatch(notices.join("\n"), /stopped/, "not a permanent disable")
   assert.match(notices.join("\n"), /reconnecting/)
@@ -872,6 +873,8 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
 // Issue #132: lifecycle completeness. The lease footer, presence on change, session replacement, compaction and tree.
 const OFF_LATCH = Symbol.for("agent-chat.pi.disabled")
 const resetLatchAfter = t => t.after(() => { delete globalThis[OFF_LATCH] }) // a disable would otherwise leak into later tests
+// Whether `promise` is still pending once the event loop has turned: every microtask that could settle it has run by then.
+const stillPending = promise => Promise.race([promise.then(() => false), flush().then(() => true)])
 
 // A monotonic clock, a wall clock and timers that move only when the test moves them. The two clocks tick together and
 // jumpWall() moves the wall clock alone, as a suspend does. advance() runs the timers that fall due, in order, with the
@@ -1047,6 +1050,37 @@ test("a wall clock that is set back does not keep a lapsed lease live", async t 
 
   await lifecycle.heartbeat()
   assert.equal(statuses.at(-1), "Agent Chat: ready", "only a confirmed heartbeat restores the text")
+})
+
+// A lapse that only the wall clock showed is latched like one that the monotonic clock showed: the spec keeps the text until a
+// heartbeat is answered without `refused`, and a wall clock set back after a suspend must not bring the state text back first.
+test("a lapse that only the wall clock showed holds when the wall clock is set back: refused heartbeats keep the footer and a confirmed one restores it", async t => {
+  resetLatchAfter(t)
+  let refusal = null
+  const { emit, ctx, statuses, lifecycle, time } = await leasedSession({ answer: answerWith(() => refusal) })
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+
+  time.jumpWall(120_000) // the host sleeps for two minutes: the monotonic clock, and the lease timer, stand still
+  await lifecycle.poll() // the first tick after the resume
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+
+  time.jumpWall(-120_000) // the wall clock is set back to before its deadline; the monotonic deadline is still ahead
+  refusal = "TRANSPORT_UNAVAILABLE"
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "a tick alone restores nothing")
+  await lifecycle.heartbeat()
+  await lifecycle.heartbeat()
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "refused heartbeats confirm nothing")
+
+  refusal = null
+  await lifecycle.heartbeat()
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "a confirmed heartbeat restores the state text")
+  time.advance(89_999)
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "the new lease runs from that heartbeat")
+  time.advance(1)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
 })
 
 test("the lease timer is cleared at shutdown, and nothing renders after it", async () => {
@@ -1305,18 +1339,163 @@ test("a change is sent once while its heartbeat is in flight: a tick that finds 
   assert.equal(beats().length, base + 1)
 })
 
+// An entry that finds the loop busy with a request other than a heartbeat of that state skips the compare, and the loop makes it
+// once its requests are done: a change seen during a slow `pending`, claim or settle is published right after it, not at a later
+// tick. `hold(op)` holds the next answer of that operation and returns the function that ends the hold with an answer;
+// `refusal.code` is what an unheld heartbeat is answered with.
+async function slowSession() {
+  const gates = { pending: null, heartbeat: null }
+  const refusal = { code: null }
+  const entries = [] // the plan-mode entries of the session, newest last
+  const session = await presenceSession(op => gates[op] ?? (
+    op === "heartbeat" && refusal.code ? { refused: refusal.code } : op === "pending" ? { messages: [] } : {}))
+  session.ctx.sessionManager.getEntries = () => entries
+  const hold = op => {
+    let end
+    gates[op] = new Promise(resolve => { end = resolve })
+    return answer => { gates[op] = null; end(answer) }
+  }
+  return { ...session, entries, refusal, hold }
+}
+const PLAN_ON = { type: "custom", customType: "plan-mode", data: { enabled: true } }
+const PLAN_OFF = { type: "custom", customType: "plan-mode", data: { enabled: false } }
+const PRESENCE_CHANGES = [
+  {
+    name: "idle to busy",
+    apply: session => { session.state.idle = false },
+    revert: session => { session.state.idle = true },
+    shows: beat => beat.fields.state.native_state === "busy",
+  },
+  {
+    name: "Plan Mode on",
+    apply: session => { session.entries.push(PLAN_ON) },
+    revert: session => { session.entries.push(PLAN_OFF) },
+    shows: beat => beat.fields.state.plan_mode === true,
+  },
+]
+// What finds the loop busy: a poll tick, which also leaves a poll due, and an event that asks for a re-evaluation and sets no flag.
+const BUSY_ENTRIES = [
+  ["a poll tick", session => session.lifecycle.poll()],
+  ["a compaction event", session => session.emit("session_compact", { type: "session_compact" }, session.ctx)],
+]
+
+for (const change of PRESENCE_CHANGES) {
+  for (const [entryName, entry] of BUSY_ENTRIES) {
+    test(`${change.name} that ${entryName} finds during a held delivery poll goes out right after it, once, with no further tick`, async () => {
+      const session = await slowSession()
+      const { worker, beats } = session
+      const base = beats().length
+      const before = worker.requests.length
+      const release = session.hold("pending")
+      const flight = session.lifecycle.poll() // nothing has changed yet, so the loop sends only `pending`, and its answer is held
+      await flush()
+      assert.equal(worker.requests.at(-1).op, "pending")
+      change.apply(session)
+      await entry(session) // finds the loop busy and sends nothing
+      assert.equal(beats().length, base, "nothing goes out while the request is held")
+      release({ messages: [] })
+      await flight // no further tick, and no further event
+      assert.deepEqual(worker.requests.slice(before, before + 2).map(row => row.op), ["pending", "heartbeat"], "the change follows the request")
+      assert.equal(beats().length, base + 1)
+      assert.ok(change.shows(beats().at(-1)), "it carries the changed state")
+      await flush()
+      assert.equal(beats().length, base + 1, "exactly once: the confirmed state is not sent again")
+    })
+  }
+
+  test(`${change.name} that has reverted by the time the held delivery poll is released sends nothing`, async () => {
+    const session = await slowSession()
+    const { beats } = session
+    const base = beats().length
+    const release = session.hold("pending")
+    const flight = session.lifecycle.poll()
+    await flush()
+    change.apply(session)
+    await session.lifecycle.poll() // finds the loop busy
+    change.revert(session)
+    release({ messages: [] })
+    await flight
+    await flush()
+    assert.equal(beats().length, base, "presence reports the current state, and that is the one that was confirmed")
+  })
+}
+
+test("a change that the worker refuses after a recheck is not sent again in a loop: the next entry retries it once, as before", async () => {
+  const session = await slowSession()
+  const { lifecycle, beats } = session
+  const base = beats().length
+  session.refusal.code = "TRANSPORT_UNAVAILABLE" // a tolerated outage: each heartbeat is refused and stays unconfirmed
+  const release = session.hold("pending")
+  const flight = lifecycle.poll()
+  await flush()
+  session.state.idle = false
+  await lifecycle.poll() // the one entry that finds the loop busy asks for one compare
+  release({ messages: [] })
+  await flight
+  await flush()
+  assert.equal(beats().length, base + 1, "the recheck sent the change once, and its refusal does not send it again")
+  await lifecycle.poll() // an entry that finds the loop free compares and retries, once
+  assert.equal(beats().length, base + 2)
+  await flush()
+  assert.equal(beats().length, base + 2)
+  session.refusal.code = null
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 3, "the next entry's retry is confirmed")
+  await lifecycle.poll()
+  await flush()
+  assert.equal(beats().length, base + 3, "and then nothing more")
+})
+
+test("a heartbeat that is refused while an entry skipped is retried once for that entry, not in a loop", async () => {
+  const session = await slowSession()
+  const { lifecycle, beats } = session
+  const base = beats().length
+  session.state.idle = false
+  const release = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds the change and sends it, and its answer is held
+  await flush()
+  assert.equal(beats().length, base + 1)
+  session.refusal.code = "TRANSPORT_UNAVAILABLE" // every heartbeat after that one is refused as well
+  await lifecycle.poll() // finds the loop busy: nothing is sent, and one compare is asked for
+  assert.equal(beats().length, base + 1)
+  release({ refused: "TRANSPORT_UNAVAILABLE" })
+  await flight
+  await flush()
+  assert.equal(beats().length, base + 2, "one try for the entry that skipped, and that refusal ends it")
+  assert.ok(beats().slice(base).every(row => row.fields.state.native_state === "busy"))
+})
+
 // One Pi extension runtime: the real factory on its own extension API, for the session `native`, with a worker that joins as
-// `instance`. Pi builds one for every session start. `log` records the order of the joins.
-function runtime(native, instance = joined, log = []) {
+// `instance`. Pi builds one for every session start. `log` records the order of the joins; `extra` replaces options, such as the timers.
+function runtime(native, instance = joined, log = [], extra = {}) {
   const fake = fakePi()
   fake.ctx.sessionManager.getSessionId = () => native
   const worker = fakeWorker({ ready: Promise.resolve(instance), holdClose: true })
   const starts = []
   agentChatExtension(fake.pi, {
-    config, ...timers, now: () => 1000,
+    config, ...timers, ...extra, now: () => 1000,
     startProcess: (_config, identity) => { log.push(`join ${native}`); starts.push(identity); return worker },
   })
   return { ...fake, worker, starts }
+}
+
+// Timers that run only when a test runs them. `log` lists every timer that was set, in order. `left(ms)` lists those of that
+// length that were neither run nor cleared, and `fire(ms)` runs them. A timer has `unrefs`, the count of its unref() calls.
+function manualTimeouts() {
+  const log = []
+  const left = new Set()
+  return {
+    log,
+    setTimeoutImpl: (fn, ms) => {
+      const timer = { fn, ms, unrefs: 0, unref() { timer.unrefs += 1; return timer } }
+      log.push(timer)
+      left.add(timer)
+      return timer
+    },
+    clearTimeoutImpl: timer => { left.delete(timer) },
+    left: ms => [...left].filter(timer => timer.ms === ms),
+    fire(ms) { for (const timer of [...left]) if (timer.ms === ms) { left.delete(timer); timer.fn() } },
+  }
 }
 const instanceTwo = {
   ...joined, session_id: "99999999-9999-4999-8999-999999999999", instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1367,6 +1546,153 @@ for (const { reason, native } of REPLACEMENTS) {
   })
 }
 
+// A rejoin episode that has stopped its worker, while the close of that worker is still pending (`holdClose`, as a process that takes
+// time to exit). fail() answers the next heartbeat with a refusal that proves the lease gone: the worker is stopped at once, and the
+// rejoin timer is `retries[0].fn`. The worker that joins next is `instanceTwo`. `live` no longer names the stopped worker, so only the
+// lifecycle's own record of what is still closing can tell a shutdown or a rejoin to wait for it. `retries` lists every timer that
+// the lifecycle sets; `clock` runs and counts them.
+async function rejoinTeardown() {
+  const { pi, emit, ctx, statuses, commands } = fakePi()
+  const clock = manualTimeouts()
+  const retries = clock.log
+  const workers = []
+  let refusal = null
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000, random: () => 0,
+    setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl,
+    startProcess: () => {
+      const first = workers.length === 0
+      const worker = fakeWorker({
+        ready: Promise.resolve(first ? joined : instanceTwo),
+        holdClose: first,
+        answer: op => (refusal && op === "heartbeat" ? { refused: refusal } : op === "pending" ? { messages: [] } : {}),
+      })
+      workers.push(worker)
+      return worker
+    },
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  return {
+    lifecycle, emit, statuses, commands, workers, retries, clock,
+    async fail() {
+      refusal = "STALE_INSTANCE"
+      await lifecycle.heartbeat()
+      refusal = null
+      assert.equal(workers[0].stops, 1, "the failure stopped the worker, and its close is held")
+      assert.equal(retries.length, 1, "a rejoin is scheduled")
+    },
+  }
+}
+
+test("a reload during a rejoin: session_shutdown waits for the worker that the rejoin stopped, and settles once it has closed", async () => {
+  const { emit, workers, statuses, fail } = await rejoinTeardown()
+  await fail()
+  assert.equal(statuses.at(-1), "Agent Chat: reconnecting")
+  // Pi awaits this handler before it starts the replacing runtime, which joins with the same native id.
+  const shutdown = Promise.all(emit("session_shutdown", { type: "session_shutdown", reason: "reload" }))
+  assert.equal(await stillPending(shutdown), true, "the handler is pending while the old worker is closing")
+  workers[0].release()
+  await shutdown
+  assert.equal(workers.length, 1, "no worker was started")
+})
+
+test("a rejoin starts its worker only after the old worker has closed, and two calls that wait start one", async () => {
+  const { lifecycle, workers, fail, retries } = await rejoinTeardown()
+  await fail()
+  retries[0].fn() // the rejoin timer fires while the old close is held
+  const second = lifecycle.connect() // and so does another call
+  await flush()
+  assert.equal(workers.length, 1, "no worker starts while the old one is closing")
+  assert.equal(lifecycle.binding(), null, "and no binding is published")
+  workers[0].release()
+  await flush()
+  await second
+  assert.equal(workers.length, 2, "one worker starts after the close, however many calls waited")
+  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
+})
+
+// What changed while the rejoin waited is checked again before it starts anything.
+for (const [name, interrupt] of [
+  ["the runtime shuts down", ({ emit }) => emit("session_shutdown", { type: "session_shutdown", reason: "reload" })],
+  ["chat is turned off", ({ commands }) => commands.find(row => row.name === "agent-chat-off").spec.handler()],
+]) {
+  test(`a rejoin that waits for the old worker starts nothing if ${name} meanwhile`, async t => {
+    resetLatchAfter(t)
+    const session = await rejoinTeardown()
+    await session.fail()
+    session.retries[0].fn()
+    await flush()
+    interrupt(session)
+    session.workers[0].release()
+    await flush()
+    assert.equal(session.workers.length, 1)
+  })
+}
+
+// A close that never comes, as from a process in uninterruptible sleep, must not hold a shutdown or a rejoin for ever. The wait
+// ends after 6000 ms, one second past the 5000 ms at which the worker sends SIGKILL (CLOSE_MS in lib/worker.js).
+const CLOSE_WAIT_MS = 6000
+
+test("a worker whose close never comes holds session_shutdown only until the bound", async () => {
+  const clock = manualTimeouts()
+  const old = runtime("native-1", joined, [], { setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl })
+  old.emit("session_start", { type: "session_start", reason: "startup" }, old.ctx)
+  await flush()
+  assert.equal(clock.log.filter(timer => timer.ms === CLOSE_WAIT_MS).length, 0, "a start with nothing closing waits for nothing")
+  const shutdown = Promise.all(old.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }))
+  assert.equal(old.worker.stops, 1)
+  assert.equal(await stillPending(shutdown), true, "the handler is pending: the close is held and the bound has not come")
+  assert.equal(clock.left(CLOSE_WAIT_MS).length, 1, "the wait sets one timer, of the length of the bound")
+  assert.equal(clock.left(CLOSE_WAIT_MS)[0].unrefs, 1, "unreferenced, so it never keeps Pi alive")
+  clock.fire(CLOSE_WAIT_MS)
+  await shutdown // settles at the bound, with the close still held
+  // A close that comes after the bound still leaves the set: another wait has nothing to wait for and sets no timer.
+  old.worker.release()
+  await flush()
+  await Promise.all(old.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }))
+  assert.equal(clock.log.filter(timer => timer.ms === CLOSE_WAIT_MS).length, 1, "no second timer")
+})
+
+test("a rejoin whose old worker never closes starts the new worker at the bound, not before", async () => {
+  const { lifecycle, workers, retries, clock, fail } = await rejoinTeardown()
+  await fail()
+  retries[0].fn() // the rejoin timer fires while the old close is held, and that close never comes
+  await flush()
+  assert.equal(workers.length, 1, "no worker starts before the bound")
+  assert.equal(clock.left(CLOSE_WAIT_MS).length, 1, "the rejoin waits on one timer, of the length of the bound")
+  clock.fire(CLOSE_WAIT_MS)
+  await flush()
+  assert.equal(workers.length, 2, "the bound ends the wait, and the rejoin starts its worker")
+  assert.match(lifecycle.binding(), /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
+})
+
+test("the timer of a shutdown that waits is cleared when the closes settle first", async () => {
+  const clock = manualTimeouts()
+  const old = runtime("native-1", joined, [], { setTimeoutImpl: clock.setTimeoutImpl, clearTimeoutImpl: clock.clearTimeoutImpl })
+  old.emit("session_start", { type: "session_start", reason: "startup" }, old.ctx)
+  await flush()
+  const shutdown = Promise.all(old.emit("session_shutdown", { type: "session_shutdown", reason: "reload" }))
+  assert.equal(clock.left(CLOSE_WAIT_MS).length, 1, "the wait set its timer")
+  old.worker.release()
+  await shutdown
+  assert.equal(clock.left(CLOSE_WAIT_MS).length, 0, "no timer is left once the close came first")
+  assert.equal(clock.log.filter(timer => timer.ms === CLOSE_WAIT_MS).length, 1)
+})
+
+test("the timer of a rejoin that waits is cleared when the closes settle first", async () => {
+  const { workers, retries, clock, fail } = await rejoinTeardown()
+  await fail()
+  retries[0].fn()
+  await flush()
+  assert.equal(clock.left(CLOSE_WAIT_MS).length, 1, "the wait set its timer")
+  workers[0].release()
+  await flush()
+  assert.equal(workers.length, 2, "the rejoin started its worker once the close came")
+  assert.equal(clock.left(CLOSE_WAIT_MS).length, 0, "no timer is left once the close came first")
+  assert.equal(clock.log.filter(timer => timer.ms === CLOSE_WAIT_MS).length, 1)
+})
+
 test("the extension ends its instance on session_shutdown only, never on session_before_switch or session_before_fork", () => {
   const { handlers } = runtime("native-1")
   assert.ok(handlers.has("session_shutdown"))
@@ -1408,7 +1734,11 @@ test("the off latch outlives its extension instance: a replaced runtime starts n
   await flush()
   old.commands.find(row => row.name === "agent-chat-off").spec.handler()
   assert.equal(old.statuses.at(-1), "Agent Chat: no live instance")
-  await Promise.all(old.emit("session_shutdown", { type: "session_shutdown", reason: "new" }))
+  // The off command stopped the worker, and its close is held: Pi awaits the shutdown, so the shutdown waits for that close.
+  const shutdown = Promise.all(old.emit("session_shutdown", { type: "session_shutdown", reason: "new" }))
+  assert.equal(await stillPending(shutdown), true, "the shutdown is pending while the worker that the off command stopped is closing")
+  old.worker.release()
+  await shutdown
   for (const { reason, native } of REPLACEMENTS) {
     const next = runtime(native)
     next.emit("session_start", { type: "session_start", reason }, next.ctx)

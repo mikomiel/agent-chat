@@ -189,6 +189,66 @@ test("a wall clock that is set back cannot keep a lapsed monotonic lease live", 
   assert.equal(lease.expired(), false, "only a confirmed request restores it")
 })
 
+// A lapse is latched, whichever clock showed it. One that only the wall clock showed, as after a suspend, must not clear when the
+// wall clock is set back to before its deadline while the monotonic deadline is still ahead: the footer keeps the text until a
+// request is confirmed. The tracker below holds such a lapse.
+function wallLapse() {
+  const state = tracker()
+  state.lease.confirm(state.lease.stamp())
+  state.time.jumpWall(91_000) // the host slept for 91 s: the monotonic clock and its timer stood still
+  assert.equal(state.lease.expired(), true)
+  state.time.jumpWall(-91_000) // the wall clock is set back to where it was; the monotonic deadline is 90 s ahead
+  return state
+}
+
+test("a lapse that only the wall clock showed holds when the wall clock is set back before the monotonic deadline", () => {
+  const { time, lease } = wallLapse()
+  assert.equal(lease.expired(), true)
+  time.advance(30_000)
+  assert.equal(lease.expired(), true, "and it stays over while the monotonic deadline is still ahead")
+  time.advance(60_000)
+  assert.equal(lease.expired(), true, "and once that deadline has passed too")
+})
+
+test("a confirmed request of the current epoch ends a latched lapse and reports the restore", () => {
+  const { time, lease, changes } = wallLapse()
+  lease.confirm(lease.stamp())
+  assert.equal(lease.expired(), false)
+  assert.deepEqual(changes, [0], "the restore is reported")
+  time.advance(89_999)
+  assert.equal(lease.expired(), false, "the new lease counts from that request, and no latch is left over")
+  time.advance(1)
+  assert.equal(lease.expired(), true)
+})
+
+test("a confirm with a stamp of an ended epoch does not end a latched lapse", () => {
+  const { time, lease, changes } = tracker()
+  const stale = lease.stamp() // taken by an instance that has since ended
+  lease.reset()
+  lease.confirm(lease.stamp()) // the next instance's own join
+  time.jumpWall(91_000)
+  assert.equal(lease.expired(), true)
+  time.jumpWall(-91_000)
+  lease.confirm(stale)
+  assert.equal(lease.expired(), true, "the reply of an ended instance restores nothing")
+  assert.deepEqual(changes, [])
+  lease.confirm(lease.stamp())
+  assert.equal(lease.expired(), false, "a request of this epoch does")
+})
+
+test("reset ends a latched lapse, and the next epoch starts with none", () => {
+  const { time, lease, changes } = wallLapse()
+  lease.reset()
+  assert.equal(lease.expired(), false, "no instance is held, so nothing is expired")
+  lease.confirm(lease.stamp())
+  assert.equal(lease.expired(), false, "the next instance starts unlatched")
+  assert.deepEqual(changes, [])
+  time.advance(89_999)
+  assert.equal(lease.expired(), false)
+  time.advance(1)
+  assert.equal(lease.expired(), true)
+})
+
 test("the wall deadline runs from the send, not from the reply", () => {
   const { time, lease } = tracker()
   const stamp = lease.stamp() // sent at wall second 0
