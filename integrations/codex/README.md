@@ -205,8 +205,8 @@ sends its request: it does not wait for the worker to end its instance.
   `CHAT_PROTOCOL_INVALID`; a binding is never joined and then left unshown.
 - **Presence.** A heartbeat every 30 seconds, and one on every state change,
   carries `native_state`, `stopped` and `plan_mode`. It carries no title. The
-  flags are facts of their own: `plan_mode` follows the Plan Mode rule (see
-  State), and `stopped` follows the running state alone, whatever the Plan
+  flags are facts of their own: `plan_mode` comes from the last-started read
+  that confirmed the mode (see State), and `stopped` follows the running state alone, whatever the Plan
   Mode: a local stop, an interruption that a read found, or a state that is
   neither idle nor busy (unknown, offline). `native_state` is `unknown` in Plan
   Mode. Delivery is still decided by one state, Plan Mode first (see Busy
@@ -268,21 +268,62 @@ sends its request: it does not wait for the worker to end its instance.
   state, so the refresh does not repeat; one that failed, found the thread
   offline or was overtaken by a hook event is dropped, and the poll waits 10
   seconds before it reads again. Polls never overlap. Once a hook event has
-  discarded the last read, Plan Mode follows the hook's hint alone, as in the
-  Claude and Pi packages: `plan` sets it and a later hook with another mode
-  ends it. The hint can be stale, since a session put into Plan Mode while a
-  turn runs is not seen until a hook payload says so (authoritative Plan Mode
-  for busy delivery: #152). A bind that leaves the thread unbound (the provider
-  changed) discards the last read too, and no read is taken while the thread
-  stays unbound: the state follows the hooks, as for a session without a
-  control socket.
+  discarded the last read, the state that decides delivery follows the hook's
+  hint, which can only refuse an output there: every chat output during a
+  running turn takes a mode read of its own (see Busy delivery). The heartbeat keeps a
+  record of its own: `plan_mode` comes from the read of any kind that confirmed
+  the mode and started last (a heartbeat read, a wake's reading, a hook's mode
+  read), whenever its answer came, and a hook event does not discard it (a
+  heartbeat read that a hook event overtook is still dropped). Only a read that
+  started later and confirms another mode lifts a Plan reading; a hint, an
+  unknown mode, a failed read and an answer after the read's time do not, and
+  they drop nothing. A `plan` hint still reports Plan Mode, unless a read that
+  started after its hook event confirmed another mode. A hook's mode read that
+  changes the Plan Mode reported queues a heartbeat at once, as any other change
+  of state does; the hook does not wait for it. The read before a receipts
+  notice records only Plan Mode: its `default` lets that notice out and lifts
+  nothing (a notice may withhold an output, never let one out). The server
+  offers nothing while
+  the heartbeat reports Plan Mode, so while it does, a hook that may claim
+  takes a mode read before its state report, and that read can lift it. A bind
+  that leaves the thread unbound (the provider changed) discards the last read
+  and that record too, and no read is taken while the thread stays unbound:
+  the state follows the hooks, as for a session without a control socket.
 - **Busy delivery.** A `prompt` or `tool` hook asks the receiver for a batch
   while the turn runs. The receiver claims only when the session is busy, and
   never in Plan Mode, while stopped or in an unknown state. A turn hook has one
   deadline, its own limit: the wait for the reply is what is left of it after
   the connect (at most 7.5 seconds), and the receiver gets that wait less 1.5
   seconds (at most 6) for the whole reply, its state report included. The
-  receiver starts a claim only with 2.5 seconds of that left. When the claim is
+  receiver starts a claim only with 2.5 seconds of that left. With `appServer`
+  and a bound thread, one rule holds for every chat output during a running
+  turn, a claimed batch and a staged receipts notice alike: right before the claim
+  (after the `pending` answer) and right before the notice, the receiver reads
+  the thread's collaboration mode on a connection of its own
+  (`thread/loaded/list`, then `thread/resume` with `excludeTurns`), and only a
+  read that confirms `default` lets the output out. The read starts after the
+  hook event arrived, so no read taken before it authorizes the output. It
+  must end 2.5 seconds (the claim margin) before the hook's deadline and takes
+  at most 3 seconds (the bind's read limit): with the longest patience, 6
+  seconds, that is at most 3 of the 3.5 seconds above the margin, less the
+  state report and the `pending` request. An answer that comes at the end of
+  that time or later is no answer, even when it is handled before the timer.
+  Plan Mode, another or unknown mode, a refused or failed read and a timeout
+  give no claim and no output, and settle nothing: the batch stays pending, and
+  a staged notice is dropped unmarked, so a later poll offers its rows again.
+  Reads of the mode overlap (two hooks of one turn, a claim and a notice), and
+  their answers can come in any order, so they are ordered by when they started:
+  a read that started after the hook's own and confirmed Plan Mode refuses the
+  output too, whether it answered first or answers before the write. A claimed
+  batch that it refuses right before the write settles `deferred` with reason
+  `plan`. The hook is still answered. A binding announcement carries no chat
+  content, so the mode read does not gate it: a hook with nothing else to carry
+  still outputs a binding whose write is not confirmed yet, in any mode, as
+  session start does. The `permission_mode` hint can only refuse. Without `appServer`, or while the
+  thread is unbound, nothing is read and the hint decides; a claim that the
+  hint allowed hands nothing, and settles `deferred` with reason `unknown`,
+  when a bind (a heartbeat tick, which reads nothing while the session is
+  busy) has bound the thread before the write. When the claim is
   granted, after the status request, and right before the notice is written,
   it checks that the hook is still connected and in time; a hook that is not
   gets nothing more (after the grant, not even a status request). This check
@@ -433,7 +474,8 @@ sends its request: it does not wait for the worker to end its instance.
   delivery. A hook that is out of patience, or whose connection has closed, gets
   no notice, and the notice stays staged. A wake carries none, and nothing polls
   while the session is idle, so a receipt cannot wake the thread. The notice is
-  checked again when a hook would carry it, with no request: the latest mute
+  checked again when a hook would carry it, with no request to the worker (the
+  mode read of Busy delivery goes to the app-server): the latest mute
   flag any worker answer carried must be `false` and the notice at most 5
   seconds old on the wall clock, so a suspend ages it, otherwise it is dropped
   (an age that is negative or not a number counts as too old), the hook is
@@ -540,7 +582,8 @@ sends its request: it does not wait for the worker to end its instance.
 
 The `appServer` field names a Codex app-server control socket. The receiver uses
 it for the thread check before every join, the heartbeat's read of the thread's
-state and the idle wake. Only the wake writes to the thread: one queued user
+state, the mode read before an output during a running turn (see Busy
+delivery) and the idle wake. Only the wake writes to the thread: one queued user
 turn per attempt.
 
 The documented topology is `codex app-server --listen unix://<path>` with the
@@ -554,7 +597,11 @@ a minimal RFC 6455 WebSocket over `node:net` and speaks JSON-RPC. It opens with
 `thread/turns/list` and `thread/items/list`, and the experimental
 `thread/queue/add` and `thread/queue/delete`. Only `thread/queue/add` starts a
 turn. `thread/resume` subscribes the connection to the thread's events, so the
-connection is closed as soon as the read ends. A wake opens two connections to
+connection is closed as soon as the read ends. A resume of a running thread
+also sends that connection the thread's pending server requests (an approval,
+say), and the app-server takes the first answer from any connection, an error
+included. The other connections answer a server request with an error; the
+mode read, the one read taken while a turn runs, answers none. A wake opens two connections to
 the same checked socket (the same device and inode): the one that carries the
 add, the fence and the confirmation, opened first and never asked
 `thread/resume`, and one for the reading, closed before the add goes out.
@@ -717,6 +764,19 @@ rule has already excluded.
    change that the status cannot show: the thread is idle after it too. A read
    that finds a child ends chat, when the read is still current; one that a hook
    event overtook, or that a retired worker started, is dropped.
+3. **Mode read.** Before an output during a running turn (see Busy delivery)
+   the receiver reads the mode alone, whatever the thread's status:
+   `thread/loaded/list`, then `thread/resume` with `excludeTurns`. A thread
+   that is not in the loaded list is not resumed, since a resume would load it.
+   `plan` is Plan Mode, `default` is not, and everything else is unknown:
+   another mode, no mode, a refused resume, an error, a timeout, and a resume
+   record that the heartbeat read would not take (missing, another thread's,
+   incomplete or a child's), that does not name the provider that the bind
+   fixed, or whose status is not `idle` or `active`. Unlike the heartbeat
+   read, which keeps a mode next to a status it does not know (`systemError`,
+   say), this read decides an output, so any other status is unknown. The connection answers no
+   server request. A child found here ends nothing; the next heartbeat read
+   decides.
 
 ## Known limits
 
@@ -735,15 +795,52 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   `plugin.json` at the plugin root. Local marketplace setup and hook trust
   review were not run. A hook that is not trusted is skipped, and chat stays
   off without a message.
-- **Plan Mode from a hook.** Whether `permission_mode` `plan` in a hook payload
-  follows the Plan collaboration mode is not confirmed, and the hint can be stale.
-  The app-server read is the authority when it answers, but a hook event
-  discards it, and no read is taken while a turn runs: Plan Mode for busy
-  delivery follows the hint alone (see State), so a session put into Plan Mode
-  during a turn is seen only if a hook payload says so. An authoritative Plan
-  Mode for busy delivery is tracked in #152. A staged receipts notice uses the
-  same hint, so a switch to Plan Mode while a hook waits on its own request can
-  still show and mark one receipt notice.
+- **The mode of the running turn.** The mode read takes `collaborationMode`
+  from `thread/resume`: the thread's mode, which `thread/settings/update` sets
+  "for subsequent turns". The protocol types of codex-cli 0.172.0 have no
+  request that reads the mode of the turn that runs: `thread/read` carries no
+  mode, and `turn/settings/update` cannot change it. So a switch to Plan Mode
+  during a turn holds output from the next read on, whether or not the running
+  turn changed mode, and a client that keeps the switch to itself until its
+  next `turn/start` is not seen until then. Whether `permission_mode` `plan` in
+  a hook payload follows the Plan collaboration mode is not confirmed either;
+  it can only refuse. Without `appServer`, or while the thread is unbound,
+  delivery and receipts follow the hint alone, and a stale hint can let one
+  output into a turn in Plan Mode.
+- **A mode read while a turn runs.** The read resumes a running thread, which
+  subscribes its connection and sends it the thread's pending server requests.
+  The connection answers none of them and is closed after the answer, which
+  leaves them to the session's own client. One local run against codex-cli
+  0.172.0, with a stub model provider on the loopback interface and no Codex
+  session client or plugin hook, observed this (`lib/appserver.js` driven by a
+  script):
+  - during a running turn, and inside a sync `UserPromptSubmit` hook of the
+    thread's first prompt that slept 3 seconds, each mode read answered in 7
+    to 10 ms;
+  - a `thread/settings/update` to `plan` during a running turn made the next
+    read answer Plan Mode at once, and the turn ran on to its end;
+  - with a command approval pending, a resume sent that approval to the new
+    connection. After the mode read closed, the session's client accepted the
+    approval and the command ran. A connection that answered it with an error
+    settled it instead: the command was rejected with "approval request
+    failed";
+  - before the thread's first turn the resume was refused (-32600 "no rollout
+    found"), and the read was unknown. At the first prompt hook it answered.
+
+  A second run, which bound the thread first, as the receiver does, took the
+  read with its record checks (origin, `ephemeral`, the bound provider): idle
+  after a turn and during a running turn, the resume record carried `id`,
+  `status` (`idle`, then `active`), `source` (`vscode`, the origin of a thread
+  that an app-server client starts), `ephemeral` false and the bound
+  `modelProvider`, and each read answered `default` in 7 to 9 ms. Not
+  observed: whether the TUI calls `thread/settings/update` when Plan Mode is
+  switched, and whether the turn that runs takes the switch. Each output
+  during a running turn costs one more connection (`initialize`,
+  `thread/loaded/list`, `thread/resume`); a hook with nothing to output opens
+  none, except while the heartbeat reports Plan Mode. A read that hangs costs
+  each such hook up to 3 seconds; nothing backs off. A Plan reading that is
+  still held at `Stop` stays published until the next heartbeat read, so an
+  idle wake can wait up to 30 seconds for it instead of 2.
 - **`thread/resume` as a read.** The Plan Mode read uses `thread/resume` with
   `excludeTurns`, which subscribes the connection to the thread; the receiver
   closes the connection straight after the answer. A thread with no turn yet

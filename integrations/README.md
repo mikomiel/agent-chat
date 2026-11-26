@@ -340,6 +340,10 @@ The rules below bind every package that shows receipts.
   and never calls `agent.steer`. `claude-code` uses only the reply of a `UserPromptSubmit` or `PostToolUse` hook: never
   `Stop`, never the idle-wake waiter, never exit code 2. `codex` uses only the reply of a prompt or tool hook of a running
   turn; a wake carries no receipt, even when one is waiting. A package never asks for receipts while the session is idle.
+  A pending receipt changes no claim, handoff, settle, heartbeat, binding announcement or wake, with one exception: the
+  read of the collaboration mode that `codex` takes before a notice. Plan Mode that it confirms can withhold an output
+  (another hook's claimed batch then settles `deferred` with reason `plan`) and set `plan_mode`. Another mode that it
+  confirms lets that notice out and changes nothing else: it never lifts Plan Mode.
 - **When a package offers receipts.** The session is joined and chat is not failed, its native state is `busy` (not idle,
   Plan Mode, stopped, unknown or offline; for `deepseek`, a running turn, since an idle agent with a parked inbox item is
   busy only for a delivery), and the worker's answer says `muted === false`. The worker reads
@@ -360,7 +364,10 @@ The rules below bind every package that shows receipts.
   staged the notice was sent at most 5 seconds before, so an answer read late, after a suspend, is never fresher than
   its request. The four packages count those seconds on the wall clock, so a
   suspend ages a notice, and an age that is negative or not a number drops it. `deepseek` also drops it unless its
-  native state, read again without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and
+  native state, read again without side effect, is a running turn outside Plan Mode. `codex`, with `appServer` and a
+  bound thread, also drops it unless a read of the thread's collaboration mode, taken by that hook after its event
+  arrived and right before the output, confirms a mode other than Plan Mode in its time, and no read that started
+  later has confirmed Plan Mode: the rule its claims follow too ([its README](codex/README.md), Busy delivery). A dropped notice is not marked: its ids stay on the server and
   a later poll offers them again. `claude-code` and `codex` answer the hook as for any reply with nothing to carry.
   `pi` hands a notice to Pi in the pass that got the answer, so it has no later boundary of its own. It makes the same
   check right before it hands the notice over, so an answer read after a suspend gives Pi nothing, and the rows are
@@ -496,6 +503,10 @@ Limits that remain:
   one commits the outcome the worker reported. Issue #177 stays open.
 - A receipt that waits while the session is muted, idle, stopped or in Plan Mode is not lost: it stays on the server until
   a later poll finds the session able to show it, or the message expires.
+- `codex` reads Plan Mode from its app-server, and only with `appServer` and a bound thread. That read gives the thread's
+  mode, the one the next turn takes; no request reads the mode of the turn that runs, so a switch during a turn holds
+  output from the next read on. Without `appServer`, or while the thread is unbound, `codex` follows the hook's
+  `permission_mode` hint, as `claude-code` does, and a stale hint can let one notice into a turn in Plan Mode.
 - The output-time check cannot see a mute that lands after the last answer that carried the flag and less than 5 seconds
   before the output. The notice is then shown and its ids are marked, and the next poll sees the mute. A notice is data,
   not an instruction, so the cost is one notice shown to a session that was just muted.
