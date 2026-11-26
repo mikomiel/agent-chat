@@ -600,7 +600,7 @@ A package that shows sender receipts MUST offer them only while the session is j
 - **AND** the receipts stay pending on the server
 
 ### Requirement: A staged sender receipts notice is checked again when it is output
-A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT make a request to do so. It MUST drop the notice unless the latest worker answer's `muted` flag is `false` (a `status` answer without a boolean one makes it unknown) and the request that asked for the notice was written at most 5 seconds before. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
+A package that stages a receipts notice and outputs it at a later boundary MUST check it again at that boundary and MUST NOT ask the worker or the server to do so. It MUST drop the notice unless the latest worker answer's `muted` flag is `false` (a `status` answer without a boolean one makes it unknown) and the request that asked for the notice was written at most 5 seconds before. A dropped notice MUST NOT be marked, and its rows MUST be offered again.
 
 #### Scenario: A mute after the notice was staged
 - **WHEN** a `status` answer says the session is muted, or more than 5 seconds pass after the request that staged a notice was written, and before its output
@@ -626,6 +626,35 @@ A package that stages a receipts notice and outputs it at a later boundary MUST 
 #### Scenario: Plan Mode after the notice was staged
 - **WHEN** `deepseek` finds its native state idle, stopped, unknown or in Plan Mode at the step that would carry a staged notice
 - **THEN** no message is appended and the ids are not marked
+
+### Requirement: `codex` outputs into a running turn only after a fresh read of the collaboration mode
+While its app-server thread is bound, `codex` MUST read the thread's collaboration mode right before each claim of a prompt or tool hook and before it outputs a staged receipts notice. The read MUST start after that hook event arrived and end 2.5 seconds before the hook's deadline, within 3 seconds. Only a read that confirms a mode other than `plan` MAY let the output out. The `permission_mode` hint MAY only refuse it.
+
+#### Scenario: Plan Mode in the app-server while the hook says default
+- **WHEN** the hook's `permission_mode` is `default` and the read finds the mode `plan`
+- **THEN** nothing is claimed, no batch or notice is output and nothing is settled
+- **AND** the hook is answered as for a reply with nothing to carry
+
+#### Scenario: Plan Mode set while the hook's `pending` request is out
+- **WHEN** the mode changes to `plan` after the hook event arrived and before the hook's read
+- **THEN** no batch is claimed, no receipts notice is output and no receipt is marked
+- **AND** a later poll offers the rows of the dropped notice again
+
+#### Scenario: A read that fails, times out or is malformed
+- **WHEN** the read is refused, fails, gives an unknown mode, answers in another shape or does not end in its time
+- **THEN** nothing is claimed or output and nothing is settled
+- **AND** the hook is answered and chat stays on
+
+#### Scenario: A read taken before the hook event
+- **WHEN** only a read that started before the hook event confirmed a mode other than `plan`
+- **THEN** that read authorizes no output of that hook
+
+### Requirement: The `codex` heartbeat reports Plan Mode from the newest read of the mode
+`codex` MUST report `plan_mode` from the newest read that confirmed the collaboration mode, and a hook event MUST NOT discard that read. Only a newer read that confirms a mode other than `plan` MAY lift a Plan reading; a `permission_mode` hint, an unknown mode and a failed read MUST NOT. A `plan` hint MUST report Plan Mode unless a read that started after its hook event confirmed another mode.
+
+#### Scenario: A Plan reading during a running turn
+- **WHEN** a hook's read finds the mode `plan` and later hooks say `default`
+- **THEN** the heartbeat reports `plan_mode` true until a newer read confirms another mode
 
 ### Requirement: A receipts pass sends one request and reads the native state without side effect
 A package's receipts pass MUST send at most one receipts request: the mark that waits or, when none waits, the feed poll. A mark that is not accepted MUST hold the feed poll until it lands. A pass that sends nothing MUST NOT delay the next one. `deepseek` MUST read its native state for receipts with a read that does not stop chat, log a warning or fence a delivery, and a state that read cannot classify MUST hold receipts for that pass and change nothing else.

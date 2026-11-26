@@ -999,6 +999,74 @@ test("a server that cannot be reached, or that sends a malformed answer, is offl
 })
 
 // A confirmation page that shows this attempt's userMessage, as codex-cli 0.171.0 lists it.
+// ---- readMode ----------------------------------------------------------------------------------------------------
+
+// The read that a turn hook takes before an output during a running turn: the collaboration mode, whatever the status.
+async function modeWith(over, { ms = 3_000 } = {}) {
+  return withServer(main(over), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    await bound.bind()
+    server.log.length = 0
+    const started = Date.now()
+    const result = await bound.readMode({ ms })
+    return { result, methods: server.methods(), server, took: Date.now() - started }
+  })
+}
+const ACTIVE = { status: { type: "active", activeFlags: [] } }
+const activeResume = mode => ({ "thread/resume": () => ok({ thread: thread(ACTIVE), collaborationMode: mode }) })
+
+test("the mode read takes the mode of a running thread: the loaded list, then the resume, and nothing else", async () => {
+  for (const [mode, plan] of [["plan", true], ["default", false]]) {
+    const { result, methods, server } = await modeWith(activeResume({ mode, settings: {} }))
+    assert.deepEqual(result, { plan }, mode)
+    assert.deepEqual(methods, ["initialize", "thread/loaded/list", "thread/resume"], mode)
+    assert.deepEqual(server.log.at(-1).params, { threadId: THREAD, excludeTurns: true })
+    for (let waited = 0; server.state.open && waited < 1000; waited += 10) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(server.state.open, 0, `${mode}: no connection outlives the read that subscribed it`)
+  }
+})
+
+test("a mode read that cannot confirm a mode answers null, and a thread that is not loaded is not resumed", async () => {
+  const notLoaded = await modeWith({ "thread/loaded/list": () => ok({ data: [], nextCursor: null }) })
+  assert.deepEqual(notLoaded.result, { plan: null })
+  assert.deepEqual(notLoaded.methods, ["initialize", "thread/loaded/list"], "a resume would load it")
+  for (const [label, over] of [
+    ["another mode", activeResume({ mode: "future-mode", settings: {} })],
+    ["no mode", activeResume(null)],
+    ["no collaborationMode", { "thread/resume": () => ok({ thread: thread(ACTIVE) }) }],
+    ["a refused resume", { "thread/resume": () => ({ error: { code: -32600, message: "no rollout found" } }) }],
+    ["no record", { "thread/resume": () => ok({ collaborationMode: { mode: "default", settings: {} } }) }],
+    ["another thread's record", { "thread/resume": () => ok({ thread: thread({ id: "thread-2" }), collaborationMode: { mode: "default", settings: {} } }) }],
+    ["a child's record", { "thread/resume": () => ok({ thread: thread({ parentThreadId: "parent" }), collaborationMode: { mode: "default", settings: {} } }) }],
+    ["a mode that is not a string", activeResume({ mode: ["default"], settings: {} })],
+  ]) assert.deepEqual((await modeWith(over)).result, { plan: null }, label)
+})
+
+test("a mode read ends within its time: a resume that never answers is null", async () => {
+  const { result, took } = await modeWith({ "thread/resume": () => undefined }, { ms: 200 })
+  assert.deepEqual(result, { plan: null })
+  assert.ok(took < 1_500, `took ${took} ms`)
+})
+
+// The other reads answer a server request with an error (see "ping is answered with pong, a server request is refused"); a
+// resume of a running thread sends its pending requests to the connection, and the app-server takes an error reply from any
+// connection as the answer.
+test("a mode read answers no server request: a pending approval replayed to its connection stays with the session's own client", async () => {
+  await withServer(main({
+    "thread/resume": (_message, { send }) => {
+      send({ id: 77, method: "item/commandExecution/requestApproval", params: { threadId: THREAD } })
+      return ok({ thread: thread(ACTIVE), collaborationMode: { mode: "default", settings: {} } })
+    },
+  }), async (path, server) => {
+    const bound = createThread({ path, threadId: THREAD })
+    await bound.bind()
+    assert.deepEqual(await bound.readMode({ ms: 3_000 }), { plan: false })
+    for (let waited = 0; server.state.open && waited < 1000; waited += 10) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.equal(server.state.open, 0, "the server has read everything the connection sent before it closed")
+    assert.deepEqual(server.state.replies.filter(reply => reply.id === 77), [], "the approval is not answered, so it is not aborted")
+  })
+})
+
 const confirmedItems = { "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) }
 
 // The newest turn is looked up after the mode. A lookup that fails, or answers in a way that is not the documented one, reads

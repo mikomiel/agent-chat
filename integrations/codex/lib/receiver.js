@@ -103,6 +103,10 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   let planHint = false // the last hook payload said permission_mode "plan"
   let stopped = false // an Interrupt hook ran; only the next UserPromptSubmit clears it
   let observed = null // the last app-server read: { status, stopped, plan }; any hook event, and a bind that leaves the thread unbound, discards it
+  // The newest read that confirmed the mode, of any kind: { plan, epoch }, `epoch` the hook generation it started in. The
+  // heartbeat's alone: a hook event does not discard it, and it never authorizes an output. A bind that leaves the thread
+  // unbound discards it.
+  let reading = null
   let epoch = 0 // counts hook events, so a read that began before one is not kept
   let reads = 0 // counts the thread reads that have started, so a read that a newer one overtook is not kept
   let threadBound = false // the newest bind found a main thread whose provider is the one that was fixed, and its queue probe finished
@@ -171,7 +175,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // The read's two answers stand apart: a mode it confirmed (`plan` true or false) decides Plan Mode even when the running
   // state is unknown, and one it could not tell (`plan: null`) leaves Plan Mode to the hook's `permission_mode` hint. A read
   // is newer than the hooks' idle, so while one is held the thread is idle only when the read shows it idle and not in Plan
-  // Mode: a read that said unknown keeps the running state unknown, whatever the hint.
+  // Mode: a read that said unknown keeps the running state unknown, whatever the hint. A hook event discards the read, so
+  // during a running turn this is the hint, which can only refuse an output there: each output takes a read of its own
+  // (modeAllows).
   const planMode = () => (observed !== null && observed.plan !== null ? observed.plan : planHint)
 
   // The running state, whatever the Plan Mode: offline, stopped, busy, idle (null) or unknown. A held read whose mode is not
@@ -187,11 +193,18 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // What a hook consumer may be given: the state that decides delivery, one word, Plan Mode first.
   const chatState = () => (!failure && planMode() ? "plan" : running())
 
+  // The Plan Mode that the heartbeat reports: the newest read that confirmed the mode, whatever hook events came since. A
+  // `plan` hint still reports Plan Mode, unless a read that started after the hook event that gave it confirmed another
+  // mode. Only a newer read that confirmed another mode lifts a Plan reading; a hint, an unknown mode and a failed read do not.
+  const reportedPlan = () => reading?.plan === true || (planHint && !(reading?.plan === false && reading.epoch === epoch))
+  const noteReading = (plan, at) => { if (typeof plan === "boolean") reading = { plan, epoch: at } }
+
   // No title: hooks carry none and this version reads none. Omitting the field preserves the stored title. The flags are
-  // facts of their own, not the one word that decides delivery: `plan_mode` is the Plan Mode rule, and `stopped` is the
-  // running state's, whatever the Plan Mode: an interruption, or a state that is neither idle nor busy (unknown, offline).
+  // facts of their own, not the one word that decides delivery: `plan_mode` is the Plan Mode the heartbeat reports, and
+  // `stopped` is the running state's, whatever the Plan Mode: an interruption, or a state that is neither idle nor busy
+  // (unknown, offline).
   function heartbeatState() {
-    const plan = !failure && planMode()
+    const plan = !failure && reportedPlan()
     const state = running()
     return {
       native_state: plan ? "unknown" : state === null ? "idle" : state === "busy" ? "busy" : "unknown",
@@ -382,6 +395,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
       // a mode it does not know): it is newer than the hooks' idle. Only a read that failed or found the thread offline is
       // dropped, and the state follows the hooks.
       observed = result.observed.status === "offline" ? null : result.observed
+      noteReading(result.observed.plan, before)
     }
     return { ...result, current }
   }
@@ -390,7 +404,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // is taken while it is unbound, and the state follows the hooks, as it does without a control socket.
   function setBound(bound) {
     threadBound = bound
-    if (!bound) observed = null
+    if (!bound) { observed = null; reading = null }
   }
 
   // What a read means for the session, the same for the tick, the wake's clearing read and the poll's refresh: false when the
@@ -487,6 +501,38 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // that already refuses it. The clearing read decides the rest before a claim is made.
   const eligible = wake => (wake ? !NO_WAKE.has(chatState() ?? "") : chatState() === "busy")
 
+  // A fresh read of the collaboration mode for the turn hook whose reply ends at `deadline`. It is taken in that hook's own
+  // handler, so it starts after the hook event was received. It ends CLAIM_MARGIN_MS before the deadline, so a claim that
+  // follows still has its margin, and within READ_MS, the time a bind's read is given: with the hook's longest patience
+  // (6 s, lib/hook.js) that is at most 3 s of the 3.5 s above the margin. A late answer is dropped. Resolves true (Plan
+  // Mode), false (another mode it confirmed), or null (not known: no time left, an unknown mode, a refusal, a failure, a
+  // timeout). The answer is the newest read for the heartbeat only while no newer read started meanwhile.
+  async function readMode(record, deadline) {
+    const ms = Math.min(READ_MS, deadline - now() - CLAIM_MARGIN_MS)
+    if (!(ms > 0)) return null
+    const at = epoch
+    const mine = ++reads
+    let timer
+    const expired = new Promise(resolve => { timer = setTimeoutImpl(() => resolve(null), ms) })
+    const answer = await Promise.race([Promise.resolve().then(() => thread.readMode({ ms })).catch(() => null), expired])
+    clearTimeoutImpl(timer)
+    const plan = typeof answer?.plan === "boolean" ? answer.plan : null
+    if (mine === reads && live === record && threadBound) noteReading(plan, at)
+    return plan
+  }
+
+  // The one ordering rule for every output during a running turn, a claimed batch and a receipts notice alike: the output
+  // needs a read of the mode that the hook asking for it took after its event arrived, and right before the claim or the
+  // notice, that confirmed a mode that is not Plan Mode. Nothing older authorizes it: not the heartbeat's reading, not an
+  // earlier hook's read, not the `permission_mode` hint, which can only refuse. Plan Mode, an unknown mode, a refused or
+  // failed read and a timeout give no output, and nothing is settled for them. Without a control socket, and while the
+  // thread is unbound, nothing is read and the state follows the hooks: the hint decides, as it does for the other state.
+  async function modeAllows(record, link, deadline) {
+    if (!thread || !threadBound) return true
+    const plan = await readMode(record, deadline)
+    return plan === false && live === record && !closed && !failure && !link.closed && eligible(false) && deadline - now() >= CLAIM_MARGIN_MS
+  }
+
   // Send `text` to the consumer, then wait for its write receipt. Handed means the
   // hook wrote and flushed the output; it does not mean the model has read it. Right before the write the hook is asked once
   // more: one that is gone, or past its `deadline`, gets nothing, and nothing was written. Once the text is sent, only the
@@ -532,6 +578,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (fresh.reason === "child") return "offline"
     reads += 1
     observed = fresh.observed.status === "offline" ? null : fresh.observed
+    noteReading(fresh.observed.plan, epoch)
     if (fresh.reason === "stale_binding") setBound(false)
     return fresh.reason
   }
@@ -564,6 +611,7 @@ export function createReceiver(config, { sessionId, ownerPid }, {
         if (live !== record || brief(candidates) || check(candidates, "pending")) return false
         const ids = Array.isArray(candidates.messages) ? candidates.messages.filter(value => typeof value === "string") : []
         if (!ids.length || link?.closed || !eligible(wake) || deadline - now() < CLAIM_MARGIN_MS) return false
+        if (!wake && !(await modeAllows(record, link, deadline))) return false
         if (wake && (!(await clearToWake(record)) || live !== record)) return false
         const cleared = { epoch, reads } // the hook generation and the read sequence that the wake was cleared at
         // Bodies mode claims only what one notice can carry. A retry batch, or a reply without sizes, is claimed whole.
@@ -778,15 +826,18 @@ export function createReceiver(config, { sessionId, ownerPid }, {
   // The one place a notice reaches the model: the reply of a prompt or tool event that would otherwise carry nothing. It
   // is confirmed by the same write receipt a delivery waits for. Anything else leaves the ids unmarked, so the feed offers
   // them again: a duplicate notice is data; a lost one is not. A hook that is gone, or past its `deadline`, is sent no notice,
-  // as a delivery is: it stays staged for the next event. The notice is checked again here and asks the server nothing: the
+  // as a delivery is: it stays staged for the next event. The notice is checked again here and asks the worker nothing: the
   // latest mute flag any answer carried must be false and the notice at most one cadence old, counted from the request that
   // asked for it, by the wall clock; an age that is negative or not a number counts as too old. Otherwise the notice is
-  // dropped, and the hook is answered as for any other reply with nothing to carry.
+  // dropped, and the hook is answered as for any other reply with nothing to carry. The read of the mode (modeAllows) goes
+  // to the app-server.
   async function receiptsReply(link, deadline) {
     const notice = staged
     if (!notice || !live || !joined || closed || failure || chatState() !== "busy" || link.closed || deadline <= now()) return link.send({ context: null })
-    if (!receipts.showable(receiptState, notice.at, wall())) {
-      releaseReceipts()
+    // The ordering rule of a claim holds for the notice too (modeAllows). A notice it does not allow is dropped unmarked: its
+    // rows come back with a later feed.
+    if (!(await modeAllows(live, link, deadline)) || staged !== notice || !receipts.showable(receiptState, notice.at, wall())) {
+      if (staged === notice) releaseReceipts()
       return link.send({ context: null })
     }
     staged = null
@@ -835,7 +886,8 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     if (isDone(await link.next(2_000), "written")) confirm(announce)
   }
 
-  // A hook event is newer than any app-server read, so it discards the read. Only a prompt clears a local stop.
+  // A hook event is newer than any app-server read, so it discards the read; the heartbeat's reading stays (reportedPlan).
+  // Only a prompt clears a local stop.
   function setNative(request, running, event) {
     const mode = request.permission_mode
     planHint = mode === "plan"
@@ -865,6 +917,9 @@ export function createReceiver(config, { sessionId, ownerPid }, {
     let replied = false
     if (inflight || (wake && waking === wake)) void report() // a slow request never stacks up behind every tool call
     else {
+      // The server offers nothing while the heartbeat reports Plan Mode, and only a newer read lifts a Plan reading: a hook
+      // that may claim takes one before its state report. It authorizes nothing; the claim takes its own (modeAllows).
+      if (threadBound && reading?.plan === true && eligible(false)) await readMode(live, deadline)
       await report({ atOnce: true }) // the head of this hook's claim sequence
       replied = (await guard(deliver({ link, announce: announcement({ from }), deadline }))) === true
     }

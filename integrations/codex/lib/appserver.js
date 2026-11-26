@@ -139,8 +139,9 @@ function trusted(path, lstat) {
 // through the whole trust check, links included, so a link in it that has moved since, a replaced socket and any failure of
 // the check all answer false, whatever the real path of the connection still holds. `expect` is the identity of another
 // connection that this one must reach too: a socket that has been replaced since is refused as untrusted, before anything
-// is connected to. `lstat` replaces the file system that the trust check looks at, for tests.
-export function openAppServer(path, { createConnection = net.createConnection, connectMs = CONNECT_MS, lstat = lstatSync, expect = null } = {}) {
+// is connected to. `lstat` replaces the file system that the trust check looks at, for tests. `answerRequests` false leaves every
+// request from the server unanswered (see `readMode`).
+export function openAppServer(path, { createConnection = net.createConnection, connectMs = CONNECT_MS, lstat = lstatSync, expect = null, answerRequests = true } = {}) {
   return new Promise((resolve, reject) => {
     let identity
     try { identity = trusted(path, lstat) } catch (error) { return reject(error) }
@@ -193,7 +194,7 @@ export function openAppServer(path, { createConnection = net.createConnection, c
       if (message === null || typeof message !== "object") return fail("APP_SERVER_PROTOCOL")
       if (typeof message.method === "string") {
         // A request from the server (an approval, say) is not ours to answer; a notification is ignored.
-        if ("id" in message) void write(0x1, Buffer.from(JSON.stringify({ id: message.id, error: { code: -32601, message: "unsupported" } })))
+        if ("id" in message && answerRequests) void write(0x1, Buffer.from(JSON.stringify({ id: message.id, error: { code: -32601, message: "unsupported" } })))
         return undefined
       }
       const call = calls.get(message.id)
@@ -491,6 +492,30 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
       try {
         return await withConnection(link => evaluate(link))
       } catch { return { reason: "offline", observed: { status: "offline", stopped: false, plan: null } } }
+    },
+
+    // The collaboration mode alone, whatever the thread's status: the read that the receiver takes before an output during a
+    // running turn. `observe` cannot give it then, because it stops at a thread that is not idle. `plan` is true for "plan",
+    // false for "default", and null for anything else: another mode, a thread that is not loaded, a resume record that is
+    // missing, another thread's or a child's, an error, a timeout. A thread that is not loaded is not resumed, since a resume
+    // would load it. Every step ends within `ms`. `thread/resume` reports the thread's mode, the one that the next turn takes
+    // (`thread/settings/update` sets it "for subsequent turns"): no request reads the mode of the turn that runs.
+    // A resume of a running thread sends that connection the thread's pending server requests (an approval, say), and the
+    // first connection that answers one settles it: an error reply aborts it. So this connection answers none, and closing
+    // it leaves them to the session's own client.
+    async readMode({ ms }) {
+      const end = now() + ms
+      const left = () => end - now()
+      try {
+        return await withConnection(async link => {
+          if (!(await loaded(link, left))) return { plan: null }
+          const resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(left))
+          const record = resumed.thread
+          if (record === null || typeof record !== "object" || record.id !== threadId || isChildThread(record)) return { plan: null }
+          const mode = resumed.collaborationMode?.mode
+          return { plan: mode === "default" ? false : mode === "plan" ? true : null }
+        }, { connectMs: Math.max(1, Math.min(CONNECT_MS, left())), answerRequests: false })
+      } catch { return { plan: null } }
     },
 
     // Queue `text` as one user turn and fence it. Resolves { outcome, reason } for the settle call. Three things prove

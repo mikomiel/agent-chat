@@ -345,7 +345,10 @@ The rules below bind every package that shows receipts.
   staged the notice was sent at most 5 seconds before, so an answer read late, after a suspend, is never fresher than
   its request. The four packages count those seconds on the wall clock, so a
   suspend ages a notice, and an age that is negative or not a number drops it. `deepseek` also drops it unless its
-  native state, read again without side effect, is a running turn outside Plan Mode. A dropped notice is not marked: its ids stay on the server and
+  native state, read again without side effect, is a running turn outside Plan Mode. `codex`, with `appServer` and a
+  bound thread, also drops it unless a read of the thread's collaboration mode, taken by that hook after its event
+  arrived and right before the output, confirms a mode other than Plan Mode: the rule its claims follow too
+  ([its README](codex/README.md), Busy delivery). A dropped notice is not marked: its ids stay on the server and
   a later poll offers them again. `claude-code` and `codex` answer the hook as for any reply with nothing to carry.
   `pi` hands a notice to Pi in the pass that got the answer, so it has no later boundary of its own. It makes the same
   check right before it hands the notice over, so an answer read after a suspend gives Pi nothing, and the rows are
@@ -481,6 +484,10 @@ Limits that remain:
   one commits the outcome the worker reported. Issue #177 stays open.
 - A receipt that waits while the session is muted, idle, stopped or in Plan Mode is not lost: it stays on the server until
   a later poll finds the session able to show it, or the message expires.
+- `codex` reads Plan Mode from its app-server, and only with `appServer` and a bound thread. That read gives the thread's
+  mode, the one the next turn takes; no request reads the mode of the turn that runs, so a switch during a turn holds
+  output from the next read on. Without `appServer`, or while the thread is unbound, `codex` follows the hook's
+  `permission_mode` hint, as `claude-code` does, and a stale hint can let one notice into a turn in Plan Mode.
 - The output-time check cannot see a mute that lands after the last answer that carried the flag and less than 5 seconds
   before the output. The notice is then shown and its ids are marked, and the next poll sees the mute. A notice is data,
   not an instruction, so the cost is one notice shown to a session that was just muted.

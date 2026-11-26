@@ -1152,12 +1152,15 @@ test("an unknown operation is refused without touching the worker", async () => 
 // `adds` holds the wakes that got as far as the add frame: lib/appserver.js asks `proceed` right before writing it and
 // ends the wake as deferred, with the reason it was given, when it answers one.
 // `fresh` is the reading the wake takes on its own connection right before the add and hands to `proceed`.
+// `mode` answers the mode read that a turn hook takes before an output (`readMode`): not Plan Mode unless a test says so.
+// `modeReads` holds the options of each such read.
 const IDLE = { reason: null, observed: { status: "idle", stopped: false, plan: false } }
-function threadDouble({ bind = { status: "bound" }, route, observation = IDLE, wake = { outcome: "handed", reason: null }, fresh = IDLE } = {}) {
+function threadDouble({ bind = { status: "bound" }, route, observation = IDLE, wake = { outcome: "handed", reason: null }, fresh = IDLE, mode = { plan: false } } = {}) {
   const thread = {
-    opened: [], calls: [], wakes: [], adds: [], route,
+    opened: [], calls: [], wakes: [], adds: [], modeReads: [], route,
     async bind(options) { thread.calls.push("bind"); return typeof bind === "function" ? bind(options) : bind },
     async observe() { thread.calls.push("observe"); return typeof observation === "function" ? observation() : observation },
+    async readMode(options) { thread.modeReads.push(options); return typeof mode === "function" ? mode(options) : mode },
     async wake(request) {
       thread.wakes.push(request)
       thread.calls.push("wake")
@@ -1997,9 +2000,11 @@ test("a read that shows Plan Mode and an interrupted newest turn reports both, w
   assert.equal(r.receiver.state(), "plan", "delivery is decided as before")
 })
 
-// A read decides Plan Mode only until a hook event discards it. After that the hook's permission_mode hint decides, as in the
-// Claude and Pi packages, and it can be stale.
-test("once a hook event has discarded the last read, Plan Mode and busy delivery follow the hook's permission_mode hint", async () => {
+// A heartbeat read decides the state only until a hook event discards it; it never authorizes a busy delivery. After the hook
+// event a `plan` hint refuses the claim with no read, and a `default` hint lets the claim go only after the hook's own fresh
+// mode read confirms a mode that is not Plan Mode (this double's read answers default). That read also lifts the earlier
+// Plan reading in the heartbeat. The message strings below predate #152 and are kept as they were.
+test("after a hook event, a plan hint refuses busy delivery, and a default hint delivers only on the hook's own fresh mode read, which lifts an earlier Plan reading", async () => {
   for (const [read, hint] of [[true, "default"], [false, "plan"]]) {
     const thread = threadDouble({ observation: { reason: read ? "plan" : null, observed: { status: "idle", stopped: false, plan: read } } })
     const r = await rig({ thread, handlers: { pending: () => ({ messages: ["m1"] }) } })
@@ -2014,6 +2019,148 @@ test("once a hook event has discarded the last read, Plan Mode and busy delivery
     if (hint === "plan") assert.deepEqual(hook.sent, [{ context: null }])
     else assert.match(hook.sent[0].context, /"id":"m1"/)
   }
+})
+
+// ---- Plan Mode during a running turn (#152) -----------------------------------------------------------------------
+// Every output during a running turn needs a read of the collaboration mode that its own hook took after the event arrived,
+// right before the claim (and before a receipts notice: receiver-receipts.test.js). Only a confirmed mode that is not Plan
+// Mode lets it out; the hook's `permission_mode` hint can only refuse.
+
+const DELIVERED = /"id":"00000000-0000-4000-8000-000000000001"/
+
+test("the app-server says Plan Mode while the hook says default: no claim, no printed batch, nothing settled", async () => {
+  const thread = threadDouble({ mode: { plan: true } })
+  const r = await rig({ thread, handlers: deliverable() })
+  await r.begin()
+  const hook = await r.op(turn())
+  assert.deepEqual(r.worker.ops("claim"), [], "nothing is claimed")
+  assert.deepEqual(r.worker.ops("settle"), [], "and nothing is settled")
+  assert.deepEqual(hook.sent, [{ context: null }], "the hook is answered with nothing")
+  assert.equal(thread.modeReads.length, 1, "after the pending answer, one read of the mode")
+  assert.deepEqual(r.worker.ops("pending").length, 1)
+})
+
+test("a mode read that fails, answers malformed or cannot tell the mode holds the output: the hook is answered, and the worker keeps serving", async () => {
+  for (const [label, answer] of [
+    ["a read that throws", () => Promise.reject(new Error("APP_SERVER_CLOSED"))],
+    ["a read that throws at once", () => { throw new Error("boom") }],
+    ["a mode that is not a boolean", () => ({ plan: "plan" })],
+    ["no answer object", () => null],
+    ["an unknown mode", () => ({ plan: null })],
+  ]) {
+    let reads = 0
+    const thread = threadDouble({ mode: options => (++reads === 1 ? answer(options) : { plan: false }) })
+    const r = await rig({ thread, handlers: deliverable() })
+    await r.begin()
+    const held = await r.op(turn())
+    assert.deepEqual(r.worker.ops("claim"), [], `${label}: nothing is claimed`)
+    assert.deepEqual(r.worker.ops("settle"), [], `${label}: nothing is settled`)
+    assert.deepEqual(held.sent, [{ context: null }], `${label}: the hook is answered`)
+    assert.equal(r.receiver.state(), "busy", `${label}: chat stays on`)
+    const next = await r.op(turn({ event: "tool" }))
+    assert.match(next.sent[0].context, DELIVERED, `${label}: the next hook's read confirms the mode, and it delivers`)
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }], label)
+  }
+})
+
+test("a mode read that does not answer in time holds the output: it ends 2.5 s before the hook's deadline, at most 3 s", async () => {
+  for (const [patience, bound] of [[6_000, 3_000], [4_000, 1_500]]) {
+    let reads = 0
+    const thread = threadDouble({ mode: () => (++reads === 1 ? new Promise(() => {}) : { plan: false }) })
+    const r = await rig({ thread, handlers: deliverable() })
+    await r.begin()
+    let answered = false
+    const pending = r.op(turn({ patience_ms: patience })).then(hook => { answered = true; return hook })
+    await settle()
+    assert.deepEqual(thread.modeReads, [{ ms: bound }], `patience ${patience}: the read's time`)
+    await r.clock.advance(bound - 1)
+    assert.equal(answered, false, `patience ${patience}: still waiting for the read`)
+    await r.clock.advance(1)
+    const hook = await pending
+    assert.deepEqual(hook.sent, [{ context: null }], `patience ${patience}: answered with nothing at the bound`)
+    assert.deepEqual(r.worker.ops("claim"), [], `patience ${patience}`)
+    const next = await r.op(turn({ event: "tool" }))
+    assert.match(next.sent[0].context, DELIVERED, `patience ${patience}: the worker keeps serving`)
+  }
+})
+
+test("a later read that confirms another mode, taken after a new hook event, lifts the block, and the delivery goes out", async () => {
+  let plan = true
+  const thread = threadDouble({ mode: () => ({ plan }) })
+  const r = await rig({ thread, handlers: deliverable() })
+  await r.begin()
+  const first = await r.op(turn())
+  assert.deepEqual(r.worker.ops("claim"), [], "Plan Mode: nothing claimed")
+  assert.deepEqual(first.sent, [{ context: null }])
+  plan = false
+  const reads = thread.modeReads.length
+  const second = await r.op(turn({ event: "tool" }))
+  assert.equal(r.worker.ops("claim").length, 1, "the next hook claims")
+  assert.match(second.sent[0].context, DELIVERED)
+  assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "handed", reason: null }])
+  assert.equal(thread.modeReads.length - reads, 2, "a read that lifts the Plan reading before the state report, then the claim's own")
+})
+
+test("the heartbeat's plan_mode follows the newest read that confirmed the mode: a hint, an unknown mode or a failed read does not lift it", async () => {
+  let mode = { plan: true }
+  const thread = threadDouble({ mode: () => mode })
+  const r = await rig({ thread, handlers: deliverable() })
+  await r.begin()
+  await r.op(turn()) // its read finds Plan Mode
+  await r.clock.advance(30_000) // the tick reports it
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true })
+  for (const [label, answer] of [["an unknown mode", { plan: null }], ["a failed read", null]]) {
+    mode = answer
+    await r.op(turn({ event: "tool" })) // the hook says default
+    await r.clock.advance(30_000)
+    assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true, label)
+  }
+  assert.deepEqual(r.worker.ops("claim"), [])
+  mode = { plan: false }
+  const hook = await r.op(turn({ event: "tool" }))
+  assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "busy", stopped: false, plan_mode: false }, "a newer read lifts it")
+  assert.match(hook.sent[0].context, DELIVERED)
+  // A hint that says plan reports Plan Mode again, over a read that a hook event before it took.
+  await r.op(turn({ event: "tool", permission_mode: "plan" }))
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true)
+})
+
+test("a read taken before the hook event cannot authorize that hook's output: another turn's mode is not this turn's", async () => {
+  // A read that finished before the hook: the tick found the idle thread clear, in default mode.
+  const thread = threadDouble({ mode: { plan: null } })
+  const r = await rig({ thread, handlers: deliverable() })
+  await r.begin()
+  await r.op({ op: "stop", permission_mode: "default" })
+  await r.clock.advance(30_000)
+  assert.equal(r.receiver.state(), null, "the tick's read found the thread idle and not in Plan Mode")
+  const hook = await r.op(turn())
+  assert.deepEqual(r.worker.ops("claim"), [], "the earlier read authorizes nothing, and the hook's own read could not tell")
+  assert.deepEqual(hook.sent, [{ context: null }])
+
+  // A read that started before the hook and lands after it, in default mode.
+  let release
+  const slow = threadDouble({
+    observation: () => new Promise(resolve => { release = () => resolve(IDLE) }),
+    mode: () => new Promise(resolve => setImmediate(() => { release?.(); resolve({ plan: null }) })),
+  })
+  const s = await rig({ thread: slow, handlers: deliverable() })
+  await s.begin()
+  await s.op({ op: "stop", permission_mode: "default" })
+  await s.clock.advance(30_000) // the tick's read starts, and is still out
+  const late = await s.op(turn())
+  await settle()
+  assert.deepEqual(s.worker.ops("claim"), [], "a read in default mode that landed during the hook's own read authorizes nothing")
+  assert.deepEqual(late.sent, [{ context: null }])
+})
+
+// A regression pin, not a test of the change: it holds before the change and after it.
+test("without a control socket nothing is read, and the hook's hint decides, as before", async () => {
+  const r = await rig({ handlers: deliverable() })
+  await r.begin()
+  assert.match((await r.op(turn())).sent[0].context, DELIVERED)
+  r.worker.log.length = 0
+  assert.deepEqual((await r.op(turn({ permission_mode: "plan" }))).sent, [{ context: null }])
+  assert.deepEqual(r.worker.ops("claim"), [])
 })
 
 // Before the first user message codex-cli 0.171.0 refuses the resume and the turns list, so the read is unknown: Plan Mode
