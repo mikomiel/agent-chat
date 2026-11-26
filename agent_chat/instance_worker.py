@@ -33,7 +33,7 @@ from typing import Any
 from uuid import UUID
 
 from . import instance_client, instance_file
-from .client import Interrupted
+from .client import Interrupted, defer_signal
 from .models import LEASE_SECONDS, ChatError, DeliveryClaim, DeliveryResult, Heartbeat, ReceiptDelivery
 
 MAX_FRAME = 128 * 1024
@@ -72,6 +72,22 @@ def _interrupt(_signum: int, _frame: Any) -> None:
 
 class _ReceiptsCancelled(Interrupted):
     """What CANCEL_SIGNAL raises inside a receipts request. SIGTERM and the alarm raise a plain `Interrupted`."""
+
+
+def _deferrable(handler: Callable[[int, Any], None]) -> Callable[[int, Any], None]:
+    """Wrap a handler that raises, so that the client can hold a call back while it starts a request's timer thread.
+
+    An exception from a handler is not safe inside `Thread.start`. The wrapper asks the client first
+    (`defer_signal`). A call that the client holds back is recorded and returns with nothing changed; the client calls
+    the handler again once the start is over. Only that call latches, records or raises, so each flag is set once.
+    With nothing held back, a call goes straight to the handler.
+    """
+
+    def run(signum: int, frame: Any) -> None:
+        if not defer_signal(signum):
+            handler(signum, frame)
+
+    return run
 
 
 def _read(expected: int) -> dict[str, Any] | None:
@@ -355,9 +371,9 @@ def main() -> int:
         finally:
             cancel_latched = False  # whatever this request's signal was, it is answered
 
-    signal.signal(signal.SIGALRM, _alarm)
-    signal.signal(signal.SIGTERM, _terminate)
-    signal.signal(CANCEL_SIGNAL, _cancel)
+    signal.signal(signal.SIGALRM, _deferrable(_alarm))
+    signal.signal(signal.SIGTERM, _deferrable(_terminate))
+    signal.signal(CANCEL_SIGNAL, _deferrable(_cancel))
     signal.setitimer(signal.ITIMER_REAL, REQUEST_SECONDS)
     try:
         request = _read(0)

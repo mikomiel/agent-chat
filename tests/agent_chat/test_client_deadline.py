@@ -426,39 +426,155 @@ def test_a_dripping_header_or_framing_cannot_outlast_the_deadline(opening: bytes
         peer.close()
 
 
-@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="no POSIX signal masks")
-def test_a_raising_signal_handler_never_runs_inside_the_watchdog_start(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Review 6065344121 (P2): the worker's receipts cancel raises from its handler. A raise in `Thread.start`, in its
-    # wait on an internal condition, is not safe, so the watchdog blocks every signal while its timer starts. The
-    # signal sent from inside the start runs its handler after the start returned, and the timer is cancelled again.
-    phase: dict[str, bool | None] = {"in_start": False, "ran_in_start": None}
-    started: list[threading.Timer] = []
+class _Cancelled(Exception):
+    """What the handlers in the next tests raise: stands for the worker's `Interrupted`."""
 
-    class Cancelled(Exception):
-        pass
 
-    def handler(_signum: int, _frame: Any) -> None:
-        phase["ran_in_start"] = phase["in_start"]
-        raise Cancelled
+def _timer_signalling_in_start(
+    started: list[threading.Timer], phase: dict[str, bool], signal_now: Callable[[], None]
+) -> type[threading.Timer]:
+    """A Timer whose `start` first runs `signal_now`, and records that it is inside the start while it does."""
 
     class SignallingTimer(threading.Timer):
         def start(self) -> None:
             started.append(self)
             phase["in_start"] = True
             try:
-                os.kill(os.getpid(), signal.SIGUSR1)
+                signal_now()
                 super().start()
             finally:
                 phase["in_start"] = False
 
+    return SignallingTimer
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="no POSIX signal masks")
+def test_a_raising_signal_handler_never_runs_inside_the_watchdog_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review 6065344121 (P2): the worker's receipts cancel raises from its handler, and a raise inside `Thread.start`,
+    # in its wait on an internal condition, is not safe. A signal mask blocks only the thread that sets it. The kernel
+    # gives a signal that is aimed at the process to any other thread that does not block it, and the interpreter then
+    # runs the handler on the main thread wherever that is, the start included. So the handler asks first
+    # (`defer_signal`), and the watchdog runs it again once the start is over and cancels its timer as the exception
+    # leaves. `sink` is the other thread: the outcome does not depend on the runner having one, as pytest-xdist does.
+    deferred: list[int] = []  # each call that was asked to wait
+    ran: list[bool] = []  # each call that did the handler's work: was it inside the start?
+    started: list[threading.Timer] = []
+    phase = {"in_start": False}
+
+    def handler(signum: int, _frame: Any) -> None:
+        if client_module.defer_signal(signum):
+            deferred.append(signum)
+            return
+        ran.append(phase["in_start"])
+        raise _Cancelled
+
+    def signal_inside_the_start() -> None:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        # `kill` returns before `sink` has taken the signal, and the interpreter runs the handler on this thread
+        # between two statements. Wait for that here, so the signal always lands inside the start. Bounded: a signal
+        # that never comes fails the test, it does not hang it.
+        give_up = time.monotonic() + 5
+        while not (deferred or ran) and time.monotonic() < give_up:
+            time.sleep(0.005)
+        assert deferred or ran, "the signal never reached the handler"
+
+    release = threading.Event()
+    sink = threading.Thread(target=release.wait, daemon=True)
+    sink.start()
     previous = signal.signal(signal.SIGUSR1, handler)
     try:
-        monkeypatch.setattr(client_module.threading, "Timer", SignallingTimer)
-        with socket.socket() as transport, pytest.raises(Cancelled):
+        monkeypatch.setattr(
+            client_module.threading, "Timer", _timer_signalling_in_start(started, phase, signal_inside_the_start)
+        )
+        with socket.socket() as transport, pytest.raises(_Cancelled):
             client_module._DeadlineWatchdog(time.monotonic() + 30, transport)
     finally:
         signal.signal(signal.SIGUSR1, previous)
-    assert phase["ran_in_start"] is False
+        release.set()
+        sink.join(timeout=5)
+    assert ran == [False]  # the handler did its work once, and after the start
+    assert deferred == [signal.SIGUSR1]  # and it had been asked to wait once, inside it
     assert len(started) == 1
     started[0].join(timeout=5)
     assert not started[0].is_alive()  # cancelled: it ended long before its 30 s interval
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="no POSIX signal masks")
+def test_a_handler_that_does_not_defer_waits_for_the_signal_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The other guard, for a handler that never calls `defer_signal`, as the default SIGINT handler does not. The
+    # signal is aimed at the main thread itself, which blocks it while the timer starts, so it waits there whatever
+    # other threads the runner has, and the handler runs when the mask is lifted, after the start.
+    ran: list[bool] = []
+    started: list[threading.Timer] = []
+    phase = {"in_start": False}
+
+    def handler(_signum: int, _frame: Any) -> None:
+        ran.append(phase["in_start"])
+        raise _Cancelled
+
+    previous = signal.signal(signal.SIGUSR1, handler)
+    try:
+        monkeypatch.setattr(
+            client_module.threading,
+            "Timer",
+            _timer_signalling_in_start(
+                started, phase, lambda: signal.pthread_kill(threading.get_ident(), signal.SIGUSR1)
+            ),
+        )
+        with socket.socket() as transport, pytest.raises(_Cancelled):
+            client_module._DeadlineWatchdog(time.monotonic() + 30, transport)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+    assert ran == [False]
+    assert len(started) == 1
+    started[0].join(timeout=5)
+    assert not started[0].is_alive()  # cancelled: it ended long before its 30 s interval
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGUSR2"), reason="no POSIX signals")
+def test_every_deferred_handler_runs_once_even_when_an_earlier_one_raises() -> None:
+    # The worker's cancel raises, and its SIGTERM handler records that it came before it raises too. A cancel that
+    # raised first must not hide the SIGTERM behind it: that would answer `refused` and serve on after a stop.
+    worked: list[int] = []
+
+    class First(Exception):
+        pass
+
+    class Second(Exception):
+        pass
+
+    def raising(error: type[Exception]) -> Callable[[int, Any], None]:
+        def handler(signum: int, _frame: Any) -> None:
+            if client_module.defer_signal(signum):
+                return
+            worked.append(signum)
+            raise error
+
+        return handler
+
+    previous = [signal.signal(signal.SIGUSR1, raising(First)), signal.signal(signal.SIGUSR2, raising(Second))]
+    try:
+        with pytest.raises(First):  # the first exception leaves, the second is dropped
+            with client_module._deferring_signals():
+                signal.raise_signal(signal.SIGUSR1)
+                signal.raise_signal(signal.SIGUSR2)
+                signal.raise_signal(signal.SIGUSR1)  # the same signal again: recorded once, as the kernel would
+                assert worked == []  # none of them did its work inside the block
+        assert worked == [signal.SIGUSR1, signal.SIGUSR2]
+        assert client_module.defer_signal(signal.SIGUSR1) is False  # and nothing is deferred once it is over
+    finally:
+        signal.signal(signal.SIGUSR1, previous[0])
+        signal.signal(signal.SIGUSR2, previous[1])
+
+
+def test_nothing_is_deferred_off_the_main_thread() -> None:
+    answers: list[bool] = []
+
+    def other_thread() -> None:
+        with client_module._deferring_signals():
+            answers.append(client_module.defer_signal(signal.SIGINT))  # a handler never runs here: nothing to hold
+
+    thread = threading.Thread(target=other_thread)
+    thread.start()
+    thread.join(timeout=5)
+    assert answers == [False]

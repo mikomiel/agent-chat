@@ -2133,6 +2133,137 @@ def test_a_real_alarm_during_a_held_receipts_request_still_ends_the_worker(
     assert wrote_at[1] - read_at[1] < 4.0  # the alarm ended it, not the end of the 8 s answer
 
 
+class _CountingServer(_ReceiptsServer):
+    """The receipts server, recording each path that reaches it."""
+
+    paths: list[str] = []
+
+    def _answer(self) -> None:
+        type(self).paths.append(self.path)
+        super()._answer()
+
+    do_GET = do_POST = _answer
+
+
+@pytest.mark.parametrize(
+    ("name", "number", "code", "refusal"),
+    [
+        ("cancel", CANCEL, 0, CANCELLED),
+        ("sigterm", signal.SIGTERM, 1, None),
+        ("alarm", signal.SIGALRM, 1, None),
+    ],
+)
+def test_a_signal_that_lands_while_the_client_starts_its_timer_waits_and_acts_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, name: str, number: int, code: int, refusal: dict[str, str] | None
+) -> None:
+    """A real socket, the real client and a real signal that is sent while the request's timer thread starts.
+
+    The three handlers raise, and an exception inside `Thread.start` is not safe, so each is asked to wait there
+    (`client.defer_signal`) and the client runs it again once the timer is running. The reply cannot show that: the
+    cancel answers `refused` and the other two end the worker with or without the wait. What shows it is where the
+    handler ran: the first call, inside the start, returns and changes nothing; the second, after it, raises.
+    """
+    instance = instance_client.JoinedInstance(
+        InstanceSecret("deferred-native", uuid4(), "1" * 64, "http://127.0.0.1:1"), uuid4(), uuid4(), uuid4(),
+        "synthetic-host", "pi",
+    )
+    _CountingServer.identity = {"instance_id": str(instance.instance_id), "session_id": str(instance.session_id)}
+    _CountingServer.stalled = frozenset()
+    _CountingServer.paths = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CountingServer)
+    server.daemon_threads = True
+    # The server's threads are where the kernel takes the signal: the main thread blocks it while the timer starts.
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    installed: list[tuple[int, Any]] = []
+    timers: list[threading.Timer] = []
+    # Each call of the handler, in order: was it inside the timer's start, and did it raise? Plain lists, as in the
+    # retry test below: the handler runs on the main thread.
+    calls: list[tuple[bool, bool]] = []
+    phase = {"in_start": False, "sent": False}
+
+    class SignallingTimer(threading.Timer):
+        def start(self) -> None:
+            timers.append(self)
+            if phase["sent"]:  # only the first request's timer; the request after it is a plain one
+                return super().start()
+            phase["sent"] = phase["in_start"] = True
+            try:
+                os.kill(os.getpid(), number)
+                # `kill` returns before another thread has taken the signal, and the interpreter runs the handler on
+                # this thread between two statements. Wait for its first call, so the signal lands inside the start.
+                until = time.monotonic() + 5
+                while not calls and time.monotonic() < until:
+                    time.sleep(0.005)
+                super().start()
+            finally:
+                phase["in_start"] = False
+
+    try:
+        port = server.server_address[1]
+        pinned = ((socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("127.0.0.1", port)),)
+        bound = instance_client.JoinedInstance(
+            InstanceSecret("deferred-native", instance.binding.boot_id, "1" * 64, f"http://127.0.0.1:{port}"),
+            instance.session_id, instance.instance_id, instance.room_id, "synthetic-host", "pi", pinned,
+        )
+        frames = iter(
+            [{"id": 0, "op": "join", "directory": str(tmp_path), "host_token": "synthetic-host-secret"}]
+            + [{"id": 1, "op": "receipts"}, {"id": 2, "op": "receipts"}]
+        )
+        output = io.BytesIO()
+
+        def readline(_size: int) -> bytes:
+            item = next(frames, None)
+            return b"" if item is None else (json.dumps(item) + "\n").encode()
+
+        def install(signum: int, handler: Any) -> None:
+            if signum == number:  # the real handler for the real signal; the others stay off
+
+                def counted(received: int, frame: Any) -> None:
+                    inside = phase["in_start"]
+                    try:
+                        handler(received, frame)
+                    except BaseException:
+                        calls.append((inside, True))
+                        raise
+                    calls.append((inside, False))
+
+                installed.append((signum, signal.signal(signum, counted)))
+
+        monkeypatch.setattr(threading, "Timer", SignallingTimer)  # the one the client's watchdog creates
+        monkeypatch.setattr(instance_worker, "RECEIPT_SECONDS", 30.0)  # only a cancelled timer is gone before then
+        monkeypatch.setattr(instance_worker, "_join", lambda _request: bound)
+        monkeypatch.setattr(
+            instance_worker, "sys",
+            SimpleNamespace(stdin=SimpleNamespace(buffer=SimpleNamespace(readline=readline)),
+                            stdout=SimpleNamespace(buffer=output)),
+        )
+        monkeypatch.setattr(
+            instance_worker, "signal",
+            SimpleNamespace(SIGALRM=signal.SIGALRM, SIGTERM=signal.SIGTERM, ITIMER_REAL=0, signal=install,
+                            setitimer=lambda *_args: None),
+        )
+        assert instance_worker.main() == code
+    finally:
+        for signum, previous in installed:
+            signal.signal(signum, previous)
+        server.shutdown()
+        server.server_close()
+    replies = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert calls == [(True, False), (False, True)], name  # asked to wait inside the start, then run after it
+    if refusal is not None:
+        _assert_one_frame_each(replies, 2)
+        assert replies[1]["result"] == refusal
+        # The cancel was answered once: the request after it is asked, and answered. The one before was never sent.
+        assert replies[2]["result"]["receipts"] == [] and "refused" not in replies[2]["result"]
+        assert _CountingServer.paths == ["/v1/instance/receipts", "/v1/instance/end"]
+    else:
+        # SIGTERM and the alarm still end the worker, which then ends its instance: nothing was swallowed.
+        assert replies[1:] == [{"id": 1, "error": {"code": "TRANSPORT_UNAVAILABLE"}}]
+        assert _CountingServer.paths == ["/v1/instance/end"]
+    timers[0].join(timeout=5)
+    assert not timers[0].is_alive()  # cancelled as the exception left: its interval was 30 s
+
+
 class _SecondHeldServer(_ReceiptsServer):
     """The receipts server, holding only the second request to a path: the first and the third are answered at once."""
 
