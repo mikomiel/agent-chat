@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto"
 import { loadConfig, PI_CHAT_CONFIG_ENV } from "./config.js"
 import { CHAT_PREFIX, MAX_CONTEXT_BYTES, NOTICE_BOUND } from "./channel.js"
+import { createLease } from "./lease.js"
 import { bindingRouteLines, packCandidates, receiptsHint, renderNotice, renderReceiptNotice } from "./notice.js"
 import { createRejoinPolicy } from "./policy.js"
 import * as receipts from "./receipts.js"
@@ -21,6 +22,9 @@ const POLL_MS = 2_000
 const HANDOFF_MS = 5_000
 const DISABLED = Symbol.for("agent-chat.pi.disabled")
 const RECEIPTS_TYPE = "agent-chat-receipts"
+// What the footer says while no instance serves: the lease lapsed, chat failed closed or the operator turned it off. A
+// blank footer means that chat was never configured.
+const NO_LIVE_INSTANCE = "Agent Chat: no live instance"
 
 const requestFailure = (error, operation) => Object.assign(error ?? new Error("CHAT_LIFECYCLE_FAILED"), { operation })
 
@@ -49,6 +53,7 @@ export function createAgentChat(pi, config, {
   clearTimeoutImpl = clearTimeout,
   setIntervalImpl = setInterval,
   clearIntervalImpl = clearInterval,
+  lease: leaseOptions = {}, // { clock, wall, setTimeoutImpl, clearTimeoutImpl } of the lease tracker, for the contract tests
 } = {}) {
   let context = null
   let nativeSessionId = null
@@ -69,10 +74,12 @@ export function createAgentChat(pi, config, {
   let stopped = true
   let closed = false
   let displayedStatus
-  let reportedPlan = null
   let planSnapshot = null
   const attempts = new Map()
   const policy = createRejoinPolicy({ now, random })
+  // Footer only: a lapsed lease changes the text and nothing else. It re-renders at its monotonic deadline and on a restoring
+  // reply; a lapse that only the wall clock shows, as after a suspend, is rendered by the next tick, in showPresence.
+  const lease = createLease({ ...leaseOptions, onChange: () => { if (live && joined) showPresence(chatState()) } })
 
   const disabled = () => globalThis[DISABLED] === true
 
@@ -110,7 +117,7 @@ export function createAgentChat(pi, config, {
     globalThis[DISABLED] = true
     finishNative("uncertain", "transport_ambiguous")
     attempts.clear()
-    status(undefined)
+    status(NO_LIVE_INSTANCE)
     notify(`Agent Chat stopped (${reason ?? "local stop"}); the native session and CI are unchanged.`)
     disconnect()
   }
@@ -123,6 +130,7 @@ export function createAgentChat(pi, config, {
     const record = live
     live = null
     joined = null
+    lease.reset()
     clearIntervalImpl(heartbeatTimer)
     clearIntervalImpl(pollTimer)
     heartbeatTimer = null
@@ -176,8 +184,10 @@ export function createAgentChat(pi, config, {
     } catch { return "unknown" }
   }
 
+  // A lapsed lease comes first: no state text is true of an instance that peers no longer see.
   function showPresence(state) {
-    if (state === "plan") status("Agent Chat: plan mode")
+    if (lease.expired()) status(NO_LIVE_INSTANCE)
+    else if (state === "plan") status("Agent Chat: plan mode")
     else if (state === "stopped") status("Agent Chat: stopped (type to resume)")
     else if (state === "unknown") status("Agent Chat: paused")
     else if (state === "busy") status("Agent Chat: busy")
@@ -193,8 +203,7 @@ export function createAgentChat(pi, config, {
     }
   }
 
-  function heartbeatState() {
-    const state = chatState()
+  function heartbeatState(state = chatState()) {
     let title
     try { title = safeTitle(context?.sessionManager?.getSessionName?.()) }
     catch { /* a title never affects presence */ }
@@ -244,13 +253,20 @@ export function createAgentChat(pi, config, {
     if (!live || !joined || disabled()) return
     const state = chatState()
     showPresence(state)
-    dirty ||= heartbeat || reportedPlan !== (state === "plan")
+    dirty ||= heartbeat
     pollDue ||= poll
     receiptsDue ||= poll
+    // The state is compared with the last one that this instance's worker confirmed once per entry, here, and never inside
+    // the loop: a heartbeat that comes back `refused` leaves it unconfirmed, and a compare in the loop would send it again at
+    // once. A refused one is retried by the next entry. A busy loop is not compared, since a heartbeat of that state may be in
+    // flight and would go out twice; the exception is a receipts request, which holds no heartbeat, so a change found then is
+    // a state report that is due now.
+    if (!busy || reading) dirty ||= live.published !== JSON.stringify(heartbeatState(state))
     if (busy) {
       // What is due waits for the single flight. A receipts request in flight would hold it, so it is ended: the worker
-      // answers it `refused` within milliseconds, and the loop takes what is due. Every call here is a heartbeat or a poll.
-      if (reading) live.worker.cancel()
+      // answers it `refused` within milliseconds, and the loop takes what is due. A re-evaluation that finds nothing due
+      // ends nothing.
+      if (reading && (dirty || pollDue)) live.worker.cancel()
       return
     }
     busy = true
@@ -258,12 +274,19 @@ export function createAgentChat(pi, config, {
       while ((dirty || pollDue || receiptsDue) && live && !disabled()) {
         if (dirty) {
           dirty = false
+          const record = live
           const snapshot = heartbeatState()
-          reportedPlan = snapshot.plan_mode
+          const text = JSON.stringify(snapshot)
+          const stamp = lease.stamp() // taken before the request is written: the lease runs from the send, not the reply
           const result = await request("heartbeat", { state: snapshot })
           if (refused(result)) {
             if (REJOIN_AFTER.has(result.refused) && !BRIEF_OUTAGE.has(result.refused))
               throw Object.assign(new Error(result.refused), { code: result.refused, operation: "heartbeat" })
+          } else {
+            // Both stay with the instance that sent the request: the snapshot lives on its record, and the stamp of an ended
+            // instance renews no lease, so a reply that arrives late changes nothing of the next instance.
+            record.published = text
+            lease.confirm(stamp)
           }
         }
         if (pollDue && live) {
@@ -451,19 +474,22 @@ export function createAgentChat(pi, config, {
   }
 
   async function connect() {
-    if (closed || disabled() || !context || !nativeSessionId) return
+    // One live record at a time: a second call, while one worker joins or serves, starts nothing and stops nothing.
+    if (closed || disabled() || live || !context || !nativeSessionId) return
     try { policy.check() } catch (error) { return failClosed(error) }
     rejoinTimer = null
     let worker
+    const stamp = lease.stamp() // the join is a lease request: it is stamped before it is written
     try {
       worker = startProcess(config, { nativeSessionId, bootId: randomUUID() })
     } catch (error) { return failClosed(requestFailure(error, "join")) }
-    const record = { worker }
+    const record = { worker, published: null } // `published`: the heartbeat snapshot, as JSON, that the worker last confirmed
     live = record
     try {
       const result = await worker.ready
       if (live !== record || closed || disabled()) { void worker.stop(); return }
       joined = result
+      lease.confirm(stamp)
       policy.succeeded()
       notify(`Agent Chat: joined as ${joined.session_id} in room ${joined.room_id}.`)
       heartbeatTimer = setIntervalImpl(() => { void drive({ heartbeat: true }) }, HEARTBEAT_MS)
@@ -493,8 +519,24 @@ export function createAgentChat(pi, config, {
     stopped = true
     planSnapshot = null
     bind(ctx)
-    if (nativeSessionId) void connect()
+    // The off latch outlives the extension instance that set it. A replaced runtime (`/new`, `/resume`, `/fork`,
+    // `/reload`) starts a fresh footer, so it says again that chat is off, and starts no worker.
+    if (disabled()) status(NO_LIVE_INSTANCE)
+    else if (nativeSessionId) void connect()
   })
+
+  // Compaction and tree navigation keep the runtime, the native session id and the binding: nothing is joined again and
+  // nothing is announced again (`before_agent_start` sets the binding section on every turn). Each event only asks the loop
+  // to look at the state, which a compaction or a navigation can change, without waiting for the next tick. The poll finds
+  // the same change, so nothing depends on these three.
+  const reevaluate = (_event, ctx) => {
+    if (closed) return
+    if (ctx) context = ctx
+    if (live) void drive()
+  }
+  pi.on("session_tree", reevaluate)
+  pi.on("session_compact", reevaluate)
+  pi.on("session_compact_failed", reevaluate)
 
   pi.on("input", (event, ctx) => {
     if (closed) return

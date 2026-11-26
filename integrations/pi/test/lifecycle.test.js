@@ -1,7 +1,11 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { PassThrough } from "node:stream"
+import agentChatExtension from "../extensions/agent-chat.js"
 import { createAgentChat } from "../lib/lifecycle.js"
 import { startWorker } from "../lib/worker.js"
 import { MAX_CONTEXT_BYTES, NOTICE_BOUND } from "../lib/channel.js"
@@ -40,23 +44,28 @@ function fakePi({ throwOnSend = false } = {}) {
       queueMicrotask(() => emit("message_start", { message: { ...payload, role: "custom" } }))
     },
   }
-  function emit(name, ...args) { for (const fn of handlers.get(name) ?? []) fn(...args) }
+  // Returns what the handlers returned, as Pi awaits them: a test that needs the result of a shutdown awaits it.
+  function emit(name, ...args) { return (handlers.get(name) ?? []).map(fn => fn(...args)) }
   const ctx = {
     mode: "tui", signal: undefined, isIdle: () => true,
     sessionManager: { getSessionId: () => "native-1", getSessionName: () => "synthetic" },
     ui: { notify: text => notices.push(text), setStatus: (_name, text) => statuses.push(text) },
   }
-  return { pi, emit, ctx, sent, notices, statuses, commands }
+  return { pi, emit, ctx, sent, notices, statuses, commands, handlers }
 }
 
-function fakeWorker({ ready = Promise.resolve(joined), answer = () => ({}) } = {}) {
+// `holdClose` keeps `closed` pending after stop() until the test calls release(), as a worker that takes time to exit.
+function fakeWorker({ ready = Promise.resolve(joined), answer = () => ({}), holdClose = false } = {}) {
   const requests = []
+  let stops = 0
   let close
   const closed = new Promise(resolve => { close = resolve })
   return {
     ready, closed, requests,
+    get stops() { return stops },
+    release: () => close({ code: 0, signal: null }),
     request(op, fields) { requests.push({ op, fields }); return Promise.resolve(answer(op, fields)) },
-    stop() { close({ code: 0, signal: null }); return closed },
+    stop() { stops += 1; if (!holdClose) close({ code: 0, signal: null }); return closed },
   }
 }
 
@@ -859,3 +868,633 @@ for (const toolRoute of ["cli", "mcp", "mcp-with-cli-fallback"]) {
     for (const id of ids) assert.ok(content.includes(`message ${id} kind question`), id)
   })
 }
+
+// Issue #132: lifecycle completeness. The lease footer, presence on change, session replacement, compaction and tree.
+const OFF_LATCH = Symbol.for("agent-chat.pi.disabled")
+const resetLatchAfter = t => t.after(() => { delete globalThis[OFF_LATCH] }) // a disable would otherwise leak into later tests
+
+// A monotonic clock, a wall clock and timers that move only when the test moves them. The two clocks tick together and
+// jumpWall() moves the wall clock alone, as a suspend does. advance() runs the timers that fall due, in order, with the
+// clocks set to the moment each one was due.
+function fakeTime() {
+  let now = 0
+  let skew = 1_700_000_000_000
+  let next = 1
+  const timers = new Map()
+  return {
+    clock: () => now,
+    wall: () => now + skew,
+    jumpWall: ms => { skew += ms },
+    setTimeoutImpl(fn, ms) { timers.set(next, { fn, at: now + ms }); return next++ },
+    clearTimeoutImpl(id) { timers.delete(id) },
+    timers,
+    advance(ms) {
+      const target = now + ms
+      for (;;) {
+        const due = [...timers].filter(([, timer]) => timer.at <= target).sort(([, a], [, b]) => a.at - b.at)[0]
+        if (!due) break
+        timers.delete(due[0])
+        now = Math.max(now, due[1].at)
+        due[1].fn()
+      }
+      now = target
+    },
+  }
+}
+
+// A session that joined, with the lease tracker on a fake clock. The lifecycle's own timers stay stubbed, so only the lease
+// can move the footer without a tick, and time.advance() is the only thing that runs it.
+async function leasedSession({ answer, ...options } = {}) {
+  const time = fakeTime()
+  const fake = fakePi()
+  const worker = fakeWorker({ answer })
+  const starts = { count: 0 }
+  const lifecycle = createAgentChat(fake.pi, config, {
+    ...timers, now: () => 1000, random: () => 0,
+    startProcess: () => { starts.count += 1; return worker },
+    lease: { clock: time.clock, wall: time.wall, setTimeoutImpl: time.setTimeoutImpl, clearTimeoutImpl: time.clearTimeoutImpl },
+    ...options,
+  })
+  fake.emit("session_start", {}, fake.ctx)
+  await flush()
+  return { ...fake, lifecycle, worker, time, starts }
+}
+
+const answerWith = refusal => op => (refusal() && op === "heartbeat" ? { refused: refusal() } : op === "pending" ? { messages: [] } : {})
+
+test("the footer reads no live instance at the lease deadline and a confirmed heartbeat restores it, with no episode", async t => {
+  resetLatchAfter(t)
+  let refusal = null
+  const retries = []
+  const { emit, ctx, statuses, notices, lifecycle, worker, time, starts } = await leasedSession({
+    answer: answerWith(() => refusal),
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+  })
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+  const binding = lifecycle.binding()
+
+  refusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: the worker answers `refused`, and nothing is renewed
+  for (const step of [30_000, 30_000]) { time.advance(step); await lifecycle.heartbeat() }
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "60 s in, the lease is live")
+  time.advance(29_999)
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "one millisecond before the deadline")
+  time.advance(1)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "the lease timer renders it at the deadline, with no tick")
+
+  // Footer only: no episode, no teardown, no fault, and the delivery poll still runs.
+  const polls = worker.requests.filter(row => row.op === "pending").length
+  await lifecycle.poll()
+  assert.equal(worker.requests.filter(row => row.op === "pending").length, polls + 1)
+  assert.deepEqual(retries, [], "no rejoin is scheduled")
+  assert.equal(starts.count, 1)
+  assert.equal(worker.stops, 0)
+  assert.equal(lifecycle.binding(), binding)
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.doesNotMatch(notices.join("\n"), /reconnecting|stopped/)
+
+  refusal = null
+  await lifecycle.heartbeat()
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "a confirmed heartbeat restores the text")
+  time.advance(89_999)
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "the new lease runs from that heartbeat")
+  time.advance(1)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+})
+
+test("a lapsed lease takes priority over busy and plan mode, and a confirmed heartbeat restores each", async t => {
+  resetLatchAfter(t)
+  let refusal = null
+  let idle = true
+  const entries = []
+  const { emit, ctx, statuses, lifecycle, time } = await leasedSession({ answer: answerWith(() => refusal) })
+  ctx.isIdle = () => idle
+  ctx.sessionManager.getEntries = () => entries
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  refusal = "SERVICE_UNAVAILABLE"
+  time.advance(90_000)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+
+  idle = false
+  await lifecycle.poll()
+  assert.equal(lifecycle.state(), "busy")
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "not busy")
+  entries.push({ type: "custom", customType: "plan-mode", data: { enabled: true } })
+  await lifecycle.poll()
+  assert.equal(lifecycle.state(), "plan")
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "not plan mode")
+
+  refusal = null
+  await lifecycle.heartbeat()
+  assert.equal(statuses.at(-1), "Agent Chat: plan mode")
+  entries.push({ type: "custom", customType: "plan-mode", data: { enabled: false } })
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: busy")
+  idle = true
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+})
+
+// A suspend stops the monotonic clock, and the lease timer with it, while the server's lease runs on. The wall clock sees the
+// lapse, and the next poll tick renders it: the timer is not needed, and a late one changes nothing.
+test("a host suspend turns the footer to no live instance within one poll tick, with no episode, and a confirmed heartbeat restores it", async t => {
+  resetLatchAfter(t)
+  const retries = []
+  const { emit, ctx, statuses, notices, lifecycle, worker, time, starts } = await leasedSession({
+    answer: answerWith(() => null),
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+  })
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+  const binding = lifecycle.binding()
+
+  time.jumpWall(120_000) // the host sleeps for two minutes: the monotonic clock, and the lease timer, stand still
+  await lifecycle.poll() // the first tick after the resume
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+
+  // Footer only, as for a lapse at the deadline: no episode, no teardown, no fault.
+  assert.deepEqual(retries, [], "no rejoin is scheduled")
+  assert.equal(starts.count, 1)
+  assert.equal(worker.stops, 0)
+  assert.equal(lifecycle.binding(), binding)
+  assert.notEqual(lifecycle.state(), "offline")
+  assert.doesNotMatch(notices.join("\n"), /reconnecting|stopped/)
+
+  await lifecycle.heartbeat() // the first heartbeat after the resume is answered without `refused`
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "a confirmed heartbeat restores the text")
+  time.advance(89_999)
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "the new lease runs from that heartbeat")
+  time.advance(1)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+})
+
+test("a wall clock that is set back does not keep a lapsed lease live", async t => {
+  resetLatchAfter(t)
+  const { emit, ctx, statuses, lifecycle, time } = await leasedSession({ answer: answerWith(() => null) })
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  time.advance(90_000)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+
+  time.jumpWall(-3_600_000) // the wall clock is set back an hour
+  const rendered = statuses.length
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "the monotonic clock still counts the lease as over")
+  assert.equal(statuses.length, rendered, "and the footer was not touched")
+
+  await lifecycle.heartbeat()
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "only a confirmed heartbeat restores the text")
+})
+
+test("the lease timer is cleared at shutdown, and nothing renders after it", async () => {
+  const { emit, statuses, time } = await leasedSession()
+  assert.equal(time.timers.size, 1, "one timer, set on the deadline")
+  emit("session_shutdown")
+  assert.equal(time.timers.size, 0)
+  const rendered = statuses.length
+  time.advance(1_000_000)
+  assert.equal(statuses.length, rendered, "the footer is not touched after shutdown")
+})
+
+test("during a rejoin episode the footer says reconnecting, never no live instance, and the new join starts a new lease", async t => {
+  resetLatchAfter(t)
+  const time = fakeTime()
+  const { pi, emit, ctx, statuses } = fakePi()
+  const retries = []
+  let failing = false
+  let starts = 0
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000, random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    lease: { clock: time.clock, wall: time.wall, setTimeoutImpl: time.setTimeoutImpl, clearTimeoutImpl: time.clearTimeoutImpl },
+    startProcess: () => {
+      starts += 1
+      return fakeWorker({ answer: op => (failing && op === "heartbeat" ? { refused: "STALE_INSTANCE" } : op === "pending" ? { messages: [] } : {}) })
+    },
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+
+  failing = true // a refusal that proves the lease gone: the worker's own answer starts the episode
+  await lifecycle.heartbeat()
+  assert.equal(statuses.at(-1), "Agent Chat: reconnecting")
+  assert.equal(time.timers.size, 0, "no lease is held while no instance is")
+  time.advance(300_000)
+  assert.equal(statuses.at(-1), "Agent Chat: reconnecting", "an episode is not a lapsed lease")
+
+  failing = false
+  retries[0].fn()
+  await flush()
+  assert.equal(starts, 2)
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+  assert.equal(time.timers.size, 1)
+  time.advance(89_999)
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "the new lease runs from the new join")
+  time.advance(1)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+})
+
+test("the join is the first lease request, counted from the moment it was sent: an outage that starts at once lapses it 90 s after", async t => {
+  resetLatchAfter(t)
+  const time = fakeTime()
+  const { pi, emit, ctx, statuses } = fakePi()
+  let answerJoin
+  const worker = fakeWorker({
+    ready: new Promise(resolve => { answerJoin = () => resolve(joined) }),
+    answer: op => (op === "heartbeat" ? { refused: "TRANSPORT_UNAVAILABLE" } : op === "pending" ? { messages: [] } : {}),
+  })
+  createAgentChat(pi, config, {
+    ...timers, now: () => 1000, startProcess: () => worker,
+    lease: { clock: time.clock, wall: time.wall, setTimeoutImpl: time.setTimeoutImpl, clearTimeoutImpl: time.clearTimeoutImpl },
+  })
+  emit("session_start", {}, ctx) // the join is written at second 0
+  await flush()
+  time.advance(40_000) // it is answered 40 s later, and every heartbeat after it is refused
+  answerJoin()
+  await flush()
+  assert.equal(statuses.at(-1), "Agent Chat: stopped (type to resume)")
+  time.advance(49_999)
+  assert.equal(statuses.at(-1), "Agent Chat: stopped (type to resume)", "89.999 s after the join was sent")
+  time.advance(1)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "90 s after the join was sent, not after its answer")
+})
+
+test("a heartbeat is counted from the moment it was sent: a slow reply does not lengthen the lease", async t => {
+  resetLatchAfter(t)
+  let hold = null
+  const { emit, ctx, statuses, lifecycle, time } = await leasedSession({
+    answer: op => (op === "heartbeat" && hold ? hold : op === "pending" ? { messages: [] } : {}),
+  })
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+  time.advance(30_000)
+  let reply
+  hold = new Promise(resolve => { reply = () => resolve({}) })
+  const beat = lifecycle.heartbeat() // sent at second 30, and its reply is held
+  await flush()
+  time.advance(40_000) // answered at second 70, without `refused`
+  hold = null
+  reply()
+  await beat
+  time.advance(49_999)
+  assert.equal(statuses.at(-1), "Agent Chat: ready", "119.999 s, which is 89.999 s after the send")
+  time.advance(1)
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "120 s, which is 90 s after the send and not after the reply")
+})
+
+test("a rejoined instance publishes its state itself: what the earlier instance confirmed counts for nothing", async t => {
+  resetLatchAfter(t)
+  const time = fakeTime()
+  const { pi, emit, ctx } = fakePi()
+  const retries = []
+  const workers = []
+  let refusal = null // what every heartbeat is answered with
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000, random: () => 0,
+    setTimeoutImpl: (fn, ms) => { retries.push({ fn, ms }); return retries.length },
+    lease: { clock: time.clock, wall: time.wall, setTimeoutImpl: time.setTimeoutImpl, clearTimeoutImpl: time.clearTimeoutImpl },
+    startProcess: () => {
+      const worker = fakeWorker({ answer: op => (op === "heartbeat" && refusal ? { refused: refusal } : op === "pending" ? { messages: [] } : {}) })
+      workers.push(worker)
+      return worker
+    },
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  const beats = worker => worker.requests.filter(row => row.op === "heartbeat")
+  const confirmed = beats(workers[0]).at(-1).fields.state
+
+  refusal = "STALE_INSTANCE" // the lease is gone: an episode begins
+  await lifecycle.heartbeat()
+  refusal = "TRANSPORT_UNAVAILABLE" // the next instance joins into an outage, so its first heartbeat is refused
+  retries[0].fn()
+  await flush()
+  assert.equal(workers.length, 2)
+  assert.deepEqual(beats(workers[1]).map(row => row.fields.state), [confirmed], "the join sends the state")
+  await lifecycle.poll()
+  assert.equal(beats(workers[1]).length, 2, "the next poll sends it again: this instance has confirmed nothing")
+})
+
+test("after a fail-closed stop the footer reads no live instance and is never blank", async t => {
+  resetLatchAfter(t)
+  const { pi, emit, ctx, statuses } = fakePi()
+  const failure = Object.assign(new Error("BINDING_FILE_UNSAFE"), { code: "BINDING_FILE_UNSAFE", operation: "join" })
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, startProcess: () => fakeWorker({ ready: Promise.reject(failure) }), now: () => 0,
+  })
+  emit("session_start", {}, ctx)
+  await flush()
+  assert.equal(lifecycle.state(), "offline")
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+  assert.ok(!statuses.includes(undefined), "the footer is never cleared")
+})
+
+test("a worker that exits under a joined session fails chat closed with no live instance in the footer", async t => {
+  resetLatchAfter(t)
+  const { pi, emit, ctx, statuses } = fakePi()
+  const worker = fakeWorker()
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => worker, now: () => 1000 })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: ready")
+  worker.release() // the worker ends by itself: its exit is the fault
+  await flush()
+  assert.equal(lifecycle.state(), "offline")
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+  assert.ok(!statuses.includes(undefined))
+})
+
+test("/agent-chat-off ends the worker and leaves no live instance in the footer", async t => {
+  resetLatchAfter(t)
+  const { pi, emit, ctx, statuses, commands } = fakePi()
+  const worker = fakeWorker()
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => worker, now: () => 1000 })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  commands.find(row => row.name === "agent-chat-off").spec.handler()
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance")
+  assert.ok(!statuses.includes(undefined))
+  assert.equal(worker.stops, 1)
+  await worker.closed
+  await lifecycle.heartbeat()
+  await lifecycle.poll()
+  assert.equal(statuses.at(-1), "Agent Chat: no live instance", "nothing renders over it")
+})
+
+// A joined session with an idle flag the test flips, and the heartbeats the worker has received.
+async function presenceSession(answer = op => (op === "pending" ? { messages: [] } : {})) {
+  const { pi, emit, ctx, statuses } = fakePi()
+  const state = { idle: true }
+  ctx.isIdle = () => state.idle
+  const worker = fakeWorker({ answer: (op, fields) => answer(op, fields, state) })
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => worker, now: () => 1000 })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  const beats = () => worker.requests.filter(row => row.op === "heartbeat")
+  return { emit, ctx, statuses, lifecycle, worker, state, beats }
+}
+
+test("an idle to busy change is published by the next poll, and the reverse too, with nothing extra while it holds", async () => {
+  const { lifecycle, state, beats } = await presenceSession()
+  const base = beats().length
+  await lifecycle.poll()
+  await lifecycle.poll()
+  assert.equal(beats().length, base, "an unchanged state sends no heartbeat from the poll")
+  state.idle = false
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 1)
+  assert.equal(beats().at(-1).fields.state.native_state, "busy")
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 1, "published once")
+  state.idle = true
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 2)
+  assert.equal(beats().at(-1).fields.state.native_state, "idle")
+})
+
+test("a changed state that the worker refused is sent again by the next poll, and once it is confirmed no more", async () => {
+  let refusal = null
+  const { lifecycle, state, beats } = await presenceSession((op) => (refusal && op === "heartbeat" ? { refused: refusal } : op === "pending" ? { messages: [] } : {}))
+  const base = beats().length
+  state.idle = false
+  refusal = "TRANSPORT_UNAVAILABLE"
+  for (let tick = 0; tick < 3; tick += 1) await lifecycle.poll()
+  assert.equal(beats().length, base + 3, "not confirmed, so each poll sends it again")
+  assert.ok(beats().slice(base).every(row => row.fields.state.native_state === "busy"))
+  refusal = null
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 4)
+  await lifecycle.poll()
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 4, "confirmed: nothing more")
+})
+
+test("a change is sent once while its heartbeat is in flight: a tick that finds the loop busy sends nothing", async () => {
+  let hold = null
+  const { lifecycle, state, beats } = await presenceSession((op) => (op === "heartbeat" && hold ? hold : op === "pending" ? { messages: [] } : {}))
+  const base = beats().length
+  let release
+  hold = new Promise(resolve => { release = () => resolve({}) })
+  state.idle = false
+  const first = lifecycle.poll() // finds the change and sends it; the reply is pending
+  await flush()
+  assert.equal(beats().length, base + 1)
+  await lifecycle.poll()
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 1, "a busy loop is not asked again")
+  hold = null
+  release()
+  await first
+  assert.equal(beats().length, base + 1, "nothing is sent again once it is confirmed")
+  await lifecycle.poll()
+  assert.equal(beats().length, base + 1)
+})
+
+// One Pi extension runtime: the real factory on its own extension API, for the session `native`, with a worker that joins as
+// `instance`. Pi builds one for every session start. `log` records the order of the joins.
+function runtime(native, instance = joined, log = []) {
+  const fake = fakePi()
+  fake.ctx.sessionManager.getSessionId = () => native
+  const worker = fakeWorker({ ready: Promise.resolve(instance), holdClose: true })
+  const starts = []
+  agentChatExtension(fake.pi, {
+    config, ...timers, now: () => 1000,
+    startProcess: (_config, identity) => { log.push(`join ${native}`); starts.push(identity); return worker },
+  })
+  return { ...fake, worker, starts }
+}
+const instanceTwo = {
+  ...joined, session_id: "99999999-9999-4999-8999-999999999999", instance_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  instance_file: "/tmp/agent-chat-state/boot-2.json",
+}
+
+// Pi replaces the runtime for /reload, /new, /resume and /fork (and /clone, which is a fork): it emits session_shutdown to the
+// old extension runtime, awaits its handlers, loads a new runtime and emits session_start to it with the reason. /reload
+// keeps the session and its native id; /resume returns to a stored session, which keeps the id it had; /new and /fork make a
+// session with a new one. A chat session is keyed by the native id: /reload and /resume return to one, /new and /fork begin one.
+const REPLACEMENTS = [
+  { reason: "reload", native: "native-1" },
+  { reason: "new", native: "native-2" },
+  { reason: "resume", native: "native-0" },
+  { reason: "fork", native: "native-3" },
+]
+
+for (const { reason, native } of REPLACEMENTS) {
+  test(`replacement on ${reason}: the old worker is closed before the new runtime joins, and the new one starts stopped with its own binding`, async () => {
+    const log = []
+    const old = runtime("native-1", joined, log)
+    old.emit("session_start", { type: "session_start", reason: "startup" }, old.ctx)
+    await flush()
+    assert.equal(old.starts.length, 1)
+
+    // Pi awaits every handler of the event, and emits session_start to the new runtime only after that.
+    const shutdown = Promise.all(old.emit("session_shutdown", { type: "session_shutdown", reason })).then(() => log.push("old closed"))
+    await flush()
+    assert.equal(old.worker.stops, 1, "the old worker is told to stop")
+    assert.deepEqual(log, ["join native-1"], "the handler is still pending while the old worker closes")
+    old.worker.release()
+    await shutdown
+
+    const next = runtime(native, instanceTwo, log)
+    next.emit("session_start", { type: "session_start", reason }, next.ctx)
+    await flush()
+    assert.deepEqual(log, ["join native-1", "old closed", `join ${native}`])
+    assert.equal(next.starts[0].nativeSessionId, native)
+    assert.notEqual(next.starts[0].bootId, old.starts[0].bootId)
+    const event = { systemPromptOptions: { sections: {} } }
+    next.emit("before_agent_start", event)
+    const section = event.systemPromptOptions.sections.agent_chat
+    assert.match(section, /"instance_file":"\/tmp\/agent-chat-state\/boot-2\.json"/)
+    assert.match(section, new RegExp(`"native_session_id":"${native}"`))
+    assert.doesNotMatch(section, /boot-1\.json/)
+    assert.equal(next.worker.requests.find(row => row.op === "heartbeat").fields.state.stopped, true, "it starts stopped")
+    assert.equal(next.statuses.at(-1), "Agent Chat: stopped (type to resume)")
+  })
+}
+
+test("the extension ends its instance on session_shutdown only, never on session_before_switch or session_before_fork", () => {
+  const { handlers } = runtime("native-1")
+  assert.ok(handlers.has("session_shutdown"))
+  assert.deepEqual([...handlers.keys()].filter(name => name.startsWith("session_before_")), [])
+})
+
+test("a Pi process with no valid chat configuration registers nothing and never touches the footer", t => {
+  const dir = mkdtempSync(join(tmpdir(), "agent-chat-pi-"))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const record = (name, value) => {
+    const file = join(dir, name)
+    writeFileSync(file, JSON.stringify(value))
+    chmodSync(file, 0o600)
+    return { AGENT_CHAT_PI_CONFIG: file }
+  }
+  const refused = {
+    "no variable": {},
+    "a file that is not there": { AGENT_CHAT_PI_CONFIG: join(dir, "missing.json") },
+    "a present record with chat disabled": record("off.json", { ...config, chatEnabled: false }),
+    "a present record with an unknown key": record("extra.json", { ...config, extra: true }),
+  }
+  for (const [name, env] of Object.entries(refused)) {
+    const { pi, handlers, commands, statuses } = fakePi()
+    agentChatExtension(pi, { env })
+    assert.equal(handlers.size, 0, name)
+    assert.deepEqual(commands, [], name)
+    assert.deepEqual(statuses, [], name)
+  }
+  const { pi, handlers, commands } = fakePi() // the control: a valid record registers
+  agentChatExtension(pi, { env: record("on.json", config) })
+  assert.ok(handlers.has("session_start") && handlers.has("session_shutdown"))
+  assert.deepEqual(commands.map(row => row.name), ["agent-chat-off"])
+})
+
+test("the off latch outlives its extension instance: a replaced runtime starts no worker and says that chat is off", async t => {
+  resetLatchAfter(t)
+  const old = runtime("native-1")
+  old.emit("session_start", { type: "session_start", reason: "startup" }, old.ctx)
+  await flush()
+  old.commands.find(row => row.name === "agent-chat-off").spec.handler()
+  assert.equal(old.statuses.at(-1), "Agent Chat: no live instance")
+  await Promise.all(old.emit("session_shutdown", { type: "session_shutdown", reason: "new" }))
+  for (const { reason, native } of REPLACEMENTS) {
+    const next = runtime(native)
+    next.emit("session_start", { type: "session_start", reason }, next.ctx)
+    await flush()
+    assert.equal(next.starts.length, 0, `${reason}: no worker is started for a latched process`)
+    assert.equal(next.statuses.at(-1), "Agent Chat: no live instance", `${reason}: the new footer says that chat is off`)
+  }
+})
+
+const IN_PLACE_EVENTS = ["session_tree", "session_compact", "session_compact_failed"]
+
+test("while a compaction or a tree summary runs (the agent is not idle) no claim is made and the heartbeat says busy", async () => {
+  let offered = false
+  const { lifecycle, worker, state, beats } = await presenceSession(op => (op === "pending" ? { messages: offered ? [message.id] : [] } : {}))
+  state.idle = false // Pi: ctx.isIdle() is false while the agent runs, compacts or summarizes a branch
+  offered = true
+  await lifecycle.poll()
+  await lifecycle.heartbeat()
+  assert.equal(worker.requests.filter(row => row.op === "claim").length, 0)
+  assert.equal(beats().at(-1).fields.state.native_state, "busy")
+  assert.equal(lifecycle.state(), "busy")
+  state.idle = true
+  await lifecycle.poll()
+  assert.equal(worker.requests.filter(row => row.op === "claim").length, 1, "once it is idle the same offer is claimed")
+})
+
+for (const name of IN_PLACE_EVENTS) {
+  test(`${name} re-evaluates the state at once, with the context it carries`, async () => {
+    const { emit, ctx, statuses, beats } = await presenceSession()
+    const base = beats().length
+    emit(name, { type: name }, { ...ctx, isIdle: () => false }) // a fresh context object, as Pi gives each event
+    await flush()
+    assert.equal(beats().length, base + 1)
+    assert.equal(beats().at(-1).fields.state.native_state, "busy")
+    assert.equal(statuses.at(-1), "Agent Chat: busy")
+    emit(name, { type: name }, ctx)
+    await flush()
+    assert.equal(beats().length, base + 2)
+    assert.equal(beats().at(-1).fields.state.native_state, "idle")
+    assert.equal(statuses.at(-1), "Agent Chat: ready")
+    emit(name, { type: name }, ctx)
+    await flush()
+    assert.equal(beats().length, base + 2, "an unchanged state sends nothing")
+  })
+}
+
+test("tree navigation and compaction keep the binding, join nothing again and set the section on the next turn", async () => {
+  const { pi, emit, ctx } = fakePi()
+  let starts = 0
+  const worker = fakeWorker()
+  const lifecycle = createAgentChat(pi, config, { ...timers, startProcess: () => { starts += 1; return worker }, now: () => 1000 })
+  emit("session_start", {}, ctx)
+  await flush()
+  const binding = lifecycle.binding()
+  assert.match(binding, /This binding supersedes every earlier Agent Chat binding in this conversation; the previous instance_file is no longer valid\./)
+  for (const name of IN_PLACE_EVENTS) {
+    emit(name, { type: name }, ctx)
+    await flush()
+    const event = { systemPromptOptions: { sections: {} } }
+    emit("before_agent_start", event)
+    assert.equal(event.systemPromptOptions.sections.agent_chat, binding, name)
+  }
+  assert.equal(lifecycle.binding(), binding)
+  assert.equal(starts, 1, "no join again")
+  assert.equal(worker.stops, 0)
+})
+
+test("connect called again while a worker joins or serves starts no second worker and stops none", async () => {
+  const { pi, emit, ctx } = fakePi()
+  const workers = []
+  let admit
+  const admitted = new Promise(resolve => { admit = resolve })
+  const lifecycle = createAgentChat(pi, config, {
+    ...timers, now: () => 1000,
+    startProcess: () => { const worker = fakeWorker({ ready: admitted.then(() => joined) }); workers.push(worker); return worker },
+  })
+  emit("session_start", {}, ctx) // the first join is under way
+  const again = lifecycle.connect()
+  admit()
+  await flush()
+  await again
+  assert.equal(workers.length, 1, "a second call while it joins starts nothing")
+  await lifecycle.connect()
+  assert.equal(workers.length, 1, "a call while it serves starts nothing")
+  assert.equal(workers[0].stops, 0)
+  assert.match(lifecycle.binding(), /boot-1\.json/)
+  emit("session_shutdown")
+  assert.equal(workers[0].stops, 1)
+})

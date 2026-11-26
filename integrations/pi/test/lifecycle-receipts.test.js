@@ -70,8 +70,9 @@ function fakePi(confirm) {
 // (`capabilities` is what its first worker names, `rejoinedCapabilities` what a later one does; null names none), and a
 // promise in `server.gates` holds that operation's answer until it resolves. `cancel()` ends a held receipts request, which
 // then answers `refused: CLI_INTERRUPTED` as the worker's does on the signal; `cancels` records every call and what was held.
+// `lease` is the lease tracker's options, and `statuses` every footer text that was set.
 const RECEIPTS_OPS = new Set(["receipts", "receipts_delivered"])
-async function session({ confirm = "inside", rows = [], toolRoute, capabilities = ["receipts-cancel"], rejoinedCapabilities = capabilities } = {}) {
+async function session({ confirm = "inside", rows = [], toolRoute, capabilities = ["receipts-cancel"], rejoinedCapabilities = capabilities, lease } = {}) {
   const { pi, emit, sent, confirm: confirmNow } = fakePi(confirm)
   const native = { idle: false, mode: "tui", plan: false }
   const server = { rows, muted: false, receiptsReply: null, markReply: null, delivery: null, fail: {}, heartbeatRefusal: null, gates: {} }
@@ -83,6 +84,7 @@ async function session({ confirm = "inside", rows = [], toolRoute, capabilities 
   const nextAttempt = () => `44444444-4444-4444-8444-${String(++claims).padStart(12, "0")}`
   const timeouts = []
   const notices = []
+  const statuses = []
   const workers = []
   const ctx = {
     mode: "tui", signal: undefined, isIdle: () => native.idle,
@@ -90,7 +92,7 @@ async function session({ confirm = "inside", rows = [], toolRoute, capabilities 
       getSessionId: () => "native-1", getSessionName: () => "synthetic",
       getEntries: () => [{ type: "custom", customType: "plan-mode", data: { enabled: native.plan } }],
     },
-    ui: { notify: text => notices.push(text), setStatus() {} },
+    ui: { notify: text => notices.push(text), setStatus: (key, text) => statuses.push(text) },
   }
   const answer = (op, fields) => {
     const failure = server.fail[op]
@@ -138,12 +140,13 @@ async function session({ confirm = "inside", rows = [], toolRoute, capabilities 
   const lifecycle = createAgentChat(pi, toolRoute === undefined ? config : { ...config, toolRoute }, {
     ...quietTimers, startProcess, now: () => clock.t, random: () => 0,
     setTimeoutImpl: (fn, ms) => { timeouts.push({ fn, ms }); return timeouts.length },
+    lease,
   })
   emit("session_start", {}, ctx)
   await flush()
   emit("input", { source: "interactive" }, ctx)
   const api = {
-    lifecycle, emit, sent, native, server, log, clock, notices, workers, ctx, cancels,
+    lifecycle, emit, sent, native, server, log, clock, notices, statuses, workers, ctx, cancels,
     // The rejoin timer: the first rejoin waits 2,500 ms (random is fixed at 0). A delivery's handoff timer waits 5,000 ms.
     rejoins: () => timeouts.filter(entry => entry.ms === 2500),
     confirm: confirmNow,
@@ -775,6 +778,43 @@ test("a session whose requests never overlap a receipts request cancels nothing"
   assert.deepEqual(run.s.cancels, [])
 })
 
+// session_tree, session_compact and session_compact_failed ask the loop to read the state (#132); they make nothing due, so
+// they give nothing way.
+test("a re-evaluation that finds nothing due leaves a receipts request in flight alone, and the poll that falls due still ends it", async () => {
+  const s = await session({ rows: [row(1)] })
+  await primed(s)
+  s.server.gates.receipts = held()
+  const first = s.tick(0)
+  await flush()
+  assert.equal(s.count("receipts"), 1, "the read is in flight")
+  for (const name of ["session_tree", "session_compact", "session_compact_failed"]) s.emit(name, {}, s.ctx)
+  await flush()
+  assert.deepEqual(s.cancels, [], "the state is what the worker has confirmed: nothing is due, so nothing ends the read")
+  const second = s.tick() // a poll falls due: now the read gives way
+  delete s.server.gates.receipts
+  await Promise.all([first, second])
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }])
+})
+
+test("a state change that a re-evaluation finds while a receipts request is in flight ends it, and its heartbeat goes in the same pass", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.server.gates.receipts = held()
+  const first = s.tick(0)
+  await flush()
+  assert.equal(s.count("receipts"), 1, "the read is in flight")
+  s.native.plan = true // Plan Mode flips while it runs: a state report is due
+  s.emit("session_tree", {}, s.ctx)
+  await flush()
+  const ended = s.cancels.length
+  s.workers[0].endHeld() // whatever the outcome, the read must not outlive the test
+  delete s.server.gates.receipts
+  await first
+  assert.equal(ended, 1, "the state report that fell due ended the read")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts", "heartbeat"], "and went out before anything else")
+  assert.equal(s.log.at(-1).fields.state.plan_mode, true)
+})
+
 test("a heartbeat or a poll that falls due while a request that is not a receipts request is in flight cancels nothing, once a receipts request has ended", async () => {
   const s = await session({ rows: [row(1)] })
   await s.tick(0)
@@ -790,3 +830,33 @@ test("a heartbeat or a poll that falls due while a request that is not a receipt
   await Promise.all([beating, polling])
   assert.deepEqual(s.cancels, [], "no receipts request was in flight: there was nothing to end")
 })
+
+// A host suspend lapses the lease on the wall clock alone (#132), and the first poll tick after the resume renders it. The tick
+// renders the footer before it looks at the single flight, so a request in flight holds nothing back. A heartbeat that was sent
+// before the suspend and is answered after it renews nothing: it is older than the lease on the wall clock.
+for (const op of ["receipts", "pending", "heartbeat"]) {
+  test(`the first poll tick after a host suspend turns the footer to no live instance while a ${op} request is in flight`, async () => {
+    let wall = 1_700_000_000_000
+    const s = await session({ rows: [row(1)], lease: { clock: () => 0, wall: () => wall, ...quietTimers } })
+    await primed(s)
+    const asked = s.count(op)
+    let release
+    s.server.gates[op] = op === "receipts" ? held() : new Promise(resolve => { release = resolve })
+    const flight = op === "heartbeat" ? s.lifecycle.heartbeat() : s.tick(0)
+    await flush()
+    assert.equal(s.count(op), asked + 1, "the request is in flight")
+
+    wall += 120_000 // the host sleeps for two minutes: the monotonic clock stands still
+    const tick = s.tick()
+    assert.equal(s.statuses.at(-1), "Agent Chat: no live instance", "rendered at once, with the request still in flight")
+    delete s.server.gates[op] // what is asked next is answered
+    release?.()
+    await Promise.all([flight, tick])
+    assert.equal(s.statuses.at(-1), "Agent Chat: no live instance", "nothing that was asked before the resume renews the lease")
+    assert.equal(s.workers.length, 1, "no episode")
+    assert.deepEqual(s.rejoins(), [])
+
+    await s.lifecycle.heartbeat() // the first heartbeat after the resume
+    assert.equal(s.statuses.at(-1), "Agent Chat: busy", "a confirmed heartbeat restores the text")
+  })
+}

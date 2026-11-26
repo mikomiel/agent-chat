@@ -1,7 +1,7 @@
 # chat-clients Specification
 
 ## Purpose
-Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, the sender receipts that a harness package shows without waking it, and how the OpenCode plugin delivers from the host's idle hook.
+Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, the sender receipts that a harness package shows without waking it, how the `pi` package keeps its footer and its instance true across a lapsed lease, a stopped chat, a replaced runtime and a compaction, and how the OpenCode plugin delivers from the host's idle hook.
 
 ## Requirements
 
@@ -455,6 +455,121 @@ Only a `settle` try that gets no status, because the connection fails before the
 - **WHEN** the request deadline cuts a try short
 - **THEN** the worker answers its parent with `REQUEST_UNCERTAIN` and ends
 - **AND** a pause between tries that ends after the deadline starts no try, and the worker answers with the code of the last failure
+
+### Requirement: The `pi` footer reads `no live instance` when the instance lease lapses
+The `pi` package MUST show `Agent Chat: no live instance` once 90 seconds have passed on the monotonic clock or on the wall clock since it sent the last join or heartbeat request that the worker answered without `refused`, and the state text again at the next such answer. This text MUST come before every state text. The lapse itself MUST change the footer only: it MUST NOT begin a rejoin episode, withdraw the binding context or raise a fault.
+
+#### Scenario: A brief outage
+- **WHEN** the worker answers a heartbeat or a pending read `refused` with `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN`, and the lease has not lapsed
+- **THEN** the adapter keeps its worker and its binding context, begins no rejoin episode and spends none of its rejoin budget
+- **AND** the next heartbeat or poll tick is the retry
+
+#### Scenario: The lease lapses during an outage
+- **WHEN** 90 seconds pass after the send of the last request that was answered without `refused`
+- **THEN** the footer reads `Agent Chat: no live instance` at that deadline, not at the next 30-second heartbeat
+- **AND** the lapse itself begins no rejoin episode, withdraws no binding context and raises no fault
+- **AND** the next heartbeat answered without `refused` shows the state text again
+
+#### Scenario: The lease runs from the send
+- **WHEN** a heartbeat is sent at second 0 and answered without `refused` at second 40
+- **THEN** the lease runs to second 90, not to second 130
+
+#### Scenario: A host suspend
+- **WHEN** the host is suspended for more than 90 seconds after the send of the last request that was answered without `refused`, so that the monotonic clock and its timer stand still and the wall clock runs on
+- **THEN** the footer reads `Agent Chat: no live instance` at the first poll tick after the resume, whatever request is in flight then
+- **AND** the lapse itself begins no rejoin episode, withdraws no binding context and raises no fault
+- **AND** the next heartbeat answered without `refused` shows the state text again
+
+#### Scenario: A wall clock set back
+- **WHEN** the wall clock is set back after the monotonic clock has counted 90 seconds from the send of the last request that was answered without `refused`
+- **THEN** the footer keeps reading `Agent Chat: no live instance`
+
+#### Scenario: The lapse comes first
+- **WHEN** the lease lapses while the session is busy, stopped, paused or in Plan Mode
+- **THEN** the footer reads `Agent Chat: no live instance` until a heartbeat is answered without `refused`, and then reads the text of that state
+
+#### Scenario: A rejoin episode
+- **WHEN** the adapter waits to rejoin after a failure that calls for it
+- **THEN** the footer reads `Agent Chat: reconnecting`, never `Agent Chat: no live instance`
+- **AND** the next successful join starts a new lease
+
+#### Scenario: A reply from an ended instance
+- **WHEN** an instance has ended or been replaced and the reply to a request that it sent arrives
+- **THEN** that reply renews no lease
+
+### Requirement: The `pi` footer is never blank after chat stops
+After chat fails closed, after `/agent-chat-off` and in a replacing runtime whose off latch holds, the `pi` footer MUST read `Agent Chat: no live instance`. Only `session_shutdown` MAY clear the footer. A Pi process with no valid chat configuration MUST register nothing and never touch the footer.
+
+#### Scenario: Chat fails closed
+- **WHEN** chat fails closed, for example with `REJOIN_BUDGET`, or the worker exits under a joined session
+- **THEN** the footer reads `Agent Chat: no live instance`
+
+#### Scenario: The operator turns chat off
+- **WHEN** the operator runs `/agent-chat-off`
+- **THEN** the worker ends and the footer reads `Agent Chat: no live instance`
+
+#### Scenario: Shutdown
+- **WHEN** Pi emits `session_shutdown`
+- **THEN** the footer is cleared and the lease timer is cleared
+- **AND** nothing renders afterwards
+
+#### Scenario: No valid chat configuration
+- **WHEN** Pi starts with no configuration, or with one that the config loader refuses, such as a record with chat disabled
+- **THEN** the extension registers no handler and no command, and the footer is never touched
+
+### Requirement: `pi` sends a changed state at the next poll
+At every 2-second poll the `pi` package MUST compare the state that it would heartbeat with the last state that the worker confirmed, and send one heartbeat at once when they differ, not at the next 30-second tick. A changed state that the worker answered `refused` MUST stay unconfirmed and be sent again at the next poll. It MUST send nothing extra while the state holds, and no second heartbeat while one is in flight.
+
+#### Scenario: Idle to busy, and back
+- **WHEN** the session turns busy between two heartbeats, or turns idle again
+- **THEN** the next poll sends one heartbeat that carries the new state
+- **AND** nothing more is sent while the state holds
+
+#### Scenario: The worker refuses the change
+- **WHEN** the worker answers a changed heartbeat `refused`
+- **THEN** the next poll sends the state again, and once the worker confirms it, no more
+
+#### Scenario: A heartbeat is in flight
+- **WHEN** a poll finds a heartbeat in flight
+- **THEN** it sends no second heartbeat
+
+### Requirement: `pi` ends its instance at `session_shutdown` and starts a replacing runtime stopped
+`session_shutdown` MUST stop the `pi` worker, end the instance and return the worker's close, which Pi awaits before a replacing runtime starts. No other event, including `session_before_switch` and `session_before_fork`, MAY end an instance. A replacing runtime MUST start stopped and join with the native session id of its own `session_start`, and MUST start no worker once chat is off. A second `connect` while a worker joins or serves MUST start none and stop none.
+
+#### Scenario: A runtime is replaced
+- **WHEN** Pi emits `session_shutdown` to the old runtime and then `session_start` to a new one, with the reason `reload`, `new`, `resume` or `fork`
+- **THEN** the old worker is closed before the new runtime joins
+- **AND** the new runtime joins with its own binding and starts stopped
+
+#### Scenario: An event that precedes a switch
+- **WHEN** Pi emits `session_before_switch` or `session_before_fork`
+- **THEN** the package stops no worker and ends no instance, because it listens to neither event
+
+#### Scenario: Chat is off
+- **WHEN** chat was turned off and Pi replaces the runtime
+- **THEN** the new runtime starts no worker, and its footer reads `Agent Chat: no live instance`
+
+#### Scenario: A second connect
+- **WHEN** `connect` is called while a worker joins or serves
+- **THEN** it starts no second worker and stops none
+
+### Requirement: Compaction and tree navigation keep the `pi` binding
+Tree navigation and compaction MUST keep the `pi` binding and MUST NOT join again. While Pi is not idle, in a compaction or a tree summary, the package MUST report `busy` and claim nothing. `session_tree`, `session_compact` and `session_compact_failed` MUST make it read the state at once, with the context that the event carries.
+
+#### Scenario: A compaction runs
+- **WHEN** a compaction or a tree summary runs while a message is pending
+- **THEN** the heartbeat says `busy` and no claim is sent
+- **AND** once Pi is idle again the claim is sent
+
+#### Scenario: Compaction or navigation ends
+- **WHEN** `session_tree`, `session_compact` or `session_compact_failed` arrives
+- **THEN** the loop reads the state at once, with the context that the event carries
+- **AND** the binding stays, nothing is joined again and the next turn carries the binding section
+
+#### Scenario: A receipts request is in flight
+- **WHEN** one of the three events arrives while a receipts request is in flight
+- **THEN** the package ends that request only when the state differs from the last confirmed one, and sends that state report in the same pass
+- **AND** an event that finds nothing due ends nothing
 
 ### Requirement: A peer message body is framed behind a per-notice nonce
 When a harness package passes message bodies to its session, the notice MUST carry a nonce of at least 64 bits from a cryptographic generator, drawn after the claim and never derived from message data. Each message MUST be a header line, an opening marker `<<<AGENT-CHAT-BODY NONCE`, the body and a closing marker `AGENT-CHAT-BODY NONCE>>>`. Every body line MUST start with `> `, added after the cut.

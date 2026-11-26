@@ -8,7 +8,8 @@ native state, the delivery callback and the bounded rejoin scheduler.
 
 ## Requirements
 
-- Pi with extension support (the API surface is listed in the table below).
+- Pi with extension support (the [compatibility matrix](../README.md#compatibility) lists the API surface and
+  the releases that were run).
 - Node 20 or newer.
 - A Python 3.11+ interpreter with the same version of the core installed: the PyPI
   distribution `sessionyard`, which provides the `agent_chat` import. Do not install
@@ -117,8 +118,35 @@ fits on `cli` fits on every route.
   session id and a fresh boot id, then publishes the binding as one system
   prompt section. A later join replaces the section; the old `instance_file` is
   no longer valid.
-- **Presence.** A heartbeat every 30 seconds carries `native_state`, `stopped`,
-  `plan_mode` and the session title when Pi exposes one.
+- **Presence.** A heartbeat carries `native_state`, `stopped`, `plan_mode` and the
+  session title when Pi exposes one. It goes out every 30 seconds and whenever that
+  snapshot differs from the last one the worker confirmed: the 2-second poll makes the
+  comparison, so an idle or busy change, a stop change, a Plan Mode flip or a new title
+  reaches peers within one tick, and an unchanged state sends nothing extra.
+  A changed snapshot that comes back `refused` stays unconfirmed, so the next poll
+  sends it again; a refused keep-alive waits for the next 30-second heartbeat. A new
+  instance after a rejoin starts with nothing confirmed.
+  `session_tree`, `session_compact` and `session_compact_failed`
+  ask for the same comparison at once, with the context they carry; the poll finds the
+  same change, so nothing depends on them.
+- **Footer and lease.** The footer shows one of `Agent Chat: ready`, `busy`,
+  `plan mode`, `paused`, `stopped (type to resume)`, `reconnecting` (while a rejoin
+  episode runs) and `no live instance`. The extension mirrors the core's instance lease:
+  an instance is live for `LEASE_SECONDS` (90, pinned to `agent_chat/models.py` by
+  `test/lease.test.js`) after the join or heartbeat that the worker answered without
+  `refused`, counted from the moment the request was sent, on a monotonic clock and on the
+  wall clock: the core counts on wall time and a monotonic clock stops while the host is
+  suspended, so the lease is over when either one has counted the 90 seconds. When the
+  monotonic deadline passes, a timer on it (not the poll) sets the footer to
+  `Agent Chat: no live instance`; a lapse that only the wall clock shows, as after a
+  suspend, is set by the next poll tick, whatever request is in flight then. It replaces
+  the state text whatever the state was, `busy` and `plan mode` included; the next
+  confirmed heartbeat restores the state text. The lapse itself is a
+  footer change only: it starts no rejoin episode, withdraws no binding and raises no
+  fault, and what starts an episode is unchanged (see Rejoin). After a fail-closed stop
+  and after `/agent-chat-off` the footer says `no live instance` too.
+  Only `session_shutdown` clears the footer. A Pi process with no valid chat
+  configuration registers nothing, so the extension never touches its footer.
 - **Delivery.** Every 2 seconds the extension asks for pending messages. It
   claims only while the session is an idle TUI, not stopped, not inside a UI
   prompt and not aborted. A claimed batch becomes one `agent-chat` custom
@@ -147,7 +175,9 @@ fits on `cli` fits on every route.
   change the bytes of a delivery, a heartbeat or the binding. It gives way: a
   heartbeat or a delivery poll that falls due while the request is in flight
   ends it with the worker's cancel signal, and the pass sends no request while
-  either is due. The signal is repeated every 5 milliseconds until the worker
+  either is due. A state change that the comparison finds then is a heartbeat
+  that fell due; a re-evaluation that finds nothing due ends nothing. The signal
+  is repeated every 5 milliseconds until the worker
   answers, so a cancel that reaches the worker before it has read the request,
   which the worker drops, is followed by one that ends it. That is client-side
   only: a receipts read that stalls inside
@@ -170,20 +200,45 @@ fits on `cli` fits on every route.
   `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` is the
   core's brief-outage answer: the worker and the binding stay, no rejoin budget
   is spent and the next heartbeat or poll is the retry. A `refused`
-  `STALE_INSTANCE` still rejoins.
+  `STALE_INSTANCE` still rejoins. A lapsed lease alone starts nothing: when the outage
+  outlasts the lease, the worker raises its own error, and that enters this path.
 - **Fail closed.** Every other refusal, an exhausted rejoin budget, a malformed
   frame and a worker exit latch chat off for the process. The native session,
-  CI and any submitted work are unchanged. `/agent-chat-off` is the operator
-  switch.
+  CI and any submitted work are unchanged. The footer then says `no live instance`.
+  `/agent-chat-off` is the operator switch.
 - **Stop.** A session start, an abort and a non-interactive input source clear
   delivery eligibility; only interactive local input restores it. The footer
-  shows whether chat is ready, busy, stopped, planning, paused or reconnecting. Stop transitions are reported at the next poll or heartbeat.
+  shows whether chat is ready, busy, stopped, planning, paused, reconnecting or has no
+  live instance. A stop transition is reported at the next poll or heartbeat.
+- **Replacement, compaction and tree.** Pi replaces the extension runtime for
+  `/reload`, `/new`, `/resume` and `/fork` (and `/clone`, which is a fork): it emits
+  `session_shutdown` to the old runtime, awaits its handlers, loads a new runtime and
+  emits `session_start` with the same reason. The extension ends its instance on
+  `session_shutdown` only, and its handler returns once the worker has exited, so the
+  old instance has ended before the new one joins. It subscribes to no
+  `session_before_switch` or `session_before_fork`, because another handler can cancel
+  those and the instance would end for a switch that never happened. The new runtime
+  starts stopped. A chat session is keyed by the native session id: `/reload` and
+  `/resume` return to the chat session of that Pi session, and `/new`, `/fork` and
+  `/clone` begin one; every join is a new instance with a new binding. The off latch is
+  process-wide, so a runtime that replaces a latched one starts no worker and shows
+  `no live instance`. `/tree` and compaction keep the runtime, the native session id and
+  the binding: nothing is joined or announced again, claims wait while Pi reports the
+  session as not idle (which covers compaction and branch summarization), and
+  `before_agent_start` sets the binding section at every turn.
 
 ## Limitations
 
 - Plan Mode detection follows the `plan-mode` state recorded by Pi's shipped
   example extension, including its startup flag. Use `/agent-chat-off` if a
   different planning extension does not expose that state.
+- A wall clock that is set forward shows `no live instance` early, by as much as it was set
+  forward. That error is on the safe side, and the next confirmed heartbeat restores the text.
+- The lease footer, the replacement contract and the tree and compaction events have run only
+  against a harness double. No live Pi run has shown them.
+- Claims wait during compaction and branch summarization because `ctx.isIdle()` is false then
+  in Pi 1.5.2's implementation. Pi's documentation promises it only for agent runs and
+  retries, so a contract test with a double pins the behaviour here and Pi does not.
 - Sender receipts have run only against a harness double. The mark waits for
   `message_start` with the message's marker, as the Pi 1.5.2 source emits it for
   a `triggerTurn: false` message; no live Pi run has shown it. If a release did
@@ -218,7 +273,9 @@ node --test
 The suite covers config refusal, the join frame and frame validation, rejoin
 budget/window/backoff, delivery and settlement, the system-prompt binding,
 fail-closed latching and the shared notice vectors, with the claim packing for
-bodies mode, and sender receipts: the offer rules, the confirmation and the mark,
+bodies mode, the lease and the footer vocabulary, presence on change, the replacement of
+the runtime for each `session_start` reason, tree navigation and compaction, and sender
+receipts: the offer rules, the confirmation and the mark,
 one request per pass, and that a delivery and the binding are byte-identical with
 receipts pending. It
 needs no PostgreSQL, no service and no credential.
