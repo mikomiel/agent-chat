@@ -1642,6 +1642,118 @@ test("a keep-alive tick that finds the snapshot just refused waits for the deliv
   assert.deepEqual(sent[2].fields.state, sent[0].fields.state, "the keep-alive carries the snapshot that was refused")
 })
 
+// Review of #191, round 6. What yields to the waiting delivery poll is every state that was refused in the run, and not only the
+// latest: A is refused, the state changes to B and B is refused, and the state returns to A while the poll still waits.
+test("a state refused earlier in the run still waits for the delivery poll when the state returns to it: heartbeat, heartbeat, poll, heartbeat", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker, entries, emit, ctx } = session
+  const before = worker.requests.length
+  session.state.idle = false // the state A
+  session.refusal.code = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat that is not held is refused as well
+  const releaseA = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds A and sends it, and its answer is held; the delivery poll is queued behind it
+  await flush()
+  entries.push(PLAN_ON) // Plan Mode starts: the state is B
+  emit("session_compact", { type: "session_compact" }, ctx) // finds the loop busy and asks for a compare
+  releaseA({ refused: "TRANSPORT_UNAVAILABLE" }) // A is refused, and the compare finds B, which differs from it
+  const releaseB = session.hold("heartbeat")
+  await flush()
+  entries.push(PLAN_OFF) // Plan Mode ends while B is out: the state is A again
+  emit("session_compact", { type: "session_compact" }, ctx) // asks for another compare
+  releaseB({ refused: "TRANSPORT_UNAVAILABLE" }) // B is refused, and the compare finds A, which was refused too, with the poll waiting
+  await flight
+  const sent = worker.requests.slice(before)
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "heartbeat", "pending", "heartbeat"], "the poll goes before A is sent again")
+  assert.deepEqual(sent.filter(row => row.op === "heartbeat").map(row => row.fields.state.plan_mode), [false, true, false], "A, B, A")
+})
+
+// A refused state is due only while it differs from the state that the worker confirmed, at the moment of the choice. Busy is
+// refused, its retry yields to the delivery poll, and the turn ends while that poll is held: the state is the confirmed one again,
+// so no heartbeat follows the poll. This brings the loop to the point where the poll is out and held; `code` is the refusal.
+async function revertedWhileThePollIsHeld(code) {
+  const session = await slowSession()
+  const { lifecycle, worker, emit, ctx } = session
+  const before = worker.requests.length
+  session.state.idle = false // the turn starts: busy, and the worker has confirmed idle
+  session.refusal.code = code
+  const releaseBeat = session.hold("heartbeat")
+  const flight = lifecycle.poll() // finds the change and sends it, and its answer is held; the delivery poll is queued behind it
+  await flush()
+  emit("session_compact", { type: "session_compact" }, ctx) // finds the loop busy and asks for a compare
+  const releasePoll = session.hold("pending")
+  releaseBeat({ refused: code }) // busy is refused and still due, so it yields to the delivery poll, which goes out and is held
+  await flush()
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending"], "the poll goes before the retry")
+  session.state.idle = true // the turn ends while the poll is held
+  emit("session_compact", { type: "session_compact" }, ctx)
+  return { session, flight, releasePoll, sent: () => worker.requests.slice(before) }
+}
+
+test("a state that returns to the confirmed one while the delivery poll is held is not sent after it: heartbeat, poll, and nothing more", async () => {
+  const { session, flight, releasePoll, sent } = await revertedWhileThePollIsHeld("TRANSPORT_UNAVAILABLE")
+  releasePoll({ messages: [] })
+  await flight
+  await flush()
+  assert.deepEqual(sent().map(row => row.op), ["heartbeat", "pending"], "idle is what the worker holds: nothing is sent for it")
+  await session.lifecycle.poll() // the next entry finds nothing changed
+  assert.deepEqual(sent().map(row => row.op), ["heartbeat", "pending", "pending"], "and sends its delivery poll alone")
+})
+
+// REQUEST_UNCERTAIN is the one tolerated refusal after which the request may have been applied (agent_chat/client.py and
+// instance_client.py answer it for a request that may have been submitted): after a heartbeat of a changed state, here busy, the
+// worker may hold that state, and what it last confirmed is unknown. The other two mean that nothing was sent, so the confirmed
+// state stays as it was. This test holds with the sticky flag of the earlier scheduler too, so it pins the behaviour and does not
+// tell the two apart; the next test does.
+test("a state that returns to the confirmed one after a REQUEST_UNCERTAIN refusal is sent: the worker may hold the state that was refused", async () => {
+  const { session, flight, releasePoll, sent } = await revertedWhileThePollIsHeld("REQUEST_UNCERTAIN")
+  session.refusal.code = null
+  releasePoll({ messages: [] })
+  await flight
+  await flush()
+  assert.deepEqual(sent().map(row => row.op), ["heartbeat", "pending", "heartbeat"], "the idle state follows the poll")
+  assert.equal(sent().at(-1).fields.state.native_state, "idle")
+  await session.lifecycle.poll()
+  assert.deepEqual(sent().map(row => row.op), ["heartbeat", "pending", "heartbeat", "pending"], "once it is confirmed, nothing more is sent for it")
+})
+
+for (const [code, sendsIdle] of [["REQUEST_UNCERTAIN", true], ["TRANSPORT_UNAVAILABLE", false], ["SERVICE_UNAVAILABLE", false]]) {
+  test(`${code} on a changed heartbeat ${sendsIdle ? "leaves no confirmed state: the next compare sends the state that was confirmed before" : "leaves the confirmed state as it was: the next compare sends nothing for it"}`, async () => {
+    const session = await slowSession()
+    const { lifecycle, worker } = session
+    const before = worker.requests.length
+    session.state.idle = false
+    session.refusal.code = code
+    await lifecycle.poll() // finds the change and sends it, and it is refused; nothing else is due but the delivery poll
+    session.state.idle = true // the state is the one that the worker confirmed before the refusal
+    session.refusal.code = null
+    await lifecycle.poll() // the next entry compares
+    const sent = worker.requests.slice(before)
+    assert.deepEqual(sent.map(row => row.op), sendsIdle ? ["heartbeat", "pending", "heartbeat", "pending"] : ["heartbeat", "pending", "pending"])
+    if (sendsIdle) assert.equal(sent[2].fields.state.native_state, "idle")
+    await lifecycle.poll()
+    assert.equal(worker.requests.slice(before).filter(row => row.op === "heartbeat").length, sendsIdle ? 2 : 1, "and once confirmed, nothing more")
+  })
+}
+
+// A refusal that may have been applied unconfirms a changed state, since the worker holds that state or the one it confirmed
+// before. A heartbeat of the state that the worker already confirmed leaves it holding that state whether or not the request was
+// applied, so such a refusal leaves it confirmed, and the next poll tick has no heartbeat to send before its delivery poll. A
+// scheduler that unconfirms on every REQUEST_UNCERTAIN refusal sends one, at every tick for as long as the refusals last.
+test("a keep-alive of the confirmed state that is refused as REQUEST_UNCERTAIN leaves it confirmed: the next poll tick sends no heartbeat before its poll", async () => {
+  const session = await slowSession()
+  const { lifecycle, worker } = session
+  const before = worker.requests.length
+  session.refusal.code = "REQUEST_UNCERTAIN"
+  await lifecycle.heartbeat() // the 30-second tick: the state is the one that the worker confirmed, and the heartbeat is refused
+  session.refusal.code = null
+  await lifecycle.poll() // the next tick compares
+  const sent = worker.requests.slice(before)
+  assert.deepEqual(sent.map(row => row.op), ["heartbeat", "pending"], "the delivery poll goes alone")
+  assert.equal(sent[0].fields.state.native_state, "idle", "the refused heartbeat carried the confirmed state")
+  await lifecycle.poll()
+  assert.deepEqual(worker.requests.slice(before).map(row => row.op), ["heartbeat", "pending", "pending"], "and nothing is sent for it later")
+})
+
 // The scheduler is one pure decision over what is due: a heartbeat goes first, unless it is the snapshot that was just refused
 // while a delivery poll or a receipts pass waits; then the delivery poll, then the receipts pass; nothing due is null. All 16
 // combinations of the four flags, in the order dirty, pollDue, receiptsDue, sameAsRefused.
@@ -1678,45 +1790,56 @@ test("nextRequest, asked about a receipts request in flight, answers receipts ex
   }
 })
 
-// Every interleaving, to depth 4, of three kinds of entry (a poll tick, the 30-second keep-alive tick and an event that changes
-// the state, here a compaction) with two kinds of answer (confirmed, and the refusal of a tolerated outage), against a worker
-// that holds each request until the script answers it, so an entry can come in while any request is out and an answer after any
-// entry. A sequence starts with an entry, since an answer to nothing is no step. After the script every request that is still out
-// is answered the same way until the loop ends, once with each answer. For every sequence:
+// Every interleaving, to depth 4, of four kinds of entry (a poll tick, the 30-second keep-alive tick and two events that change
+// the state: a compaction that turns the session busy or idle, and a rename that changes its title) with two kinds of answer
+// (confirmed, and the refusal of a tolerated outage, run once as `TRANSPORT_UNAVAILABLE`, which sent nothing, and once as
+// `REQUEST_UNCERTAIN`, which may have been applied), against a worker that holds each request until the script answers it, so an
+// entry can come in while any request is out and an answer after any entry. A sequence starts with an entry, since an answer to
+// nothing is no step. It runs from two starts: with the state the one that the worker confirmed, and with the session already
+// busy, a change that no entry has seen, so that the first entry finds it and sends it. Only from the second start does a state
+// refused, another state refused and a return to the first, while the delivery poll waits, fall within four steps. After the
+// script every request that is still out is answered the same way until the loop ends, once with each answer. For every sequence:
 //  - the loop ends, and the next poll tick finds it free and sends a request;
-//  - a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again (the rule reads
-//    "a delivery poll or a receipts request": this worker never has a receipts request in flight, so only the poll is checked
-//    here, and lifecycle-receipts.test.js checks the receipts request);
-//  - a changed state is never left behind a delivery poll, unless it is the snapshot that was just refused;
+//  - a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again, unless a state is
+//    confirmed meanwhile, whichever state it was and however many others were refused since (the rule reads "a delivery poll or a
+//    receipts request": this worker never has a receipts request in flight, so only the poll is checked here, and
+//    lifecycle-receipts.test.js checks the receipts request);
+//  - a changed state is never left behind a delivery poll, unless it is a state that was refused since the last poll or confirm;
+//  - a heartbeat of the confirmed state is sent only when a keep-alive tick has come since the last heartbeat, or when the confirmed
+//    state is unknown, which a `REQUEST_UNCERTAIN` refusal of a changed state makes it;
 //  - no due flag is spent twice: no more heartbeats than entries, no more delivery polls than poll ticks.
-const ENTRIES = ["poll", "beat", "event"]
+const ENTRIES = ["poll", "beat", "event", "rename"]
 const ANSWERS = ["confirmed", "refused"]
-const REFUSAL = { refused: "TRANSPORT_UNAVAILABLE" }
+const REFUSALS = ["TRANSPORT_UNAVAILABLE", "REQUEST_UNCERTAIN"] // what a refusal says: nothing was sent, or the request may have been applied
 
-async function interleaving(script, drain) {
+async function interleaving(script, drain, changed, code) {
+  const refusal = { refused: code }
   const { pi, emit, ctx } = fakePi()
-  const state = { idle: true }
+  const state = { idle: true, title: "synthetic" }
   ctx.isIdle = () => state.idle
-  const snapshot = () => (state.idle ? "idle" : "busy") // the only part of a heartbeat that the script changes
+  ctx.sessionManager.getSessionName = () => state.title
+  const snapshot = () => `${state.idle ? "idle" : "busy"} ${state.title}` // the only parts of a heartbeat that the script changes
   const problems = []
   const count = { heartbeats: 0, polls: 0, entries: 0, ticks: 0 }
-  // What the worker has confirmed and what it has refused, a poll tick that no delivery poll has taken, and the snapshot that was
-  // refused while one waited.
-  const model = { confirmed: "idle", refused: null, pollWaiting: false, heldBack: null }
+  // What the worker has confirmed, the states it has refused since the last poll or confirm, a poll tick that no delivery poll has
+  // taken, the states that were refused while one waited, and whether a keep-alive tick has come since the last heartbeat.
+  const model = { confirmed: "idle synthetic", refused: new Set(), pollWaiting: false, heldBack: new Set(), keepAlive: false }
   let armed = false // the invariants hold from the first step of the script, not for the join
   let held = null // the request whose answer is out: { op, text, resolve }
   const worker = fakeWorker({
     answer: (op, fields) => {
-      const text = op === "heartbeat" ? fields.state.native_state : null
+      const text = op === "heartbeat" ? `${fields.state.native_state} ${fields.state.title}` : null
       if (armed && op === "heartbeat") {
         count.heartbeats += 1
-        if (text === model.heldBack) problems.push("a snapshot that was refused while a delivery poll waited went ahead of that poll")
+        if (model.heldBack.has(text)) problems.push("a state that was refused while a delivery poll waited went ahead of that poll")
+        if (text === model.confirmed && !model.keepAlive) problems.push("a heartbeat of the confirmed state was sent with no keep-alive due")
+        model.keepAlive = false
       }
       if (armed && op === "pending") {
         count.polls += 1
         model.pollWaiting = false
-        model.heldBack = null
-        if (snapshot() !== model.confirmed && snapshot() !== model.refused) problems.push("a changed state waited behind a delivery poll")
+        model.heldBack.clear()
+        if (snapshot() !== model.confirmed && !model.refused.has(snapshot())) problems.push("a changed state waited behind a delivery poll")
       }
       return new Promise(resolve => { held = { op, text, resolve } })
     },
@@ -1726,24 +1849,37 @@ async function interleaving(script, drain) {
     if (!held) return
     const { op, text, resolve } = held
     held = null
-    if (op !== "heartbeat") model.refused = null // a poll is done: the snapshot that waited for it is due again
-    else if (value.refused) Object.assign(model, { refused: text, heldBack: model.pollWaiting ? text : null })
-    else Object.assign(model, { confirmed: text, refused: null, heldBack: null })
+    if (op !== "heartbeat") model.refused.clear() // a poll is done: the states that waited for it are due again
+    else if (value.refused) {
+      model.refused.add(text)
+      if (model.pollWaiting) model.heldBack.add(text)
+      if (value.refused === "REQUEST_UNCERTAIN" && text !== model.confirmed) model.confirmed = null // a changed state may have been applied: what the worker confirmed last is unknown
+    } else {
+      model.confirmed = text
+      model.refused.clear()
+      model.heldBack.clear()
+    }
     resolve(value)
     await flush()
   }
   const answerAll = async value => { for (let step = 0; step < 12 && held; step += 1) await reply(value) }
   const steps = {
     poll: async () => { count.entries += 1; count.ticks += 1; model.pollWaiting = true; void lifecycle.poll(); await flush() },
-    beat: async () => { count.entries += 1; void lifecycle.heartbeat(); await flush() },
+    beat: async () => { count.entries += 1; model.keepAlive = true; void lifecycle.heartbeat(); await flush() },
     event: async () => {
       count.entries += 1
       state.idle = !state.idle
       emit("session_compact", { type: "session_compact" }, ctx)
       await flush()
     },
+    rename: async () => {
+      count.entries += 1
+      state.title = state.title === "synthetic" ? "renamed" : "synthetic"
+      emit("session_tree", { type: "session_tree" }, ctx)
+      await flush()
+    },
     confirmed: () => reply({}),
-    refused: () => reply(REFUSAL),
+    refused: () => reply(refusal),
   }
 
   emit("session_start", {}, ctx) // the join, and then the interactive input that makes the idle flag count: idle is what is confirmed
@@ -1753,9 +1889,10 @@ async function interleaving(script, drain) {
   void lifecycle.poll()
   await flush()
   await answerAll({})
+  if (changed) state.idle = false // busy, and nothing has asked yet: the first entry of the script finds it
   armed = true
   for (const step of script) await steps[step]()
-  await answerAll(drain === "refused" ? REFUSAL : {})
+  await answerAll(drain === "refused" ? refusal : {})
   if (held) problems.push("the loop did not end")
   if (count.heartbeats > count.entries) problems.push(`${count.heartbeats} heartbeats for ${count.entries} entries`)
   if (count.polls > count.ticks) problems.push(`${count.polls} delivery polls for ${count.ticks} poll ticks`)
@@ -1775,12 +1912,17 @@ test("every interleaving of poll ticks, keep-alive ticks, events and answers to 
     words = words.flatMap(word => [...ENTRIES, ...ANSWERS].map(step => [...word, step]))
     scripts.push(...words.filter(word => ENTRIES.includes(word[0])))
   }
-  assert.equal(scripts.length, 3 * (1 + 5 + 25 + 125), "every sequence that starts with an entry")
+  const kinds = ENTRIES.length + ANSWERS.length
+  assert.equal(scripts.length, ENTRIES.length * (1 + kinds + kinds ** 2 + kinds ** 3), "every sequence that starts with an entry")
   const failures = []
-  for (const script of scripts) {
-    for (const drain of ANSWERS) {
-      const problems = await interleaving(script, drain)
-      if (problems.length) failures.push(`${script.join(" ")}, then ${drain}: ${problems.join("; ")}`)
+  for (const changed of [false, true]) {
+    for (const code of REFUSALS) {
+      for (const script of scripts) {
+        for (const drain of ANSWERS) {
+          const problems = await interleaving(script, drain, changed, code)
+          if (problems.length) failures.push(`${changed ? "from busy" : "from confirmed"}, ${code}: ${script.join(" ")}, then ${drain}: ${problems.join("; ")}`)
+        }
+      }
     }
   }
   assert.deepEqual(failures, [])

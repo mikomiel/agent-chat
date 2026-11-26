@@ -553,7 +553,7 @@ A state change that a poll or an event sees while a request other than a receipt
 - **AND** a state that stays unconfirmed is sent again by the next poll that finds no request in flight
 
 ### Requirement: `pi` sends a refused heartbeat again only after the request that waited for it
-A delivery poll or a receipts request that was waiting when the worker refused a heartbeat MUST go before that state is sent again, unless another state is confirmed meanwhile. In that run the refused state also yields to either one that falls due later, until a delivery poll has run or a heartbeat is confirmed. The next run forgets the refusal, so the entry that starts it may send the state before its poll. Any other changed state goes first, and a delivery poll goes before a receipts request.
+A delivery poll that was waiting when the worker refused a heartbeat MUST go before that state is sent again, unless another state is confirmed meanwhile; when no delivery poll was waiting, a receipts request that was waiting MUST go before it. In that run every refused state also yields until a delivery poll runs or a heartbeat is confirmed. The next run forgets the refusals. A `REQUEST_UNCERTAIN` refusal of a changed state leaves no confirmed state, so the next compare sends the current one.
 
 #### Scenario: A refusal that outlasts every tick
 - **WHEN** each heartbeat is answered `refused` after a poll tick has come, so a delivery poll is due each time
@@ -567,6 +567,11 @@ A delivery poll or a receipts request that was waiting when the worker refused a
 #### Scenario: Only a receipts request waits
 - **WHEN** a heartbeat is refused after an event asked for a compare, no delivery poll is due, and a receipts request is
 - **THEN** the receipts request is sent before the retry
+
+#### Scenario: A delivery poll and a receipts request both wait
+- **WHEN** a heartbeat is refused after a poll tick found a change, so that a delivery poll and a receipts request both wait
+- **THEN** the delivery poll is sent first, the retry second and the receipts request third
+- **AND** a poll tick makes both due at once, so this is the order after every tick that finds a change
 
 #### Scenario: A receipts request that the refused state yielded to
 - **WHEN** a heartbeat is refused while a receipts request is due, that request is out, and an event or the keep-alive finds the same state
@@ -582,18 +587,37 @@ A delivery poll or a receipts request that was waiting when the worker refused a
 - **WHEN** a heartbeat is refused, and the state then differs from the refused one while a delivery poll waits
 - **THEN** the heartbeat of the new state is sent before the delivery poll
 
+#### Scenario: Two states refused in one run
+- **WHEN** a heartbeat of one state is refused, the state changes and that heartbeat is refused too, and the state returns to the first one while a delivery poll waits
+- **THEN** the delivery poll is sent before the first state is sent again: heartbeat, heartbeat, delivery poll, heartbeat
+
 #### Scenario: A refused state that comes back
 - **WHEN** a heartbeat is refused, a different state is then confirmed, and the state returns to the refused one while a delivery poll waits
 - **THEN** the heartbeat of that state is sent before the delivery poll, as for any change
+
+#### Scenario: A refused state that has reverted to the confirmed one
+- **WHEN** a heartbeat is refused as a brief outage that sent nothing, its retry waits for a delivery poll or a receipts request, and the state is the confirmed one again meanwhile
+- **THEN** no heartbeat follows that request, and a receipts request that is out is not ended for it
+
+#### Scenario: A refusal that may have been applied
+- **WHEN** a heartbeat of a changed state is refused as `REQUEST_UNCERTAIN`, and the state later returns to the one that was confirmed before it
+- **THEN** the next compare sends that state, because the worker may hold the refused one
+- **AND** a refusal that sent nothing, `SERVICE_UNAVAILABLE` or `TRANSPORT_UNAVAILABLE`, leaves the confirmed state as it was and sends nothing for a state that returns to it
+
+#### Scenario: A refusal that may have been applied, of the confirmed state
+- **WHEN** a heartbeat of the state that the worker already confirmed, a keep-alive for example, is refused as `REQUEST_UNCERTAIN`
+- **THEN** that state stays confirmed, because the worker holds it whether or not the request was applied
+- **AND** the next poll tick sends its delivery poll with no heartbeat before it
 
 #### Scenario: Nothing waits
 - **WHEN** a heartbeat that an event found in flight is refused and no delivery poll or receipts request is due
 - **THEN** that state is sent again once, at once
 
 #### Scenario: Any order of ticks, events and answers
-- **WHEN** poll ticks, keep-alive ticks and events come in any order while each request is confirmed, refused as a brief outage, or held until a later tick
+- **WHEN** poll ticks, keep-alive ticks and events that change busy or idle or the title come in any order, from a confirmed state and from a changed one, while each request is confirmed, refused as a brief outage, refused as `REQUEST_UNCERTAIN`, or held until a later tick
 - **THEN** the loop ends and a later poll tick finds it free
-- **AND** a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again, unless another state is confirmed meanwhile, and a changed state is never left behind a delivery poll
+- **AND** a delivery poll that was waiting when the worker refused a heartbeat goes before that state is sent again, unless a state is confirmed meanwhile, whichever states were refused since, and a changed state that was not refused in the run is never left behind a delivery poll
+- **AND** a heartbeat of the confirmed state is sent only after an entry that asks for one outright, such as a keep-alive tick, or when a `REQUEST_UNCERTAIN` refusal of a changed state left no confirmed state
 - **AND** no request is sent twice for one due flag
 
 ### Requirement: `pi` asks for the end of its instance at `session_shutdown` and starts a replacing runtime stopped
