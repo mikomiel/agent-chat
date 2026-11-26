@@ -370,6 +370,9 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
   // A record that can show what the thread is: the origin, the `ephemeral` flag and a model provider, next to the id and a status.
   const complete = record => isCompleteRecord(record) && typeof record.modelProvider === "string" && record.modelProvider !== ""
 
+  // Whether a `thread/resume` answer carries this thread's own record: an object with this id and a status.
+  const resumedRecord = record => record !== null && typeof record === "object" && record.id === threadId && typeof record.status?.type === "string"
+
   // The thread as the app-server shows it now, for the heartbeat and for the wake: loaded, read, then the `thread/resume` answer, which
   // is a record of its own and carries the collaboration mode, and last the newest turn. The resume record must be
   // complete and agree with the read and the bound provider, or the answer says nothing. The mode decides Plan Mode:
@@ -396,7 +399,7 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
     let resumed = null
     try { resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(left)) } catch (error) { if (error?.code !== "APP_SERVER_ERROR") throw error }
     const record = resumed?.thread
-    if (record === null || typeof record !== "object" || record.id !== threadId || typeof record.status?.type !== "string") {
+    if (!resumedRecord(record)) {
       return { reason: "unknown", observed } // no record of its own: nothing newer than the read, and nothing to check it against
     }
     if (!isChildThread(record) && !complete(record)) return { reason: "unknown", observed } // it cannot show the origin or the provider
@@ -496,9 +499,10 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
 
     // The collaboration mode alone, whatever the thread's status: the read that the receiver takes before an output during a
     // running turn. `observe` cannot give it then, because it stops at a thread that is not idle. `plan` is true for "plan",
-    // false for "default", and null for anything else: another mode, a thread that is not loaded, a resume record that is
-    // missing, another thread's or a child's, an error, a timeout. A thread that is not loaded is not resumed, since a resume
-    // would load it. Every step ends within `ms`. `thread/resume` reports the thread's mode, the one that the next turn takes
+    // false for "default", and null for anything else: another mode, a thread that is not loaded, an error, a timeout, and a
+    // resume record that does not pass the checks of `observe` (this thread's own, complete, not a child) or that does not
+    // name the provider that the bind fixed. No bind fixed one: null too. A thread that is not loaded is not resumed, since a
+    // resume would load it. Every step ends within `ms`. `thread/resume` reports the thread's mode, the one that the next turn takes
     // (`thread/settings/update` sets it "for subsequent turns"): no request reads the mode of the turn that runs.
     // A resume of a running thread sends that connection the thread's pending server requests (an approval, say), and the
     // first connection that answers one settles it: an error reply aborts it. So this connection answers none, and closing
@@ -511,7 +515,7 @@ export function createThread({ path, threadId, open = openAppServer, now = monot
           if (!(await loaded(link, left))) return { plan: null }
           const resumed = await link.request("thread/resume", { threadId, excludeTurns: true }, allowed(left))
           const record = resumed.thread
-          if (record === null || typeof record !== "object" || record.id !== threadId || isChildThread(record)) return { plan: null }
+          if (!resumedRecord(record) || isChildThread(record) || !complete(record) || record.modelProvider !== provider) return { plan: null }
           const mode = resumed.collaborationMode?.mode
           return { plan: mode === "default" ? false : mode === "plan" ? true : null }
         }, { connectMs: Math.max(1, Math.min(CONNECT_MS, left())), answerRequests: false })

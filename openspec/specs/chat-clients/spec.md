@@ -628,7 +628,7 @@ A package that stages a receipts notice and outputs it at a later boundary MUST 
 - **THEN** no message is appended and the ids are not marked
 
 ### Requirement: `codex` outputs into a running turn only after a fresh read of the collaboration mode
-While its app-server thread is bound, `codex` MUST read the thread's collaboration mode right before each claim of a prompt or tool hook and before it outputs a staged receipts notice. The read MUST start after that hook event arrived and end 2.5 seconds before the hook's deadline, within 3 seconds. Only a read that confirms a mode other than `plan` MAY let the output out. The `permission_mode` hint MAY only refuse it.
+While its app-server thread is bound, `codex` MUST read the thread's collaboration mode right before each claim of a prompt or tool hook and before it outputs a staged receipts notice. The read MUST start after that hook event arrived and answer within 3 seconds and at least 2.5 seconds before the hook's deadline. Only such a read that confirms a mode other than `plan` MAY let the output out. The `permission_mode` hint MAY only refuse it.
 
 #### Scenario: Plan Mode in the app-server while the hook says default
 - **WHEN** the hook's `permission_mode` is `default` and the read finds the mode `plan`
@@ -649,12 +649,24 @@ While its app-server thread is bound, `codex` MUST read the thread's collaborati
 - **WHEN** only a read that started before the hook event confirmed a mode other than `plan`
 - **THEN** that read authorizes no output of that hook
 
-### Requirement: The `codex` heartbeat reports Plan Mode from the newest read of the mode
-`codex` MUST report `plan_mode` from the newest read that confirmed the collaboration mode, and a hook event MUST NOT discard that read. Only a newer read that confirms a mode other than `plan` MAY lift a Plan reading; a `permission_mode` hint, an unknown mode and a failed read MUST NOT. A `plan` hint MUST report Plan Mode unless a read that started after its hook event confirmed another mode.
+#### Scenario: A later-started read confirms Plan Mode
+- **WHEN** a read that started after the hook's own read confirms `plan`, before or after the hook's read answers, and before the write
+- **THEN** that hook claims nothing, or settles its claimed batch `deferred` with reason `plan`, and outputs nothing
+
+#### Scenario: An answer after the read's time
+- **WHEN** the read's answer comes at the end of its time or later
+- **THEN** it counts as no answer: nothing is output, and the heartbeat does not record it
+
+### Requirement: The `codex` heartbeat reports Plan Mode from the last-started read of the mode
+`codex` MUST report `plan_mode` from the read that confirmed the collaboration mode and started last, and a hook event MUST NOT discard it. Only a read that started later and confirms a mode other than `plan` MAY lift a Plan reading; a `permission_mode` hint, an unknown mode, a failed read and a late answer MUST NOT. A `plan` hint MUST report Plan Mode unless a read that started after its hook event confirmed another mode.
 
 #### Scenario: A Plan reading during a running turn
 - **WHEN** a hook's read finds the mode `plan` and later hooks say `default`
-- **THEN** the heartbeat reports `plan_mode` true until a newer read confirms another mode
+- **THEN** the heartbeat reports `plan_mode` true until a read that started later confirms another mode
+
+#### Scenario: A later-started read that cannot tell the mode
+- **WHEN** a read confirms `plan` after a read that started later could not tell the mode
+- **THEN** the heartbeat reports `plan_mode` true
 
 ### Requirement: A receipts pass sends one request and reads the native state without side effect
 A package's receipts pass MUST send at most one receipts request: the mark that waits or, when none waits, the feed poll. A mark that is not accepted MUST hold the feed poll until it lands. A pass that sends nothing MUST NOT delay the next one. `deepseek` MUST read its native state for receipts with a read that does not stop chat, log a warning or fence a delivery, and a state that read cannot classify MUST hold receipts for that pass and change nothing else.

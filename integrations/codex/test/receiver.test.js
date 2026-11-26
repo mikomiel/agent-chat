@@ -2084,6 +2084,24 @@ test("a mode read that does not answer in time holds the output: it ends 2.5 s b
   }
 })
 
+// The timer that ends a read and the read's answer race: an answer handled before the timer, though the read's time is over,
+// is as late as one that comes after it. 3.2 s into a 6 s patience a claim would still have its margin.
+test("a mode answer that comes after the read's time, before its timer runs, holds the output and is not recorded", async () => {
+  for (const [label, answer] of [["default", { plan: false }], ["Plan Mode", { plan: true }]]) {
+    let late = 0
+    let reads = 0
+    const thread = threadDouble({ mode: () => { if (++reads > 1) return { plan: false }; late = 3_200; return answer } })
+    const r = await rig({ thread, handlers: deliverable(), skew: () => late })
+    await r.begin()
+    const hook = await r.op(turn())
+    assert.deepEqual(thread.modeReads, [{ ms: 3_000 }], label)
+    assert.deepEqual(r.worker.ops("claim"), [], `${label}: a late answer allows nothing`)
+    assert.deepEqual(hook.sent, [{ context: null }], label)
+    await r.clock.advance(30_000)
+    assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, false, `${label}: and it is not the heartbeat's reading`)
+  }
+})
+
 test("a later read that confirms another mode, taken after a new hook event, lifts the block, and the delivery goes out", async () => {
   let plan = true
   const thread = threadDouble({ mode: () => ({ plan }) })
@@ -2235,6 +2253,23 @@ test("a default-mode read that started before a Plan Mode read and lands after i
   await settle()
   assert.equal(r.receiver.state(), "plan", "the older read is not the newest word on the thread")
   assert.deepEqual(r.worker.ops("heartbeat").at(-1).state, { native_state: "unknown", stopped: false, plan_mode: true })
+})
+
+// The heartbeat's reading is ordered by when the read started, not by whether it was kept: a read that started later and
+// could not tell the mode drops no mode that an earlier one confirmed.
+test("a heartbeat read that confirms Plan Mode after a later-started read could not tell the mode is still the heartbeat's reading", async () => {
+  let release
+  let reads = 0
+  const thread = threadDouble({ observation: () => (++reads === 1 ? new Promise(resolve => { release = () => resolve(reading("plan", { plan: true })) }) : reading("unknown", { plan: null })) })
+  const r = await rig({ thread })
+  await idleSession(r)
+  await r.clock.advance(30_000) // the first read starts and stays out
+  await r.clock.advance(30_000) // the second starts and answers: the mode is not known
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, false)
+  release() // the first one answers Plan Mode
+  await settle()
+  await r.clock.advance(30_000)
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true, "the unknown answer dropped nothing")
 })
 
 // A read that was overtaken is dropped and moves nothing, so its refusal cannot make a newer read stale: only a kept refusal

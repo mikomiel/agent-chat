@@ -205,8 +205,8 @@ sends its request: it does not wait for the worker to end its instance.
   `CHAT_PROTOCOL_INVALID`; a binding is never joined and then left unshown.
 - **Presence.** A heartbeat every 30 seconds, and one on every state change,
   carries `native_state`, `stopped` and `plan_mode`. It carries no title. The
-  flags are facts of their own: `plan_mode` comes from the newest read that
-  confirmed the mode (see State), and `stopped` follows the running state alone, whatever the Plan
+  flags are facts of their own: `plan_mode` comes from the last-started read
+  that confirmed the mode (see State), and `stopped` follows the running state alone, whatever the Plan
   Mode: a local stop, an interruption that a read found, or a state that is
   neither idle nor busy (unknown, offline). `native_state` is `unknown` in Plan
   Mode. Delivery is still decided by one state, Plan Mode first (see Busy
@@ -271,12 +271,14 @@ sends its request: it does not wait for the worker to end its instance.
   discarded the last read, the state that decides delivery follows the hook's
   hint, which can only refuse an output there: every output during a running
   turn takes a mode read of its own (see Busy delivery). The heartbeat keeps a
-  record of its own: `plan_mode` comes from the newest read of any kind that
-  confirmed the mode (a heartbeat read, a wake's reading, a hook's mode read),
-  and a hook event does not discard it. Only a newer read that confirms
-  another mode lifts a Plan reading; a hint, an unknown mode and a failed read
-  do not. A `plan` hint still reports Plan Mode, unless a read that started
-  after its hook event confirmed another mode. The server offers nothing while
+  record of its own: `plan_mode` comes from the read of any kind that confirmed
+  the mode and started last (a heartbeat read, a wake's reading, a hook's mode
+  read), whenever its answer came, and a hook event does not discard it (a
+  heartbeat read that a hook event overtook is still dropped). Only a read that
+  started later and confirms another mode lifts a Plan reading; a hint, an
+  unknown mode, a failed read and an answer after the read's time do not, and
+  they drop nothing. A `plan` hint still reports Plan Mode, unless a read that
+  started after its hook event confirmed another mode. The server offers nothing while
   the heartbeat reports Plan Mode, so while it does, a hook that may claim
   takes a mode read before its state report, and that read can lift it. A bind
   that leaves the thread unbound (the provider changed) discards the last read
@@ -299,10 +301,17 @@ sends its request: it does not wait for the worker to end its instance.
   must end 2.5 seconds (the claim margin) before the hook's deadline and takes
   at most 3 seconds (the bind's read limit): with the longest patience, 6
   seconds, that is at most 3 of the 3.5 seconds above the margin, less the
-  state report and the `pending` request. Plan Mode, another or unknown mode, a
-  refused or failed read and a timeout give no claim and no output, and settle
-  nothing: the batch stays pending, and a staged notice is dropped unmarked, so
-  a later poll offers its rows again. The hook is still answered. The
+  state report and the `pending` request. An answer that comes at the end of
+  that time or later is no answer, even when it is handled before the timer.
+  Plan Mode, another or unknown mode, a refused or failed read and a timeout
+  give no claim and no output, and settle nothing: the batch stays pending, and
+  a staged notice is dropped unmarked, so a later poll offers its rows again.
+  Reads of the mode overlap (two hooks of one turn, a claim and a notice), and
+  their answers can come in any order, so they are ordered by when they started:
+  a read that started after the hook's own and confirmed Plan Mode refuses the
+  output too, whether it answered first or answers before the write. A claimed
+  batch that it refuses right before the write settles `deferred` with reason
+  `plan`. The hook is still answered. The
   `permission_mode` hint can only refuse. Without `appServer`, or while the
   thread is unbound, nothing is read and the hint decides. When the claim is
   granted, after the status request, and right before the notice is written,
@@ -750,8 +759,10 @@ rule has already excluded.
    `thread/loaded/list`, then `thread/resume` with `excludeTurns`. A thread
    that is not in the loaded list is not resumed, since a resume would load it.
    `plan` is Plan Mode, `default` is not, and everything else is unknown:
-   another mode, no mode, a refused resume, a record that is missing, another
-   thread's or a child's, an error and a timeout. The connection answers no
+   another mode, no mode, a refused resume, an error, a timeout, and a resume
+   record that the heartbeat read would not take (missing, another thread's,
+   incomplete or a child's) or that does not name the provider that the bind
+   fixed. The connection answers no
    server request. A child found here ends nothing; the next heartbeat read
    decides.
 
@@ -804,8 +815,14 @@ against codex-cli 0.171.0. No session joined through the hooks. The first
   - before the thread's first turn the resume was refused (-32600 "no rollout
     found"), and the read was unknown. At the first prompt hook it answered.
 
-  Not observed: whether the TUI calls `thread/settings/update` when Plan Mode
-  is switched, and whether the turn that runs takes the switch. Each output
+  A second run, which bound the thread first, as the receiver does, took the
+  read with its record checks (origin, `ephemeral`, the bound provider): idle
+  after a turn and during a running turn, the resume record carried `id`,
+  `status` (`idle`, then `active`), `source` (`vscode`, the origin of a thread
+  that an app-server client starts), `ephemeral` false and the bound
+  `modelProvider`, and each read answered `default` in 7 to 9 ms. Not
+  observed: whether the TUI calls `thread/settings/update` when Plan Mode is
+  switched, and whether the turn that runs takes the switch. Each output
   during a running turn costs one more connection (`initialize`,
   `thread/loaded/list`, `thread/resume`); a hook with nothing to output opens
   none, except while the heartbeat reports Plan Mode. A read that hangs costs

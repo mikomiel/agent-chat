@@ -998,7 +998,6 @@ test("a server that cannot be reached, or that sends a malformed answer, is offl
   assert.equal(result.reason, "offline")
 })
 
-// A confirmation page that shows this attempt's userMessage, as codex-cli 0.171.0 lists it.
 // ---- readMode ----------------------------------------------------------------------------------------------------
 
 // The read that a turn hook takes before an output during a running turn: the collaboration mode, whatever the status.
@@ -1042,6 +1041,31 @@ test("a mode read that cannot confirm a mode answers null, and a thread that is 
   ]) assert.deepEqual((await modeWith(over)).result, { plan: null }, label)
 })
 
+// The resume record must pass what `observe` asks of it, and name the provider that the bind fixed: a record that does
+// not can be another thread's, and its mode does not authorize this thread's output.
+test("a mode read whose resume record is not this main thread's, as the bind found it, is null", async () => {
+  const active = extra => ({ "thread/resume": () => ok({ thread: thread({ ...ACTIVE, ...extra }), collaborationMode: { mode: "default", settings: {} } }) })
+  const lacking = key => ({ "thread/resume": () => { const record = thread(ACTIVE); delete record[key]; return ok({ thread: record, collaborationMode: { mode: "default", settings: {} } }) } })
+  for (const [label, over] of [
+    ["another provider than the bound one", active({ modelProvider: "other" })],
+    ["no provider", lacking("modelProvider")],
+    ["an empty provider", active({ modelProvider: "" })],
+    ["no origin", lacking("source")],
+    ["an empty origin", active({ source: "" })],
+    ["an origin that is a list", active({ source: ["cli"] })],
+    ["no ephemeral flag", lacking("ephemeral")],
+    ["no status", lacking("status")],
+    ["an ephemeral thread", active({ ephemeral: true })],
+    ["a one-shot exec origin", active({ source: "exec" })],
+    ["a sub-agent origin", active({ source: { subAgent: "review" } })],
+    ["a delegated thread", active({ agentRole: "worker" })],
+  ]) assert.deepEqual((await modeWith(over)).result, { plan: null }, label)
+  assert.deepEqual((await modeWith(active({}))).result, { plan: false }, "the same record, complete and with the bound provider")
+  await withServer(main(activeResume({ mode: "default", settings: {} })), async path => {
+    assert.deepEqual(await createThread({ path, threadId: THREAD }).readMode({ ms: 3_000 }), { plan: null }, "no bind fixed a provider")
+  })
+})
+
 test("a mode read ends within its time: a resume that never answers is null", async () => {
   const { result, took } = await modeWith({ "thread/resume": () => undefined }, { ms: 200 })
   assert.deepEqual(result, { plan: null })
@@ -1067,6 +1091,7 @@ test("a mode read answers no server request: a pending approval replayed to its 
   })
 })
 
+// A confirmation page that shows this attempt's userMessage, as codex-cli 0.171.0 lists it.
 const confirmedItems = { "thread/items/list": () => ok({ data: [{ turnId: "t", item: { type: "userMessage", id: "i", clientId: "agent-chat:attempt-9" } }], nextCursor: null }) }
 
 // The newest turn is looked up after the mode. A lookup that fails, or answers in a way that is not the documented one, reads

@@ -457,6 +457,77 @@ test("a staged notice is not output when the mode read fails or cannot tell the 
   }
 })
 
+// Two hooks of one turn read the mode at once: one to claim, one to show a staged notice. The answers can come in any order,
+// and the read that started later is the newer word on the mode, whichever answers first.
+// A mode that answers each read in turn: a function answers at once, `"held"` waits until the test releases it.
+function modeQueue(answers) {
+  const releases = []
+  let index = 0
+  const mode = () => {
+    const answer = answers[index++] ?? (() => ({ plan: false }))
+    if (answer !== "held") return answer()
+    return new Promise(resolve => { releases.push(resolve) })
+  }
+  return { mode, release: value => releases.shift()(value) }
+}
+
+test("a claim's mode read that a later-started read overtook with Plan Mode claims nothing, and hands nothing", async () => {
+  // The later read's Plan Mode comes in before the earlier read's default.
+  {
+    const reads = modeQueue(["held", () => ({ plan: true })])
+    const thread = threadDouble({ mode: reads.mode })
+    const r = await staged({ rows: [rcpt(1)], thread })
+    r.server.pending = [uid(1)]
+    const claiming = hookDouble({ events: r.events })
+    const first = r.op(turn(), claiming) // its pending answer is in, and its mode read is out
+    await settle()
+    assert.equal(thread.modeReads, 1, "the claim's read is the first one")
+    const notice = await r.op(turn({ event: "tool" })) // the notice's read starts later and answers Plan Mode
+    assert.deepEqual(notice.sent, [{ context: null }], "the notice is not shown in Plan Mode")
+    reads.release({ plan: false }) // the claim's read answers default, last
+    await first
+    assert.equal(r.count("claim"), 0, "a read that started later confirmed Plan Mode: nothing is claimed")
+    assert.deepEqual(claiming.sent, [{ context: null }], "and nothing is handed")
+    assert.equal(r.count("settle"), 0)
+    assert.equal(r.count("receipts_delivered"), 0)
+  }
+  // The later read's Plan Mode comes in after the claim, before the write.
+  {
+    const reads = modeQueue([() => ({ plan: false }), () => ({ plan: true })])
+    const thread = threadDouble({ mode: reads.mode })
+    const r = await staged({ rows: [rcpt(1)], thread })
+    r.server.pending = [uid(1)]
+    let open
+    r.server.gates.status = new Promise(resolve => { open = resolve })
+    const claiming = hookDouble({ events: r.events })
+    const first = r.op(turn(), claiming)
+    await settle()
+    assert.equal(r.count("claim"), 1, "the claim's own read allowed it, and the status request is out")
+    const notice = await r.op(turn({ event: "tool" }))
+    assert.deepEqual(notice.sent, [{ context: null }])
+    delete r.server.gates.status
+    open()
+    await first
+    assert.deepEqual(claiming.sent, [{ context: null }], "right before the write, the newer Plan Mode reading refuses it")
+    assert.deepEqual(r.worker.ops("settle").map(entry => entry.result), [{ outcome: "deferred", reason: "plan" }])
+  }
+})
+
+test("a read that confirmed Plan Mode and answers after a later-started read could not tell the mode is still the heartbeat's reading", async () => {
+  const reads = modeQueue(["held", () => ({ plan: null })])
+  const thread = threadDouble({ mode: reads.mode })
+  const r = await staged({ rows: [rcpt(1)], thread })
+  r.server.pending = [uid(1)]
+  const first = r.op(turn()) // the claim's read is out
+  await settle()
+  await r.op(turn({ event: "tool" })) // the notice's read starts later and cannot tell the mode
+  reads.release({ plan: true }) // the claim's read answers Plan Mode
+  await first
+  assert.equal(r.count("claim"), 0)
+  await r.clock.advance(HEARTBEAT_MS)
+  assert.equal(r.worker.ops("heartbeat").at(-1).state.plan_mode, true, "an unknown answer drops no mode that a read confirmed")
+})
+
 test("a Stop event replies with nothing but its acknowledgement and drops the staged notice", async () => {
   const r = await staged({ rows: [rcpt(1)] })
   const stop = await r.op(stopEvent)

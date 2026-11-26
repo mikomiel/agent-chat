@@ -347,8 +347,8 @@ The rules below bind every package that shows receipts.
   suspend ages a notice, and an age that is negative or not a number drops it. `deepseek` also drops it unless its
   native state, read again without side effect, is a running turn outside Plan Mode. `codex`, with `appServer` and a
   bound thread, also drops it unless a read of the thread's collaboration mode, taken by that hook after its event
-  arrived and right before the output, confirms a mode other than Plan Mode: the rule its claims follow too
-  ([its README](codex/README.md), Busy delivery). A dropped notice is not marked: its ids stay on the server and
+  arrived and right before the output, confirms a mode other than Plan Mode in its time, and no read that started
+  later has confirmed Plan Mode: the rule its claims follow too ([its README](codex/README.md), Busy delivery). A dropped notice is not marked: its ids stay on the server and
   a later poll offers them again. `claude-code` and `codex` answer the hook as for any reply with nothing to carry.
   `pi` hands a notice to Pi in the pass that got the answer, so it has no later boundary of its own. It makes the same
   check right before it hands the notice over, so an answer read after a suspend gives Pi nothing, and the rows are
