@@ -48,8 +48,9 @@ OpenCode and Codex rows record no run, so no core version applies.
 Adding a row for a live release needs a recorded run against that exact
 release, including the install command and the observed join, delivery and
 rejoin behavior. Update this table in the same change. Name the package
-version and the core version, and install both from the same release (see
-[Install a pinned release](#install-a-pinned-release)). A `NOT RUN` row records
+version and the core version. For a release run, install both from the same
+release (see [Install a pinned release](#install-a-pinned-release)); for a
+source run, take both from the same checkout and name its commit. A `NOT RUN` row records
 a release that was read but never run: it is not verification. `0.2.2-rc.2` to
 `0.2.2-rc.4` are `NOT RUN` too.
 
@@ -117,8 +118,9 @@ requests that the stub model received.
   `wait` hook was still running: its Stop-hook summary listed `wait` without a
   duration, and the process listing showed the waiter about seven seconds
   later. A question sent 25 seconds after that turn ended was handed about 3.2
-  seconds after the send. The transcript then queued a `Stop hook feedback` task
-  notification, and the session made a new model request. With
+  seconds after the send, by the service clock. The transcript recorded a queued
+  `Stop hook feedback` task notification within the same second, by the session
+  clock, and that notification started a new model request. With
   `noticeBodies: false`, that request carried a metadata notice for the
   question, without its body, as a Stop-hook blocking error. Claude Code 2.1.332
   therefore ran the waiter after the turn ended, with `asyncRewake`, and acted
