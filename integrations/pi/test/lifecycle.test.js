@@ -2669,3 +2669,200 @@ test("connect called again while a worker joins or serves starts no second worke
   emit("session_shutdown")
   assert.equal(workers[0].stops, 1)
 })
+
+// Issue #163: `planEntries` names custom entries of another planning extension that count as Plan Mode. The session manager
+// double is a tree: `rows` are entries with an id and a parent, `tree.leaf` is the current leaf, and `getBranch` walks from the
+// leaf to the root and returns the path root first, as Pi does.
+const PLAN_ITEM = { customType: "example-orchestrator", field: "phase", values: ["planning", "planned"] }
+const phase = (id, parentId, value) => ({ id, parentId, type: "custom", customType: "example-orchestrator", data: { phase: value } })
+
+function fakeTree(rows, leaf = rows.at(-1)?.id ?? null) {
+  const tree = { rows, leaf, branchReads: 0 }
+  tree.manager = {
+    getEntryCount: () => tree.rows.length,
+    getEntries: () => tree.rows,
+    getLeafId: () => tree.leaf,
+    getBranch: () => {
+      tree.branchReads += 1
+      const path = []
+      for (let row = tree.rows.find(item => item.id === tree.leaf); row; row = tree.rows.find(item => item.id === row.parentId)) path.unshift(row)
+      return path
+    },
+  }
+  return tree
+}
+
+async function planEntriesSession({ rows = [], manager, planEntries = [PLAN_ITEM], answer } = {}) {
+  const { pi, emit, ctx, sent, statuses } = fakePi()
+  const tree = fakeTree(rows)
+  Object.assign(ctx.sessionManager, manager ?? tree.manager)
+  const worker = fakeWorker({ answer: answer ?? (op => (op === "pending" ? { messages: [message.id] } : {})) })
+  const planConfig = planEntries === null ? config : { ...config, planEntries }
+  const lifecycle = createAgentChat(pi, planConfig, { ...timers, startProcess: () => worker, now: () => 1000 })
+  emit("session_start", {}, ctx)
+  await flush()
+  emit("input", { source: "interactive" }, ctx)
+  await lifecycle.poll()
+  await flush()
+  const beats = () => worker.requests.filter(row => row.op === "heartbeat")
+  const claims = () => worker.requests.filter(row => row.op === "claim")
+  return { emit, ctx, sent, statuses, lifecycle, worker, tree, beats, claims }
+}
+
+test("planEntries: a second extension's planning entry is state plan, claims nothing and sets plan_mode", async () => {
+  for (const value of PLAN_ITEM.values) {
+    const { lifecycle, beats, claims, sent, statuses, emit } = await planEntriesSession({ rows: [phase("a", null, value)] })
+    assert.equal(lifecycle.state(), "plan", value)
+    assert.equal(beats().at(-1).fields.state.plan_mode, true)
+    assert.equal(claims().length, 0, "no claim, so nothing is steered into the session")
+    assert.equal(sent.length, 0)
+    assert.equal(statuses.at(-1), "Agent Chat: plan mode")
+    emit("session_shutdown")
+  }
+})
+
+test("planEntries: a boolean value counts when it is listed", async () => {
+  const item = { customType: "example-orchestrator", field: "planning", values: [true] }
+  const on = await planEntriesSession({ planEntries: [item], rows: [{ id: "a", parentId: null, type: "custom", customType: item.customType, data: { planning: true } }] })
+  assert.equal(on.lifecycle.state(), "plan")
+  on.emit("session_shutdown")
+  const off = await planEntriesSession({ planEntries: [item], rows: [{ id: "a", parentId: null, type: "custom", customType: item.customType, data: { planning: false } }] })
+  assert.equal(off.lifecycle.state(), null)
+  off.emit("session_shutdown")
+})
+
+test("planEntries: an entry that does not say planning, or no entry, leaves the state as it was", async () => {
+  for (const rows of [[phase("a", null, "executing")], [], [{ id: "a", parentId: null, type: "custom", customType: "other-extension", data: { phase: "planning" } }]]) {
+    const { lifecycle, beats, claims, emit } = await planEntriesSession({ rows })
+    assert.equal(lifecycle.state(), null)
+    assert.equal(beats().at(-1).fields.state.plan_mode, false)
+    assert.equal(beats().at(-1).fields.state.native_state, "idle")
+    assert.equal(claims().length, 1, "an idle session is claimed for, as without the key")
+    emit("session_shutdown")
+  }
+})
+
+test("planEntries: an unreadable entry is unknown, never idle, and claims nothing", async () => {
+  const bad = [
+    ["a missing field", { other: "planning" }],
+    ["a null field", { phase: null }],
+    ["a number", { phase: 1 }],
+    ["an object", { phase: { name: "planning" } }],
+    ["an array", { phase: ["planning"] }],
+    ["data that is absent", undefined],
+    ["data that is null", null],
+    ["data that is a string", "planning"],
+    ["data that is an array", ["planning"]],
+  ]
+  for (const [name, data] of bad) {
+    const row = { id: "a", parentId: null, type: "custom", customType: PLAN_ITEM.customType, ...(data === undefined ? {} : { data }) }
+    const { lifecycle, beats, claims, emit } = await planEntriesSession({ rows: [row] })
+    assert.equal(lifecycle.state(), "unknown", name)
+    assert.equal(beats().at(-1).fields.state.native_state, "unknown", name)
+    assert.equal(beats().at(-1).fields.state.plan_mode, false, name)
+    assert.equal(claims().length, 0, name)
+    emit("session_shutdown")
+  }
+})
+
+test("planEntries: a field that is only inherited is not read", async () => {
+  const row = { id: "a", parentId: null, type: "custom", customType: PLAN_ITEM.customType, data: Object.create({ phase: "planning" }) }
+  const { lifecycle, emit } = await planEntriesSession({ rows: [row] })
+  assert.equal(lifecycle.state(), "unknown")
+  emit("session_shutdown")
+})
+
+test("planEntries: a branch that cannot be read is unknown", async () => {
+  const tree = fakeTree([phase("a", null, "executing")])
+  for (const getBranch of [undefined, () => { throw new Error("no branch") }, () => null, () => "x"]) {
+    const { lifecycle, claims, emit } = await planEntriesSession({ manager: { ...tree.manager, getBranch } })
+    assert.equal(lifecycle.state(), "unknown")
+    assert.equal(claims().length, 0)
+    emit("session_shutdown")
+  }
+})
+
+test("planEntries: the newest entry of the type on the branch wins", async () => {
+  const later = await planEntriesSession({ rows: [phase("a", null, "executing"), phase("b", "a", "planning")] })
+  assert.equal(later.lifecycle.state(), "plan")
+  later.emit("session_shutdown")
+  const earlier = await planEntriesSession({ rows: [phase("a", null, "planning"), phase("b", "a", "executing")] })
+  assert.equal(earlier.lifecycle.state(), null)
+  earlier.emit("session_shutdown")
+  const lastUnreadable = await planEntriesSession({ rows: [phase("a", null, "planning"), phase("b", "a", 7)] })
+  assert.equal(lastUnreadable.lifecycle.state(), "unknown", "an older entry never vouches for a newer one that cannot be read")
+  lastUnreadable.emit("session_shutdown")
+})
+
+test("planEntries: any item can say planning, and planning outweighs an item that cannot be read", async () => {
+  const second = { customType: "example-reviewer", field: "mode", values: ["draft"] }
+  const rows = [phase("a", null, "executing"), { id: "b", parentId: "a", type: "custom", customType: "example-reviewer", data: { mode: "draft" } }]
+  const either = await planEntriesSession({ planEntries: [PLAN_ITEM, second], rows })
+  assert.equal(either.lifecycle.state(), "plan")
+  either.emit("session_shutdown")
+  const mixed = await planEntriesSession({ planEntries: [PLAN_ITEM, second], rows: [phase("a", null, 3), rows[1]] })
+  assert.equal(mixed.lifecycle.state(), "plan")
+  mixed.emit("session_shutdown")
+  const unreadable = await planEntriesSession({ planEntries: [PLAN_ITEM, second], rows: [phase("a", null, 3), { ...rows[1], data: { mode: "final" } }] })
+  assert.equal(unreadable.lifecycle.state(), "unknown")
+  unreadable.emit("session_shutdown")
+})
+
+test("planEntries: the shipped plan-mode entry still counts and stays fail-closed", async () => {
+  const shipped = { id: "p", parentId: null, type: "custom", customType: "plan-mode", data: { enabled: true } }
+  const on = await planEntriesSession({ rows: [shipped, phase("a", "p", "executing")] })
+  assert.equal(on.lifecycle.state(), "plan")
+  on.emit("session_shutdown")
+  const onOverUnreadable = await planEntriesSession({ rows: [shipped, phase("a", "p", 3)] })
+  assert.equal(onOverUnreadable.lifecycle.state(), "plan", "the shipped source saying planning outweighs an unreadable item")
+  onOverUnreadable.emit("session_shutdown")
+  const off = await planEntriesSession({ rows: [{ ...shipped, data: { enabled: false } }, phase("a", "p", "executing")] })
+  assert.equal(off.lifecycle.state(), null)
+  off.emit("session_shutdown")
+  const unreadableShipped = await planEntriesSession({ rows: [{ ...shipped, data: { enabled: "yes" } }, phase("a", "p", "planning")] })
+  assert.equal(unreadableShipped.lifecycle.state(), "unknown", "the shipped source stays fail-closed")
+  unreadableShipped.emit("session_shutdown")
+})
+
+test("planEntries: tree navigation to a branch that is not planning flips the state at an equal entry count", async () => {
+  // root, then two branches of one entry each: a planning one and an executing one.
+  const rows = [phase("r", null, "executing"), phase("plan", "r", "planning"), phase("run", "r", "executing")]
+  const { lifecycle, tree, ctx, emit, beats } = await planEntriesSession({ rows })
+  tree.leaf = "plan"
+  assert.equal(lifecycle.state(), "plan")
+  assert.equal(lifecycle.state(), "plan")
+  const reads = tree.branchReads
+  assert.equal(lifecycle.state(), "plan")
+  assert.equal(tree.branchReads, reads, "an unchanged branch is read once")
+  const count = tree.manager.getEntryCount()
+  tree.leaf = "run"
+  assert.equal(tree.manager.getEntryCount(), count, "the count did not change")
+  emit("session_tree", {}, ctx)
+  assert.equal(lifecycle.state(), null, "a branch whose newest entry is not planning is not Plan Mode")
+  await lifecycle.heartbeat()
+  assert.equal(beats().at(-1).fields.state.plan_mode, false)
+  tree.leaf = "plan"
+  assert.equal(lifecycle.state(), "plan", "and back")
+  emit("session_shutdown")
+})
+
+test("planEntries: a session manager that cannot name its leaf is read every time, never cached", async () => {
+  const rows = [phase("r", null, "executing"), phase("plan", "r", "planning"), phase("run", "r", "executing")]
+  const tree = fakeTree(rows, "plan")
+  const { getLeafId, ...manager } = tree.manager
+  const { lifecycle, emit } = await planEntriesSession({ manager })
+  assert.equal(lifecycle.state(), "plan")
+  tree.leaf = "run"
+  assert.equal(lifecycle.state(), null)
+  tree.leaf = "plan"
+  assert.equal(lifecycle.state(), "plan")
+  emit("session_shutdown")
+})
+
+test("without planEntries a second extension's entry is ignored and the shipped source is unchanged", async () => {
+  const { lifecycle, tree, claims, emit } = await planEntriesSession({ planEntries: null, rows: [phase("a", null, "planning")] })
+  assert.equal(lifecycle.state(), null)
+  assert.equal(claims().length, 1)
+  assert.equal(tree.branchReads, 0, "the branch is not read")
+  emit("session_shutdown")
+})

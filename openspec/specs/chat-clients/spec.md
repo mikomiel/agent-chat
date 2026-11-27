@@ -719,6 +719,26 @@ Tree navigation and compaction MUST keep the `pi` binding and MUST NOT join agai
 - **THEN** the package ends that request only when the state differs from the last confirmed one, and sends that state report in the same pass
 - **AND** an event that finds nothing due ends nothing
 
+### Requirement: `pi` reads Plan Mode from configured custom entries
+With the optional config key `planEntries`, `pi` MUST also report Plan Mode when the newest custom entry of a configured `customType` on the current branch holds a listed value in its named field. No such entry means not planning. A field that is not a string or a boolean, or a branch that cannot be read, MUST make the state `unknown` unless another source says planning. A config that is not valid MUST keep chat off. Without the key nothing changes.
+
+#### Scenario: A configured entry says planning
+- **WHEN** the newest entry of a configured type holds a listed value
+- **THEN** the state is `plan`, the heartbeat says `plan_mode` true and no claim is sent
+
+#### Scenario: A configured entry says not planning
+- **WHEN** the newest entry holds a value that is not listed, or no entry of that type exists
+- **THEN** the state is as it was without the key, and the heartbeat says `plan_mode` false
+
+#### Scenario: A configured entry cannot be read
+- **WHEN** its field is missing, null, a number, an object or an array, or the branch cannot be read
+- **THEN** the state is `unknown` and no claim is sent
+- **AND** when the shipped source or another configured entry says planning, the state is `plan`
+
+#### Scenario: The branch changes at an equal entry count
+- **WHEN** tree navigation makes a branch current whose newest entry of that type is not planning, and the entry count is the same
+- **THEN** the next state read says not planning
+
 ### Requirement: A peer message body is framed behind a per-notice nonce
 When a harness package passes message bodies to its session, the notice MUST carry a nonce of at least 64 bits from a cryptographic generator, drawn after the claim and never derived from message data. Each message MUST be a header line, an opening marker `<<<AGENT-CHAT-BODY NONCE`, the body and a closing marker `AGENT-CHAT-BODY NONCE>>>`. Every body line MUST start with `> `, added after the cut.
 

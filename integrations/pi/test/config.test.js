@@ -97,3 +97,51 @@ test("a valid toolRoute does not open the key set: an unknown sibling key still 
   assert.equal(withConfig({ ...base, toolRoute: "mcp", toolRouteFallback: "cli" }), null)
   assert.equal(withConfig({ ...base, toolRoute: "cli", mcpServer: "agent-chat" }), null)
 })
+
+// Issue #163: `planEntries` is one optional key. Every malformed shape keeps chat off, as every other config error does.
+const item = { customType: "example-orchestrator", field: "phase", values: ["planning", "planned"] }
+
+test("planEntries is optional and a valid list is returned as written", () => {
+  assert.equal(withConfig(base).planEntries, undefined)
+  const one = [item]
+  assert.deepEqual(withConfig({ ...base, planEntries: one }), { ...base, planEntries: one })
+  const many = Array.from({ length: 8 }, (_, index) => ({ customType: `example-${index}`, field: "on", values: [true, "yes"] }))
+  assert.deepEqual(withConfig({ ...base, planEntries: many }), { ...base, planEntries: many })
+  const edge = [{ customType: "t".repeat(128), field: "f", values: Array.from({ length: 16 }, (_, index) => `v${index}`) }]
+  assert.deepEqual(withConfig({ ...base, planEntries: edge }), { ...base, planEntries: edge })
+})
+
+test("any malformed planEntries keeps chat off", () => {
+  const bad = {
+    "not an array": item,
+    "a string": "example-orchestrator",
+    null: null,
+    "an empty array": [],
+    "nine items": Array.from({ length: 9 }, () => item),
+    "an item that is not an object": ["example-orchestrator"],
+    "a null item": [null],
+    "an array item": [[item]],
+    "a missing customType": [{ field: "phase", values: ["planning"] }],
+    "a missing field": [{ customType: "example-orchestrator", values: ["planning"] }],
+    "a missing values": [{ customType: "example-orchestrator", field: "phase" }],
+    "an extra key": [{ ...item, extra: true }],
+    "an empty customType": [{ ...item, customType: "" }],
+    "a customType over 128 characters": [{ ...item, customType: "t".repeat(129) }],
+    "a customType that is not a string": [{ ...item, customType: 1 }],
+    "an empty field": [{ ...item, field: "" }],
+    "a field that is not a string": [{ ...item, field: ["phase"] }],
+    "empty values": [{ ...item, values: [] }],
+    "values that are not an array": [{ ...item, values: "planning" }],
+    "seventeen values": [{ ...item, values: Array.from({ length: 17 }, (_, index) => `v${index}`) }],
+    "a number value": [{ ...item, values: ["planning", 1] }],
+    "a null value": [{ ...item, values: [null] }],
+    "an object value": [{ ...item, values: [{}] }],
+    "an array value": [{ ...item, values: [["planning"]] }],
+    "one bad item among good ones": [item, { ...item, values: [] }],
+  }
+  for (const [name, planEntries] of Object.entries(bad)) assert.equal(withConfig({ ...base, planEntries }), null, name)
+})
+
+test("a valid planEntries does not open the key set", () => {
+  assert.equal(withConfig({ ...base, planEntries: [item], planFlag: true }), null)
+})

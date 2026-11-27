@@ -11,7 +11,19 @@ import { TOOL_ROUTES } from "./notice.js"
 export const PI_CHAT_CONFIG_ENV = "AGENT_CHAT_PI_CONFIG"
 const MAX_BYTES = 16 * 1024
 const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "python"]
-const OPTIONAL = ["noticeBodies", "harness", "toolRoute"]
+const OPTIONAL = ["noticeBodies", "harness", "toolRoute", "planEntries"]
+const PLAN_ENTRY_KEYS = ["customType", "field", "values"]
+
+// Extra custom entries that count as Plan Mode: 1 to 8 items, each with exactly these keys.
+function planEntriesValid(items) {
+  return Array.isArray(items) && items.length >= 1 && items.length <= 8 && items.every(item =>
+    item !== null && typeof item === "object" && !Array.isArray(item) &&
+    Object.keys(item).length === PLAN_ENTRY_KEYS.length && PLAN_ENTRY_KEYS.every(key => key in item) &&
+    typeof item.customType === "string" && item.customType.length >= 1 && item.customType.length <= 128 &&
+    typeof item.field === "string" && item.field.length >= 1 &&
+    Array.isArray(item.values) && item.values.length >= 1 && item.values.length <= 16 &&
+    item.values.every(value => typeof value === "boolean" || typeof value === "string"))
+}
 
 export function loadConfig(env = process.env, name = PI_CHAT_CONFIG_ENV) {
   const raw = env[name]
@@ -38,6 +50,7 @@ export function loadConfig(env = process.env, name = PI_CHAT_CONFIG_ENV) {
     (OPTIONAL.includes("noticeBodies") && "noticeBodies" in data && typeof data.noticeBodies !== "boolean") ||
     ("toolRoute" in data && !TOOL_ROUTES.includes(data.toolRoute)) ||
     ("harness" in data && data.harness !== "pi") ||
+    ("planEntries" in data && !planEntriesValid(data.planEntries)) ||
     data.chatEnabled !== true ||
     !REQUIRED.slice(1).every(key => typeof data[key] === "string" && data[key]) ||
     !["python", "directory"].every(key => isAbsolute(data[key]))

@@ -74,6 +74,35 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
 | `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
+| `planEntries` | Optional. 1 to 8 objects `{ "customType", "field", "values" }`: custom session entries of another planning extension that count as Plan Mode. See [Plan Mode from other extensions](#plan-mode-from-other-extensions). Any other shape keeps chat off. |
+
+### Plan Mode from other extensions
+
+Without `planEntries`, Plan Mode is the `plan-mode` custom entry of Pi's shipped
+extension (`data.enabled`) or the `--plan` flag, and nothing below applies. An
+extension that records its own planning phase in its own custom entries can be
+named in `planEntries`, so that a session in that phase is reported as `plan`:
+no claim, no steering, `plan_mode: true` in the heartbeat. The package never
+learns an extension's name or format, only what the file says:
+
+```json
+"planEntries": [
+  { "customType": "example-orchestrator", "field": "phase", "values": ["planning", "planned"] }
+]
+```
+
+- `customType` is a non-empty string of at most 128 characters. `field` is a non-empty string, read as one top-level
+  key of the entry's `data`; it is never a path. `values` holds 1 to 16 strings or booleans that count as planning.
+  An item has exactly these three keys, and an array has 1 to 8 items. Anything else keeps chat off, as every other
+  config error does.
+- The package reads the newest custom entry of that `customType` on the current branch
+  (`sessionManager.getBranch()`), so tree navigation changes the answer. No entry of that type means not planning.
+- Fail closed: when `data[field]` is missing, `null`, a number, an object or an array, or the branch cannot be read, the
+  state is `unknown` and nothing is claimed. It is never reported as idle.
+- The session is in Plan Mode when the shipped source or any item says planning, even if another item cannot be read.
+  With no source saying planning, an unreadable item makes the state `unknown`. An unreadable shipped entry is
+  `unknown` whatever the items say, as without the key.
+- The package reads no other part of an extension's entries: only the named field of the newest entry of the named type.
 
 Point Pi at the file:
 
@@ -300,8 +329,9 @@ fits on `cli` fits on every route.
 ## Limitations
 
 - Plan Mode detection follows the `plan-mode` state recorded by Pi's shipped
-  example extension, including its startup flag. Use `/agent-chat-off` if a
-  different planning extension does not expose that state.
+  example extension, including its startup flag, and the entries that
+  `planEntries` names. A planning extension that does neither is not seen: use
+  `/agent-chat-off` for it.
 - A wall clock that is set forward shows `no live instance` early, by as much as it was set
   forward. That error is on the safe side, and the next confirmed heartbeat restores the text.
 - The lease footer, the replacement contract and the tree and compaction events have run only

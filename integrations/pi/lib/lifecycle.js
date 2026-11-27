@@ -215,16 +215,46 @@ export function createAgentChat(pi, config, {
     rejoinTimer = setTimeoutImpl(() => { void connect() }, delay)
   }
 
+  // One configured entry (`planEntries`, config.js) says planning when the newest custom entry of its type on the current
+  // branch holds a listed value in the named top-level field. No entry says not planning. Anything unreadable throws, so the
+  // state is unknown and never idle.
+  function configuredPlanning(branch, { customType, field, values }) {
+    if (!Array.isArray(branch)) throw new Error("Unreadable session branch")
+    const entry = branch.findLast(row => row.type === "custom" && row.customType === customType)
+    if (!entry) return false
+    const data = entry.data
+    if (data === null || typeof data !== "object" || Array.isArray(data) || !Object.hasOwn(data, field)) {
+      throw new Error("Unrecognized Plan Mode entry")
+    }
+    const value = data[field]
+    if (typeof value !== "string" && typeof value !== "boolean") throw new Error("Unrecognized Plan Mode entry")
+    return values.includes(value)
+  }
+
   function planMode() {
     // Pi's shipped plan-mode extension persists its state as a custom entry.
     // Use the entry count when available to avoid copying an unchanged session.
+    // A configured entry is read from the current branch, which tree navigation changes at an equal count: the leaf joins
+    // the key, and a session manager that cannot name its leaf is never cached.
     const manager = context?.sessionManager
     const count = manager?.getEntryCount?.()
-    if (Number.isInteger(count) && planSnapshot?.count === count) return planSnapshot.enabled
+    const leaf = config.planEntries ? manager?.getLeafId?.() : undefined
+    const cacheable = Number.isInteger(count) && (!config.planEntries || typeof leaf === "string")
+    if (cacheable && planSnapshot?.count === count && planSnapshot.leaf === leaf) return planSnapshot.enabled
     const entry = manager?.getEntries?.().findLast(row => row.type === "custom" && row.customType === "plan-mode")
-    const enabled = entry ? entry.data?.enabled : pi.getFlag?.("plan") === true
+    let enabled = entry ? entry.data?.enabled : pi.getFlag?.("plan") === true
     if (typeof enabled !== "boolean") throw new Error("Unrecognized Plan Mode state")
-    planSnapshot = { count, enabled }
+    if (config.planEntries) {
+      let branch
+      try { branch = manager.getBranch() } catch { branch = null }
+      // Planning wins over an entry that cannot be read, and an unreadable entry that nothing else outweighs is unknown.
+      let failure = null
+      for (const item of config.planEntries) {
+        try { enabled = configuredPlanning(branch, item) || enabled } catch (error) { failure = error }
+      }
+      if (failure && !enabled) throw failure
+    }
+    planSnapshot = { count, leaf, enabled }
     return enabled
   }
 
