@@ -166,7 +166,7 @@ def heartbeat(instance: JoinedInstance, state: Heartbeat, *, deadline: float | N
     """Only publish the owner's explicit observation; never clear stop implicitly."""
     if not isinstance(state, Heartbeat):
         raise ChatError("INVALID_REQUEST")
-    return _request(
+    result = _request(
         instance,
         "POST",
         "/v1/instance/heartbeat",
@@ -174,6 +174,18 @@ def heartbeat(instance: JoinedInstance, state: Heartbeat, *, deadline: float | N
         invalid="INVALID_RESPONSE",
         deadline=deadline,
     )
+    # A harness treats a clean return as the confirmation that the lease renewed and the sent state is stored.
+    # The server returns the stored row, so a reply without a timestamp, or one that stored other values, is not that.
+    heartbeat_at = result.get("heartbeat_at")
+    if (
+        not isinstance(heartbeat_at, str)
+        or not heartbeat_at
+        or result.get("native_state") != state.native_state
+        or result.get("stopped") is not state.stopped
+        or result.get("plan_mode") is not state.plan_mode
+    ):
+        raise ChatError("INVALID_RESPONSE")
+    return result
 
 
 def status(instance: JoinedInstance, *, deadline: float | None = None) -> dict[str, Any]:

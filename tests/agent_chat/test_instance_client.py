@@ -415,6 +415,56 @@ def test_a_server_reply_carrying_refused_is_invalid_not_an_outage(monkeypatch):
         instance_client.status(instance)
 
 
+SENT = Heartbeat(native_state="busy", stopped=True, plan_mode=False)
+STORED = {
+    "heartbeat_at": "2026-10-19T00:00:00+00:00", "native_state": "busy", "stopped": True, "plan_mode": False
+}
+
+
+def _heartbeat_with(monkeypatch, **changes):
+    """Send SENT to a server whose reply is the stored row with `changes`; a value of None drops the key."""
+    row = {key: value for key, value in (STORED | changes).items() if value is not None}
+    instance = _canned(monkeypatch, lambda instance_id, session_id: {"instance_id": instance_id, **row})
+    return instance_client.heartbeat(instance, SENT), row, instance
+
+
+def test_a_heartbeat_reply_with_the_stored_row_is_returned_unchanged(monkeypatch):
+    result, row, instance = _heartbeat_with(monkeypatch)
+    assert result == {"instance_id": str(instance.instance_id)} | row
+
+
+def test_a_heartbeat_reply_with_only_the_instance_id_is_invalid(monkeypatch):
+    instance = _canned(monkeypatch, lambda instance_id, session_id: {"instance_id": instance_id})
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        instance_client.heartbeat(instance, SENT)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"native_state": "idle"},
+        {"native_state": None},
+        {"native_state": ["busy"]},
+        {"stopped": False},
+        {"stopped": None},
+        {"stopped": 1},
+        {"stopped": "true"},
+        {"plan_mode": True},
+        {"plan_mode": None},
+        {"plan_mode": 0},
+        {"plan_mode": "false"},
+        {"heartbeat_at": None},
+        {"heartbeat_at": ""},
+        {"heartbeat_at": 1760832000},
+        {"heartbeat_at": ["2026-10-19T00:00:00+00:00"]},
+    ],
+    ids=str,
+)
+def test_a_heartbeat_reply_that_is_not_the_stored_row_is_invalid(monkeypatch, changes):
+    with pytest.raises(ChatError, match="^INVALID_RESPONSE$"):
+        _heartbeat_with(monkeypatch, **changes)
+
+
 def _worker_frame(process: subprocess.Popen[str], frame: dict) -> dict:
     assert process.stdin is not None and process.stdout is not None
     process.stdin.write(json.dumps(frame) + "\n")
