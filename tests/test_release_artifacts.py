@@ -196,20 +196,48 @@ MARKDOWN_LINK = re.compile(
 )
 
 
-@pytest.mark.parametrize("package", PACKAGES, ids=lambda path: path.name)
-def test_each_package_readme_links_by_relative_path_only_to_files_it_ships(package: Path) -> None:
-    """The tarball holds only the package; a relative link to anything else is dead there."""
+def dead_links(package: Path, text: str) -> list[str]:
+    """Relative links in ``text`` that an extracted tarball of ``package`` cannot follow."""
+    root = package.resolve()
     shipped = {entry.rstrip("/") for entry in read_json(package / "package.json")["files"]}
     dead = []
-    for match in MARKDOWN_LINK.finditer(package_readme(package)):
+    for match in MARKDOWN_LINK.finditer(text):
         target = (match.group(1) or match.group(2)).split("#", 1)[0]
         if not target or re.match(r"[a-z][a-z0-9+.-]*:", target, re.IGNORECASE):
             continue
         resolved = (package / target).resolve()
-        inside = resolved.is_relative_to(package.resolve())
-        if not inside or resolved.relative_to(package.resolve()).parts[0] not in shipped:
+        if (
+            not resolved.is_relative_to(root)
+            or resolved == root
+            or resolved.relative_to(root).parts[0] not in shipped
+            or not resolved.exists()
+        ):
             dead.append(match.group(0))
-    assert dead == []
+    return dead
+
+
+@pytest.mark.parametrize("package", PACKAGES, ids=lambda path: path.name)
+def test_each_package_readme_links_by_relative_path_only_to_files_it_ships(package: Path) -> None:
+    """The tarball holds only the package; a relative link to anything else is dead there."""
+    assert dead_links(package, package_readme(package)) == []
+
+
+def test_the_link_check_finds_each_kind_of_dead_link() -> None:
+    """A check that passes every README must still be able to fail."""
+    package = INTEGRATIONS / "pi"
+    live = "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
+    assert dead_links(package, live) == []
+    dead = {
+        "a parent file": "[x](../README.md#notice-contract)",
+        "the repository root": "[x](../../README.md)",
+        "a missing file in a shipped directory": "[x](lib/notcie.js)",
+        "a file the package does not ship": "[x](test/config.test.js)",
+        "an angle-bracket target": "[x](<../README.md>)",
+        "a titled link": '[x](../README.md "overview")',
+        "a reference definition": "[x]: ../README.md",
+    }
+    for name, text in dead.items():
+        assert dead_links(package, text + "\n") != [], name
 
 
 def test_the_overview_documents_the_install_by_version_steps_and_the_compatibility_rule() -> None:
