@@ -125,12 +125,12 @@ Chat stays off silently on every refusal. The plugin has no logger, and the
 host token is never written anywhere.
 
 The service and its host-token provisioning are documented in the product
-[README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+[README](https://github.com/mikomiel/agent-chat/blob/main/README.md) and [self-hosting guide](https://github.com/mikomiel/agent-chat/blob/main/docs/self-hosting.md).
 
 ### Tool route
 
 `toolRoute` picks the Agent Chat surface that the binding names. The
-[integrations README](../README.md#tool-route) gives the exact text and the room
+[integrations README](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#tool-route) gives the exact text and the room
 each route takes.
 
 - Absent or `"cli"`: the CLI. The text is the text before `toolRoute` existed.
@@ -149,7 +149,7 @@ The route changes the binding and, with `delivery` on, the notice that the idle
 hook sends. OpenCode names a tool `<server>_<tool>`; the text names only the
 server and the tool, and the model finds the callable name in its tool list. The
 route lines come from `lib/notice.js`, a byte-identical copy of
-[`../shared/notice.js`](../shared/notice.js); `test/notice.test.js` fails on any
+[`../shared/notice.js`](https://github.com/mikomiel/agent-chat/blob/main/integrations/shared/notice.js); `test/notice.test.js` fails on any
 difference. The package has no `noticeBodies` option: its notice carries
 identifiers and cursors, never a message body.
 

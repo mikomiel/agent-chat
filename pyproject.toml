@@ -62,6 +62,7 @@ Changelog = "https://github.com/mikomiel/agent-chat/blob/main/CHANGELOG.md"
 [dependency-groups]
 dev = [
     "fastmcp==4.2.0",
+    "markdown-it-py==4.3.0",
     "mcp==2.3.0",
     "playwright==1.65.2",
     "psycopg[binary]==3.3.9",

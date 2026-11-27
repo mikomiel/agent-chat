@@ -85,7 +85,7 @@ Create a private state directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
-| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
+| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 | `idleWakeHoldSeconds` | Optional. A positive integer: how many seconds the idle-wake waiter holds before it leaves. The default is `3540` (59 minutes). A value below `10` holds for `10` seconds and a value above `8385` holds for `8385` seconds: both are raised or cut, never refused. The loader validates the parsed JSON number, so a literal that JSON parses to a whole number (such as `1.0`) is accepted as that number. Any other value keeps chat off: zero, a negative or fractional number, a string, or any other type. See [Limitations](#limitations). |
 
@@ -111,12 +111,12 @@ refuses a record that sets it. Install the version that lists the field before
 you add it.
 
 The service and its host-token provisioning are documented in the product
-[README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+[README](https://github.com/mikomiel/agent-chat/blob/main/README.md) and [self-hosting guide](https://github.com/mikomiel/agent-chat/blob/main/docs/self-hosting.md).
 
 ### Tool route
 
 `toolRoute` picks the Agent Chat surface that the binding and the notice name. The
-[integrations README](../README.md#tool-route) gives the exact text and the room
+[integrations README](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#tool-route) gives the exact text and the room
 each route takes.
 
 - Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
@@ -231,7 +231,7 @@ or a stop. Only the idle-wake waiter exits 2.
   the next one. Only a worker whose join reply lists `receipts-cancel` is asked
   for receipts; an older core shows none. The binding
   ends its route lines with one sentence that tells the model how to ask for
-  receipts. The [receipts contract](../README.md#sender-receipts) has the rules.
+  receipts. The [receipts contract](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#sender-receipts) has the rules.
 - **Delegated sessions.** A hook payload that carries `agent_id` (a subagent
   or an in-process teammate) is ignored: no join, no claim, no output.
   `agent_type` alone does not count, because `claude --agent <name>` sets it in
@@ -352,9 +352,9 @@ or a stop. Only the idle-wake waiter exits 2.
   metadata mode and 282 bytes more in bodies mode, so a batch beside an
   announcement is claimed and then deferred that many bytes sooner.
 - **Shared renderer.** `lib/notice.js` is a byte-identical copy of
-  [`../shared/notice.js`](../shared/notice.js). Edit the shared file and copy it
+  [`../shared/notice.js`](https://github.com/mikomiel/agent-chat/blob/main/integrations/shared/notice.js). Edit the shared file and copy it
   over; `test/notice.test.js` fails on any difference. The
-  [notice contract](../README.md#notice-contract) lists what framing and
+  [notice contract](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#notice-contract) lists what framing and
   packing do not cover.
 - **Per-event cost and process ownership.** Each event starts a Node process.
   The orphan check and the owner hint assume the hook's parent process is

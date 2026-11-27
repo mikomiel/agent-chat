@@ -8,7 +8,7 @@ native state, the delivery callback and the bounded rejoin scheduler.
 
 ## Requirements
 
-- Pi with extension support (the [compatibility matrix](../README.md#compatibility) lists the API surface and
+- Pi with extension support (the [compatibility matrix](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#compatibility) lists the API surface and
   the releases that were run).
 - Node 20 or newer.
 - A Python 3.11+ interpreter with the same version of the core installed: the PyPI
@@ -72,7 +72,7 @@ Create a private directory and a `0600` JSON file outside the repository:
 | `serverOrigin` | The Agent Chat service origin, `http` or `https`. |
 | `hostToken` | A host token accepted by that service. Keep it in this file, never in a command line. |
 | `python` | Absolute interpreter that can import `agent_chat`. It must be the interpreter itself, not a wrapper or a launcher: the cancel signal (`SIGUSR1`) goes to the process that the package starts, and only the worker handles it. |
-| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](../README.md#notice-contract); default metadata only. |
+| `noticeBodies` | Optional. `true` includes message bodies in the notice, framed and neutralized by the [notice contract](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#notice-contract); default metadata only. |
 | `toolRoute` | Optional. `"cli"` (the default), `"mcp"` or `"mcp-with-cli-fallback"`: the Agent Chat surface that the binding and the notice tell the model to use. See [Tool route](#tool-route). Any other value keeps chat off. |
 | `planEntries` | Optional. 1 to 8 objects `{ "customType", "field", "values" }`: custom session entries of another planning extension that count as Plan Mode. See [Plan Mode from other extensions](#plan-mode-from-other-extensions). Any other shape keeps chat off. |
 
@@ -119,12 +119,12 @@ current user, a file with any group or world permission bit, a file larger than
 Chat stays off silently on every refusal; the host token is never logged.
 
 The service and its host-token provisioning are documented in the product
-[README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
+[README](https://github.com/mikomiel/agent-chat/blob/main/README.md) and [self-hosting guide](https://github.com/mikomiel/agent-chat/blob/main/docs/self-hosting.md).
 
 ### Tool route
 
 `toolRoute` picks the Agent Chat surface that the binding and the notice name. The
-[integrations README](../README.md#tool-route) gives the exact text and the room
+[integrations README](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#tool-route) gives the exact text and the room
 each route takes.
 
 - Absent or `"cli"`: the CLI. The route lines are the text before `toolRoute` existed, and
@@ -228,7 +228,7 @@ fits on `cli` fits on every route.
   the extension reads each candidate's size from `pending` and claims the
   longest prefix that one 8 KiB notice is estimated to carry; a retry batch is
   claimed whole. A body that outgrows the estimate can still be cut after the
-  claim; the [notice contract](../README.md#notice-contract) lists the limit.
+  claim; the [notice contract](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#notice-contract) lists the limit.
 - **Mute.** A muted session settles the batch as `deferred` and delivers
   nothing.
 - **Sender receipts.** While a turn runs, at most every 5 seconds, the extension
@@ -265,7 +265,7 @@ fits on `cli` fits on every route.
   chat; a thrown error that carries a code takes the path it takes on any
   request. The binding ends its route lines with one sentence that tells the
   model how to ask for receipts. The
-  [receipts contract](../README.md#sender-receipts) has the rules.
+  [receipts contract](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#sender-receipts) has the rules.
 - **Rejoin.** A worker error or a request timeout that carries
   `STALE_INSTANCE`, `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or
   `REQUEST_UNCERTAIN`, and a join `BINDING_CONFLICT`, start a bounded rejoin:
@@ -365,12 +365,12 @@ fits on `cli` fits on every route.
   names the `agent-chat` MCP tools instead (see [Tool route](#tool-route)). This
   version registers no chat tools of its own: an MCP route needs an
   `agent-chat` MCP server that Pi reaches outside this package.
-- `lib/notice.js` is a byte-identical copy of [`../shared/notice.js`](../shared/notice.js).
+- `lib/notice.js` is a byte-identical copy of [`../shared/notice.js`](https://github.com/mikomiel/agent-chat/blob/main/integrations/shared/notice.js).
   Edit the shared file and copy it over; `test/notice.test.js` fails on any
-  difference. The [notice contract](../README.md#notice-contract) lists what
+  difference. The [notice contract](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#notice-contract) lists what
   framing and packing do not cover.
 
-The [compatibility matrix](../README.md#compatibility) records the Pi 1.5.2
+The [compatibility matrix](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#compatibility) records the Pi 1.5.2
 join, delivery, rejoin and shutdown runs. Contract tests use a harness double.
 
 ## Test

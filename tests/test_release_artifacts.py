@@ -27,10 +27,13 @@ import tarfile
 import textwrap
 import tomllib
 import zipfile
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
 import yaml
+from markdown_it import MarkdownIt
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATIONS = ROOT / "integrations"
@@ -187,6 +190,141 @@ def test_each_package_readme_names_its_release_asset_and_points_at_the_install_s
     assert f"agent-chat-{package.name}-<version>.tgz" in readme
     # An absolute link: the tarball ships only the package README.
     assert "https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release" in readme
+
+
+class RenderedTargets(HTMLParser):
+    """The ``href`` of each ``a`` and the ``src`` of each ``img`` in rendered HTML."""
+
+    WANTED = {"a": "href", "img": "src"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.targets: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.targets.extend(value for name, value in attrs if name == self.WANTED.get(tag) and value is not None)
+
+    handle_startendtag = handle_starttag
+
+
+def link_targets(text: str) -> list[str]:
+    """Every link and image target in ``text`` as a CommonMark renderer with tables renders it.
+
+    Reading the rendered HTML, not the parse tree, takes raw HTML links in and leaves out a link that only
+    becomes text, such as one inside an image description.
+    """
+    parser = RenderedTargets()
+    parser.feed(MarkdownIt("commonmark").enable("table").render(text))
+    parser.close()
+    return parser.targets
+
+
+def climbs_out(path: str) -> bool:
+    """Whether a relative path goes above its starting directory at any step, even to come back."""
+    depth = 0
+    for segment in path.split("/"):
+        depth += -1 if segment == ".." else 0 if segment in {"", "."} else 1
+        if depth < 0:
+            return True
+    return False
+
+
+def shipped_tree(package: Path, destination: Path) -> Path:
+    """The package as its tarball holds it, by the release check's own rule.
+
+    ``check_tarball`` expects the tracked files of the package minus ``test/``, plus the repository ``LICENSE``
+    that the pack step adds. Each is a regular file; nothing is followed, and every target stays in ``destination``.
+    """
+    # The pack step's own refusal: a link anywhere in the package, a linked directory included, stops it.
+    script.refuse_special_files(package)
+    prefix = f"{script.INTEGRATIONS}/{package.name}/"
+    names = [
+        name[len(prefix) :]
+        for name in script.tracked_integration_files(ROOT)
+        if name.startswith(prefix) and not name[len(prefix) :].startswith(script.UNSHIPPED_DIRECTORY)
+    ]
+    sources = {name: package / name for name in names} | {script.LICENSE: ROOT / script.LICENSE}
+    for name, source in sources.items():
+        script.require_regular(source)
+        target = destination / name
+        assert target.resolve().is_relative_to(destination.resolve()), name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+    return destination
+
+
+def dead_links(tree: Path, text: str) -> list[str]:
+    """Relative link targets in ``text`` that the extracted package ``tree`` cannot follow.
+
+    The tarball holds the package under its own top directory, so a target may not leave the package at any step or
+    name the package directory itself. The raw path goes to the file system of the shipped tree, not to ``pathlib``,
+    which would drop a trailing slash or fold ``config.js/..`` or ``test/..`` that the tarball cannot follow.
+    """
+    dead = []
+    for link in link_targets(text):
+        # Split the URL first and decode only its path: an encoded `#` or `?` is part of the file name.
+        parts = urlsplit(link)
+        if parts.scheme or parts.netloc or not parts.path:
+            continue
+        path = unquote(parts.path)
+        if (
+            path.startswith("/")
+            or climbs_out(path)
+            or os.path.normpath(path) == "."
+            or not os.path.exists(os.path.join(tree, path))
+        ):
+            dead.append(link)
+    return dead
+
+
+@pytest.mark.parametrize("package", PACKAGES, ids=lambda path: path.name)
+def test_each_package_readme_links_by_relative_path_only_to_files_it_ships(package: Path, tmp_path: Path) -> None:
+    """The tarball holds only the package; a relative link to anything else is dead there."""
+    assert dead_links(shipped_tree(package, tmp_path / "package"), package_readme(package)) == []
+
+
+def test_the_link_check_finds_each_kind_of_dead_link(tmp_path: Path) -> None:
+    """A check that passes every README must still be able to fail."""
+    package = shipped_tree(INTEGRATIONS / "pi", tmp_path / "package")
+    live = (
+        "[license](LICENSE) "
+        "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
+        '[f](lib/config.js "see [g](../README.md)")\n'
+        "[h](lib/config.js?raw=1) [i](lib/con%66ig.js) [j](lib/) [k](lib/../README.md)\n"
+        "![See [overview](../README.md)](lib/config.js)\n"
+    )
+    # A link inside a title is title text, not a link.
+    expected = ["LICENSE", "lib/config.js", "lib/config.js#L1", "#configure", "https://example.com/x", "README.md"]
+    expected += ["lib/config.js", "lib/config.js?raw=1", "lib/con%66ig.js", "lib/", "lib/../README.md"]
+    expected.append("lib/config.js")
+    assert sorted(link_targets(live)) == sorted(expected)
+    assert dead_links(package, live) == []
+    dead = {
+        "a parent file": "[x](../README.md#notice-contract)",
+        "the repository root": "[x](../../README.md)",
+        "a missing file in a shipped directory": "[x](lib/notcie.js)",
+        "a file the package does not ship": "[x](test/config.test.js)",
+        "an angle-bracket target": "[x](<../README.md>)",
+        "a titled link": '[x](../README.md "overview")',
+        "a link with a single-quoted title": "[x](../README.md 'overview')",
+        "a link with a parenthesized title": "[x](../README.md (overview))",
+        "the package directory itself": "[x](./)",
+        "a reference link": "[x][r]\n\n[r]: ../README.md",
+        "a reference link in angle brackets": "[x][r]\n\n[r]: <../README.md>",
+        "a reference link in a block quote": "> [x][r]\n>\n> [r]: ../README.md",
+        "a link in a table cell": "| a |\n|---|\n| [x](../README.md) |",
+        "an image": "![x](../logo.png)",
+        "a raw HTML link": '<a href="../README.md">x</a>',
+        "a raw HTML image": '<p><img src="../logo.png" alt="x"></p>',
+        "an encoded number sign, which is part of the file name": "[x](lib/config.js%23missing)",
+        "a file with a trailing slash": "[x](lib/config.js/)",
+        "the parent of a file": "[x](lib/config.js/..)",
+        "a path that leaves the package and comes back": "[x](../pi/lib/config.js)",
+        "an absolute path": "[x](/integrations/pi/lib/config.js)",
+        "a path through a directory the package does not ship": "[x](test/../README.md)",
+    }
+    for name, text in dead.items():
+        assert dead_links(package, text + "\n") != [], name
 
 
 def test_the_overview_documents_the_install_by_version_steps_and_the_compatibility_rule() -> None:
