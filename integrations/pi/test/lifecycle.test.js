@@ -2753,6 +2753,9 @@ test("planEntries: an unreadable entry is unknown, never idle, and claims nothin
     ["data that is null", null],
     ["data that is a string", "planning"],
     ["data that is an array", ["planning"]],
+    // A live entry can hold an object whose read throws a falsy value: the failure itself must count, not what was thrown.
+    // eslint-disable-next-line no-throw-literal
+    ["a field whose read throws undefined", { get phase() { throw undefined } }],
   ]
   for (const [name, data] of bad) {
     const row = { id: "a", parentId: null, type: "custom", customType: PLAN_ITEM.customType, ...(data === undefined ? {} : { data }) }

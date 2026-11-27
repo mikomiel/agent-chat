@@ -248,11 +248,12 @@ export function createAgentChat(pi, config, {
       let branch
       try { branch = manager.getBranch() } catch { branch = null }
       // Planning wins over an entry that cannot be read, and an unreadable entry that nothing else outweighs is unknown.
-      let failure = null
+      // The failure counts, not what was thrown: a read can throw a falsy value.
+      let unreadable = false
       for (const item of config.planEntries) {
-        try { enabled = configuredPlanning(branch, item) || enabled } catch (error) { failure = error }
+        try { enabled = configuredPlanning(branch, item) || enabled } catch { unreadable = true }
       }
-      if (failure && !enabled) throw failure
+      if (unreadable && !enabled) throw new Error("Unrecognized Plan Mode entry")
     }
     planSnapshot = { count, leaf, enabled }
     return enabled

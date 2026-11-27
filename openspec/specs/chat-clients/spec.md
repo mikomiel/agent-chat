@@ -720,23 +720,27 @@ Tree navigation and compaction MUST keep the `pi` binding and MUST NOT join agai
 - **AND** an event that finds nothing due ends nothing
 
 ### Requirement: `pi` reads Plan Mode from configured custom entries
-With the optional config key `planEntries`, `pi` MUST also report Plan Mode when the newest custom entry of a configured `customType` on the current branch holds a listed value in its named field. No such entry means not planning. A field that is not a string or a boolean, or a branch that cannot be read, MUST make the state `unknown` unless another source says planning. A config that is not valid MUST keep chat off. Without the key nothing changes.
+With the optional config key `planEntries`, `pi` MUST also report Plan Mode when the newest custom entry of a configured `customType` on the current branch holds a listed value in its named field. No such entry means that item is not planning. When that field is not a string or a boolean, or the branch cannot be read, the state MUST be `unknown` unless the shipped source or another configured entry says planning. An unreadable shipped entry MUST stay `unknown`. A config that is not valid MUST keep chat off. Without the key nothing changes.
 
 #### Scenario: A configured entry says planning
-- **WHEN** the newest entry of a configured type holds a listed value
+- **WHEN** the newest entry of a configured type holds a listed value, and the shipped Plan Mode entry, if there is one, can be read
 - **THEN** the state is `plan`, the heartbeat says `plan_mode` true and no claim is sent
+- **AND** this holds when another configured entry cannot be read
 
-#### Scenario: A configured entry says not planning
-- **WHEN** the newest entry holds a value that is not listed, or no entry of that type exists
-- **THEN** the state is as it was without the key, and the heartbeat says `plan_mode` false
+#### Scenario: No source says planning
+- **WHEN** the shipped source says not planning, and for each configured type the newest entry holds a value that is not listed or no entry of that type exists
+- **THEN** the state is as it would be without the key, and the heartbeat says `plan_mode` false
 
 #### Scenario: A configured entry cannot be read
-- **WHEN** its field is missing, null, a number, an object or an array, or the branch cannot be read
+- **WHEN** its field is missing, null, a number, an object or an array, its read fails, or the branch cannot be read, and neither the shipped source nor another configured entry says planning
 - **THEN** the state is `unknown` and no claim is sent
-- **AND** when the shipped source or another configured entry says planning, the state is `plan`
+
+#### Scenario: The shipped entry cannot be read
+- **WHEN** the shipped Plan Mode entry does not hold a boolean
+- **THEN** the state is `unknown` and no claim is sent, whatever the configured entries say
 
 #### Scenario: The branch changes at an equal entry count
-- **WHEN** tree navigation makes a branch current whose newest entry of that type is not planning, and the entry count is the same
+- **WHEN** tree navigation makes a branch current whose newest entry of that type is not planning, the entry count is the same, and no other source says planning
 - **THEN** the next state read says not planning
 
 ### Requirement: A peer message body is framed behind a per-notice nonce
