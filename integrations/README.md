@@ -38,6 +38,7 @@ OpenCode and Codex rows record no run, so no core version applies.
 | Package | Harness surface | Verified release | Evidence |
 |---|---|---|---|
 | `pi` 0.1.0 | extension factory, `session_start`, `input`, `agent_start`, `agent_settled`, `ui_prompt_*`, `session_info_changed`, `before_agent_start`, `session_shutdown`, `message_start`, `sendMessage`, `registerCommand` | `1.5.2` | RPC join and shutdown; interactive delivery and rejoin against a disposable service |
+| `agent-chat-pi` (source after 0.8.0) | `session_tree`, `session_compact`, `session_compact_failed`; `ctx.ui.setStatus` with the `Agent Chat: no live instance` text; `ctx.isIdle()` during compaction and branch summarization; `session_shutdown` followed by `session_start` for the reasons `reload`, `new`, `resume` and `fork` | `NOT RUN` | None. The `1.5.2` type declarations and sources were read and nothing ran against Pi. No release was run for these surfaces, `1.6.0` and `1.6.1` included. Contract tests use a harness double |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | eligibility: `ctx.agents.get` and the session header `origin`, plus `roots()` and `isOwnedBy()` where the registry has them | `NOT RUN` on `0.2.2-rc.5` | No run. The published type declarations were compared; nothing was executed. `@deepseek-ai/dsh-agent` `0.2.2-rc.1` declares `AgentRegistry.roots()`, `AgentRegistry.isOwnedBy(id, owner)` and `CreateAgentOptions.parentAgent`. `0.2.2-rc.2` to `0.2.2-rc.5` declare none of them, and `enter(agent)` takes no owner; `get(id)` and `list()` remain. In `0.2.2-rc.5` the host's own subagent test is `session.header.origin === 'subagent'`, and the subagent child factory sets that value. The package reads which registry surface it finds and uses that header test where `roots()` and `isOwnedBy()` are both absent; a registry with only one of them refuses every agent. |
 | `agent-chat-opencode` 0.8.0 | OpenCode server plugin: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.created`, `session.execution.started`, `session.forked`, `session.deleted`, `session.compaction.started`/`ended`/`failed`; with `delivery: true` also `ctx.session.hook("experimental.idle")`, `ctx.session.synthetic` and the event `session.inbox.delivered` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin, and the idle delivery has never run live |
@@ -89,6 +90,20 @@ private DSH home, a disposable Agent Chat service and test principals.
 
 CI runs the contract suites with harness doubles. [Issue #41](https://github.com/mikomiel/agent-chat/issues/41)
 tracks live-harness CI and the Claude Code and Codex live runs.
+
+## Lifecycle transitions
+
+A package meets the same five classes of lifecycle transition, whatever its harness calls them. The table says what a
+package must do for each class. Only the `pi` column is filled in: another package adds its own column when its
+lifecycle is checked against the rows, so an empty cell makes no claim about that package.
+
+| Transition | A package must | `pi` |
+|---|---|---|
+| Runtime replaced: the harness unloads the extension runtime and loads another, for a new, resumed, forked or reloaded session | Ask the worker of the old instance to end it, and wait for that worker to exit, up to a bound, before the new one joins; wait the same way for a worker that an earlier failure stopped and that is still exiting. A rejoin starts its worker only after the one it stopped has exited, or at the bound. Neither the request nor the exit proves that the server ended the instance: a join that still meets the old instance is retried after a back-off. Ask for the end on the harness's shutdown event only, never on a "before switch" event that another handler can cancel. Start the new runtime stopped. The native session id keys the chat session, so a replacement that keeps the id returns to its chat session and one that changes it begins another. A latch that turned chat off for the process holds across the replacement. | `session_shutdown` with the reason `reload`, `new`, `resume` or `fork`, which Pi awaits, then `session_start` with the same reason on the new runtime. The handler returns once every worker that is still closing has exited, one that a rejoin stopped included, or after 6 seconds. A rejoin starts its worker only after the old one has closed, or after the same 6 seconds, so a child that never exits holds neither for ever. A join that still meets the old instance, because the `end` failed, is retried after a back-off. No `session_before_switch` or `session_before_fork` handler. |
+| Context rewritten in place: compaction, tree navigation | Keep the binding and the native session id, join nothing again and announce nothing again. Evaluate the native state again, and let no claim happen while the harness is not idle. | `session_tree`, `session_compact` and `session_compact_failed` evaluate it again. `ctx.isIdle()` is false during compaction and branch summarization. `before_agent_start` sets the binding section at every turn. |
+| Lease lapsed: the last confirmed join or heartbeat is `LEASE_SECONDS` old | Change the footer or status line only, to say that no instance is live. Start no rejoin episode, withdraw no binding and raise no fault because of the lapse: what starts an episode is unchanged, a refusal or an error of the worker. Keep the text until a confirmed heartbeat restores the normal text: a clock that is set back after the lapse does not. | `ctx.ui.setStatus` with `Agent Chat: no live instance`, set by a timer on the monotonic deadline, or by the next poll tick when only the wall clock shows the lapse, as after a suspend. The lapse is latched until a heartbeat is answered without `refused`. |
+| Operator abort | Clear delivery eligibility until local input. | `agent_start` with an aborted signal, `agent_settled` with `aborted`, and `input` from a non-interactive source stop it; `input` from the interactive source restores it. |
+| Tolerated outage: the worker answers a heartbeat or a pending read with `refused` and keeps the binding | Take it as no renewal, not as a failure: keep the worker and the binding, start no episode and spend no rejoin budget. The next heartbeat or poll is the retry. A `refused` that proves the lease gone, and a worker error, still rejoin. | `refused` with `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN` on `heartbeat` or `pending`. |
 
 ## Notice contract
 
@@ -311,7 +326,8 @@ The rules below bind every package that shows receipts.
   path, the first hook claims, and no hook waits behind another hook's delivery. `claude-code` also records the state of
   a report that queues behind a receipts request as it queues, so that second hook sends no second report.
   `pi` and `deepseek` cancel when a heartbeat or a delivery poll falls due while
-  their receipts request is in flight, and send none while either is due. The worker's own deadline for a receipts request, 2 seconds
+  their receipts request is in flight, and send none while either is due; in `pi`, an entry that finds the state the
+  worker confirmed makes no heartbeat due. The worker's own deadline for a receipts request, 2 seconds
   (`RECEIPT_SECONDS` in `agent_chat/instance_worker.py`), stays as the backstop for a request that nothing ends. The
   tests hold a receipts request on a gate that nothing releases, so only the cancel can end it, and a hook delivers
   while it is held: client-side, no hook skips its claim for a receipts request. The first request after a cancel is
@@ -502,7 +518,8 @@ Limits that remain:
 - A notice is output only at a boundary within 5 seconds of the request that staged it: a second prompt or tool event in
   `claude-code` and `codex`, a pre-step in `deepseek`. A staged notice holds the next poll until a boundary shows it or
   drops it, so a session whose boundaries are always more than 5 seconds apart drops each notice, and its receipts
-  arrive late or not at all. The rows stay on the server, so nothing is lost.
+  arrive late or not at all. A late notice deletes no row: the feed offers a receipt while its message is retained and
+  the session can still read its room.
 
 ## Rules
 

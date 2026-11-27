@@ -1,7 +1,7 @@
 # chat-clients Specification
 
 ## Purpose
-Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, the sender receipts that a harness package shows without waking it, and how the OpenCode plugin delivers from the host's idle hook.
+Defines how the shipped command-line client and the per-process adapter core behave toward a harness session: the exact binding context, binding-file safety, message and recipient handling, role selectors, one-step replies, the history and roster options of the CLI with the matching arguments of the MCP `history` and `who` tools, the adapter's join, heartbeat and bounded rejoin lifecycle, the notice contract that puts a peer message body into a harness session, the sender receipts that a harness package shows without waking it, how the `pi` package keeps its footer and its instance true across a lapsed lease, a stopped chat, a replaced runtime and a compaction, and how the OpenCode plugin delivers from the host's idle hook.
 
 ## Requirements
 
@@ -462,6 +462,262 @@ Only a `settle` try that gets no status, because the connection fails before the
 - **WHEN** the request deadline cuts a try short
 - **THEN** the worker answers its parent with `REQUEST_UNCERTAIN` and ends
 - **AND** a pause between tries that ends after the deadline starts no try, and the worker answers with the code of the last failure
+
+### Requirement: The `pi` footer reads `no live instance` when the instance lease lapses
+The `pi` package MUST show `Agent Chat: no live instance` once 90 seconds have passed on the monotonic clock or on the wall clock since it sent the last join or heartbeat request that the worker answered without `refused`, and the state text again only at the next such answer, even if the wall clock is set back. This text MUST come before every state text. The lapse itself MUST change the footer only: it MUST NOT begin a rejoin episode, withdraw the binding context or raise a fault.
+
+#### Scenario: A brief outage
+- **WHEN** the worker answers a heartbeat or a pending read `refused` with `SERVICE_UNAVAILABLE`, `TRANSPORT_UNAVAILABLE` or `REQUEST_UNCERTAIN`, and the lease has not lapsed
+- **THEN** the adapter keeps its worker and its binding context, begins no rejoin episode and spends none of its rejoin budget
+- **AND** the next heartbeat or poll tick is the retry
+
+#### Scenario: The lease lapses during an outage
+- **WHEN** 90 seconds pass after the send of the last request that was answered without `refused`
+- **THEN** the footer reads `Agent Chat: no live instance` at that deadline, not at the next 30-second heartbeat
+- **AND** the lapse itself begins no rejoin episode, withdraws no binding context and raises no fault
+- **AND** the next heartbeat answered without `refused` shows the state text again
+
+#### Scenario: The lease runs from the send
+- **WHEN** a heartbeat is sent at second 0 and answered without `refused` at second 40
+- **THEN** the lease runs to second 90, not to second 130
+
+#### Scenario: A host suspend
+- **WHEN** the host is suspended for more than 90 seconds after the send of the last request that was answered without `refused`, so that the monotonic clock and its timer stand still and the wall clock runs on
+- **THEN** the footer reads `Agent Chat: no live instance` at the first poll tick after the resume, whatever request is in flight then
+- **AND** the lapse itself begins no rejoin episode, withdraws no binding context and raises no fault
+- **AND** the next heartbeat answered without `refused` shows the state text again
+
+#### Scenario: A wall clock set back after a lapse
+- **WHEN** 90 seconds have passed on either clock since the send of the last request that was answered without `refused`, and the wall clock is then set back to a time before its own deadline, while the monotonic clock may not yet have counted 90 seconds
+- **THEN** the footer keeps reading `Agent Chat: no live instance` at every poll tick and after every heartbeat that the worker answers `refused`
+- **AND** the next heartbeat answered without `refused` shows the state text again
+
+#### Scenario: The lapse comes first
+- **WHEN** the lease lapses while the session is busy, stopped, paused or in Plan Mode
+- **THEN** the footer reads `Agent Chat: no live instance` until a heartbeat is answered without `refused`, and then reads the text of that state
+
+#### Scenario: A rejoin episode
+- **WHEN** the adapter waits to rejoin after a failure that calls for it
+- **THEN** the footer reads `Agent Chat: reconnecting`, never `Agent Chat: no live instance`
+- **AND** the next successful join starts a new lease
+
+#### Scenario: A reply from an ended instance
+- **WHEN** an instance has ended or been replaced and the reply to a request that it sent arrives
+- **THEN** that reply renews no lease
+
+### Requirement: The `pi` footer is never blank after chat stops
+After chat fails closed, after `/agent-chat-off` and in a replacing runtime whose off latch holds, the `pi` footer MUST read `Agent Chat: no live instance`. Only `session_shutdown` MAY clear the footer. A Pi process with no valid chat configuration MUST register nothing and never touch the footer.
+
+#### Scenario: Chat fails closed
+- **WHEN** chat fails closed, for example with `REJOIN_BUDGET`, or the worker exits under a joined session
+- **THEN** the footer reads `Agent Chat: no live instance`
+
+#### Scenario: The operator turns chat off
+- **WHEN** the operator runs `/agent-chat-off`
+- **THEN** the worker ends and the footer reads `Agent Chat: no live instance`
+
+#### Scenario: Shutdown
+- **WHEN** Pi emits `session_shutdown`
+- **THEN** the footer is cleared and the lease timer is cleared
+- **AND** nothing renders afterwards
+
+#### Scenario: No valid chat configuration
+- **WHEN** Pi starts with no configuration, or with one that the config loader refuses, such as a record with chat disabled
+- **THEN** the extension registers no handler and no command, and the footer is never touched
+
+### Requirement: `pi` sends a changed state at the next poll
+At every 2-second poll the `pi` package MUST compare the state that it would heartbeat with the last state that the worker confirmed, and send one heartbeat at once when they differ, not at the next 30-second tick. A changed state that the worker answered `refused` MUST stay unconfirmed and be sent again at the next poll. It MUST send nothing extra while the state holds, and no second heartbeat while one is in flight.
+
+#### Scenario: Idle to busy, and back
+- **WHEN** the session turns busy between two heartbeats, or turns idle again
+- **THEN** the next poll sends one heartbeat that carries the new state
+- **AND** nothing more is sent while the state holds
+
+#### Scenario: The worker refuses the change
+- **WHEN** the worker answers a changed heartbeat `refused`
+- **THEN** the next poll sends the state again, and once the worker confirms it, no more
+
+#### Scenario: A heartbeat is in flight
+- **WHEN** a poll finds a heartbeat in flight
+- **THEN** it sends no second heartbeat
+
+### Requirement: `pi` compares the state again when a slow request is done
+A state change that a poll or event sees during a request other than a receipts request MUST NOT start a second one. When that request is done, `pi` MUST compare the state with the confirmed one once and send a heartbeat if it differs, before a waiting request, not at a later poll, unless that request was a heartbeat sent since the last delivery poll pass: a waiting poll goes first. A refused heartbeat MUST NOT repeat in a loop: at most once for each poll or event that found a request in flight.
+
+#### Scenario: A change during a slow request
+- **WHEN** the session turns busy or enters Plan Mode while a pending read, a claim, a settlement or a heartbeat is in flight, and a poll finds that request in flight
+- **THEN** one heartbeat that carries the new state is sent when that request is done, not at a later poll, unless that request is a heartbeat and a delivery poll waits behind it
+- **AND** nothing is sent if the state has changed back by then
+
+#### Scenario: A poll that waits behind a heartbeat
+- **WHEN** a poll finds a heartbeat in flight and leaves a delivery poll due, and the state changes while that heartbeat is out
+- **THEN** the delivery poll is sent when the first heartbeat is done, before the heartbeat of the new state
+- **AND** the heartbeat of the new state follows the delivery poll
+
+#### Scenario: A refusal is not repeated in a loop
+- **WHEN** the worker answers `refused` to a heartbeat that was sent when a slow request was done, or that was in flight when a poll found it
+- **THEN** that heartbeat is sent again at most once for each such poll or event, and never in a loop
+- **AND** a state that stays unconfirmed is sent again by the next poll that finds no request in flight
+
+### Requirement: `pi` takes turns between a heartbeat and a delivery poll
+In one instance, a heartbeat and a delivery poll MUST take turns, whether the worker confirms or refuses: at most one heartbeat goes between a poll tick and the next delivery poll, and at most one delivery poll pass goes between a heartbeat falling due, by a keep-alive or a changed state, and the next heartbeat. A further pass goes only when the state is the confirmed one as that pass is chosen and no keep-alive asked. A `REQUEST_UNCERTAIN` refusal of a changed state leaves no confirmed state.
+
+#### Scenario: A refusal that outlasts every tick
+- **WHEN** each heartbeat is answered `refused`, and a poll tick comes while each one is out, so that the tick asks for a compare and leaves a delivery poll due
+- **THEN** the delivery poll is sent after each refusal, and the retry that the tick asked for follows it
+- **AND** two heartbeats never follow each other while a poll waits
+
+#### Scenario: Heartbeats that are confirmed take their turn too
+- **WHEN** the title changes during each of several slow heartbeats, a poll tick comes with each change, and the worker confirms every heartbeat
+- **THEN** a delivery poll is sent after each heartbeat, and not after the last one only
+- **AND** at most one heartbeat goes between a poll tick and the next delivery poll
+
+#### Scenario: A delivery poll that is held
+- **WHEN** a heartbeat is refused after a poll tick asked for a compare, so that its retry waits for a delivery poll, and another poll tick comes while that poll is held
+- **THEN** the retry is sent when that poll is done, before the second poll
+
+#### Scenario: A keep-alive and a poll tick come while a delivery is held in its hand-off
+- **WHEN** a heartbeat has gone in the run, a delivery's hand-off is held, and a keep-alive tick and a poll tick come meanwhile
+- **THEN** the held pass settles first, the heartbeat that the keep-alive asked for goes second, and the delivery poll that waited goes third
+
+#### Scenario: The keep-alive asks again
+- **WHEN** a heartbeat is refused while a delivery poll waits, and the 30-second tick came while it was out
+- **THEN** the delivery poll is sent first, and the heartbeat that the tick asked for follows it: heartbeat, delivery poll, heartbeat
+- **AND** an event that asks for a compare of a state that the worker has not confirmed is treated the same way
+
+#### Scenario: A further change
+- **WHEN** a heartbeat is refused or confirmed while a delivery poll waits, and an event or a poll tick finds the state changed again while it was out
+- **THEN** the delivery poll is sent first, and the heartbeat of the new state follows it
+
+#### Scenario: A delivery poll and a receipts request both wait
+- **WHEN** a poll tick finds a change and its heartbeat is refused, and an event came while that heartbeat was out and asked for a compare, so that a delivery poll, a retry and a receipts request all wait
+- **THEN** the delivery poll is sent first, the retry that the event asked for second and the receipts request third
+
+#### Scenario: Nothing waits
+- **WHEN** a heartbeat that an event found in flight is refused and no delivery poll is due
+- **THEN** that state is sent again once, at once, before a receipts request that waits
+
+#### Scenario: A state that has reverted to the confirmed one while a delivery poll is out
+- **WHEN** a poll tick finds a change, its heartbeat is refused as a brief outage that sent nothing, an event that came while it was out asked for a compare, and the state is the confirmed one again while the delivery poll that the tick queued is out
+- **THEN** no heartbeat follows that poll
+
+#### Scenario: A state that has reverted to the confirmed one while a receipts request is out
+- **WHEN** a heartbeat is refused as a brief outage that sent nothing, no entry asks for it again, and only a receipts request is due, so that it goes out, and the state is the confirmed one again while it is out
+- **THEN** an event that finds the state confirmed ends nothing, and no heartbeat follows the request
+
+#### Scenario: A change of the stop state while a receipts request is out
+- **WHEN** a receipts request is out and a stop, an abort of the turn or the user's input that ends a stop changes the state
+- **THEN** that request ends at once when the new state is not the confirmed one, and that state report is the next request unless a delivery poll has the turn
+- **AND** a change that returns the state to the confirmed one ends nothing, and no heartbeat follows the request
+
+#### Scenario: A refusal that may have been applied
+- **WHEN** a heartbeat of a changed state is refused as `REQUEST_UNCERTAIN`, and the state later returns to the one that was confirmed before it
+- **THEN** the next compare sends that state, because the worker may hold the refused one
+- **AND** a refusal that sent nothing, `SERVICE_UNAVAILABLE` or `TRANSPORT_UNAVAILABLE`, leaves the confirmed state as it was and sends nothing for a state that returns to it
+
+#### Scenario: A refusal that may have been applied, of the confirmed state
+- **WHEN** a heartbeat of the state that the worker already confirmed, a keep-alive for example, is refused as `REQUEST_UNCERTAIN`
+- **THEN** that state stays confirmed, because the worker holds it whether or not the request was applied
+- **AND** the next poll tick sends its delivery poll with no heartbeat before it
+
+#### Scenario: Any order of ticks, events and answers
+- **WHEN** poll ticks, keep-alive ticks and events that change busy or idle or the title come in any order, from a confirmed state and from a changed one, while each request is confirmed, refused as a brief outage, refused as `REQUEST_UNCERTAIN`, or held until a later tick
+- **THEN** the loop ends and a later poll tick finds it free
+- **AND** at most one heartbeat goes between a poll tick and the next delivery poll
+- **AND** at most one delivery poll pass goes between a heartbeat falling due and the next heartbeat, and a further pass goes only when the state is the confirmed one as that pass is chosen and no keep-alive asked
+- **AND** a heartbeat of the confirmed state is sent only after an entry that asks for one outright, such as a keep-alive tick, or when a `REQUEST_UNCERTAIN` refusal of a changed state left no confirmed state
+- **AND** no request is sent twice for one due flag
+
+### Requirement: `pi` asks for the end of its instance at `session_shutdown` and starts a replacing runtime stopped
+`session_shutdown` MUST stop the `pi` worker, which requests the instance's end, and return a promise that Pi awaits before a replacing runtime starts. The promise MUST settle when every worker that the package stopped has closed, a rejoin's included, or after 6 seconds. Neither the request nor the close proves that the server accepted the end. No other event MAY end an instance. A replacing runtime MUST start stopped, join with its own native session id and start no worker once chat is off.
+
+#### Scenario: A runtime is replaced
+- **WHEN** Pi emits `session_shutdown` to the old runtime and then `session_start` to a new one, with the reason `reload`, `new`, `resume` or `fork`
+- **THEN** the old worker is closed before the new runtime joins
+- **AND** the new runtime joins with its own binding and starts stopped
+
+#### Scenario: A reload during a rejoin
+- **WHEN** a failure that calls for a rejoin has stopped the worker, that worker has not closed yet, and Pi emits `session_shutdown` for a reload, and that worker closes within 6 seconds
+- **THEN** the promise that the handler returns settles only after that worker has closed
+- **AND** the replacing runtime joins after it, which removes the usual cause of `BINDING_CONFLICT`: an old worker that is still ending its instance
+
+#### Scenario: A worker that closed without ending its instance
+- **WHEN** Pi emits `session_shutdown`, and the worker closes within 6 seconds, but its `end` request failed, so its instance stays until its lease expires
+- **THEN** the promise that the handler returns settles, because a close shows that the process exited and not that the server accepted `end`
+- **AND** a join of the replacing runtime that meets `BINDING_CONFLICT` is retried after a back-off like any other
+
+#### Scenario: A worker that does not close at shutdown
+- **WHEN** Pi emits `session_shutdown` and a worker that the package stopped has not closed 6 seconds later
+- **THEN** the promise that the handler returns settles at that time, with that worker still not closed
+
+#### Scenario: A delivery whose hand-off is held
+- **WHEN** Pi has the message of a claimed delivery and has not reported it, and Pi emits `session_shutdown` or the worker exits
+- **THEN** nothing is settled and no worker starts, whether Pi reports the message later or the hand-off times out
+
+#### Scenario: An event that precedes a switch
+- **WHEN** Pi emits `session_before_switch` or `session_before_fork`
+- **THEN** the package stops no worker and ends no instance, because it listens to neither event
+
+#### Scenario: Chat is off
+- **WHEN** chat was turned off and Pi replaces the runtime
+- **THEN** the new runtime starts no worker, and its footer reads `Agent Chat: no live instance`
+
+### Requirement: A `pi` worker waits for every worker that the package stopped to close, for 6 seconds at most
+`connect` MUST start no worker while another joins or serves, and none until every worker that the package stopped has closed, a rejoin's included. A wait MUST end after 6 seconds at the latest, and the worker then starts. After a wait it MUST check again that its runtime was not shut down and chat was not turned off. A call that comes while another waits MUST wait for that one, so waits that end at different times start one worker. A call that finds a worker joining or serving MUST stop none.
+
+#### Scenario: A rejoin waits for the old worker
+- **WHEN** the rejoin timer fires while the worker that the rejoin stopped has not closed yet, and it closes within 6 seconds
+- **THEN** no worker starts until that one has closed, and then exactly one starts, however many calls waited
+- **AND** none starts if Pi shut the runtime down or the operator turned chat off during the wait
+
+#### Scenario: A worker that does not close before a rejoin
+- **WHEN** a rejoin waits and the worker that it stopped has not closed 6 seconds later
+- **THEN** the wait ends and the rejoin starts one worker
+- **AND** a join that still meets the old instance is refused with `BINDING_CONFLICT`, which the rejoin retries after a back-off
+
+#### Scenario: A worker that closed without ending its instance
+- **WHEN** the worker that a rejoin stopped closes within 6 seconds, but its `end` request failed, so its instance stays until its lease expires
+- **THEN** the rejoin starts one worker, because a close shows that the process exited and not that the server accepted `end`
+- **AND** a join that meets `BINDING_CONFLICT` is retried after a back-off like any other
+
+#### Scenario: Waits that end at different times
+- **WHEN** a second call comes while the first one waits for a worker that has not closed, and the join of the worker that starts after the wait meets `BINDING_CONFLICT`
+- **THEN** the second call starts no worker, and none starts before the back-off is over
+- **AND** the next worker starts after the back-off and once the worker that the failed join stopped has closed, or after 6 seconds
+
+#### Scenario: A second connect
+- **WHEN** `connect` is called while a worker joins or serves
+- **THEN** it starts no second worker and stops none
+
+### Requirement: A `pi` disconnect ends the instance for good
+`disconnect` MUST end the instance as `session_shutdown` and the off latch do: it MUST stop the live worker, and no `connect` after it MAY start a worker, nor MAY the `connect` call that is out, whether it waits for a close, joins or waits for the answer to its first heartbeat.
+
+#### Scenario: A disconnect during a wait
+- **WHEN** `connect` waits for a worker that has not closed, `disconnect` is called, and that worker then closes
+- **THEN** the call that waited starts no worker
+
+#### Scenario: A connect after a disconnect
+- **WHEN** `disconnect` is called and `connect` follows, while the old worker is still closing or after it has closed
+- **THEN** the call that waits for the close starts no worker, and nor does a call after it
+- **AND** no binding is published
+
+### Requirement: Compaction and tree navigation keep the `pi` binding
+Tree navigation and compaction MUST keep the `pi` binding and MUST NOT join again. While Pi is not idle, in a compaction or a tree summary, the package MUST report `busy` and claim nothing. `session_tree`, `session_compact` and `session_compact_failed` MUST make it read the state at once, with the context that the event carries.
+
+#### Scenario: A compaction runs
+- **WHEN** a compaction or a tree summary runs while a message is pending
+- **THEN** the heartbeat says `busy` and no claim is sent
+- **AND** once Pi is idle again the claim is sent
+
+#### Scenario: Compaction or navigation ends
+- **WHEN** `session_tree`, `session_compact` or `session_compact_failed` arrives
+- **THEN** the loop reads the state at once, with the context that the event carries
+- **AND** the binding stays, nothing is joined again and the next turn carries the binding section
+
+#### Scenario: A receipts request is in flight
+- **WHEN** one of the three events arrives while a receipts request is in flight
+- **THEN** the package ends that request only when the state differs from the last confirmed one, and sends that state report in the same pass
+- **AND** an event that finds nothing due ends nothing
 
 ### Requirement: A peer message body is framed behind a per-notice nonce
 When a harness package passes message bodies to its session, the notice MUST carry a nonce of at least 64 bits from a cryptographic generator, drawn after the claim and never derived from message data. Each message MUST be a header line, an opening marker `<<<AGENT-CHAT-BODY NONCE`, the body and a closing marker `AGENT-CHAT-BODY NONCE>>>`. Every body line MUST start with `> `, added after the cut.

@@ -70,8 +70,9 @@ function fakePi(confirm) {
 // (`capabilities` is what its first worker names, `rejoinedCapabilities` what a later one does; null names none), and a
 // promise in `server.gates` holds that operation's answer until it resolves. `cancel()` ends a held receipts request, which
 // then answers `refused: CLI_INTERRUPTED` as the worker's does on the signal; `cancels` records every call and what was held.
+// `lease` is the lease tracker's options, and `statuses` every footer text that was set.
 const RECEIPTS_OPS = new Set(["receipts", "receipts_delivered"])
-async function session({ confirm = "inside", rows = [], toolRoute, capabilities = ["receipts-cancel"], rejoinedCapabilities = capabilities } = {}) {
+async function session({ confirm = "inside", rows = [], toolRoute, capabilities = ["receipts-cancel"], rejoinedCapabilities = capabilities, lease } = {}) {
   const { pi, emit, sent, confirm: confirmNow } = fakePi(confirm)
   const native = { idle: false, mode: "tui", plan: false }
   const server = { rows, muted: false, receiptsReply: null, markReply: null, delivery: null, fail: {}, heartbeatRefusal: null, gates: {} }
@@ -83,6 +84,7 @@ async function session({ confirm = "inside", rows = [], toolRoute, capabilities 
   const nextAttempt = () => `44444444-4444-4444-8444-${String(++claims).padStart(12, "0")}`
   const timeouts = []
   const notices = []
+  const statuses = []
   const workers = []
   const ctx = {
     mode: "tui", signal: undefined, isIdle: () => native.idle,
@@ -90,7 +92,7 @@ async function session({ confirm = "inside", rows = [], toolRoute, capabilities 
       getSessionId: () => "native-1", getSessionName: () => "synthetic",
       getEntries: () => [{ type: "custom", customType: "plan-mode", data: { enabled: native.plan } }],
     },
-    ui: { notify: text => notices.push(text), setStatus() {} },
+    ui: { notify: text => notices.push(text), setStatus: (key, text) => statuses.push(text) },
   }
   const answer = (op, fields) => {
     const failure = server.fail[op]
@@ -138,12 +140,13 @@ async function session({ confirm = "inside", rows = [], toolRoute, capabilities 
   const lifecycle = createAgentChat(pi, toolRoute === undefined ? config : { ...config, toolRoute }, {
     ...quietTimers, startProcess, now: () => clock.t, random: () => 0,
     setTimeoutImpl: (fn, ms) => { timeouts.push({ fn, ms }); return timeouts.length },
+    lease,
   })
   emit("session_start", {}, ctx)
   await flush()
   emit("input", { source: "interactive" }, ctx)
   const api = {
-    lifecycle, emit, sent, native, server, log, clock, notices, workers, ctx, cancels,
+    lifecycle, emit, sent, native, server, log, clock, notices, statuses, workers, ctx, cancels,
     // The rejoin timer: the first rejoin waits 2,500 ms (random is fixed at 0). A delivery's handoff timer waits 5,000 ms.
     rejoins: () => timeouts.filter(entry => entry.ms === 2500),
     confirm: confirmNow,
@@ -775,6 +778,43 @@ test("a session whose requests never overlap a receipts request cancels nothing"
   assert.deepEqual(run.s.cancels, [])
 })
 
+// session_tree, session_compact and session_compact_failed ask the loop to read the state (#132); they make nothing due, so
+// they give nothing way.
+test("a re-evaluation that finds nothing due leaves a receipts request in flight alone, and the poll that falls due still ends it", async () => {
+  const s = await session({ rows: [row(1)] })
+  await primed(s)
+  s.server.gates.receipts = held()
+  const first = s.tick(0)
+  await flush()
+  assert.equal(s.count("receipts"), 1, "the read is in flight")
+  for (const name of ["session_tree", "session_compact", "session_compact_failed"]) s.emit(name, {}, s.ctx)
+  await flush()
+  assert.deepEqual(s.cancels, [], "the state is what the worker has confirmed: nothing is due, so nothing ends the read")
+  const second = s.tick() // a poll falls due: now the read gives way
+  delete s.server.gates.receipts
+  await Promise.all([first, second])
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }])
+})
+
+test("a state change that a re-evaluation finds while a receipts request is in flight ends it, and its heartbeat goes in the same pass", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.server.gates.receipts = held()
+  const first = s.tick(0)
+  await flush()
+  assert.equal(s.count("receipts"), 1, "the read is in flight")
+  s.native.plan = true // Plan Mode flips while it runs: a state report is due
+  s.emit("session_tree", {}, s.ctx)
+  await flush()
+  const ended = s.cancels.length
+  s.workers[0].endHeld() // whatever the outcome, the read must not outlive the test
+  delete s.server.gates.receipts
+  await first
+  assert.equal(ended, 1, "the state report that fell due ended the read")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts", "heartbeat"], "and went out before anything else")
+  assert.equal(s.log.at(-1).fields.state.plan_mode, true)
+})
+
 test("a heartbeat or a poll that falls due while a request that is not a receipts request is in flight cancels nothing, once a receipts request has ended", async () => {
   const s = await session({ rows: [row(1)] })
   await s.tick(0)
@@ -790,3 +830,327 @@ test("a heartbeat or a poll that falls due while a request that is not a receipt
   await Promise.all([beating, polling])
   assert.deepEqual(s.cancels, [], "no receipts request was in flight: there was nothing to end")
 })
+
+// A heartbeat that is refused after a re-evaluation asked for a compare is sent again before the receipts request that waits: the
+// receipts request is the last of the three, and it has waited behind the heartbeats and polls so far. The delivery poll goes
+// between the first two heartbeats, since a heartbeat has gone since the last poll pass; with no poll waiting after that, the
+// retry goes at once.
+test("a refused heartbeat that a re-evaluation asked for is sent again before the receipts request that waits, with the delivery poll between the first two", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.ctx.sessionManager.getSessionName = () => "renamed" // a state report is due, and the turn still runs, so a receipts request is asked for
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat is refused and stays unconfirmed
+  let releaseFirst
+  s.server.gates.heartbeat = new Promise(resolve => { releaseFirst = resolve })
+  const flight = s.tick() // a poll tick that finds the change: its heartbeat is held, and a delivery poll and a receipts request wait
+  await flush()
+  await s.tick(0) // a tick while that heartbeat is out: it asks for a compare
+  let releaseSecond
+  releaseFirst()
+  s.server.gates.heartbeat = new Promise(resolve => { releaseSecond = resolve }) // the retry that follows the delivery poll is held in its turn
+  await flush()
+  s.emit("session_compact", {}, s.ctx) // an event while that retry is out asks for a compare, and sets no delivery poll
+  delete s.server.gates.heartbeat
+  releaseSecond()
+  await flight
+  assert.deepEqual(opsSince(s, start).filter(op => op !== "tick"), ["heartbeat", "pending", "heartbeat", "heartbeat", "receipts"],
+    "the delivery poll follows the first refusal, the retry that the event asked for follows the second, and the receipts request goes last")
+})
+
+// Review of #191, round 7. This brings the loop to the point where a receipts request is in flight while the state is not the one
+// that the worker confirmed. A delivery poll is out, the state changes, and the heartbeat of the new state, T, is refused while no
+// entry asks for it again, so no heartbeat is due. Only the receipts request is, so it goes out and is held; an entry that asks for
+// T again ends it, and one that finds the state confirmed leaves it alone. `flight` is the poll tick that began the run, and `start`
+// is where the log counts from.
+async function receiptsOutWhileUnconfirmed(s) {
+  const start = await primed(s)
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat is refused and stays unconfirmed
+  let endPoll
+  s.server.gates.pending = new Promise(resolve => { endPoll = resolve })
+  const flight = s.tick() // the delivery poll is out, and a receipts request waits behind it
+  await flush()
+  s.ctx.sessionManager.getSessionName = () => "renamed" // a state report is due; the loop is busy, so the event asks for a compare
+  s.emit("session_tree", {}, s.ctx)
+  let endBeat
+  s.server.gates.heartbeat = new Promise(resolve => { endBeat = resolve })
+  delete s.server.gates.pending
+  endPoll()
+  await flush() // the poll is done, the compare finds the change, and T is out
+  s.server.gates.receipts = held()
+  delete s.server.gates.heartbeat
+  endBeat()
+  await flush() // T is refused while only the receipts request is due: that goes next
+  delete s.server.gates.receipts // a later receipts request is answered; the one in flight stays held
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts"], "the receipts request is in flight, and T is refused")
+  assert.deepEqual(s.cancels, [], "and nothing has ended it")
+  return { start, flight }
+}
+
+for (const [name, enter] of [
+  ["a session_tree event", s => s.emit("session_tree", {}, s.ctx)],
+  ["a session_compact event", s => s.emit("session_compact", {}, s.ctx)],
+  ["the keep-alive tick", s => s.lifecycle.heartbeat()],
+]) {
+  test(`${name} that finds the state unconfirmed ends the receipts request in flight, and the retry goes right after it: heartbeat, receipts, heartbeat`, async () => {
+    const s = await session({ rows: [row(1)] })
+    const { start, flight } = await receiptsOutWhileUnconfirmed(s)
+    await enter(s)
+    await flush()
+    assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "the worker has not confirmed the state, so a heartbeat is due and the request in flight gives way")
+    await flight
+    assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "and that is the only cancel")
+    assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts", "heartbeat"],
+      "with no delivery poll due, the retry goes right after the request that it ended")
+    assert.equal(s.log.at(-1).fields.state.title, "renamed", "and it carries the state that was refused")
+  })
+}
+
+test("a poll tick ends the receipts request that is out while the state is unconfirmed, and the delivery poll goes before the retry", async () => {
+  const s = await session({ rows: [row(1)] })
+  const { start, flight } = await receiptsOutWhileUnconfirmed(s)
+  const second = s.tick() // a delivery poll falls due: it ends the request, as it ends any
+  await Promise.all([flight, second])
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "one cancel, made for the poll")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts", "tick", "pending", "heartbeat", "receipts"],
+    "the poll the cancel was made for goes before the retry, as a heartbeat has gone since the last poll pass, and the unconfirmed state follows it")
+})
+
+test("an entry that finds another state ends the receipts request that is out while the state is unconfirmed, and that state goes at once", async () => {
+  const s = await session({ rows: [row(1)] })
+  const { start, flight } = await receiptsOutWhileUnconfirmed(s)
+  s.ctx.sessionManager.getSessionName = () => "renamed again" // not the snapshot that was refused
+  s.emit("session_tree", {}, s.ctx)
+  await flight
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "a changed state is due at once, and the request in flight gives way")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts", "heartbeat"])
+  assert.equal(s.log.at(-1).fields.state.title, "renamed again")
+})
+
+// Each run starts with no heartbeat sent, and nothing of a refusal is kept from the run before. The first entry of the next run
+// sends the state that is still unconfirmed before its delivery poll, once, as any entry does that finds a state unconfirmed.
+test("a run starts with no heartbeat sent, so the state that the run before left unconfirmed goes before its delivery poll", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.ctx.sessionManager.getSessionName = () => "renamed"
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE"
+  await s.lifecycle.heartbeat() // nothing else is due, so the run ends with that snapshot refused
+  await s.tick() // the next run finds the same snapshot, with a delivery poll and a receipts request due
+  assert.deepEqual(opsSince(s, start), ["heartbeat", "tick", "heartbeat", "pending", "receipts"],
+    "the retry goes first, once, and the poll and the receipts request follow it")
+  assert.deepEqual(s.cancels, [])
+})
+
+// Review of #191, round 6: what is due is the state that the worker has not confirmed, at the moment the choice is made, and not a
+// flag that an earlier refusal left set. Once the state is back to the one that the worker confirmed, the receipts request in
+// flight is left alone, and no heartbeat follows it.
+test("a state that returns to the confirmed one while the receipts request is out ends nothing, and no heartbeat follows", async () => {
+  const s = await session({ rows: [row(1)] })
+  const { start, flight } = await receiptsOutWhileUnconfirmed(s)
+  s.ctx.sessionManager.getSessionName = () => "synthetic" // the title that the worker confirmed: nothing differs from it any more
+  s.emit("session_tree", {}, s.ctx)
+  await flush()
+  assert.deepEqual(s.cancels, [], "no heartbeat is due, so nothing ends the request in flight")
+  s.workers[0].endHeld() // the request ends as it would of itself, and not by a cancel
+  await flight
+  assert.deepEqual(s.cancels, [])
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts"], "and the state that is confirmed is not sent again")
+})
+
+// Review of #191, round 8, finding 2: a stop, an abort and local input change the state without starting the loop, so the entry that
+// makes a heartbeat due is not a call of `drive`. It asks what a receipts request in flight does all the same: the state is not the
+// one that the worker confirmed, so the request gives way, and the heartbeat of the stopped state goes right after it. The read is
+// held on a gate that nothing releases, so only the cancel can end it, and the cancel is asserted before the flight is awaited:
+// with no cancel nothing ends the read, and the flight would not settle.
+for (const [name, stop] of [
+  ["the signal of the turn aborts", s => {
+    const controller = new AbortController()
+    s.ctx.signal = controller.signal
+    s.emit("agent_start", {}, s.ctx)
+    controller.abort()
+  }],
+  ["the turn settles as aborted", s => s.emit("agent_settled", { aborted: true })],
+  ["an input that is not the user's arrives", s => s.emit("input", { source: "extension" }, s.ctx)],
+]) {
+  test(`when ${name} while a receipts read is in flight, the read ends at once and the heartbeat of the stopped state goes right after it`, async () => {
+    const s = await session({ rows: [row(1)] })
+    const start = await primed(s)
+    s.server.gates.receipts = held()
+    const flight = s.tick(0)
+    await flush()
+    assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts"], "the read is in flight, and the busy state is the confirmed one")
+    assert.deepEqual(s.cancels, [], "nothing has asked for it to end")
+    stop(s)
+    await flush()
+    assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "the stop makes a heartbeat due, so the read gives way")
+    await flight
+    assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "and that is the only cancel")
+    assert.deepEqual(opsSince(s, start), ["tick", "pending", "receipts", "heartbeat"], "the heartbeat goes the moment the read has ended")
+    assert.deepEqual(s.log.at(-1).fields.state, { title: "synthetic", native_state: "unknown", stopped: true, plan_mode: false })
+    assert.equal(s.workers.length, 1, "a cancelled read is not a failure: no rejoin")
+    assert.notEqual(globalThis[Symbol.for("agent-chat.pi.disabled")], true)
+  })
+}
+
+// The same holds for the mark. A mark goes in any state, so it can be in flight while the session is stopped. Local input ends the
+// stop: the state is not the one that the worker confirmed, so the mark gives way, the heartbeat of the resumed state goes right
+// after it, and the mark that was ended is not sent again before the next pass.
+test("when local input ends a stop while a receipts mark is in flight, the mark ends at once and the heartbeat of the resumed state goes right after it", async () => {
+  const feed = [row(1)]
+  const s = await session({ rows: feed, confirm: "later" })
+  await s.tick(0) // the notice is sent, and Pi has not yet reported it as output
+  s.confirm()
+  s.emit("agent_settled", { aborted: true }) // the turn is aborted: the session is stopped, and the mark waits
+  s.server.gates.receipts_delivered = held()
+  const start = s.log.length
+  const flight = s.tick() // the stopped state is sent, the delivery poll goes, and the mark is held
+  await flush()
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts_delivered"], "the mark is in flight, and the stopped state is the confirmed one")
+  assert.deepEqual(s.cancels, [], "nothing has asked for it to end")
+  s.emit("input", { source: "interactive" }, s.ctx) // the user types: the stop ends
+  await flush()
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts_delivered" }], "the resumed state is not the confirmed one, so the mark gives way")
+  await flight
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts_delivered" }], "and that is the only cancel")
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts_delivered", "heartbeat"], "the heartbeat goes the moment the mark has ended")
+  assert.deepEqual(s.log.at(-1).fields.state, { title: "synthetic", native_state: "busy", stopped: false, plan_mode: false })
+  assert.deepEqual(s.log.filter(entry => entry.op === "receipts_delivered").map(entry => entry.fields), [{ receipts: ids(feed) }], "the mark that was ended is not sent again before the next pass")
+  assert.equal(s.workers.length, 1, "a cancelled mark is not a failure: no rejoin")
+})
+
+// A stop that puts the state back where the worker holds it makes no heartbeat due, so it ends nothing, as an event that finds the
+// state confirmed ends nothing. The join confirmed the stopped state. The heartbeat of the busy state that local input made due was
+// refused as a brief outage, which sent nothing, so the worker still holds the stopped state, and the receipts read goes out with
+// the busy state unconfirmed and no entry asking for it. The abort puts the state back to the confirmed one.
+test("a stop that returns the state to the confirmed one while a receipts read is in flight ends nothing, and no heartbeat follows", async () => {
+  const s = await session({ rows: [row(1)] }) // the join confirmed the stopped state, and the input that ended the stop has asked for a compare
+  const start = s.log.length
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: the busy state is refused and stays unconfirmed
+  s.server.gates.receipts = held()
+  const flight = s.tick(0)
+  await flush()
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts"], "the busy state was refused, and the read is in flight")
+  assert.deepEqual(s.cancels, [], "nothing has asked for it to end")
+  s.emit("agent_settled", { aborted: true }) // the stop: the state is the one that the worker holds
+  await flush()
+  assert.equal(s.statuses.at(-1), "Agent Chat: stopped (type to resume)", "the footer shows the stop")
+  assert.deepEqual(s.cancels, [], "no heartbeat is due, so nothing ends the request in flight")
+  s.workers[0].endHeld() // the request ends as it would of itself, and not by a cancel
+  await flight
+  assert.deepEqual(s.cancels, [])
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "receipts"], "and the state that is confirmed is not sent again")
+})
+
+// A delivery poll and a receipts request both wait when a heartbeat is refused: the poll goes first, the retry follows it, and the
+// receipts request follows the retry. A poll tick sets both at once, so this is the order after every tick that finds a change.
+test("a refused heartbeat with a delivery poll and a receipts request both waiting: the poll, then the retry, then the receipts request", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.ctx.sessionManager.getSessionName = () => "renamed" // a state report is due, and the turn runs, so a receipts request is asked for
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat is refused and stays unconfirmed
+  let end
+  s.server.gates.heartbeat = new Promise(resolve => { end = resolve })
+  const flight = s.tick() // finds the change: its heartbeat is held, and a delivery poll and a receipts request wait behind it
+  await flush()
+  s.emit("session_compact", {}, s.ctx) // asks for a compare, so that the state is due again once this heartbeat is refused
+  delete s.server.gates.heartbeat
+  end()
+  await flight
+  assert.deepEqual(opsSince(s, start), ["tick", "heartbeat", "pending", "heartbeat", "receipts"],
+    "the poll goes before the retry, and the receipts request after it")
+  assert.deepEqual(s.cancels, [])
+})
+
+// Review of #191, round 7, finding 1: the reviewer's run sent a delivery poll, the state A (refused), the state B (refused), a
+// delivery poll, A, and then the receipts request. That is the order of the scheduler: the receipts request is the last of the
+// three, so it goes only when no heartbeat and no delivery poll is due, whatever was refused before. It is late, and the delay
+// deletes nothing: the feed offers a receipt while its message is retained and the session can still read its room.
+test("the receipts request goes last: a state that is due again and a delivery poll both go before it, and it goes once nothing is due", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  s.server.heartbeatRefusal = "TRANSPORT_UNAVAILABLE" // a tolerated outage: every heartbeat is refused and stays unconfirmed
+  const setTitle = title => { s.ctx.sessionManager.getSessionName = () => title }
+  let endPoll
+  s.server.gates.pending = new Promise(resolve => { endPoll = resolve })
+  const flight = s.tick() // the delivery poll is out, and a receipts request waits behind it
+  await flush()
+  setTitle("A") // the state is A
+  s.emit("session_tree", {}, s.ctx) // the loop is busy: the event asks for a compare
+  let endA
+  s.server.gates.heartbeat = new Promise(resolve => { endA = resolve })
+  delete s.server.gates.pending
+  endPoll() // the poll is done, the compare finds A, and A is out and held
+  await flush()
+  setTitle("B") // the state is B
+  s.emit("session_tree", {}, s.ctx) // asks for a compare, and no delivery poll waits
+  let endB
+  s.server.gates.heartbeat = new Promise(resolve => { endB = resolve }) // B is held in its turn
+  endA() // A is refused, and B goes at once
+  await flush()
+  setTitle("A") // the state returns to A while B is out
+  s.emit("session_tree", {}, s.ctx)
+  const second = s.tick() // a poll tick comes: a delivery poll and the receipts request wait
+  delete s.server.gates.heartbeat
+  endB() // B is refused: the delivery poll goes before A, and A before the receipts request
+  await Promise.all([flight, second])
+  assert.deepEqual(opsSince(s, start).filter(op => op !== "tick"), ["pending", "heartbeat", "heartbeat", "pending", "heartbeat", "receipts"],
+    "a delivery poll, A, B, a delivery poll, A, and the receipts request last")
+  assert.deepEqual(s.cancels, [], "no receipts request was in flight to end")
+  assert.equal(s.receiptSends().length, 1, "the request was late, and the delay deleted nothing: its row is shown")
+})
+
+// A heartbeat and a delivery poll take turns, and a receipts request between them gives no turn back: the heartbeat of this run
+// still counts when the receipts request has ended, so the delivery poll that waits goes before the next heartbeat. (A receipts
+// pass that ended the turn would send that heartbeat first, as the loop did before the turns were kept.)
+test("a receipts request between a heartbeat and a delivery poll does not give the heartbeat's turn back: the poll that waits goes before the next heartbeat", async () => {
+  const s = await session({ rows: [row(1)] })
+  const start = await primed(s)
+  let endPoll
+  s.server.gates.pending = new Promise(resolve => { endPoll = resolve })
+  const flight = s.tick() // a delivery poll is out
+  await flush()
+  s.ctx.sessionManager.getSessionName = () => "A" // the title changes during the pass
+  s.emit("session_tree", {}, s.ctx)
+  delete s.server.gates.pending
+  s.server.gates.receipts = held()
+  endPoll()
+  await flush() // the pass ends, A is sent and confirmed, and with nothing due the receipts request goes out and is held
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts"], "the receipts request is in flight after A")
+  delete s.server.gates.receipts // a later receipts request is answered; the one in flight stays held
+  s.ctx.sessionManager.getSessionName = () => "B" // the title changes again, and a poll tick comes with it: a heartbeat and a delivery poll are due
+  const second = s.tick()
+  await Promise.all([flight, second])
+  assert.deepEqual(s.cancels, [{ worker: 0, held: "receipts" }], "one cancel, of the request in flight")
+  assert.deepEqual(opsSince(s, start), ["tick", "pending", "heartbeat", "receipts", "tick", "pending", "heartbeat", "receipts"],
+    "the delivery poll goes first, then B, then the receipts request that was ended")
+  assert.equal(s.log.filter(entry => entry.op === "heartbeat").at(-1).fields.state.title, "B")
+})
+
+// A host suspend lapses the lease on the wall clock alone (#132), and the first poll tick after the resume renders it. The tick
+// renders the footer before it looks at the single flight, so a request in flight holds nothing back. A heartbeat that was sent
+// before the suspend and is answered after it renews nothing: it is older than the lease on the wall clock.
+for (const op of ["receipts", "pending", "heartbeat"]) {
+  test(`the first poll tick after a host suspend turns the footer to no live instance while a ${op} request is in flight`, async () => {
+    let wall = 1_700_000_000_000
+    const s = await session({ rows: [row(1)], lease: { clock: () => 0, wall: () => wall, ...quietTimers } })
+    await primed(s)
+    const asked = s.count(op)
+    let release
+    s.server.gates[op] = op === "receipts" ? held() : new Promise(resolve => { release = resolve })
+    const flight = op === "heartbeat" ? s.lifecycle.heartbeat() : s.tick(0)
+    await flush()
+    assert.equal(s.count(op), asked + 1, "the request is in flight")
+
+    wall += 120_000 // the host sleeps for two minutes: the monotonic clock stands still
+    const tick = s.tick()
+    assert.equal(s.statuses.at(-1), "Agent Chat: no live instance", "rendered at once, with the request still in flight")
+    delete s.server.gates[op] // what is asked next is answered
+    release?.()
+    await Promise.all([flight, tick])
+    assert.equal(s.statuses.at(-1), "Agent Chat: no live instance", "nothing that was asked before the resume renews the lease")
+    assert.equal(s.workers.length, 1, "no episode")
+    assert.deepEqual(s.rejoins(), [])
+
+    await s.lifecycle.heartbeat() // the first heartbeat after the resume
+    assert.equal(s.statuses.at(-1), "Agent Chat: busy", "a confirmed heartbeat restores the text")
+  })
+}

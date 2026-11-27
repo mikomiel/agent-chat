@@ -8,7 +8,7 @@ import { isAbsolute } from "node:path"
 
 const MAX_FRAME = 128 * 1024
 const REQUEST_MS = 22_000 // the worker's 20s I/O deadline plus exit/IPC margin
-const CLOSE_MS = 5000
+export const CLOSE_MS = 5000
 const OPERATIONS = new Set(["join", "heartbeat", "status", "end", "pending", "claim", "settle", "receipts", "receipts_delivered"])
 // A receipts request is the only one a signal may end: the worker answers it `refused` and serves on. Only a worker whose
 // join reply names the capability is signalled, because one without the handler would die of the signal, and only such a
