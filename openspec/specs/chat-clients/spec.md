@@ -426,6 +426,13 @@ An episode begins at the first failure that calls for a rejoin and ends at the n
 - **WHEN** a join or heartbeat request fails with `UNAUTHENTICATED` or `INVALID_REQUEST`
 - **THEN** the adapter fails with that code and does not rejoin
 
+### Requirement: A heartbeat reply confirms the stored state or it is invalid
+The instance client MUST treat a heartbeat reply as `INVALID_RESPONSE`, never as a confirmation, when it names another instance, lacks a non-empty `heartbeat_at` string, or does not echo the sent `native_state`, `stopped` and `plan_mode`.
+
+#### Scenario: Incomplete heartbeat reply
+- **WHEN** a heartbeat reply carries only the instance, lacks `heartbeat_at`, or echoes a `native_state`, `stopped` or `plan_mode` other than the one sent
+- **THEN** the call fails with `INVALID_RESPONSE`, so the sender does not treat the reply as a lease renewal or as publication of the state
+
 ### Requirement: The instance worker sends a settlement again until its request deadline
 Only a `settle` try that gets no status, because the connection fails before the status line and headers are read or ends before a three-digit status code, or that gets a 5xx reply, MUST be sent again by the instance worker, with the same attempt and result, until 1 second before its 20-second request deadline, when the last failure MUST end the worker. A try the deadline cuts MUST report `REQUEST_UNCERTAIN`. A definite delivery refusal MUST be answered as refused. Any other failure MUST end the worker at once.
 
