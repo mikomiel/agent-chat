@@ -28,9 +28,11 @@ import textwrap
 import tomllib
 import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 import yaml
+from markdown_it import MarkdownIt
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEGRATIONS = ROOT / "integrations"
@@ -189,18 +191,26 @@ def test_each_package_readme_names_its_release_asset_and_points_at_the_install_s
     assert "https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release" in readme
 
 
-# The target of an inline link or of a reference definition, in angle brackets or up to the first space. Only the
-# target is read, so any title form after it ("t", 't' or (t)) does not matter.
-MARKDOWN_LINK = re.compile(r"\]\(\s*(?:<([^>]*)>|([^)\s]+))|^ {0,3}\[[^\]]+\]:\s*(?:<([^>]*)>|(\S+))", re.MULTILINE)
+def link_targets(text: str) -> list[str]:
+    """Every link and image target that a CommonMark renderer with tables makes of ``text``."""
+    targets = []
+    stack = list(MarkdownIt("commonmark").enable("table").parse(text))
+    while stack:
+        token = stack.pop()
+        stack.extend(token.children or [])
+        target = token.attrGet("href") if token.type == "link_open" else token.attrGet("src")
+        if token.type in {"link_open", "image"} and isinstance(target, str):
+            targets.append(unquote(target))
+    return targets
 
 
 def dead_links(package: Path, text: str) -> list[str]:
-    """Relative links in ``text`` that an extracted tarball of ``package`` cannot follow."""
+    """Relative link targets in ``text`` that an extracted tarball of ``package`` cannot follow."""
     root = package.resolve()
     shipped = {entry.rstrip("/") for entry in read_json(package / "package.json")["files"]}
     dead = []
-    for match in MARKDOWN_LINK.finditer(text):
-        target = next(group for group in match.groups() if group is not None).split("#", 1)[0]
+    for link in link_targets(text):
+        target = link.split("#", 1)[0]
         if not target or re.match(r"[a-z][a-z0-9+.-]*:", target, re.IGNORECASE):
             continue
         resolved = (package / target).resolve()
@@ -210,7 +220,7 @@ def dead_links(package: Path, text: str) -> list[str]:
             or resolved.relative_to(root).parts[0] not in shipped
             or not resolved.exists()
         ):
-            dead.append(match.group(0))
+            dead.append(link)
     return dead
 
 
@@ -223,7 +233,14 @@ def test_each_package_readme_links_by_relative_path_only_to_files_it_ships(packa
 def test_the_link_check_finds_each_kind_of_dead_link() -> None:
     """A check that passes every README must still be able to fail."""
     package = INTEGRATIONS / "pi"
-    live = "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
+    live = (
+        "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
+        '[f](lib/config.js "see [g](../README.md)")\n'
+    )
+    # A link inside a title is title text, not a link.
+    expected = ["lib/config.js", "lib/config.js#L1", "#configure", "https://example.com/x", "README.md"]
+    expected.append("lib/config.js")
+    assert sorted(link_targets(live)) == sorted(expected)
     assert dead_links(package, live) == []
     dead = {
         "a parent file": "[x](../README.md#notice-contract)",
@@ -235,8 +252,11 @@ def test_the_link_check_finds_each_kind_of_dead_link() -> None:
         "a link with a single-quoted title": "[x](../README.md 'overview')",
         "a link with a parenthesized title": "[x](../README.md (overview))",
         "the package directory itself": "[x](./)",
-        "a reference definition": "[x]: ../README.md",
-        "a reference definition in angle brackets": "[x]: <../README.md>",
+        "a reference link": "[x][r]\n\n[r]: ../README.md",
+        "a reference link in angle brackets": "[x][r]\n\n[r]: <../README.md>",
+        "a reference link in a block quote": "> [x][r]\n>\n> [r]: ../README.md",
+        "a link in a table cell": "| a |\n|---|\n| [x](../README.md) |",
+        "an image": "![x](../logo.png)",
     }
     for name, text in dead.items():
         assert dead_links(package, text + "\n") != [], name
