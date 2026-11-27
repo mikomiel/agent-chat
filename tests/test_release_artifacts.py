@@ -215,14 +215,24 @@ def climbs_out(path: str) -> bool:
 
 
 def shipped_tree(package: Path, destination: Path) -> Path:
-    """The package as its tarball holds it: ``package.json`` and each ``files`` entry, nothing else."""
-    for entry in ["package.json", *read_json(package / "package.json")["files"]]:
-        source, target = package / entry.rstrip("/"), destination / entry.rstrip("/")
-        if source.is_dir():
-            shutil.copytree(source, target)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+    """The package as its tarball holds it, by the release check's own rule.
+
+    ``check_tarball`` expects the tracked files of the package minus ``test/``, plus the repository ``LICENSE``
+    that the pack step adds. Each is a regular file; nothing is followed, and every target stays in ``destination``.
+    """
+    prefix = f"{script.INTEGRATIONS}/{package.name}/"
+    names = [
+        name[len(prefix) :]
+        for name in script.tracked_integration_files(ROOT)
+        if name.startswith(prefix) and not name[len(prefix) :].startswith(script.UNSHIPPED_DIRECTORY)
+    ]
+    sources = {name: package / name for name in names} | {script.LICENSE: ROOT / script.LICENSE}
+    for name, source in sources.items():
+        script.require_regular(source)
+        target = destination / name
+        assert target.resolve().is_relative_to(destination.resolve()), name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
     return destination
 
 
@@ -260,12 +270,13 @@ def test_the_link_check_finds_each_kind_of_dead_link(tmp_path: Path) -> None:
     """A check that passes every README must still be able to fail."""
     package = shipped_tree(INTEGRATIONS / "pi", tmp_path / "package")
     live = (
+        "[license](LICENSE) "
         "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
         '[f](lib/config.js "see [g](../README.md)")\n'
         "[h](lib/config.js?raw=1) [i](lib/con%66ig.js) [j](lib/) [k](lib/../README.md)\n"
     )
     # A link inside a title is title text, not a link.
-    expected = ["lib/config.js", "lib/config.js#L1", "#configure", "https://example.com/x", "README.md"]
+    expected = ["LICENSE", "lib/config.js", "lib/config.js#L1", "#configure", "https://example.com/x", "README.md"]
     expected += ["lib/config.js", "lib/config.js?raw=1", "lib/con%66ig.js", "lib/", "lib/../README.md"]
     assert sorted(link_targets(live)) == sorted(expected)
     assert dead_links(package, live) == []
