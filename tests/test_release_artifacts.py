@@ -214,14 +214,25 @@ def climbs_out(path: str) -> bool:
     return False
 
 
-def dead_links(package: Path, text: str) -> list[str]:
-    """Relative link targets in ``text`` that an extracted tarball of ``package`` cannot follow.
+def shipped_tree(package: Path, destination: Path) -> Path:
+    """The package as its tarball holds it: ``package.json`` and each ``files`` entry, nothing else."""
+    for entry in ["package.json", *read_json(package / "package.json")["files"]]:
+        source, target = package / entry.rstrip("/"), destination / entry.rstrip("/")
+        if source.is_dir():
+            shutil.copytree(source, target)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    return destination
 
-    The tarball holds the package under its own top directory, so a target may not leave the package at any step,
-    must lie under an entry of ``files`` and must exist. The raw path goes to the file system, not to ``pathlib``,
-    which would drop a trailing slash or fold ``config.js/..`` that no file system follows.
+
+def dead_links(tree: Path, text: str) -> list[str]:
+    """Relative link targets in ``text`` that the extracted package ``tree`` cannot follow.
+
+    The tarball holds the package under its own top directory, so a target may not leave the package at any step or
+    name the package directory itself. The raw path goes to the file system of the shipped tree, not to ``pathlib``,
+    which would drop a trailing slash or fold ``config.js/..`` or ``test/..`` that the tarball cannot follow.
     """
-    shipped = {entry.rstrip("/") for entry in read_json(package / "package.json")["files"]}
     dead = []
     for link in link_targets(text):
         # Split the URL first and decode only its path: an encoded `#` or `?` is part of the file name.
@@ -232,22 +243,22 @@ def dead_links(package: Path, text: str) -> list[str]:
         if (
             path.startswith("/")
             or climbs_out(path)
-            or os.path.normpath(path).split("/")[0] not in shipped
-            or not os.path.exists(os.path.join(package, path))
+            or os.path.normpath(path) == "."
+            or not os.path.exists(os.path.join(tree, path))
         ):
             dead.append(link)
     return dead
 
 
 @pytest.mark.parametrize("package", PACKAGES, ids=lambda path: path.name)
-def test_each_package_readme_links_by_relative_path_only_to_files_it_ships(package: Path) -> None:
+def test_each_package_readme_links_by_relative_path_only_to_files_it_ships(package: Path, tmp_path: Path) -> None:
     """The tarball holds only the package; a relative link to anything else is dead there."""
-    assert dead_links(package, package_readme(package)) == []
+    assert dead_links(shipped_tree(package, tmp_path / "package"), package_readme(package)) == []
 
 
-def test_the_link_check_finds_each_kind_of_dead_link() -> None:
+def test_the_link_check_finds_each_kind_of_dead_link(tmp_path: Path) -> None:
     """A check that passes every README must still be able to fail."""
-    package = INTEGRATIONS / "pi"
+    package = shipped_tree(INTEGRATIONS / "pi", tmp_path / "package")
     live = (
         "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
         '[f](lib/config.js "see [g](../README.md)")\n'
@@ -278,6 +289,7 @@ def test_the_link_check_finds_each_kind_of_dead_link() -> None:
         "the parent of a file": "[x](lib/config.js/..)",
         "a path that leaves the package and comes back": "[x](../pi/lib/config.js)",
         "an absolute path": "[x](/integrations/pi/lib/config.js)",
+        "a path through a directory the package does not ship": "[x](test/../README.md)",
     }
     for name, text in dead.items():
         assert dead_links(package, text + "\n") != [], name
