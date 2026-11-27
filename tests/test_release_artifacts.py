@@ -28,7 +28,7 @@ import textwrap
 import tomllib
 import zipfile
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import pytest
 import yaml
@@ -200,7 +200,7 @@ def link_targets(text: str) -> list[str]:
         stack.extend(token.children or [])
         target = token.attrGet("href") if token.type == "link_open" else token.attrGet("src")
         if token.type in {"link_open", "image"} and isinstance(target, str):
-            targets.append(unquote(target))
+            targets.append(target)
     return targets
 
 
@@ -210,10 +210,11 @@ def dead_links(package: Path, text: str) -> list[str]:
     shipped = {entry.rstrip("/") for entry in read_json(package / "package.json")["files"]}
     dead = []
     for link in link_targets(text):
-        target = link.split("#", 1)[0]
-        if not target or re.match(r"[a-z][a-z0-9+.-]*:", target, re.IGNORECASE):
+        # Split the URL first and decode only its path: an encoded `#` or `?` is part of the file name.
+        parts = urlsplit(link)
+        if parts.scheme or parts.netloc or not parts.path:
             continue
-        resolved = (package / target).resolve()
+        resolved = (package / unquote(parts.path)).resolve()
         if (
             not resolved.is_relative_to(root)
             or resolved == root
@@ -236,10 +237,11 @@ def test_the_link_check_finds_each_kind_of_dead_link() -> None:
     live = (
         "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
         '[f](lib/config.js "see [g](../README.md)")\n'
+        "[h](lib/config.js?raw=1) [i](lib/con%66ig.js)\n"
     )
     # A link inside a title is title text, not a link.
     expected = ["lib/config.js", "lib/config.js#L1", "#configure", "https://example.com/x", "README.md"]
-    expected.append("lib/config.js")
+    expected += ["lib/config.js", "lib/config.js?raw=1", "lib/con%66ig.js"]
     assert sorted(link_targets(live)) == sorted(expected)
     assert dead_links(package, live) == []
     dead = {
@@ -257,6 +259,7 @@ def test_the_link_check_finds_each_kind_of_dead_link() -> None:
         "a reference link in a block quote": "> [x][r]\n>\n> [r]: ../README.md",
         "a link in a table cell": "| a |\n|---|\n| [x](../README.md) |",
         "an image": "![x](../logo.png)",
+        "an encoded number sign, which is part of the file name": "[x](lib/config.js%23missing)",
     }
     for name, text in dead.items():
         assert dead_links(package, text + "\n") != [], name
