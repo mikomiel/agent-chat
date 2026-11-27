@@ -98,9 +98,8 @@ plugin came from that one checkout: core 0.8.0 and plugin `agent-chat` 0.8.0.
 The plugin config set `idleWakeHoldSeconds: 120` and `noticeBodies: false`.
 The run used Node 24.22.1, PostgreSQL 17.11 and Python 3.12.13. The Python was
 provisioned with `uv` and `--python 3.12`, and the plugin config named that
-interpreter, which the package starts directly; `uv` resolved its default to
-Python 3.15, which is untested. The service was a disposable product
-service with a private database. The model was a local stub of the Messages API,
+interpreter, which the package starts directly. The service was a disposable
+product service with a private database. The model was a local stub of the Messages API,
 so no real model ran and no paid call was made. A fresh Claude Code profile
 needed `hasCompletedOnboarding` set, or start-up preflight contacts the vendor
 API.
@@ -108,24 +107,27 @@ API.
 - Join: the binding file had mode 0600, the socket mode 0600 and the state
   directory mode 0700. The instance started `unknown`/`stopped`, and the binding
   was announced as `SessionStart` context.
-- Busy delivery: a question sent during a Bash `sleep 15` was handed while the
-  tool ran, as `PostToolUse` `additionalContext`.
+- Busy delivery: a question sent during a Bash `sleep 15` was handed about 5.6
+  seconds after the send, as `PostToolUse` `additionalContext` once the tool
+  returned.
 - Idle wake: Claude Code 2.1.332 honours the exit code 2 of the `Stop` hook with
-  `asyncRewake`. A question sent to the idle session woke it, and the request
-  that reached the stub model carried the question as a Stop-hook blocking error
-  inside a system notification. The configured hold was 120 seconds; the end of
-  the hold was not recorded as evidence.
+  `asyncRewake`. A question sent to the idle session woke it and was handed
+  about 3.2 seconds after the send. With `noticeBodies: false`, the request that
+  reached the stub model carried a metadata notice for the question, without its
+  body, as a Stop-hook blocking error inside a system notification. The
+  configured hold was 120 seconds; the end of the hold was not recorded as
+  evidence.
 - Rejoin, three cases. Killing the receiver: the worker ended the instance on
   standard input EOF and the binding was removed; the next prompt started a new
   receiver with the same session ID, a new instance and a new binding, announced
   one prompt later ([issue #193](https://github.com/mikomiel/agent-chat/issues/193)).
-  Lease expiry, with the service paused for more than 90 seconds: the same
-  receiver joined a new instance after its back-off. Killing
+  Lease expiry, with the service paused past the 90-second lease: the server
+  ended the instance, and the same receiver joined a new one after its back-off. Killing
   the worker: the documented fail-closed latch held and chat did not rejoin;
   the binding file and the instance that was not ended stayed behind
   ([issue #192](https://github.com/mikomiel/agent-chat/issues/192)).
-- End: `/exit` ended the instance and removed the binding, the socket, the
-  receiver, the worker and the waiter. `/clear` is a `SessionEnd` followed by a
+- End: after `/exit` the instance was ended, no plugin process was left, the
+  state directory was empty and no binding file remained. `/clear` is a `SessionEnd` followed by a
   new chat session.
 - Plan Mode: a question sent to the idle session in Plan Mode was neither woken
   nor delivered. It was delivered at the first prompt after Plan Mode ended.
