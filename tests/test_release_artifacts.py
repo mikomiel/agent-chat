@@ -189,11 +189,9 @@ def test_each_package_readme_names_its_release_asset_and_points_at_the_install_s
     assert "https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release" in readme
 
 
-# An inline link target (group 1) or a reference definition target (group 2).
-MARKDOWN_LINK = re.compile(
-    r"\]\(<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\)|^\s*\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)",
-    re.MULTILINE,
-)
+# The target of an inline link or of a reference definition, in angle brackets or up to the first space. Only the
+# target is read, so any title form after it ("t", 't' or (t)) does not matter.
+MARKDOWN_LINK = re.compile(r"\]\(\s*(?:<([^>]*)>|([^)\s]+))|^ {0,3}\[[^\]]+\]:\s*(?:<([^>]*)>|(\S+))", re.MULTILINE)
 
 
 def dead_links(package: Path, text: str) -> list[str]:
@@ -202,7 +200,7 @@ def dead_links(package: Path, text: str) -> list[str]:
     shipped = {entry.rstrip("/") for entry in read_json(package / "package.json")["files"]}
     dead = []
     for match in MARKDOWN_LINK.finditer(text):
-        target = (match.group(1) or match.group(2)).split("#", 1)[0]
+        target = next(group for group in match.groups() if group is not None).split("#", 1)[0]
         if not target or re.match(r"[a-z][a-z0-9+.-]*:", target, re.IGNORECASE):
             continue
         resolved = (package / target).resolve()
@@ -234,7 +232,11 @@ def test_the_link_check_finds_each_kind_of_dead_link() -> None:
         "a file the package does not ship": "[x](test/config.test.js)",
         "an angle-bracket target": "[x](<../README.md>)",
         "a titled link": '[x](../README.md "overview")',
+        "a link with a single-quoted title": "[x](../README.md 'overview')",
+        "a link with a parenthesized title": "[x](../README.md (overview))",
+        "the package directory itself": "[x](./)",
         "a reference definition": "[x]: ../README.md",
+        "a reference definition in angle brackets": "[x]: <../README.md>",
     }
     for name, text in dead.items():
         assert dead_links(package, text + "\n") != [], name
