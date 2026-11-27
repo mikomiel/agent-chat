@@ -204,9 +204,23 @@ def link_targets(text: str) -> list[str]:
     return targets
 
 
+def climbs_out(path: str) -> bool:
+    """Whether a relative path goes above its starting directory at any step, even to come back."""
+    depth = 0
+    for segment in path.split("/"):
+        depth += -1 if segment == ".." else 0 if segment in {"", "."} else 1
+        if depth < 0:
+            return True
+    return False
+
+
 def dead_links(package: Path, text: str) -> list[str]:
-    """Relative link targets in ``text`` that an extracted tarball of ``package`` cannot follow."""
-    root = package.resolve()
+    """Relative link targets in ``text`` that an extracted tarball of ``package`` cannot follow.
+
+    The tarball holds the package under its own top directory, so a target may not leave the package at any step,
+    must lie under an entry of ``files`` and must exist. The raw path goes to the file system, not to ``pathlib``,
+    which would drop a trailing slash or fold ``config.js/..`` that no file system follows.
+    """
     shipped = {entry.rstrip("/") for entry in read_json(package / "package.json")["files"]}
     dead = []
     for link in link_targets(text):
@@ -214,12 +228,12 @@ def dead_links(package: Path, text: str) -> list[str]:
         parts = urlsplit(link)
         if parts.scheme or parts.netloc or not parts.path:
             continue
-        resolved = (package / unquote(parts.path)).resolve()
+        path = unquote(parts.path)
         if (
-            not resolved.is_relative_to(root)
-            or resolved == root
-            or resolved.relative_to(root).parts[0] not in shipped
-            or not resolved.exists()
+            path.startswith("/")
+            or climbs_out(path)
+            or os.path.normpath(path).split("/")[0] not in shipped
+            or not os.path.exists(os.path.join(package, path))
         ):
             dead.append(link)
     return dead
@@ -237,11 +251,11 @@ def test_the_link_check_finds_each_kind_of_dead_link() -> None:
     live = (
         "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
         '[f](lib/config.js "see [g](../README.md)")\n'
-        "[h](lib/config.js?raw=1) [i](lib/con%66ig.js)\n"
+        "[h](lib/config.js?raw=1) [i](lib/con%66ig.js) [j](lib/) [k](lib/../README.md)\n"
     )
     # A link inside a title is title text, not a link.
     expected = ["lib/config.js", "lib/config.js#L1", "#configure", "https://example.com/x", "README.md"]
-    expected += ["lib/config.js", "lib/config.js?raw=1", "lib/con%66ig.js"]
+    expected += ["lib/config.js", "lib/config.js?raw=1", "lib/con%66ig.js", "lib/", "lib/../README.md"]
     assert sorted(link_targets(live)) == sorted(expected)
     assert dead_links(package, live) == []
     dead = {
@@ -260,6 +274,10 @@ def test_the_link_check_finds_each_kind_of_dead_link() -> None:
         "a link in a table cell": "| a |\n|---|\n| [x](../README.md) |",
         "an image": "![x](../logo.png)",
         "an encoded number sign, which is part of the file name": "[x](lib/config.js%23missing)",
+        "a file with a trailing slash": "[x](lib/config.js/)",
+        "the parent of a file": "[x](lib/config.js/..)",
+        "a path that leaves the package and comes back": "[x](../pi/lib/config.js)",
+        "an absolute path": "[x](/integrations/pi/lib/config.js)",
     }
     for name, text in dead.items():
         assert dead_links(package, text + "\n") != [], name
