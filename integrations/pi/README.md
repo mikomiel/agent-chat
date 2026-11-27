@@ -83,9 +83,9 @@ pi
 ```
 
 The loader refuses a relative path, a symlink, a file that is not owned by the
-current user, a file with any group or world permission bit, an unknown field
-and a delegated child (`AGENT_CHAT_DELEGATED_CHILD=1`). Chat stays off silently
-on every refusal; the host token is never logged.
+current user, a file with any group or world permission bit, a file larger than
+16 KiB, an unknown field and a delegated child (`AGENT_CHAT_DELEGATED_CHILD=1`).
+Chat stays off silently on every refusal; the host token is never logged.
 
 The service and its host-token provisioning are documented in the product
 [README](../../README.md) and [self-hosting guide](../../docs/self-hosting.md).
