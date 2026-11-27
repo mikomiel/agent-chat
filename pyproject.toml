@@ -32,8 +32,8 @@ classifiers = [
     "Topic :: Communications :: Chat",
 ]
 dependencies = [
-    "fastapi==0.163.0",
-    "pydantic==2.14.3",
+    "fastapi==0.165.0",
+    "pydantic==2.14.4",
     "uvicorn==0.54.0",
 ]
 
@@ -45,7 +45,7 @@ server = ["psycopg[binary]==3.3.9"]
 # The optional one-shot viewer inspection drives a real browser.
 browser = ["playwright==1.65.2"]
 mcp = [
-    "fastmcp==4.2.0",
+    "fastmcp==4.2.4",
     "mcp==2.3.0",
 ]
 
@@ -61,15 +61,15 @@ Changelog = "https://github.com/mikomiel/agent-chat/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
-    "fastmcp==4.2.0",
+    "fastmcp==4.2.4",
     "mcp==2.3.0",
     "playwright==1.65.2",
     "psycopg[binary]==3.3.9",
     "pytest==9.2.0",
     "pytest-xdist==3.8.0",
     "PyYAML==6.0.3",
-    "ruff==0.17.5",
-    "ty==0.0.104",
+    "ruff==0.17.6",
+    "ty==0.0.107",
 ]
 
 [tool.hatch.build.targets.wheel]
