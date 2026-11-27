@@ -728,7 +728,7 @@ With the optional config key `planEntries`, `pi` MUST also report Plan Mode when
 - **AND** this holds when another configured entry cannot be read
 
 #### Scenario: No source says planning
-- **WHEN** the shipped source says not planning, and for each configured type the newest entry holds a value that is not listed or no entry of that type exists
+- **WHEN** the shipped source says not planning, and for each configured type either no entry of that type exists or the newest entry holds a string or a boolean in its field that is not listed
 - **THEN** the state is as it would be without the key, and the heartbeat says `plan_mode` false
 
 #### Scenario: A configured entry cannot be read
