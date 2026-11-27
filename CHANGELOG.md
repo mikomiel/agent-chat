@@ -5,6 +5,42 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0](https://github.com/mikomiel/agent-chat/compare/v0.8.0...v0.9.0) (2026-11-27)
+
+
+### Features
+
+* **claude-code:** configurable idle-wake hold up to 8385 s, and pin the waiter across rejoin episodes ([#180](https://github.com/mikomiel/agent-chat/issues/180)) ([d0da9c8](https://github.com/mikomiel/agent-chat/commit/d0da9c87d85c7a8e98dbfb70e77c35e153f01279))
+* **codex:** read the thread's Plan Mode before each chat output during a turn ([#190](https://github.com/mikomiel/agent-chat/issues/190)) ([f13acdd](https://github.com/mikomiel/agent-chat/commit/f13acdde6110ee6caad1e1cb3060ade3fd598ef9))
+* **integrations:** add the Claude Code plugin package ([#124](https://github.com/mikomiel/agent-chat/issues/124)) ([50e3de4](https://github.com/mikomiel/agent-chat/commit/50e3de4b4fa997005e40388d6e008baff0292d1f)), closes [#123](https://github.com/mikomiel/agent-chat/issues/123)
+* **integrations:** Codex idle wake through the app-server queue ([#159](https://github.com/mikomiel/agent-chat/issues/159)) ([0e4a657](https://github.com/mikomiel/agent-chat/commit/0e4a6579eb28aa317e192f99933b92a34a994b18)), closes [#154](https://github.com/mikomiel/agent-chat/issues/154)
+* **integrations:** Codex plugin for Agent Chat (hooks and app-server thread check) ([#143](https://github.com/mikomiel/agent-chat/issues/143)) ([7695726](https://github.com/mikomiel/agent-chat/commit/7695726f3e938f8002eb01255330a812e86bb93e)), closes [#136](https://github.com/mikomiel/agent-chat/issues/136)
+* **integrations:** configurable tool route for binding and notice text ([#165](https://github.com/mikomiel/agent-chat/issues/165)) ([7b1ac32](https://github.com/mikomiel/agent-chat/commit/7b1ac32410e9d4e6d9fe23403c9cdeae183b07aa))
+* **integrations:** one tested notice contract for peer message bodies ([#140](https://github.com/mikomiel/agent-chat/issues/140)) ([9b59c80](https://github.com/mikomiel/agent-chat/commit/9b59c805c3ff7552afb1991371ca4e219839b9f6)), closes [#129](https://github.com/mikomiel/agent-chat/issues/129)
+* **integrations:** OpenCode server plugin for Agent Chat (join and binding context) ([#142](https://github.com/mikomiel/agent-chat/issues/142)) ([07bb7a6](https://github.com/mikomiel/agent-chat/commit/07bb7a690b45f16010ec126a367856137d976fab)), closes [#137](https://github.com/mikomiel/agent-chat/issues/137)
+* **integrations:** show sender receipts in Pi, DeepSeek, Claude Code and Codex ([#170](https://github.com/mikomiel/agent-chat/issues/170)) ([2ab635b](https://github.com/mikomiel/agent-chat/commit/2ab635b0e44e8d9b7a0d18fa6bd339ae65fc4a42))
+* **opencode:** deliver chat from the experimental.idle hook, off by default ([#173](https://github.com/mikomiel/agent-chat/issues/173)) ([6f3b1dd](https://github.com/mikomiel/agent-chat/commit/6f3b1dd524bdba5e70a0a2aea8f44b6fc81c7ed8)), closes [#148](https://github.com/mikomiel/agent-chat/issues/148)
+* **pi:** lease-accurate footer, presence on change, replacement contract ([#191](https://github.com/mikomiel/agent-chat/issues/191)) ([86806d6](https://github.com/mikomiel/agent-chat/commit/86806d6347952d9211eafe42389380606760584d))
+* **pi:** read Plan Mode from configured custom entries ([#196](https://github.com/mikomiel/agent-chat/issues/196)) ([44eb12d](https://github.com/mikomiel/agent-chat/commit/44eb12d5867fc76f72ef8593bb9c28ff1a3e49b4))
+* **release:** ship every harness integration with each release ([#139](https://github.com/mikomiel/agent-chat/issues/139)) ([5f6af4d](https://github.com/mikomiel/agent-chat/commit/5f6af4d5aa42db61cdcdd3ba1733766c8b0cd41e)), closes [#135](https://github.com/mikomiel/agent-chat/issues/135)
+
+
+### Bug Fixes
+
+* **core:** a delivery claim records no attempt after a deadline below the client step ([#181](https://github.com/mikomiel/agent-chat/issues/181)) ([e52282b](https://github.com/mikomiel/agent-chat/commit/e52282bf5d8c0af2a8c3c9df7b9c25d6d5031100))
+* **core:** a heartbeat reply must echo the stored state ([#194](https://github.com/mikomiel/agent-chat/issues/194)) ([e597a9b](https://github.com/mikomiel/agent-chat/commit/e597a9bc414ac1a5784fc83ab4616a1f79cbd1bd))
+* **core:** a refusal sweep that cannot lock rolls back alone ([#187](https://github.com/mikomiel/agent-chat/issues/187)) ([c5f411f](https://github.com/mikomiel/agent-chat/commit/c5f411fe696f14eda97c281caefff16f154a43be))
+* **core:** discard the instance file even when the end fails ([#149](https://github.com/mikomiel/agent-chat/issues/149)) ([4f3fffa](https://github.com/mikomiel/agent-chat/commit/4f3fffab0d4122838885fbc90824ad2d6af2916d))
+* **integrations:** install the worker error handler before touching pipes ([#161](https://github.com/mikomiel/agent-chat/issues/161)) ([9231f4e](https://github.com/mikomiel/agent-chat/commit/9231f4e2fe4e86b4bfeb28ae85f00977ba21e31a)), closes [#153](https://github.com/mikomiel/agent-chat/issues/153)
+* **integrations:** keep DeepSeek eligibility working without roots() ([#138](https://github.com/mikomiel/agent-chat/issues/138)) ([f3bbb2f](https://github.com/mikomiel/agent-chat/commit/f3bbb2f24297248522e224fd660b2a36e17a5ab1)), closes [#134](https://github.com/mikomiel/agent-chat/issues/134)
+* **integrations:** rejoin after a worker request timeout ([#145](https://github.com/mikomiel/agent-chat/issues/145)) ([489ca28](https://github.com/mikomiel/agent-chat/commit/489ca28d920bfced2914b4c4cd172d3cae1ca8e8)), closes [#144](https://github.com/mikomiel/agent-chat/issues/144)
+* **integrations:** retry a brief outage on the next tick, not rejoin ([#147](https://github.com/mikomiel/agent-chat/issues/147)) ([0037f00](https://github.com/mikomiel/agent-chat/commit/0037f00de5d6ebed6b0b860cf9f2e60bd15fd408)), closes [#146](https://github.com/mikomiel/agent-chat/issues/146)
+* **pi:** refuse a config file larger than 16 KiB ([#198](https://github.com/mikomiel/agent-chat/issues/198)) ([006efe0](https://github.com/mikomiel/agent-chat/commit/006efe0cbf57e450baa3119a96747be130490f7a))
+* **receipts:** read and mark receipts without the event clock ([#189](https://github.com/mikomiel/agent-chat/issues/189)) ([4fb8c46](https://github.com/mikomiel/agent-chat/commit/4fb8c46a5ec311367f18ad83ac1dfd3ec26cdafa))
+* **worker:** resolve the server host once at join ([#166](https://github.com/mikomiel/agent-chat/issues/166)) ([1df9fb8](https://github.com/mikomiel/agent-chat/commit/1df9fb84e59e1ac1750fd0a91a133c06e6d75e5c)), closes [#151](https://github.com/mikomiel/agent-chat/issues/151)
+* **worker:** send a settlement with no answer again until the request deadline ([#188](https://github.com/mikomiel/agent-chat/issues/188)) ([048a3c1](https://github.com/mikomiel/agent-chat/commit/048a3c1d7f8311964d1ca7115f58224829336594))
+* **worker:** write replies past the stdout buffer so exit cannot block ([#162](https://github.com/mikomiel/agent-chat/issues/162)) ([ff095e0](https://github.com/mikomiel/agent-chat/commit/ff095e0efd58018da299709e33673e6c2e32e381)), closes [#150](https://github.com/mikomiel/agent-chat/issues/150)
+
 ## [0.8.0](https://github.com/mikomiel/agent-chat/compare/v0.7.0...v0.8.0) (2026-11-18)
 
 
