@@ -14,12 +14,13 @@ const REQUIRED = ["chatEnabled", "directory", "serverOrigin", "hostToken", "pyth
 const OPTIONAL = ["noticeBodies", "harness", "toolRoute", "planEntries"]
 const PLAN_ENTRY_KEYS = ["customType", "field", "values"]
 
-// Extra custom entries that count as Plan Mode: 1 to 8 items, each with exactly these keys.
+// Extra custom entries that count as Plan Mode: 1 to 8 items, each with exactly these keys. `customType` is counted in
+// Unicode code points, as the README states characters.
 function planEntriesValid(items) {
   return Array.isArray(items) && items.length >= 1 && items.length <= 8 && items.every(item =>
     item !== null && typeof item === "object" && !Array.isArray(item) &&
     Object.keys(item).length === PLAN_ENTRY_KEYS.length && PLAN_ENTRY_KEYS.every(key => key in item) &&
-    typeof item.customType === "string" && item.customType.length >= 1 && item.customType.length <= 128 &&
+    typeof item.customType === "string" && item.customType.length >= 1 && [...item.customType].length <= 128 &&
     typeof item.field === "string" && item.field.length >= 1 &&
     Array.isArray(item.values) && item.values.length >= 1 && item.values.length <= 16 &&
     item.values.every(value => typeof value === "boolean" || typeof value === "string"))

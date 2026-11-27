@@ -97,6 +97,8 @@ learns an extension's name or format, only what the file says:
   config error does.
 - The package reads the newest custom entry of that `customType` on the current branch
   (`sessionManager.getBranch()`), so tree navigation changes the answer. No entry of that type means not planning.
+  Pi session entries are append-only: an extension records a phase change by appending a new entry, and a change
+  made in place to an entry's `data` is not seen.
 - Fail closed: when `data[field]` is missing, `null`, a number, an object or an array, or the branch cannot be read, the
   state is `unknown` and nothing is claimed. It is never reported as idle.
 - The session is in Plan Mode when the shipped source or any item says planning, even if another item cannot be read.

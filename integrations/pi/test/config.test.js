@@ -121,6 +121,9 @@ test("planEntries is optional and a valid list is returned as written", () => {
   assert.deepEqual(withConfig({ ...base, planEntries: many }), { ...base, planEntries: many })
   const edge = [{ customType: "t".repeat(128), field: "f", values: Array.from({ length: 16 }, (_, index) => `v${index}`) }]
   assert.deepEqual(withConfig({ ...base, planEntries: edge }), { ...base, planEntries: edge })
+  // 128 characters outside the Basic Multilingual Plane are 256 UTF-16 code units: the limit counts characters.
+  const wide = [{ customType: "\u{1F600}".repeat(128), field: "f", values: ["on"] }]
+  assert.deepEqual(withConfig({ ...base, planEntries: wide }), { ...base, planEntries: wide })
 })
 
 test("any malformed planEntries keeps chat off", () => {
@@ -139,6 +142,7 @@ test("any malformed planEntries keeps chat off", () => {
     "an extra key": [{ ...item, extra: true }],
     "an empty customType": [{ ...item, customType: "" }],
     "a customType over 128 characters": [{ ...item, customType: "t".repeat(129) }],
+    "a customType over 128 wide characters": [{ ...item, customType: "\u{1F600}".repeat(129) }],
     "a customType that is not a string": [{ ...item, customType: 1 }],
     "an empty field": [{ ...item, field: "" }],
     "a field that is not a string": [{ ...item, field: ["phase"] }],
