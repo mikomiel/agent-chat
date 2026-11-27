@@ -104,7 +104,8 @@ Messages API, so no real model ran. A first start with a fresh profile, before
 vendor API and exited.
 
 Each result below is what the run record shows: the service database, process
-and state-directory listings, and the requests that the stub model received.
+and state-directory listings, the Claude Code session transcript, and the
+requests that the stub model received.
 
 - Join: the binding file had mode 0600, the socket mode 0600 and the state
   directory mode 0700. The instance started `unknown`/`stopped`, and a request
@@ -112,12 +113,16 @@ and state-directory listings, and the requests that the stub model received.
 - Busy delivery: a question sent during a Bash `sleep 15` was handed about 5.6
   seconds after the send, and the next model request carried its notice as
   `PostToolUse` `additionalContext`.
-- Idle wake: a question sent to the idle session was handed about 3.2 seconds
-  after the send, and the session made a new model request. With
+- Idle wake: the transcript recorded the end of the previous turn while the
+  `wait` hook was still running: its Stop-hook summary listed `wait` without a
+  duration, and the process listing showed the waiter about seven seconds
+  later. A question sent 25 seconds after that turn ended was handed about 3.2
+  seconds after the send. The transcript then queued a `Stop hook feedback` task
+  notification, and the session made a new model request. With
   `noticeBodies: false`, that request carried a metadata notice for the
-  question, without its body, as a Stop-hook blocking error inside a system
-  notification: Claude Code 2.1.332 acted on the exit code 2 of the `Stop` hook
-  with `asyncRewake`. The configured hold was 120 seconds; the end of the hold
+  question, without its body, as a Stop-hook blocking error. Claude Code 2.1.332
+  therefore ran the waiter after the turn ended, with `asyncRewake`, and acted
+  on its exit code 2. The configured hold was 120 seconds; the end of the hold
   is not in the record.
 - Rejoin, three cases. After the receiver was killed, the instance was ended
   and the binding was gone; the next prompt started a new receiver with the
@@ -132,7 +137,7 @@ and state-directory listings, and the requests that the stub model received.
 - End: after `/exit` the instance was ended, no plugin process was left, the
   state directory was empty and no binding file remained. After `/clear`, a new
   chat session started.
-- Plan Mode: a question sent while the session was idle in Plan Mode was handed
+- Plan Mode: a question sent while the session was in Plan Mode was handed
   at the first prompt after Plan Mode ended, 37 seconds after the send. The
   record shows when it was handed; it does not show the turns in between.
 - `claude plugin validate` exited 0, with a notice that `network.hosts` is not

@@ -398,8 +398,10 @@ with `claude --plugin-dir`. The model was a local stub of the Messages API. The 
 observed the join, busy delivery, idle wake, rejoin, end and Plan Mode. The
 install command, the versions, the results and the surfaces not run are in
 [Claude Code 2.1.332
-verification](../README.md#claude-code-21332-verification), and the row is in the
-[compatibility matrix](../README.md#compatibility). No other release was run.
+verification](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#claude-code-21332-verification),
+and the row is in the
+[compatibility matrix](https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#compatibility).
+No other release was run.
 Sender receipts, a real model and the other surfaces that section lists were
 not. The contract tests use hook-payload and worker doubles.
 
