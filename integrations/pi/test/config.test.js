@@ -31,6 +31,18 @@ test("a private complete record is accepted", () => {
   assert.deepEqual(withConfig(base), base)
 })
 
+test("a record larger than 16 KiB is refused, even when its first 16 KiB parse", () => {
+  // A valid record padded to the read bound, then text that makes the whole file invalid JSON.
+  const record = JSON.stringify(base)
+  const dir = mkdtempSync(join(tmpdir(), "agent-chat-config-"))
+  const file = join(dir, "chat.json")
+  try {
+    writeFileSync(file, record + " ".repeat(16 * 1024 - Buffer.byteLength(record, "utf8")) + "not json")
+    chmodSync(file, 0o600)
+    assert.equal(loadConfig({ AGENT_CHAT_PI_CONFIG: file }), null)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
 test("a group- or world-readable record is refused", () => {
   assert.equal(withConfig(base, 0o644), null)
 })

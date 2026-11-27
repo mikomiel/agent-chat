@@ -35,7 +35,7 @@ export function loadConfig(env = process.env, name = PI_CHAT_CONFIG_ENV) {
   let data
   try {
     const info = fstatSync(descriptor)
-    if (!info.isFile() || info.uid !== process.geteuid() || (info.mode & 0o077) !== 0) return null
+    if (!info.isFile() || info.uid !== process.geteuid() || (info.mode & 0o077) !== 0 || info.size > MAX_BYTES) return null
     const buffer = Buffer.alloc(MAX_BYTES)
     const length = readSync(descriptor, buffer, 0, MAX_BYTES, 0)
     data = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, length)))
