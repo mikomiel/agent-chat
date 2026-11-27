@@ -27,6 +27,7 @@ import tarfile
 import textwrap
 import tomllib
 import zipfile
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -191,17 +192,31 @@ def test_each_package_readme_names_its_release_asset_and_points_at_the_install_s
     assert "https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release" in readme
 
 
+class RenderedTargets(HTMLParser):
+    """The ``href`` of each ``a`` and the ``src`` of each ``img`` in rendered HTML."""
+
+    WANTED = {"a": "href", "img": "src"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.targets: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.targets.extend(value for name, value in attrs if name == self.WANTED.get(tag) and value is not None)
+
+    handle_startendtag = handle_starttag
+
+
 def link_targets(text: str) -> list[str]:
-    """Every link and image target that a CommonMark renderer with tables makes of ``text``."""
-    targets = []
-    stack = list(MarkdownIt("commonmark").enable("table").parse(text))
-    while stack:
-        token = stack.pop()
-        stack.extend(token.children or [])
-        target = token.attrGet("href") if token.type == "link_open" else token.attrGet("src")
-        if token.type in {"link_open", "image"} and isinstance(target, str):
-            targets.append(target)
-    return targets
+    """Every link and image target in ``text`` as a CommonMark renderer with tables renders it.
+
+    Reading the rendered HTML, not the parse tree, takes raw HTML links in and leaves out a link that only
+    becomes text, such as one inside an image description.
+    """
+    parser = RenderedTargets()
+    parser.feed(MarkdownIt("commonmark").enable("table").render(text))
+    parser.close()
+    return parser.targets
 
 
 def climbs_out(path: str) -> bool:
@@ -220,6 +235,8 @@ def shipped_tree(package: Path, destination: Path) -> Path:
     ``check_tarball`` expects the tracked files of the package minus ``test/``, plus the repository ``LICENSE``
     that the pack step adds. Each is a regular file; nothing is followed, and every target stays in ``destination``.
     """
+    # The pack step's own refusal: a link anywhere in the package, a linked directory included, stops it.
+    script.refuse_special_files(package)
     prefix = f"{script.INTEGRATIONS}/{package.name}/"
     names = [
         name[len(prefix) :]
@@ -274,10 +291,12 @@ def test_the_link_check_finds_each_kind_of_dead_link(tmp_path: Path) -> None:
         "[a](lib/config.js) [b](lib/config.js#L1) [c](#configure) [d](https://example.com/x) [e](README.md)\n"
         '[f](lib/config.js "see [g](../README.md)")\n'
         "[h](lib/config.js?raw=1) [i](lib/con%66ig.js) [j](lib/) [k](lib/../README.md)\n"
+        "![See [overview](../README.md)](lib/config.js)\n"
     )
     # A link inside a title is title text, not a link.
     expected = ["LICENSE", "lib/config.js", "lib/config.js#L1", "#configure", "https://example.com/x", "README.md"]
     expected += ["lib/config.js", "lib/config.js?raw=1", "lib/con%66ig.js", "lib/", "lib/../README.md"]
+    expected.append("lib/config.js")
     assert sorted(link_targets(live)) == sorted(expected)
     assert dead_links(package, live) == []
     dead = {
@@ -295,6 +314,8 @@ def test_the_link_check_finds_each_kind_of_dead_link(tmp_path: Path) -> None:
         "a reference link in a block quote": "> [x][r]\n>\n> [r]: ../README.md",
         "a link in a table cell": "| a |\n|---|\n| [x](../README.md) |",
         "an image": "![x](../logo.png)",
+        "a raw HTML link": '<a href="../README.md">x</a>',
+        "a raw HTML image": '<p><img src="../logo.png" alt="x"></p>',
         "an encoded number sign, which is part of the file name": "[x](lib/config.js%23missing)",
         "a file with a trailing slash": "[x](lib/config.js/)",
         "the parent of a file": "[x](lib/config.js/..)",
