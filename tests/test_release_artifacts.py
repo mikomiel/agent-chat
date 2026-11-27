@@ -189,6 +189,29 @@ def test_each_package_readme_names_its_release_asset_and_points_at_the_install_s
     assert "https://github.com/mikomiel/agent-chat/blob/main/integrations/README.md#install-a-pinned-release" in readme
 
 
+# An inline link target (group 1) or a reference definition target (group 2).
+MARKDOWN_LINK = re.compile(
+    r"\]\(<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\)|^\s*\[[^\]]+\]:\s*<?(\S+?)>?(?:\s|$)",
+    re.MULTILINE,
+)
+
+
+@pytest.mark.parametrize("package", PACKAGES, ids=lambda path: path.name)
+def test_each_package_readme_links_by_relative_path_only_to_files_it_ships(package: Path) -> None:
+    """The tarball holds only the package; a relative link to anything else is dead there."""
+    shipped = {entry.rstrip("/") for entry in read_json(package / "package.json")["files"]}
+    dead = []
+    for match in MARKDOWN_LINK.finditer(package_readme(package)):
+        target = (match.group(1) or match.group(2)).split("#", 1)[0]
+        if not target or re.match(r"[a-z][a-z0-9+.-]*:", target, re.IGNORECASE):
+            continue
+        resolved = (package / target).resolve()
+        inside = resolved.is_relative_to(package.resolve())
+        if not inside or resolved.relative_to(package.resolve()).parts[0] not in shipped:
+            dead.append(match.group(0))
+    assert dead == []
+
+
 def test_the_overview_documents_the_install_by_version_steps_and_the_compatibility_rule() -> None:
     overview = (INTEGRATIONS / "README.md").read_text(encoding="utf-8")
     assert INSTALL_SECTION in overview
