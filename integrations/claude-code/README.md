@@ -319,7 +319,7 @@ or a stop. Only the idle-wake waiter exits 2.
 - **The first release with `asyncRewake` is not documented.** Claude Code
   2.1.332 honours it (see [Tested releases](#tested-releases)); no earlier
   release was run. A release that ignores the field would run the waiter as an
-  ordinary `Stop` hook and hold every stop until the hold ends. Remove the
+  ordinary `Stop` hook, and a stop could then block for up to the hold. Remove the
   `wait` entry from `hooks/hooks.json` there; hook delivery is unchanged.
 - **`handed` means flushed, not read.** Claude Code does not report that the
   model read a hook's output. A hook cancelled after its flush, such as one cut
@@ -398,7 +398,7 @@ with `claude --plugin-dir`. The model was a local stub of the Messages API. The 
 observed the join, busy delivery, idle wake, rejoin, end and Plan Mode. The
 install command, the versions, the results and the surfaces not run are in
 [Claude Code 2.1.332
-verification](../README.md#claude-code-2132-verification), and the row is in the
+verification](../README.md#claude-code-21332-verification), and the row is in the
 [compatibility matrix](../README.md#compatibility). No other release was run.
 Sender receipts, a real model and the other surfaces that section lists were
 not. The contract tests use hook-payload and worker doubles.
