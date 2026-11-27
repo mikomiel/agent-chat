@@ -8,8 +8,9 @@ session gets one detached receiver process. The receiver runs the product's
 claim, settle and rejoin policy stay in the Python core. The receiver supplies
 the native state, the hand-over to a hook and the bounded rejoin scheduler.
 
-**Status:** source present, contract-tested with doubles, live run pending. No
-Claude Code release is recorded as verified yet; see [Tested
+**Status:** source present, contract-tested with doubles, and live-tested once:
+Claude Code 2.1.332 against source after 0.8.0, with a local stub of the model.
+Sender receipts and a real model are not run; see [Tested
 releases](#tested-releases).
 
 ## Requirements
@@ -315,10 +316,11 @@ or a stop. Only the idle-wake waiter exits 2.
   that. The two-hour window bounds when a retry may start. A retry that started
   before the window ended and finishes after it still joins, and a registered
   waiter can then be woken: the receiver does not discard a completed join.
-- **The first release with `asyncRewake` is not documented.** A release that
-  ignores the field would run the waiter as an ordinary `Stop` hook and hold
-  every stop until the hold ends. Remove the `wait` entry from
-  `hooks/hooks.json` there; hook delivery is unchanged.
+- **The first release with `asyncRewake` is not documented.** Claude Code
+  2.1.332 honours it (see [Tested releases](#tested-releases)); no earlier
+  release was run. A release that ignores the field would run the waiter as an
+  ordinary `Stop` hook and hold every stop until the hold ends. Remove the
+  `wait` entry from `hooks/hooks.json` there; hook delivery is unchanged.
 - **`handed` means flushed, not read.** Claude Code does not report that the
   model read a hook's output. A hook cancelled after its flush, such as one cut
   off at its timeout, can still settle `handed`.
@@ -356,7 +358,8 @@ or a stop. Only the idle-wake waiter exits 2.
   packing do not cover.
 - **Per-event cost and process ownership.** Each event starts a Node process.
   The orphan check and the owner hint assume the hook's parent process is
-  Claude Code; the contract tests cannot confirm that, so the live run must.
+  Claude Code; the contract tests cannot confirm that, and the Claude Code
+  2.1.332 run did not exercise the orphan self-end.
 - **Reused pids off Linux.** The start time comes from `/proc`. Where `/proc`
   cannot be read, only the pid is checked, so a pid that another process
   reuses keeps a dead owner's receiver up.
@@ -389,11 +392,16 @@ or a stop. Only the idle-wake waiter exits 2.
 
 ## Tested releases
 
-No live run is recorded. The Claude Code release this package was exercised
-against will be recorded with that run: the install command, the observed
-join, busy delivery, idle wake, rejoin and end. Until then the package has no
-row in the [compatibility matrix](../README.md#compatibility), and the
-contract tests use hook-payload and worker doubles.
+One live run is recorded: Claude Code `2.1.332`, with the plugin from source
+`2ab635b` (after 0.8.0, unreleased) and core 0.8.0 from the same checkout, loaded
+with `claude --plugin-dir`. The model was a local stub of the Messages API. The run
+observed the join, busy delivery, idle wake, rejoin, end and Plan Mode. The
+install command, the versions, the results and the surfaces not run are in
+[Claude Code 2.1.332
+verification](../README.md#claude-code-2132-verification), and the row is in the
+[compatibility matrix](../README.md#compatibility). No other release was run.
+Sender receipts, a real model and the other surfaces that section lists were
+not. The contract tests use hook-payload and worker doubles.
 
 ## Test
 

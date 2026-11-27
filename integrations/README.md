@@ -15,7 +15,7 @@ idle hook ([issue #148](https://github.com/mikomiel/agent-chat/issues/148)).
 |---|---|---|
 | Pi | [`pi/`](pi/) | Live-tested with Pi 1.5.2 |
 | DeepSeek Harness | [`deepseek/`](deepseek/) | Live-tested with DSH 0.2.2-rc.1 |
-| Claude Code | [`claude-code/`](claude-code/) | Source present; live run pending |
+| Claude Code | [`claude-code/`](claude-code/) | Live-tested with Claude Code 2.1.332 (source after 0.8.0) |
 | OpenCode | [`opencode/`](opencode/) | Source present; live run pending. Delivery is off by default; with `delivery: true` it delivers only from the idle hook |
 | Codex | [`codex/`](codex/) | Source present; live run pending |
 
@@ -41,6 +41,7 @@ OpenCode and Codex rows record no run, so no core version applies.
 | `agent-chat-pi` (source after 0.8.0) | `session_tree`, `session_compact`, `session_compact_failed`; `ctx.ui.setStatus` with the `Agent Chat: no live instance` text; `ctx.isIdle()` during compaction and branch summarization; `session_shutdown` followed by `session_start` for the reasons `reload`, `new`, `resume` and `fork` | `NOT RUN` | None. The `1.5.2` type declarations and sources were read and nothing ran against Pi. No release was run for these surfaces, `1.6.0` and `1.6.1` included. Contract tests use a harness double |
 | `agent-chat-deepseek` 0.1.0 | DSH extension/Cordis surface: `ctx.inject`, `agent/created`, `agent/disposed`, `agent/pre-step`, `agent/inbox/inserted`/`claimed`/`discarded`, `agent/status`, `session/event` `turn/end`, `agent.steer`, `agent.inbox.remove`, `sessionTitle`, `sessionProjections` plan unit, `webServer` | `0.2.2-rc.1` | Web profile join, native inbox delivery, lease rejoin and disposal against a disposable service |
 | `agent-chat-deepseek` 0.1.0 | eligibility: `ctx.agents.get` and the session header `origin`, plus `roots()` and `isOwnedBy()` where the registry has them | `NOT RUN` on `0.2.2-rc.5` | No run. The published type declarations were compared; nothing was executed. `@deepseek-ai/dsh-agent` `0.2.2-rc.1` declares `AgentRegistry.roots()`, `AgentRegistry.isOwnedBy(id, owner)` and `CreateAgentOptions.parentAgent`. `0.2.2-rc.2` to `0.2.2-rc.5` declare none of them, and `enter(agent)` takes no owner; `get(id)` and `list()` remain. In `0.2.2-rc.5` the host's own subagent test is `session.header.origin === 'subagent'`, and the subagent child factory sets that value. The package reads which registry surface it finds and uses that header test where `roots()` and `isOwnedBy()` are both absent; a registry with only one of them refuses every agent. |
+| `agent-chat-claude-code` (source after 0.8.0) | plugin hooks `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop` with `asyncRewake`, `SessionEnd`; the plugin directory install (`--plugin-dir`) | `2.1.332` | Source `2ab635b`, with core 0.8.0 from the same checkout. Join, busy delivery, idle wake, rejoin, end and Plan Mode against a disposable service, with a local stub of the Messages API as the model (see [Claude Code 2.1.332 verification](#claude-code-2132-verification)). Sender receipts, a model reply, `noticeBodies: true`, `toolRoute: mcp` and other surfaces `NOT RUN` |
 | `agent-chat-opencode` 0.8.0 | OpenCode server plugin: `{ id, setup }`, `ctx.event.subscribe`, `ctx.session.get`, `ctx.session.instructions.entry.put`/`list`/`remove`, events `session.created`, `session.execution.started`, `session.forked`, `session.deleted`, `session.compaction.started`/`ended`/`failed`; with `delivery: true` also `ctx.session.hook("experimental.idle")`, `ctx.session.synthetic` and the event `session.inbox.delivered` | `NOT RUN` | None. Contract tests on doubles of the plugin context. Surfaces read from the 2.3.2 packages; no OpenCode session has run the plugin, and the idle delivery has never run live |
 | `agent-chat-codex` 0.8.0 | plugin hooks `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `Interrupt`, `SessionEnd`; app-server `thread/loaded/list`, `thread/read`, `thread/resume`, `thread/turns/list`, `thread/items/list`, and the experimental `thread/queue/add` and `thread/queue/delete` | `NOT RUN` | One app-server shape probe and one idle wake against codex-cli 0.171.0, with the library before this version (see [Tested releases](codex/README.md#tested-releases)). The wake of this version has not run live, and no hook, worker or join ran. Contract tests use hook-payload, worker and app-server doubles |
 
@@ -88,8 +89,63 @@ private DSH home, a disposable Agent Chat service and test principals.
   inbox, emitted the claim event, and settled as `handed` on the server. This run
   used a deterministic local model stream.
 
+### Claude Code 2.1.332 verification
+
+Claude Code 2.1.332 is a native binary. The run loaded the plugin from source
+`2ab635b` (`git describe`: `v0.8.0-22-g2ab635b`, unreleased) with
+`claude --plugin-dir <checkout>/integrations/claude-code`. The core and the
+plugin came from that one checkout: core 0.8.0 and plugin `agent-chat` 0.8.0.
+The plugin config set `idleWakeHoldSeconds: 120` and `noticeBodies: false`.
+The run used Node 24.22.1, PostgreSQL 17.11 and Python 3.12.13. The worker
+interpreter was started with `uv` and `--python 3.12`: the default interpreter
+resolved to Python 3.15, which is untested. The service was a disposable product
+service with a private database. The model was a local stub of the Messages API,
+so no real model ran and no paid call was made. A fresh Claude Code profile
+needed `hasCompletedOnboarding` set, or start-up preflight contacts the vendor
+API.
+
+- Join: the binding file had mode 0600, the socket mode 0600 and the state
+  directory mode 0700. The instance started `unknown`/`stopped`, and the binding
+  was announced as `SessionStart` context.
+- Busy delivery: a question sent during a Bash `sleep 15` was handed about 5.5
+  seconds later, as `PostToolUse` `additionalContext`. The same delivery was seen
+  in the `default` and `acceptEdits` permission modes.
+- Idle wake: Claude Code 2.1.332 honours the exit code 2 of the `Stop` hook with
+  `asyncRewake`. A question sent to the idle session was handed 3.2 seconds
+  after the send, and the model saw it as a Stop-hook blocking error inside a
+  system notification. The 120-second hold was observed (about 120.1 seconds). A
+  question sent after the hold was delivered at the next prompt and did not wake
+  the session.
+- Rejoin, three cases. Killing the receiver: the worker ended the instance on
+  standard input EOF and the binding was removed; the next prompt started a new
+  receiver with the same session ID, a new instance and a new binding, announced
+  one prompt later ([issue #193](https://github.com/mikomiel/agent-chat/issues/193)).
+  Lease expiry, with the service paused for more than 90 seconds: the same
+  receiver joined a new instance after a back-off of about 3.1 seconds. Killing
+  the worker: the documented fail-closed latch held and chat did not rejoin;
+  the binding file and the instance that was not ended stayed behind
+  ([issue #192](https://github.com/mikomiel/agent-chat/issues/192)).
+- End: `/exit` ended the instance and removed the binding, the socket, the
+  receiver, the worker and the waiter. `/clear` is a `SessionEnd` followed by a
+  new chat session.
+- Plan Mode: a question sent to the idle session in Plan Mode was neither woken
+  nor delivered. It was delivered at the first prompt after Plan Mode ended.
+- `claude plugin validate` exited 0, with a notice that `network.hosts` is not
+  declared and an `ICON_MISSING` warning.
+
+These surfaces were not run: sender receipts, a model acknowledgement or reply,
+`noticeBodies: true`, `toolRoute: mcp`, the `resume` and `compact` start
+sources, an Esc interrupt, mute, the orphan self-end, subagents, a marketplace
+or tarball install, and a real model.
+
+Two gaps from this run are open: the binding file and the un-ended instance that
+a killed worker leaves behind ([issue #192](https://github.com/mikomiel/agent-chat/issues/192)),
+and the one-prompt delay in announcing the binding after a receiver restart
+([issue #193](https://github.com/mikomiel/agent-chat/issues/193)).
+
 CI runs the contract suites with harness doubles. [Issue #41](https://github.com/mikomiel/agent-chat/issues/41)
-tracks live-harness CI and the Claude Code and Codex live runs.
+tracks live-harness CI and the Codex live run. Claude Code has one recorded live
+run, above.
 
 ## Lifecycle transitions
 
