@@ -405,6 +405,11 @@ def _timed_worker(
         if path == "/v1/instance/status":
             return binding
         assert (method, path) in {("POST", "/v1/instance/heartbeat"), ("POST", "/v1/instance/end")}
+        if path == "/v1/instance/heartbeat":
+            # The real server returns the stored row: the sent state and the lease timestamp.
+            return binding | {"heartbeat_at": "2026-10-19T00:00:00+00:00"} | {
+                key: payload[key] for key in ("native_state", "stopped", "plan_mode")
+            }
         return binding
 
     with monkeypatch.context() as patch:

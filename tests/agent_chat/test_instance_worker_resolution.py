@@ -84,11 +84,15 @@ class _Server:
             def _answer(self) -> None:
                 state.hosts.append((self.path, self.headers.get("Host", "")))
                 length = int(self.headers.get("Content-Length") or 0)
-                if length:
-                    self.rfile.read(length)
+                sent = json.loads(self.rfile.read(length)) if length else {}
                 binding = {"instance_id": state.instance_id, "session_id": state.session_id}
                 if self.path == "/v1/sessions":
                     result = binding | {"room_id": str(uuid4()), "host": "synthetic-host", "harness": "pi"}
+                elif self.path == "/v1/instance/heartbeat":
+                    # The real server returns the stored row: the sent state and the lease timestamp.
+                    result = {"instance_id": state.instance_id, "heartbeat_at": "2026-10-19T00:00:00+00:00"} | {
+                        key: sent[key] for key in ("native_state", "stopped", "plan_mode")
+                    }
                 else:
                     result = binding
                 data = json.dumps(result).encode()
