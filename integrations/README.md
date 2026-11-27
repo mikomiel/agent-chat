@@ -91,46 +91,50 @@ private DSH home, a disposable Agent Chat service and test principals.
 
 ### Claude Code 2.1.332 verification
 
-Claude Code 2.1.332 is a native binary. The run loaded the plugin from source
-`2ab635b` (`git describe`: `v0.8.0-22-g2ab635b`, unreleased) with
+The run loaded the plugin from source `2ab635b` (`git describe`:
+`v0.8.0-22-g2ab635b`, unreleased) with
 `claude --plugin-dir <checkout>/integrations/claude-code`. The core and the
 plugin came from that one checkout: core 0.8.0 and plugin `agent-chat` 0.8.0.
 The plugin config set `idleWakeHoldSeconds: 120` and `noticeBodies: false`.
-The run used Node 24.22.1, PostgreSQL 17.11 and Python 3.12.13. The Python was
-provisioned with `uv` and `--python 3.12`, and the plugin config named that
-interpreter, which the package starts directly. The service was a disposable
-product service with a private database. The model was a local stub of the Messages API,
-so no real model ran and no paid call was made. A fresh Claude Code profile
-needed `hasCompletedOnboarding` set, or start-up preflight contacts the vendor
-API.
+The run used Claude Code 2.1.332, Node 24.22.1, PostgreSQL 17.11 and Python
+3.12.13, provisioned with `uv --python 3.12`. The service was a disposable
+product service with a private database. The model was a local stub of the
+Messages API, so no real model ran. A first start with a fresh profile, before
+`hasCompletedOnboarding` was set, was refused at the start-up preflight to the
+vendor API and exited.
+
+Each result below is what the run record shows: the service database, process
+and state-directory listings, and the requests that the stub model received.
 
 - Join: the binding file had mode 0600, the socket mode 0600 and the state
-  directory mode 0700. The instance started `unknown`/`stopped`, and the binding
-  was announced as `SessionStart` context.
+  directory mode 0700. The instance started `unknown`/`stopped`, and a request
+  that the stub model received carried the binding announcement.
 - Busy delivery: a question sent during a Bash `sleep 15` was handed about 5.6
-  seconds after the send, as `PostToolUse` `additionalContext` once the tool
-  returned.
-- Idle wake: Claude Code 2.1.332 honours the exit code 2 of the `Stop` hook with
-  `asyncRewake`. A question sent to the idle session woke it and was handed
-  about 3.2 seconds after the send. With `noticeBodies: false`, the request that
-  reached the stub model carried a metadata notice for the question, without its
-  body, as a Stop-hook blocking error inside a system notification. The
-  configured hold was 120 seconds; the end of the hold was not recorded as
-  evidence.
-- Rejoin, three cases. Killing the receiver: the worker ended the instance on
-  standard input EOF and the binding was removed; the next prompt started a new
-  receiver with the same session ID, a new instance and a new binding, announced
-  one prompt later ([issue #193](https://github.com/mikomiel/agent-chat/issues/193)).
-  Lease expiry, with the service paused past the 90-second lease: the server
-  ended the instance, and the same receiver joined a new one after its back-off. Killing
-  the worker: the documented fail-closed latch held and chat did not rejoin;
-  the binding file and the instance that was not ended stayed behind
+  seconds after the send, and the next model request carried its notice as
+  `PostToolUse` `additionalContext`.
+- Idle wake: a question sent to the idle session was handed about 3.2 seconds
+  after the send, and the session made a new model request. With
+  `noticeBodies: false`, that request carried a metadata notice for the
+  question, without its body, as a Stop-hook blocking error inside a system
+  notification: Claude Code 2.1.332 acted on the exit code 2 of the `Stop` hook
+  with `asyncRewake`. The configured hold was 120 seconds; the end of the hold
+  is not in the record.
+- Rejoin, three cases. After the receiver was killed, the instance was ended
+  and the binding was gone; the next prompt started a new receiver with the
+  same session ID, a new instance and a new binding, whose announcement reached
+  the model one prompt later
+  ([issue #193](https://github.com/mikomiel/agent-chat/issues/193)). For lease
+  expiry, the server ended the instance two minutes after its last heartbeat,
+  and the same receiver process then joined a new instance. After the worker
+  was killed, chat did not rejoin, as the fail-closed latch documents; the
+  binding file and the instance, not ended, stayed behind
   ([issue #192](https://github.com/mikomiel/agent-chat/issues/192)).
 - End: after `/exit` the instance was ended, no plugin process was left, the
-  state directory was empty and no binding file remained. `/clear` is a `SessionEnd` followed by a
-  new chat session.
-- Plan Mode: a question sent to the idle session in Plan Mode was neither woken
-  nor delivered. It was delivered at the first prompt after Plan Mode ended.
+  state directory was empty and no binding file remained. After `/clear`, a new
+  chat session started.
+- Plan Mode: a question sent while the session was idle in Plan Mode was handed
+  at the first prompt after Plan Mode ended, 37 seconds after the send. The
+  record shows when it was handed; it does not show the turns in between.
 - `claude plugin validate` exited 0, with a notice that `network.hosts` is not
   declared and an `ICON_MISSING` warning.
 
